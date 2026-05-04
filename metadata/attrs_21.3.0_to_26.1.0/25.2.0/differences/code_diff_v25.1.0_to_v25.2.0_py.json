@@ -1,0 +1,539 @@
+{
+  "old_dir": ".packages/attrs/25.1.0",
+  "new_dir": ".packages/attrs/25.2.0",
+  "extracted_at": "2026-04-12T22:48:04.129080",
+  "diff_file": "confirmed/attrs/25.2.0/differences/code_diff_v25.1.0_to_v25.2.0_py.diff",
+  "diff_content": "diff --git a/src/attr/_cmp.py b/src/attr/_cmp.py\nindex f367bb3..09bab49 100644\n--- a/src/attr/_cmp.py\n+++ b/src/attr/_cmp.py\n@@ -4,7 +4,7 @@\n import functools\n import types\n \n-from ._make import _make_ne\n+from ._make import __ne__\n \n \n _operation_names = {\"eq\": \"==\", \"lt\": \"<\", \"le\": \"<=\", \"gt\": \">\", \"ge\": \">=\"}\n@@ -71,7 +71,7 @@ def cmp_using(\n     if eq is not None:\n         has_eq_function = True\n         body[\"__eq__\"] = _make_operator(\"eq\", eq)\n-        body[\"__ne__\"] = _make_ne()\n+        body[\"__ne__\"] = __ne__\n \n     if lt is not None:\n         num_order_functions += 1\n\ndiff --git a/src/attr/_make.py b/src/attr/_make.py\nindex 152bb4f..7439dc2 100644\n--- a/src/attr/_make.py\n+++ b/src/attr/_make.py\n@@ -6,15 +6,16 @@ import abc\n import contextlib\n import copy\n import enum\n-import functools\n import inspect\n import itertools\n import linecache\n import sys\n import types\n-import typing\n+import unicodedata\n \n-from operator import itemgetter\n+from collections.abc import Callable, Mapping\n+from functools import cached_property\n+from typing import Any, NamedTuple, TypeVar\n \n # We need to import _compat itself in addition to the _compat members to avoid\n # having the thread-local in the globals here.\n@@ -208,7 +209,12 @@ def attrib(\n     )\n \n \n-def _compile_and_eval(script, globs, locs=None, filename=\"\"):\n+def _compile_and_eval(\n+    script: str,\n+    globs: dict[str, Any] | None,\n+    locs: Mapping[str, object] | None = None,\n+    filename: str = \"\",\n+) -> None:\n     \"\"\"\n     Evaluate the script with the given global (globs) and local (locs)\n     variables.\n@@ -217,10 +223,16 @@ def _compile_and_eval(script, globs, locs=None, filename=\"\"):\n     eval(bytecode, globs, locs)\n \n \n-def _make_method(name, script, filename, globs, locals=None):\n+def _linecache_and_compile(\n+    script: str,\n+    filename: str,\n+    globs: dict[str, Any] | None,\n+    locals: Mapping[str, object] | None = None,\n+) -> dict[str, Any]:\n     \"\"\"\n-    Create the method with the script given and return the method object.\n+    Cache the script with _linecache_, compile it and return the _locals_.\n     \"\"\"\n+\n     locs = {} if locals is None else locals\n \n     # In order of debuggers like PDB being able to step through the code,\n@@ -243,10 +255,10 @@ def _make_method(name, script, filename, globs, locals=None):\n \n     _compile_and_eval(script, globs, locs, filename)\n \n-    return locs[name]\n+    return locs\n \n \n-def _make_attr_tuple_class(cls_name, attr_names):\n+def _make_attr_tuple_class(cls_name: str, attr_names: list[str]) -> type:\n     \"\"\"\n     Create a tuple subclass to hold `Attribute`s for an `attrs` class.\n \n@@ -257,35 +269,22 @@ def _make_attr_tuple_class(cls_name, attr_names):\n         x = property(itemgetter(0))\n     \"\"\"\n     attr_class_name = f\"{cls_name}Attributes\"\n-    attr_class_template = [\n-        f\"class {attr_class_name}(tuple):\",\n-        \"    __slots__ = ()\",\n-    ]\n-    if attr_names:\n-        for i, attr_name in enumerate(attr_names):\n-            attr_class_template.append(\n-                f\"    {attr_name} = _attrs_property(_attrs_itemgetter({i}))\"\n-            )\n-    else:\n-        attr_class_template.append(\"    pass\")\n-    globs = {\"_attrs_itemgetter\": itemgetter, \"_attrs_property\": property}\n-    _compile_and_eval(\"\\n\".join(attr_class_template), globs)\n-    return globs[attr_class_name]\n+    body = {}\n+    for i, attr_name in enumerate(attr_names):\n+\n+        def getter(self, i=i):\n+            return self[i]\n+\n+        body[attr_name] = property(getter)\n+    return type(attr_class_name, (tuple,), body)\n \n \n # Tuple class for extracted attributes from a class definition.\n # `base_attrs` is a subset of `attrs`.\n-_Attributes = _make_attr_tuple_class(\n-    \"_Attributes\",\n-    [\n-        # all attributes to build dunder methods for\n-        \"attrs\",\n-        # attributes that have been inherited\n-        \"base_attrs\",\n-        # map inherited attributes to their originating classes\n-        \"base_attrs_map\",\n-    ],\n-)\n+class _Attributes(NamedTuple):\n+    attrs: type\n+    base_attrs: list[Attribute]\n+    base_attrs_map: dict[str, type]\n \n \n def _is_class_var(annot):\n@@ -312,7 +311,9 @@ def _has_own_attribute(cls, attrib_name):\n     return attrib_name in cls.__dict__\n \n \n-def _collect_base_attrs(cls, taken_attr_names):\n+def _collect_base_attrs(\n+    cls, taken_attr_names\n+) -> tuple[list[Attribute], dict[str, type]]:\n     \"\"\"\n     Collect attr.ibs from base classes of *cls*, except *taken_attr_names*.\n     \"\"\"\n@@ -373,7 +374,7 @@ def _collect_base_attrs_broken(cls, taken_attr_names):\n \n def _transform_attrs(\n     cls, these, auto_attribs, kw_only, collect_by_mro, field_transformer\n-):\n+) -> _Attributes:\n     \"\"\"\n     Transform all `_CountingAttr`s on a class into `Attribute`s.\n \n@@ -393,7 +394,7 @@ def _transform_attrs(\n         ca_names = {\n             name\n             for name, attr in cd.items()\n-            if isinstance(attr, _CountingAttr)\n+            if attr.__class__ is _CountingAttr\n         }\n         ca_list = []\n         annot_names = set()\n@@ -403,12 +404,12 @@ def _transform_attrs(\n             annot_names.add(attr_name)\n             a = cd.get(attr_name, NOTHING)\n \n-            if not isinstance(a, _CountingAttr):\n-                a = attrib() if a is NOTHING else attrib(default=a)\n+            if a.__class__ is not _CountingAttr:\n+                a = attrib(a)\n             ca_list.append((attr_name, a))\n \n         unannotated = ca_names - annot_names\n-        if len(unannotated) > 0:\n+        if unannotated:\n             raise UnannotatedAttributeError(\n                 \"The following `attr.ib`s lack a type annotation: \"\n                 + \", \".join(\n@@ -421,16 +422,14 @@ def _transform_attrs(\n             (\n                 (name, attr)\n                 for name, attr in cd.items()\n-                if isinstance(attr, _CountingAttr)\n+                if attr.__class__ is _CountingAttr\n             ),\n             key=lambda e: e[1].counter,\n         )\n \n+    fca = Attribute.from_counting_attr\n     own_attrs = [\n-        Attribute.from_counting_attr(\n-            name=attr_name, ca=ca, type=anns.get(attr_name)\n-        )\n-        for attr_name, ca in ca_list\n+        fca(attr_name, ca, anns.get(attr_name)) for attr_name, ca in ca_list\n     ]\n \n     if collect_by_mro:\n@@ -448,6 +447,10 @@ def _transform_attrs(\n \n     attrs = base_attrs + own_attrs\n \n+    if field_transformer is not None:\n+        attrs = field_transformer(cls, attrs)\n+\n+    # Check attr order after executing the field_transformer.\n     # Mandatory vs non-mandatory attr order only matters when they are part of\n     # the __init__ signature and when they aren't kw_only (which are moved to\n     # the end and can be mandatory or non-mandatory in any order, as they will\n@@ -461,23 +464,20 @@ def _transform_attrs(\n         if had_default is False and a.default is not NOTHING:\n             had_default = True\n \n-    if field_transformer is not None:\n-        attrs = field_transformer(cls, attrs)\n-\n     # Resolve default field alias after executing field_transformer.\n     # This allows field_transformer to differentiate between explicit vs\n     # default aliases and supply their own defaults.\n-    attrs = [\n-        a.evolve(alias=_default_init_alias_for(a.name)) if not a.alias else a\n-        for a in attrs\n-    ]\n+    for a in attrs:\n+        if not a.alias:\n+            # Evolve is very slow, so we hold our nose and do it dirty.\n+            _OBJ_SETATTR.__get__(a)(\"alias\", _default_init_alias_for(a.name))\n \n     # Create AttrsClass *after* applying the field_transformer since it may\n     # add or remove attributes!\n     attr_names = [a.name for a in attrs]\n     AttrsClass = _make_attr_tuple_class(cls.__name__, attr_names)\n \n-    return _Attributes((AttrsClass(attrs), base_attrs, base_attr_map))\n+    return _Attributes(AttrsClass(attrs), base_attrs, base_attr_map)\n \n \n def _make_cached_property_getattr(cached_properties, original_getattr, cls):\n@@ -527,15 +527,9 @@ def _make_cached_property_getattr(cached_properties, original_getattr, cls):\n         \"original_getattr\": original_getattr,\n     }\n \n-    return _make_method(\n-        \"__getattr__\",\n-        \"\\n\".join(lines),\n-        unique_filename,\n-        glob,\n-        locals={\n-            \"_cls\": cls,\n-        },\n-    )\n+    return _linecache_and_compile(\n+        \"\\n\".join(lines), unique_filename, glob, locals={\"_cls\": cls}\n+    )[\"__getattr__\"]\n \n \n def _frozen_setattrs(self, name, value):\n@@ -630,6 +624,7 @@ class _ClassBuilder:\n     \"\"\"\n \n     __slots__ = (\n+        \"_add_method_dunders\",\n         \"_attr_names\",\n         \"_attrs\",\n         \"_base_attr_map\",\n@@ -645,6 +640,8 @@ class _ClassBuilder:\n         \"_is_exc\",\n         \"_on_setattr\",\n         \"_pre_init_has_args\",\n+        \"_repr_added\",\n+        \"_script_snippets\",\n         \"_slots\",\n         \"_weakref_slot\",\n         \"_wrote_own_setattr\",\n@@ -652,7 +649,7 @@ class _ClassBuilder:\n \n     def __init__(\n         self,\n-        cls,\n+        cls: type,\n         these,\n         slots,\n         frozen,\n@@ -742,15 +739,49 @@ class _ClassBuilder:\n                 self._cls_dict[\"__setstate__\"],\n             ) = self._make_getstate_setstate()\n \n+        # tuples of script, globs, hook\n+        self._script_snippets: list[\n+            tuple[str, dict, Callable[[dict, dict], Any]]\n+        ] = []\n+        self._repr_added = False\n+\n+        # We want to only do this check once; in 99.9% of cases these\n+        # exist.\n+        if not hasattr(self._cls, \"__module__\") or not hasattr(\n+            self._cls, \"__qualname__\"\n+        ):\n+            self._add_method_dunders = self._add_method_dunders_safe\n+        else:\n+            self._add_method_dunders = self._add_method_dunders_unsafe\n+\n     def __repr__(self):\n         return f\"<_ClassBuilder(cls={self._cls.__name__})>\"\n \n+    def _eval_snippets(self) -> None:\n+        \"\"\"\n+        Evaluate any registered snippets in one go.\n+        \"\"\"\n+        script = \"\\n\".join([snippet[0] for snippet in self._script_snippets])\n+        globs = {}\n+        for _, snippet_globs, _ in self._script_snippets:\n+            globs.update(snippet_globs)\n+\n+        locs = _linecache_and_compile(\n+            script,\n+            _generate_unique_filename(self._cls, \"methods\"),\n+            globs,\n+        )\n+\n+        for _, _, hook in self._script_snippets:\n+            hook(self._cls_dict, locs)\n+\n     def build_class(self):\n         \"\"\"\n         Finalize class based on the accumulated configuration.\n \n         Builder cannot be used after calling this method.\n         \"\"\"\n+        self._eval_snippets()\n         if self._slots is True:\n             cls = self._create_slots_class()\n         else:\n@@ -857,9 +888,9 @@ class _ClassBuilder:\n             names += (\"__weakref__\",)\n \n         cached_properties = {\n-            name: cached_property.func\n-            for name, cached_property in cd.items()\n-            if isinstance(cached_property, functools.cached_property)\n+            name: cached_prop.func\n+            for name, cached_prop in cd.items()\n+            if isinstance(cached_prop, cached_property)\n         }\n \n         # Collect methods with a `__class__` reference that are shadowed in the new class.\n@@ -944,14 +975,17 @@ class _ClassBuilder:\n         return cls\n \n     def add_repr(self, ns):\n-        self._cls_dict[\"__repr__\"] = self._add_method_dunders(\n-            _make_repr(self._attrs, ns, self._cls)\n-        )\n+        script, globs = _make_repr_script(self._attrs, ns)\n+\n+        def _attach_repr(cls_dict, globs):\n+            cls_dict[\"__repr__\"] = self._add_method_dunders(globs[\"__repr__\"])\n+\n+        self._script_snippets.append((script, globs, _attach_repr))\n+        self._repr_added = True\n         return self\n \n     def add_str(self):\n-        repr = self._cls_dict.get(\"__repr__\")\n-        if repr is None:\n+        if not self._repr_added:\n             msg = \"__str__ can only be generated if a __repr__ exists.\"\n             raise ValueError(msg)\n \n@@ -1007,35 +1041,43 @@ class _ClassBuilder:\n         return self\n \n     def add_hash(self):\n-        self._cls_dict[\"__hash__\"] = self._add_method_dunders(\n-            _make_hash(\n-                self._cls,\n-                self._attrs,\n-                frozen=self._frozen,\n-                cache_hash=self._cache_hash,\n-            )\n+        script, globs = _make_hash_script(\n+            self._cls,\n+            self._attrs,\n+            frozen=self._frozen,\n+            cache_hash=self._cache_hash,\n         )\n \n+        def attach_hash(cls_dict: dict, locs: dict) -> None:\n+            cls_dict[\"__hash__\"] = self._add_method_dunders(locs[\"__hash__\"])\n+\n+        self._script_snippets.append((script, globs, attach_hash))\n+\n         return self\n \n     def add_init(self):\n-        self._cls_dict[\"__init__\"] = self._add_method_dunders(\n-            _make_init(\n-                self._cls,\n-                self._attrs,\n-                self._has_pre_init,\n-                self._pre_init_has_args,\n-                self._has_post_init,\n-                self._frozen,\n-                self._slots,\n-                self._cache_hash,\n-                self._base_attr_map,\n-                self._is_exc,\n-                self._on_setattr,\n-                attrs_init=False,\n-            )\n+        script, globs, annotations = _make_init_script(\n+            self._cls,\n+            self._attrs,\n+            self._has_pre_init,\n+            self._pre_init_has_args,\n+            self._has_post_init,\n+            self._frozen,\n+            self._slots,\n+            self._cache_hash,\n+            self._base_attr_map,\n+            self._is_exc,\n+            self._on_setattr,\n+            attrs_init=False,\n         )\n \n+        def _attach_init(cls_dict, globs):\n+            init = globs[\"__init__\"]\n+            init.__annotations__ = annotations\n+            cls_dict[\"__init__\"] = self._add_method_dunders(init)\n+\n+        self._script_snippets.append((script, globs, _attach_init))\n+\n         return self\n \n     def add_replace(self):\n@@ -1052,32 +1094,41 @@ class _ClassBuilder:\n         )\n \n     def add_attrs_init(self):\n-        self._cls_dict[\"__attrs_init__\"] = self._add_method_dunders(\n-            _make_init(\n-                self._cls,\n-                self._attrs,\n-                self._has_pre_init,\n-                self._pre_init_has_args,\n-                self._has_post_init,\n-                self._frozen,\n-                self._slots,\n-                self._cache_hash,\n-                self._base_attr_map,\n-                self._is_exc,\n-                self._on_setattr,\n-                attrs_init=True,\n-            )\n+        script, globs, annotations = _make_init_script(\n+            self._cls,\n+            self._attrs,\n+            self._has_pre_init,\n+            self._pre_init_has_args,\n+            self._has_post_init,\n+            self._frozen,\n+            self._slots,\n+            self._cache_hash,\n+            self._base_attr_map,\n+            self._is_exc,\n+            self._on_setattr,\n+            attrs_init=True,\n         )\n \n+        def _attach_attrs_init(cls_dict, globs):\n+            init = globs[\"__attrs_init__\"]\n+            init.__annotations__ = annotations\n+            cls_dict[\"__attrs_init__\"] = self._add_method_dunders(init)\n+\n+        self._script_snippets.append((script, globs, _attach_attrs_init))\n+\n         return self\n \n     def add_eq(self):\n         cd = self._cls_dict\n \n-        cd[\"__eq__\"] = self._add_method_dunders(\n-            _make_eq(self._cls, self._attrs)\n-        )\n-        cd[\"__ne__\"] = self._add_method_dunders(_make_ne())\n+        script, globs = _make_eq_script(self._attrs)\n+\n+        def _attach_eq(cls_dict, globs):\n+            cls_dict[\"__eq__\"] = self._add_method_dunders(globs[\"__eq__\"])\n+\n+        self._script_snippets.append((script, globs, _attach_eq))\n+\n+        cd[\"__ne__\"] = __ne__\n \n         return self\n \n@@ -1092,9 +1143,6 @@ class _ClassBuilder:\n         return self\n \n     def add_setattr(self):\n-        if self._frozen:\n-            return self\n-\n         sa_attrs = {}\n         for a in self._attrs:\n             on_setattr = a.on_setattr or self._on_setattr\n@@ -1126,7 +1174,21 @@ class _ClassBuilder:\n \n         return self\n \n-    def _add_method_dunders(self, method):\n+    def _add_method_dunders_unsafe(self, method: Callable) -> Callable:\n+        \"\"\"\n+        Add __module__ and __qualname__ to a *method*.\n+        \"\"\"\n+        method.__module__ = self._cls.__module__\n+\n+        method.__qualname__ = f\"{self._cls.__qualname__}.{method.__name__}\"\n+\n+        method.__doc__ = (\n+            f\"Method generated by attrs for class {self._cls.__qualname__}.\"\n+        )\n+\n+        return method\n+\n+    def _add_method_dunders_safe(self, method: Callable) -> Callable:\n         \"\"\"\n         Add __module__ and __qualname__ to a *method* if possible.\n         \"\"\"\n@@ -1137,10 +1199,7 @@ class _ClassBuilder:\n             method.__qualname__ = f\"{self._cls.__qualname__}.{method.__name__}\"\n \n         with contextlib.suppress(AttributeError):\n-            method.__doc__ = (\n-                \"Method generated by attrs for class \"\n-                f\"{self._cls.__qualname__}.\"\n-            )\n+            method.__doc__ = f\"Method generated by attrs for class {self._cls.__qualname__}.\"\n \n         return method\n \n@@ -1386,10 +1445,12 @@ def attrs(\n             has_own_setattr,\n             field_transformer,\n         )\n+\n         if _determine_whether_to_implement(\n             cls, repr, auto_detect, (\"__repr__\",)\n         ):\n             builder.add_repr(repr_ns)\n+\n         if str is True:\n             builder.add_str()\n \n@@ -1403,7 +1464,8 @@ def attrs(\n         ):\n             builder.add_order()\n \n-        builder.add_setattr()\n+        if not frozen:\n+            builder.add_setattr()\n \n         nonlocal hash\n         if (\n@@ -1481,7 +1543,7 @@ def _has_frozen_base_class(cls):\n     return cls.__setattr__ is _frozen_setattrs\n \n \n-def _generate_unique_filename(cls, func_name):\n+def _generate_unique_filename(cls: type, func_name: str) -> str:\n     \"\"\"\n     Create a \"filename\" suitable for a function being generated.\n     \"\"\"\n@@ -1491,15 +1553,16 @@ def _generate_unique_filename(cls, func_name):\n     )\n \n \n-def _make_hash(cls, attrs, frozen, cache_hash):\n+def _make_hash_script(\n+    cls: type, attrs: list[Attribute], frozen: bool, cache_hash: bool\n+) -> tuple[str, dict]:\n     attrs = tuple(\n         a for a in attrs if a.hash is True or (a.hash is None and a.eq is True)\n     )\n \n     tab = \"        \"\n \n-    unique_filename = _generate_unique_filename(cls, \"hash\")\n-    type_hash = hash(unique_filename)\n+    type_hash = hash(_generate_unique_filename(cls, \"hash\"))\n     # If eq is custom generated, we need to include the functions in globs\n     globs = {}\n \n@@ -1559,43 +1622,41 @@ def _make_hash(cls, attrs, frozen, cache_hash):\n         append_hash_computation_lines(\"return \", tab)\n \n     script = \"\\n\".join(method_lines)\n-    return _make_method(\"__hash__\", script, unique_filename, globs)\n+    return script, globs\n \n \n-def _add_hash(cls, attrs):\n+def _add_hash(cls: type, attrs: list[Attribute]):\n     \"\"\"\n     Add a hash method to *cls*.\n     \"\"\"\n-    cls.__hash__ = _make_hash(cls, attrs, frozen=False, cache_hash=False)\n+    script, globs = _make_hash_script(\n+        cls, attrs, frozen=False, cache_hash=False\n+    )\n+    _compile_and_eval(\n+        script, globs, filename=_generate_unique_filename(cls, \"__hash__\")\n+    )\n+    cls.__hash__ = globs[\"__hash__\"]\n     return cls\n \n \n-def _make_ne():\n+def __ne__(self, other):\n     \"\"\"\n-    Create __ne__ method.\n+    Check equality and either forward a NotImplemented or\n+    return the result negated.\n     \"\"\"\n+    result = self.__eq__(other)\n+    if result is NotImplemented:\n+        return NotImplemented\n \n-    def __ne__(self, other):\n-        \"\"\"\n-        Check equality and either forward a NotImplemented or\n-        return the result negated.\n-        \"\"\"\n-        result = self.__eq__(other)\n-        if result is NotImplemented:\n-            return NotImplemented\n-\n-        return not result\n-\n-    return __ne__\n+    return not result\n \n \n-def _make_eq(cls, attrs):\n+def _make_eq_script(attrs: list) -> tuple[str, dict]:\n     \"\"\"\n     Create __eq__ method for *cls* with *attrs*.\n     \"\"\"\n     attrs = [a for a in attrs if a.eq]\n \n-    unique_filename = _generate_unique_filename(cls, \"eq\")\n     lines = [\n         \"def __eq__(self, other):\",\n         \"    if other.__class__ is not self.__class__:\",\n@@ -1624,7 +1685,7 @@ def _make_eq(cls, attrs):\n \n     script = \"\\n\".join(lines)\n \n-    return _make_method(\"__eq__\", script, unique_filename, globs)\n+    return script, globs\n \n \n def _make_order(cls, attrs):\n@@ -1690,14 +1751,20 @@ def _add_eq(cls, attrs=None):\n     if attrs is None:\n         attrs = cls.__attrs_attrs__\n \n-    cls.__eq__ = _make_eq(cls, attrs)\n-    cls.__ne__ = _make_ne()\n+    script, globs = _make_eq_script(attrs)\n+    _compile_and_eval(\n+        script, globs, filename=_generate_unique_filename(cls, \"__eq__\")\n+    )\n+    cls.__eq__ = globs[\"__eq__\"]\n+    cls.__ne__ = __ne__\n \n     return cls\n \n \n-def _make_repr(attrs, ns, cls):\n-    unique_filename = _generate_unique_filename(cls, \"repr\")\n+def _make_repr_script(attrs, ns) -> tuple[str, dict]:\n+    \"\"\"\n+    Create the source and globs for a __repr__ and return it.\n+    \"\"\"\n     # Figure out which attributes to include, and which function to use to\n     # format them. The a.repr value can be either bool or a custom\n     # callable.\n@@ -1748,9 +1815,7 @@ def _make_repr(attrs, ns, cls):\n         \"    already_repring.remove(id(self))\",\n     ]\n \n-    return _make_method(\n-        \"__repr__\", \"\\n\".join(lines), unique_filename, globs=globs\n-    )\n+    return \"\\n\".join(lines), globs\n \n \n def _add_repr(cls, ns=None, attrs=None):\n@@ -1760,7 +1825,11 @@ def _add_repr(cls, ns=None, attrs=None):\n     if attrs is None:\n         attrs = cls.__attrs_attrs__\n \n-    cls.__repr__ = _make_repr(attrs, ns, cls)\n+    script, globs = _make_repr_script(attrs, ns)\n+    _compile_and_eval(\n+        script, globs, filename=_generate_unique_filename(cls, \"__repr__\")\n+    )\n+    cls.__repr__ = globs[\"__repr__\"]\n     return cls\n \n \n@@ -1865,7 +1934,7 @@ def _is_slot_attr(a_name, base_attr_map):\n     return cls and \"__slots__\" in cls.__dict__\n \n \n-def _make_init(\n+def _make_init_script(\n     cls,\n     attrs,\n     pre_init,\n@@ -1878,7 +1947,7 @@ def _make_init(\n     is_exc,\n     cls_on_setattr,\n     attrs_init,\n-):\n+) -> tuple[str, dict, dict]:\n     has_cls_on_setattr = (\n         cls_on_setattr is not None and cls_on_setattr is not setters.NO_OP\n     )\n@@ -1906,8 +1975,6 @@ def _make_init(\n         elif has_cls_on_setattr and a.on_setattr is not setters.NO_OP:\n             needs_cached_setattr = True\n \n-    unique_filename = _generate_unique_filename(cls, \"init\")\n-\n     script, globs, annotations = _attrs_to_init_script(\n         filtered_attrs,\n         frozen,\n@@ -1933,15 +2000,7 @@ def _make_init(\n         # setattr hooks.\n         globs[\"_cached_setattr_get\"] = _OBJ_SETATTR.__get__\n \n-    init = _make_method(\n-        \"__attrs_init__\" if attrs_init else \"__init__\",\n-        script,\n-        unique_filename,\n-        globs,\n-    )\n-    init.__annotations__ = annotations\n-\n-    return init\n+    return script, globs, annotations\n \n \n def _setattr(attr_name: str, value_var: str, has_on_setattr: bool) -> str:\n@@ -2427,33 +2486,32 @@ class Attribute:\n         raise FrozenInstanceError\n \n     @classmethod\n-    def from_counting_attr(cls, name, ca, type=None):\n+    def from_counting_attr(cls, name: str, ca: _CountingAttr, type=None):\n         # type holds the annotated value. deal with conflicts:\n         if type is None:\n             type = ca.type\n         elif ca.type is not None:\n-            msg = \"Type annotation and type argument cannot both be present\"\n+            msg = f\"Type annotation and type argument cannot both be present for '{name}'.\"\n             raise ValueError(msg)\n-        inst_dict = {\n-            k: getattr(ca, k)\n-            for k in Attribute.__slots__\n-            if k\n-            not in (\n-                \"name\",\n-                \"validator\",\n-                \"default\",\n-                \"type\",\n-                \"inherited\",\n-            )  # exclude methods and deprecated alias\n-        }\n         return cls(\n-            name=name,\n-            validator=ca._validator,\n-            default=ca._default,\n-            type=type,\n-            cmp=None,\n-            inherited=False,\n-            **inst_dict,\n+            name,\n+            ca._default,\n+            ca._validator,\n+            ca.repr,\n+            None,\n+            ca.hash,\n+            ca.init,\n+            False,\n+            ca.metadata,\n+            type,\n+            ca.converter,\n+            ca.kw_only,\n+            ca.eq,\n+            ca.eq_key,\n+            ca.order,\n+            ca.order_key,\n+            ca.on_setattr,\n+            ca.alias,\n         )\n \n     # Don't use attrs.evolve since fields(Attribute) doesn't work\n@@ -2877,6 +2935,12 @@ def make_class(\n         `attrs.define`, you have to pass the hooks yourself: ``make_class(...,\n         on_setattr=setters.pipe(setters.convert, setters.validate)``\n \n+    .. warning::\n+\n+        It is *your* duty to ensure that the class name and the attribute names\n+        are valid identifiers. ``make_class()`` will *not* validate them for\n+        you.\n+\n     Args:\n         name (str): The name for the new class.\n \n@@ -2901,7 +2965,11 @@ def make_class(\n     .. versionadded:: 17.1.0 *bases*\n     .. versionchanged:: 18.1.0 If *attrs* is ordered, the order is retained.\n     .. versionchanged:: 23.2.0 *class_body*\n+    .. versionchanged:: 25.2.0 Class names can now be unicode.\n     \"\"\"\n+    # Class identifiers are converted into the normal form NFKC while parsing\n+    name = unicodedata.normalize(\"NFKC\", name)\n+\n     if isinstance(attrs, dict):\n         cls_dict = attrs\n     elif isinstance(attrs, (list, tuple)):\n@@ -3033,7 +3101,7 @@ def pipe(*converters):\n \n     if not converters:\n         # If the converter list is empty, pipe_converter is the identity.\n-        A = typing.TypeVar(\"A\")\n+        A = TypeVar(\"A\")\n         pipe_converter.__annotations__.update({\"val\": A, \"return\": A})\n     else:\n         # Get parameter type from first converter.\n",
+  "structured_diff": {
+    "src/attr/_cmp.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -4,7 +4,7 @@",
+          "snippet": " import functools\n import types\n \n-from ._make import _make_ne\n+from ._make import __ne__\n \n \n _operation_names = {\"eq\": \"==\", \"lt\": \"<\", \"le\": \"<=\", \"gt\": \">\", \"ge\": \">=\"}",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/attr/_cmp.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -71,7 +71,7 @@",
+          "snippet": " def cmp_using(\n     if eq is not None:\n         has_eq_function = True\n         body[\"__eq__\"] = _make_operator(\"eq\", eq)\n-        body[\"__ne__\"] = _make_ne()\n+        body[\"__ne__\"] = __ne__\n \n     if lt is not None:\n         num_order_functions += 1\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_cmp.py::cmp_using"
+            }
+          ]
+        }
+      ]
+    },
+    "src/attr/_make.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -6,15 +6,16 @@",
+          "snippet": " import abc\n import contextlib\n import copy\n import enum\n-import functools\n import inspect\n import itertools\n import linecache\n import sys\n import types\n-import typing\n+import unicodedata\n \n-from operator import itemgetter\n+from collections.abc import Callable, Mapping\n+from functools import cached_property\n+from typing import Any, NamedTuple, TypeVar\n \n # We need to import _compat itself in addition to the _compat members to avoid\n # having the thread-local in the globals here.",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/attr/_make.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -208,7 +209,12 @@",
+          "snippet": " def attrib(\n     )\n \n \n-def _compile_and_eval(script, globs, locs=None, filename=\"\"):\n+def _compile_and_eval(\n+    script: str,\n+    globs: dict[str, Any] | None,\n+    locs: Mapping[str, object] | None = None,\n+    filename: str = \"\",\n+) -> None:\n     \"\"\"\n     Evaluate the script with the given global (globs) and local (locs)\n     variables.",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_compile_and_eval"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -217,10 +223,16 @@",
+          "snippet": " def _compile_and_eval(script, globs, locs=None, filename=\"\"):\n     eval(bytecode, globs, locs)\n \n \n-def _make_method(name, script, filename, globs, locals=None):\n+def _linecache_and_compile(\n+    script: str,\n+    filename: str,\n+    globs: dict[str, Any] | None,\n+    locals: Mapping[str, object] | None = None,\n+) -> dict[str, Any]:\n     \"\"\"\n-    Create the method with the script given and return the method object.\n+    Cache the script with _linecache_, compile it and return the _locals_.\n     \"\"\"\n+\n     locs = {} if locals is None else locals\n \n     # In order of debuggers like PDB being able to step through the code,",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_linecache_and_compile"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -243,10 +255,10 @@",
+          "snippet": " def _make_method(name, script, filename, globs, locals=None):\n \n     _compile_and_eval(script, globs, locs, filename)\n \n-    return locs[name]\n+    return locs\n \n \n-def _make_attr_tuple_class(cls_name, attr_names):\n+def _make_attr_tuple_class(cls_name: str, attr_names: list[str]) -> type:\n     \"\"\"\n     Create a tuple subclass to hold `Attribute`s for an `attrs` class.\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_linecache_and_compile"
+            },
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_make_attr_tuple_class"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -257,35 +269,22 @@",
+          "snippet": " def _make_attr_tuple_class(cls_name, attr_names):\n         x = property(itemgetter(0))\n     \"\"\"\n     attr_class_name = f\"{cls_name}Attributes\"\n-    attr_class_template = [\n-        f\"class {attr_class_name}(tuple):\",\n-        \"    __slots__ = ()\",\n-    ]\n-    if attr_names:\n-        for i, attr_name in enumerate(attr_names):\n-            attr_class_template.append(\n-                f\"    {attr_name} = _attrs_property(_attrs_itemgetter({i}))\"\n-            )\n-    else:\n-        attr_class_template.append(\"    pass\")\n-    globs = {\"_attrs_itemgetter\": itemgetter, \"_attrs_property\": property}\n-    _compile_and_eval(\"\\n\".join(attr_class_template), globs)\n-    return globs[attr_class_name]\n+    body = {}\n+    for i, attr_name in enumerate(attr_names):\n+\n+        def getter(self, i=i):\n+            return self[i]\n+\n+        body[attr_name] = property(getter)\n+    return type(attr_class_name, (tuple,), body)\n \n \n # Tuple class for extracted attributes from a class definition.\n # `base_attrs` is a subset of `attrs`.\n-_Attributes = _make_attr_tuple_class(\n-    \"_Attributes\",\n-    [\n-        # all attributes to build dunder methods for\n-        \"attrs\",\n-        # attributes that have been inherited\n-        \"base_attrs\",\n-        # map inherited attributes to their originating classes\n-        \"base_attrs_map\",\n-    ],\n-)\n+class _Attributes(NamedTuple):\n+    attrs: type\n+    base_attrs: list[Attribute]\n+    base_attrs_map: dict[str, type]\n \n \n def _is_class_var(annot):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_make_attr_tuple_class"
+            },
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::getter"
+            },
+            {
+              "kind": "class",
+              "node": "src/attr/_make.py::_Attributes"
+            },
+            {
+              "kind": "attribute",
+              "node": "src/attr/_make.py::_Attributes::attrs"
+            },
+            {
+              "kind": "attribute",
+              "node": "src/attr/_make.py::_Attributes::base_attrs"
+            },
+            {
+              "kind": "attribute",
+              "node": "src/attr/_make.py::_Attributes::base_attrs_map"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -312,7 +311,9 @@",
+          "snippet": " def _has_own_attribute(cls, attrib_name):\n     return attrib_name in cls.__dict__\n \n \n-def _collect_base_attrs(cls, taken_attr_names):\n+def _collect_base_attrs(\n+    cls, taken_attr_names\n+) -> tuple[list[Attribute], dict[str, type]]:\n     \"\"\"\n     Collect attr.ibs from base classes of *cls*, except *taken_attr_names*.\n     \"\"\"",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_collect_base_attrs"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -373,7 +374,7 @@",
+          "snippet": " def _collect_base_attrs_broken(cls, taken_attr_names):\n \n def _transform_attrs(\n     cls, these, auto_attribs, kw_only, collect_by_mro, field_transformer\n-):\n+) -> _Attributes:\n     \"\"\"\n     Transform all `_CountingAttr`s on a class into `Attribute`s.\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_transform_attrs"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -393,7 +394,7 @@",
+          "snippet": " def _transform_attrs(\n         ca_names = {\n             name\n             for name, attr in cd.items()\n-            if isinstance(attr, _CountingAttr)\n+            if attr.__class__ is _CountingAttr\n         }\n         ca_list = []\n         annot_names = set()",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_transform_attrs"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -403,12 +404,12 @@",
+          "snippet": " def _transform_attrs(\n             annot_names.add(attr_name)\n             a = cd.get(attr_name, NOTHING)\n \n-            if not isinstance(a, _CountingAttr):\n-                a = attrib() if a is NOTHING else attrib(default=a)\n+            if a.__class__ is not _CountingAttr:\n+                a = attrib(a)\n             ca_list.append((attr_name, a))\n \n         unannotated = ca_names - annot_names\n-        if len(unannotated) > 0:\n+        if unannotated:\n             raise UnannotatedAttributeError(\n                 \"The following `attr.ib`s lack a type annotation: \"\n                 + \", \".join(",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_transform_attrs"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -421,16 +422,14 @@",
+          "snippet": " def _transform_attrs(\n             (\n                 (name, attr)\n                 for name, attr in cd.items()\n-                if isinstance(attr, _CountingAttr)\n+                if attr.__class__ is _CountingAttr\n             ),\n             key=lambda e: e[1].counter,\n         )\n \n+    fca = Attribute.from_counting_attr\n     own_attrs = [\n-        Attribute.from_counting_attr(\n-            name=attr_name, ca=ca, type=anns.get(attr_name)\n-        )\n-        for attr_name, ca in ca_list\n+        fca(attr_name, ca, anns.get(attr_name)) for attr_name, ca in ca_list\n     ]\n \n     if collect_by_mro:",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_transform_attrs"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -448,6 +447,10 @@",
+          "snippet": " def _transform_attrs(\n \n     attrs = base_attrs + own_attrs\n \n+    if field_transformer is not None:\n+        attrs = field_transformer(cls, attrs)\n+\n+    # Check attr order after executing the field_transformer.\n     # Mandatory vs non-mandatory attr order only matters when they are part of\n     # the __init__ signature and when they aren't kw_only (which are moved to\n     # the end and can be mandatory or non-mandatory in any order, as they will",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_transform_attrs"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -461,23 +464,20 @@",
+          "snippet": " def _transform_attrs(\n         if had_default is False and a.default is not NOTHING:\n             had_default = True\n \n-    if field_transformer is not None:\n-        attrs = field_transformer(cls, attrs)\n-\n     # Resolve default field alias after executing field_transformer.\n     # This allows field_transformer to differentiate between explicit vs\n     # default aliases and supply their own defaults.\n-    attrs = [\n-        a.evolve(alias=_default_init_alias_for(a.name)) if not a.alias else a\n-        for a in attrs\n-    ]\n+    for a in attrs:\n+        if not a.alias:\n+            # Evolve is very slow, so we hold our nose and do it dirty.\n+            _OBJ_SETATTR.__get__(a)(\"alias\", _default_init_alias_for(a.name))\n \n     # Create AttrsClass *after* applying the field_transformer since it may\n     # add or remove attributes!\n     attr_names = [a.name for a in attrs]\n     AttrsClass = _make_attr_tuple_class(cls.__name__, attr_names)\n \n-    return _Attributes((AttrsClass(attrs), base_attrs, base_attr_map))\n+    return _Attributes(AttrsClass(attrs), base_attrs, base_attr_map)\n \n \n def _make_cached_property_getattr(cached_properties, original_getattr, cls):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_transform_attrs"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -527,15 +527,9 @@",
+          "snippet": " def _make_cached_property_getattr(cached_properties, original_getattr, cls):\n         \"original_getattr\": original_getattr,\n     }\n \n-    return _make_method(\n-        \"__getattr__\",\n-        \"\\n\".join(lines),\n-        unique_filename,\n-        glob,\n-        locals={\n-            \"_cls\": cls,\n-        },\n-    )\n+    return _linecache_and_compile(\n+        \"\\n\".join(lines), unique_filename, glob, locals={\"_cls\": cls}\n+    )[\"__getattr__\"]\n \n \n def _frozen_setattrs(self, name, value):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_make_cached_property_getattr"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -630,6 +624,7 @@",
+          "snippet": " class _ClassBuilder:\n     \"\"\"\n \n     __slots__ = (\n+        \"_add_method_dunders\",\n         \"_attr_names\",\n         \"_attrs\",\n         \"_base_attr_map\",",
+          "affect": [
+            {
+              "kind": "attribute",
+              "node": "src/attr/_make.py::_ClassBuilder::__slots__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -645,6 +640,8 @@",
+          "snippet": " class _ClassBuilder:\n         \"_is_exc\",\n         \"_on_setattr\",\n         \"_pre_init_has_args\",\n+        \"_repr_added\",\n+        \"_script_snippets\",\n         \"_slots\",\n         \"_weakref_slot\",\n         \"_wrote_own_setattr\",",
+          "affect": [
+            {
+              "kind": "attribute",
+              "node": "src/attr/_make.py::_ClassBuilder::__slots__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -652,7 +649,7 @@",
+          "snippet": " class _ClassBuilder:\n \n     def __init__(\n         self,\n-        cls,\n+        cls: type,\n         these,\n         slots,\n         frozen,",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -742,15 +739,49 @@",
+          "snippet": " class _ClassBuilder:\n                 self._cls_dict[\"__setstate__\"],\n             ) = self._make_getstate_setstate()\n \n+        # tuples of script, globs, hook\n+        self._script_snippets: list[\n+            tuple[str, dict, Callable[[dict, dict], Any]]\n+        ] = []\n+        self._repr_added = False\n+\n+        # We want to only do this check once; in 99.9% of cases these\n+        # exist.\n+        if not hasattr(self._cls, \"__module__\") or not hasattr(\n+            self._cls, \"__qualname__\"\n+        ):\n+            self._add_method_dunders = self._add_method_dunders_safe\n+        else:\n+            self._add_method_dunders = self._add_method_dunders_unsafe\n+\n     def __repr__(self):\n         return f\"<_ClassBuilder(cls={self._cls.__name__})>\"\n \n+    def _eval_snippets(self) -> None:\n+        \"\"\"\n+        Evaluate any registered snippets in one go.\n+        \"\"\"\n+        script = \"\\n\".join([snippet[0] for snippet in self._script_snippets])\n+        globs = {}\n+        for _, snippet_globs, _ in self._script_snippets:\n+            globs.update(snippet_globs)\n+\n+        locs = _linecache_and_compile(\n+            script,\n+            _generate_unique_filename(self._cls, \"methods\"),\n+            globs,\n+        )\n+\n+        for _, _, hook in self._script_snippets:\n+            hook(self._cls_dict, locs)\n+\n     def build_class(self):\n         \"\"\"\n         Finalize class based on the accumulated configuration.\n \n         Builder cannot be used after calling this method.\n         \"\"\"\n+        self._eval_snippets()\n         if self._slots is True:\n             cls = self._create_slots_class()\n         else:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::__init__"
+            },
+            {
+              "kind": "class",
+              "node": "src/attr/_make.py::_ClassBuilder"
+            },
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::_eval_snippets"
+            },
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::build_class"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -857,9 +888,9 @@",
+          "snippet": " class _ClassBuilder:\n             names += (\"__weakref__\",)\n \n         cached_properties = {\n-            name: cached_property.func\n-            for name, cached_property in cd.items()\n-            if isinstance(cached_property, functools.cached_property)\n+            name: cached_prop.func\n+            for name, cached_prop in cd.items()\n+            if isinstance(cached_prop, cached_property)\n         }\n \n         # Collect methods with a `__class__` reference that are shadowed in the new class.",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::_create_slots_class"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -944,14 +975,17 @@",
+          "snippet": " class _ClassBuilder:\n         return cls\n \n     def add_repr(self, ns):\n-        self._cls_dict[\"__repr__\"] = self._add_method_dunders(\n-            _make_repr(self._attrs, ns, self._cls)\n-        )\n+        script, globs = _make_repr_script(self._attrs, ns)\n+\n+        def _attach_repr(cls_dict, globs):\n+            cls_dict[\"__repr__\"] = self._add_method_dunders(globs[\"__repr__\"])\n+\n+        self._script_snippets.append((script, globs, _attach_repr))\n+        self._repr_added = True\n         return self\n \n     def add_str(self):\n-        repr = self._cls_dict.get(\"__repr__\")\n-        if repr is None:\n+        if not self._repr_added:\n             msg = \"__str__ can only be generated if a __repr__ exists.\"\n             raise ValueError(msg)\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::add_repr"
+            },
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::_attach_repr"
+            },
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::add_str"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1007,35 +1041,43 @@",
+          "snippet": " class _ClassBuilder:\n         return self\n \n     def add_hash(self):\n-        self._cls_dict[\"__hash__\"] = self._add_method_dunders(\n-            _make_hash(\n-                self._cls,\n-                self._attrs,\n-                frozen=self._frozen,\n-                cache_hash=self._cache_hash,\n-            )\n+        script, globs = _make_hash_script(\n+            self._cls,\n+            self._attrs,\n+            frozen=self._frozen,\n+            cache_hash=self._cache_hash,\n         )\n \n+        def attach_hash(cls_dict: dict, locs: dict) -> None:\n+            cls_dict[\"__hash__\"] = self._add_method_dunders(locs[\"__hash__\"])\n+\n+        self._script_snippets.append((script, globs, attach_hash))\n+\n         return self\n \n     def add_init(self):\n-        self._cls_dict[\"__init__\"] = self._add_method_dunders(\n-            _make_init(\n-                self._cls,\n-                self._attrs,\n-                self._has_pre_init,\n-                self._pre_init_has_args,\n-                self._has_post_init,\n-                self._frozen,\n-                self._slots,\n-                self._cache_hash,\n-                self._base_attr_map,\n-                self._is_exc,\n-                self._on_setattr,\n-                attrs_init=False,\n-            )\n+        script, globs, annotations = _make_init_script(\n+            self._cls,\n+            self._attrs,\n+            self._has_pre_init,\n+            self._pre_init_has_args,\n+            self._has_post_init,\n+            self._frozen,\n+            self._slots,\n+            self._cache_hash,\n+            self._base_attr_map,\n+            self._is_exc,\n+            self._on_setattr,\n+            attrs_init=False,\n         )\n \n+        def _attach_init(cls_dict, globs):\n+            init = globs[\"__init__\"]\n+            init.__annotations__ = annotations\n+            cls_dict[\"__init__\"] = self._add_method_dunders(init)\n+\n+        self._script_snippets.append((script, globs, _attach_init))\n+\n         return self\n \n     def add_replace(self):",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::add_hash"
+            },
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::attach_hash"
+            },
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::add_init"
+            },
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::_attach_init"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1052,32 +1094,41 @@",
+          "snippet": " class _ClassBuilder:\n         )\n \n     def add_attrs_init(self):\n-        self._cls_dict[\"__attrs_init__\"] = self._add_method_dunders(\n-            _make_init(\n-                self._cls,\n-                self._attrs,\n-                self._has_pre_init,\n-                self._pre_init_has_args,\n-                self._has_post_init,\n-                self._frozen,\n-                self._slots,\n-                self._cache_hash,\n-                self._base_attr_map,\n-                self._is_exc,\n-                self._on_setattr,\n-                attrs_init=True,\n-            )\n+        script, globs, annotations = _make_init_script(\n+            self._cls,\n+            self._attrs,\n+            self._has_pre_init,\n+            self._pre_init_has_args,\n+            self._has_post_init,\n+            self._frozen,\n+            self._slots,\n+            self._cache_hash,\n+            self._base_attr_map,\n+            self._is_exc,\n+            self._on_setattr,\n+            attrs_init=True,\n         )\n \n+        def _attach_attrs_init(cls_dict, globs):\n+            init = globs[\"__attrs_init__\"]\n+            init.__annotations__ = annotations\n+            cls_dict[\"__attrs_init__\"] = self._add_method_dunders(init)\n+\n+        self._script_snippets.append((script, globs, _attach_attrs_init))\n+\n         return self\n \n     def add_eq(self):\n         cd = self._cls_dict\n \n-        cd[\"__eq__\"] = self._add_method_dunders(\n-            _make_eq(self._cls, self._attrs)\n-        )\n-        cd[\"__ne__\"] = self._add_method_dunders(_make_ne())\n+        script, globs = _make_eq_script(self._attrs)\n+\n+        def _attach_eq(cls_dict, globs):\n+            cls_dict[\"__eq__\"] = self._add_method_dunders(globs[\"__eq__\"])\n+\n+        self._script_snippets.append((script, globs, _attach_eq))\n+\n+        cd[\"__ne__\"] = __ne__\n \n         return self\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::add_attrs_init"
+            },
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::_attach_attrs_init"
+            },
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::add_eq"
+            },
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::_attach_eq"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1092,9 +1143,6 @@",
+          "snippet": " class _ClassBuilder:\n         return self\n \n     def add_setattr(self):\n-        if self._frozen:\n-            return self\n-\n         sa_attrs = {}\n         for a in self._attrs:\n             on_setattr = a.on_setattr or self._on_setattr",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::add_setattr"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1126,7 +1174,21 @@",
+          "snippet": " class _ClassBuilder:\n \n         return self\n \n-    def _add_method_dunders(self, method):\n+    def _add_method_dunders_unsafe(self, method: Callable) -> Callable:\n+        \"\"\"\n+        Add __module__ and __qualname__ to a *method*.\n+        \"\"\"\n+        method.__module__ = self._cls.__module__\n+\n+        method.__qualname__ = f\"{self._cls.__qualname__}.{method.__name__}\"\n+\n+        method.__doc__ = (\n+            f\"Method generated by attrs for class {self._cls.__qualname__}.\"\n+        )\n+\n+        return method\n+\n+    def _add_method_dunders_safe(self, method: Callable) -> Callable:\n         \"\"\"\n         Add __module__ and __qualname__ to a *method* if possible.\n         \"\"\"",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::_add_method_dunders_unsafe"
+            },
+            {
+              "kind": "class",
+              "node": "src/attr/_make.py::_ClassBuilder"
+            },
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::_add_method_dunders_safe"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1137,10 +1199,7 @@",
+          "snippet": " class _ClassBuilder:\n             method.__qualname__ = f\"{self._cls.__qualname__}.{method.__name__}\"\n \n         with contextlib.suppress(AttributeError):\n-            method.__doc__ = (\n-                \"Method generated by attrs for class \"\n-                f\"{self._cls.__qualname__}.\"\n-            )\n+            method.__doc__ = f\"Method generated by attrs for class {self._cls.__qualname__}.\"\n \n         return method\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::_add_method_dunders_safe"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1386,10 +1445,12 @@",
+          "snippet": " def attrs(\n             has_own_setattr,\n             field_transformer,\n         )\n+\n         if _determine_whether_to_implement(\n             cls, repr, auto_detect, (\"__repr__\",)\n         ):\n             builder.add_repr(repr_ns)\n+\n         if str is True:\n             builder.add_str()\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::wrap"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1403,7 +1464,8 @@",
+          "snippet": " def attrs(\n         ):\n             builder.add_order()\n \n-        builder.add_setattr()\n+        if not frozen:\n+            builder.add_setattr()\n \n         nonlocal hash\n         if (",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::wrap"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1481,7 +1543,7 @@",
+          "snippet": " def _has_frozen_base_class(cls):\n     return cls.__setattr__ is _frozen_setattrs\n \n \n-def _generate_unique_filename(cls, func_name):\n+def _generate_unique_filename(cls: type, func_name: str) -> str:\n     \"\"\"\n     Create a \"filename\" suitable for a function being generated.\n     \"\"\"",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_generate_unique_filename"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1491,15 +1553,16 @@",
+          "snippet": " def _generate_unique_filename(cls, func_name):\n     )\n \n \n-def _make_hash(cls, attrs, frozen, cache_hash):\n+def _make_hash_script(\n+    cls: type, attrs: list[Attribute], frozen: bool, cache_hash: bool\n+) -> tuple[str, dict]:\n     attrs = tuple(\n         a for a in attrs if a.hash is True or (a.hash is None and a.eq is True)\n     )\n \n     tab = \"        \"\n \n-    unique_filename = _generate_unique_filename(cls, \"hash\")\n-    type_hash = hash(unique_filename)\n+    type_hash = hash(_generate_unique_filename(cls, \"hash\"))\n     # If eq is custom generated, we need to include the functions in globs\n     globs = {}\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_make_hash_script"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1559,43 +1622,41 @@",
+          "snippet": " def _make_hash(cls, attrs, frozen, cache_hash):\n         append_hash_computation_lines(\"return \", tab)\n \n     script = \"\\n\".join(method_lines)\n-    return _make_method(\"__hash__\", script, unique_filename, globs)\n+    return script, globs\n \n \n-def _add_hash(cls, attrs):\n+def _add_hash(cls: type, attrs: list[Attribute]):\n     \"\"\"\n     Add a hash method to *cls*.\n     \"\"\"\n-    cls.__hash__ = _make_hash(cls, attrs, frozen=False, cache_hash=False)\n+    script, globs = _make_hash_script(\n+        cls, attrs, frozen=False, cache_hash=False\n+    )\n+    _compile_and_eval(\n+        script, globs, filename=_generate_unique_filename(cls, \"__hash__\")\n+    )\n+    cls.__hash__ = globs[\"__hash__\"]\n     return cls\n \n \n-def _make_ne():\n+def __ne__(self, other):\n     \"\"\"\n-    Create __ne__ method.\n+    Check equality and either forward a NotImplemented or\n+    return the result negated.\n     \"\"\"\n+    result = self.__eq__(other)\n+    if result is NotImplemented:\n+        return NotImplemented\n \n-    def __ne__(self, other):\n-        \"\"\"\n-        Check equality and either forward a NotImplemented or\n-        return the result negated.\n-        \"\"\"\n-        result = self.__eq__(other)\n-        if result is NotImplemented:\n-            return NotImplemented\n-\n-        return not result\n-\n-    return __ne__\n+    return not result\n \n \n-def _make_eq(cls, attrs):\n+def _make_eq_script(attrs: list) -> tuple[str, dict]:\n     \"\"\"\n     Create __eq__ method for *cls* with *attrs*.\n     \"\"\"\n     attrs = [a for a in attrs if a.eq]\n \n-    unique_filename = _generate_unique_filename(cls, \"eq\")\n     lines = [\n         \"def __eq__(self, other):\",\n         \"    if other.__class__ is not self.__class__:\",",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_make_hash_script"
+            },
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_add_hash"
+            },
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::__ne__"
+            },
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_make_eq_script"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1624,7 +1685,7 @@",
+          "snippet": " def _make_eq(cls, attrs):\n \n     script = \"\\n\".join(lines)\n \n-    return _make_method(\"__eq__\", script, unique_filename, globs)\n+    return script, globs\n \n \n def _make_order(cls, attrs):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_make_eq_script"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1690,14 +1751,20 @@",
+          "snippet": " def _add_eq(cls, attrs=None):\n     if attrs is None:\n         attrs = cls.__attrs_attrs__\n \n-    cls.__eq__ = _make_eq(cls, attrs)\n-    cls.__ne__ = _make_ne()\n+    script, globs = _make_eq_script(attrs)\n+    _compile_and_eval(\n+        script, globs, filename=_generate_unique_filename(cls, \"__eq__\")\n+    )\n+    cls.__eq__ = globs[\"__eq__\"]\n+    cls.__ne__ = __ne__\n \n     return cls\n \n \n-def _make_repr(attrs, ns, cls):\n-    unique_filename = _generate_unique_filename(cls, \"repr\")\n+def _make_repr_script(attrs, ns) -> tuple[str, dict]:\n+    \"\"\"\n+    Create the source and globs for a __repr__ and return it.\n+    \"\"\"\n     # Figure out which attributes to include, and which function to use to\n     # format them. The a.repr value can be either bool or a custom\n     # callable.",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_add_eq"
+            },
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_make_repr_script"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1748,9 +1815,7 @@",
+          "snippet": " def _make_repr(attrs, ns, cls):\n         \"    already_repring.remove(id(self))\",\n     ]\n \n-    return _make_method(\n-        \"__repr__\", \"\\n\".join(lines), unique_filename, globs=globs\n-    )\n+    return \"\\n\".join(lines), globs\n \n \n def _add_repr(cls, ns=None, attrs=None):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_make_repr_script"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1760,7 +1825,11 @@",
+          "snippet": " def _add_repr(cls, ns=None, attrs=None):\n     if attrs is None:\n         attrs = cls.__attrs_attrs__\n \n-    cls.__repr__ = _make_repr(attrs, ns, cls)\n+    script, globs = _make_repr_script(attrs, ns)\n+    _compile_and_eval(\n+        script, globs, filename=_generate_unique_filename(cls, \"__repr__\")\n+    )\n+    cls.__repr__ = globs[\"__repr__\"]\n     return cls\n \n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_add_repr"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1865,7 +1934,7 @@",
+          "snippet": " def _is_slot_attr(a_name, base_attr_map):\n     return cls and \"__slots__\" in cls.__dict__\n \n \n-def _make_init(\n+def _make_init_script(\n     cls,\n     attrs,\n     pre_init,",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_make_init_script"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1878,7 +1947,7 @@",
+          "snippet": " def _make_init(\n     is_exc,\n     cls_on_setattr,\n     attrs_init,\n-):\n+) -> tuple[str, dict, dict]:\n     has_cls_on_setattr = (\n         cls_on_setattr is not None and cls_on_setattr is not setters.NO_OP\n     )",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_make_init_script"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1906,8 +1975,6 @@",
+          "snippet": " def _make_init(\n         elif has_cls_on_setattr and a.on_setattr is not setters.NO_OP:\n             needs_cached_setattr = True\n \n-    unique_filename = _generate_unique_filename(cls, \"init\")\n-\n     script, globs, annotations = _attrs_to_init_script(\n         filtered_attrs,\n         frozen,",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_make_init_script"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1933,15 +2000,7 @@",
+          "snippet": " def _make_init(\n         # setattr hooks.\n         globs[\"_cached_setattr_get\"] = _OBJ_SETATTR.__get__\n \n-    init = _make_method(\n-        \"__attrs_init__\" if attrs_init else \"__init__\",\n-        script,\n-        unique_filename,\n-        globs,\n-    )\n-    init.__annotations__ = annotations\n-\n-    return init\n+    return script, globs, annotations\n \n \n def _setattr(attr_name: str, value_var: str, has_on_setattr: bool) -> str:",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_make_init_script"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2427,33 +2486,32 @@",
+          "snippet": " class Attribute:\n         raise FrozenInstanceError\n \n     @classmethod\n-    def from_counting_attr(cls, name, ca, type=None):\n+    def from_counting_attr(cls, name: str, ca: _CountingAttr, type=None):\n         # type holds the annotated value. deal with conflicts:\n         if type is None:\n             type = ca.type\n         elif ca.type is not None:\n-            msg = \"Type annotation and type argument cannot both be present\"\n+            msg = f\"Type annotation and type argument cannot both be present for '{name}'.\"\n             raise ValueError(msg)\n-        inst_dict = {\n-            k: getattr(ca, k)\n-            for k in Attribute.__slots__\n-            if k\n-            not in (\n-                \"name\",\n-                \"validator\",\n-                \"default\",\n-                \"type\",\n-                \"inherited\",\n-            )  # exclude methods and deprecated alias\n-        }\n         return cls(\n-            name=name,\n-            validator=ca._validator,\n-            default=ca._default,\n-            type=type,\n-            cmp=None,\n-            inherited=False,\n-            **inst_dict,\n+            name,\n+            ca._default,\n+            ca._validator,\n+            ca.repr,\n+            None,\n+            ca.hash,\n+            ca.init,\n+            False,\n+            ca.metadata,\n+            type,\n+            ca.converter,\n+            ca.kw_only,\n+            ca.eq,\n+            ca.eq_key,\n+            ca.order,\n+            ca.order_key,\n+            ca.on_setattr,\n+            ca.alias,\n         )\n \n     # Don't use attrs.evolve since fields(Attribute) doesn't work",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::Attribute::from_counting_attr"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2877,6 +2935,12 @@",
+          "snippet": " def make_class(\n         `attrs.define`, you have to pass the hooks yourself: ``make_class(...,\n         on_setattr=setters.pipe(setters.convert, setters.validate)``\n \n+    .. warning::\n+\n+        It is *your* duty to ensure that the class name and the attribute names\n+        are valid identifiers. ``make_class()`` will *not* validate them for\n+        you.\n+\n     Args:\n         name (str): The name for the new class.\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::make_class"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2901,7 +2965,11 @@",
+          "snippet": " def make_class(\n     .. versionadded:: 17.1.0 *bases*\n     .. versionchanged:: 18.1.0 If *attrs* is ordered, the order is retained.\n     .. versionchanged:: 23.2.0 *class_body*\n+    .. versionchanged:: 25.2.0 Class names can now be unicode.\n     \"\"\"\n+    # Class identifiers are converted into the normal form NFKC while parsing\n+    name = unicodedata.normalize(\"NFKC\", name)\n+\n     if isinstance(attrs, dict):\n         cls_dict = attrs\n     elif isinstance(attrs, (list, tuple)):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::make_class"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -3033,7 +3101,7 @@",
+          "snippet": " def pipe(*converters):\n \n     if not converters:\n         # If the converter list is empty, pipe_converter is the identity.\n-        A = typing.TypeVar(\"A\")\n+        A = TypeVar(\"A\")\n         pipe_converter.__annotations__.update({\"val\": A, \"return\": A})\n     else:\n         # Get parameter type from first converter.",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::pipe"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

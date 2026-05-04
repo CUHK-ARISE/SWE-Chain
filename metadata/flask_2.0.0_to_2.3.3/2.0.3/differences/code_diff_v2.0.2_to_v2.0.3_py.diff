@@ -1,0 +1,277 @@
+diff --git a/src/flask/__init__.py b/src/flask/__init__.py
+index 43b5468..feb5334 100644
+--- a/src/flask/__init__.py
++++ b/src/flask/__init__.py
+@@ -43,4 +43,4 @@ from .signals import template_rendered as template_rendered
+ from .templating import render_template as render_template
+ from .templating import render_template_string as render_template_string
+ 
+-__version__ = "2.0.2"
++__version__ = "2.0.3"
+
+diff --git a/src/flask/cli.py b/src/flask/cli.py
+index 7ab4fa1..8e21532 100644
+--- a/src/flask/cli.py
++++ b/src/flask/cli.py
+@@ -258,15 +258,16 @@ def locate_app(script_info, module_name, app_name, raise_if_not_found=True):
+ 
+     try:
+         __import__(module_name)
+-    except ImportError as e:
++    except ImportError:
+         # Reraise the ImportError if it occurred within the imported module.
+         # Determine this by checking whether the trace has a depth > 1.
+         if sys.exc_info()[2].tb_next:
+             raise NoAppException(
+-                f"While importing {module_name!r}, an ImportError was raised."
+-            ) from e
++                f"While importing {module_name!r}, an ImportError was"
++                f" raised:\n\n{traceback.format_exc()}"
++            ) from None
+         elif raise_if_not_found:
+-            raise NoAppException(f"Could not import {module_name!r}.") from e
++            raise NoAppException(f"Could not import {module_name!r}.") from None
+         else:
+             return
+ 
+
+diff --git a/src/flask/ctx.py b/src/flask/ctx.py
+index 5c06463..47465fd 100644
+--- a/src/flask/ctx.py
++++ b/src/flask/ctx.py
+@@ -130,7 +130,15 @@ def after_this_request(f: AfterRequestCallable) -> AfterRequestCallable:
+ 
+     .. versionadded:: 0.9
+     """
+-    _request_ctx_stack.top._after_request_functions.append(f)
++    top = _request_ctx_stack.top
++
++    if top is None:
++        raise RuntimeError(
++            "This decorator can only be used when a request context is"
++            " active, such as within a view function."
++        )
++
++    top._after_request_functions.append(f)
+     return f
+ 
+ 
+@@ -159,12 +167,13 @@ def copy_current_request_context(f: t.Callable) -> t.Callable:
+     .. versionadded:: 0.10
+     """
+     top = _request_ctx_stack.top
++
+     if top is None:
+         raise RuntimeError(
+-            "This decorator can only be used at local scopes "
+-            "when a request context is on the stack.  For instance within "
+-            "view functions."
++            "This decorator can only be used when a request context is"
++            " active, such as within a view function."
+         )
++
+     reqctx = top.copy()
+ 
+     def wrapper(*args, **kwargs):
+
+diff --git a/src/flask/helpers.py b/src/flask/helpers.py
+index 7b8b087..4359780 100644
+--- a/src/flask/helpers.py
++++ b/src/flask/helpers.py
+@@ -714,7 +714,7 @@ def get_root_path(import_name: str) -> str:
+     # Module already imported and has a file attribute. Use that first.
+     mod = sys.modules.get(import_name)
+ 
+-    if mod is not None and hasattr(mod, "__file__"):
++    if mod is not None and hasattr(mod, "__file__") and mod.__file__ is not None:
+         return os.path.dirname(os.path.abspath(mod.__file__))
+ 
+     # Next attempt: check the loader.
+
+diff --git a/src/flask/json/__init__.py b/src/flask/json/__init__.py
+index 10d5123..ccb9efb 100644
+--- a/src/flask/json/__init__.py
++++ b/src/flask/json/__init__.py
+@@ -81,6 +81,11 @@ def _dump_arg_defaults(
+         if bp is not None and bp.json_encoder is not None:
+             cls = bp.json_encoder
+ 
++        # Only set a custom encoder if it has custom behavior. This is
++        # faster on PyPy.
++        if cls is not _json.JSONEncoder:
++            kwargs.setdefault("cls", cls)
++
+         kwargs.setdefault("cls", cls)
+         kwargs.setdefault("ensure_ascii", app.config["JSON_AS_ASCII"])
+         kwargs.setdefault("sort_keys", app.config["JSON_SORT_KEYS"])
+@@ -102,9 +107,10 @@ def _load_arg_defaults(
+         if bp is not None and bp.json_decoder is not None:
+             cls = bp.json_decoder
+ 
+-        kwargs.setdefault("cls", cls)
+-    else:
+-        kwargs.setdefault("cls", JSONDecoder)
++        # Only set a custom decoder if it has custom behavior. This is
++        # faster on PyPy.
++        if cls not in {JSONDecoder, _json.JSONDecoder}:
++            kwargs.setdefault("cls", cls)
+ 
+ 
+ def dumps(obj: t.Any, app: t.Optional["Flask"] = None, **kwargs: t.Any) -> str:
+
+diff --git a/src/flask/sessions.py b/src/flask/sessions.py
+index 34b1d0c..20648de 100644
+--- a/src/flask/sessions.py
++++ b/src/flask/sessions.py
+@@ -131,6 +131,13 @@ class SessionInterface:
+         app = Flask(__name__)
+         app.session_interface = MySessionInterface()
+ 
++    Multiple requests with the same session may be sent and handled
++    concurrently. When implementing a new session interface, consider
++    whether reads or writes to the backing store must be synchronized.
++    There is no guarantee on the order in which the session for each
++    request is opened or saved, it will occur in the order that requests
++    begin and end processing.
++
+     .. versionadded:: 0.8
+     """
+ 
+@@ -292,20 +299,25 @@ class SessionInterface:
+     def open_session(
+         self, app: "Flask", request: "Request"
+     ) -> t.Optional[SessionMixin]:
+-        """This method has to be implemented and must either return ``None``
+-        in case the loading failed because of a configuration error or an
+-        instance of a session object which implements a dictionary like
+-        interface + the methods and attributes on :class:`SessionMixin`.
++        """This is called at the beginning of each request, after
++        pushing the request context, before matching the URL.
++
++        This must return an object which implements a dictionary-like
++        interface as well as the :class:`SessionMixin` interface.
++
++        This will return ``None`` to indicate that loading failed in
++        some way that is not immediately an error. The request
++        context will fall back to using :meth:`make_null_session`
++        in this case.
+         """
+         raise NotImplementedError()
+ 
+     def save_session(
+         self, app: "Flask", session: SessionMixin, response: "Response"
+     ) -> None:
+-        """This is called for actual sessions returned by :meth:`open_session`
+-        at the end of the request.  This is still called during a request
+-        context so if you absolutely need access to the request you can do
+-        that.
++        """This is called at the end of each request, after generating
++        a response, before removing the request context. It is skipped
++        if :meth:`is_null_session` returns ``True``.
+         """
+         raise NotImplementedError()
+ 
+
+diff --git a/src/flask/testing.py b/src/flask/testing.py
+index fe3b846..1b35cc7 100644
+--- a/src/flask/testing.py
++++ b/src/flask/testing.py
+@@ -9,14 +9,15 @@ from werkzeug.test import Client
+ from werkzeug.urls import url_parse
+ from werkzeug.wrappers import Request as BaseRequest
+ 
+-from . import _request_ctx_stack
+ from .cli import ScriptInfo
++from .globals import _request_ctx_stack
+ from .json import dumps as json_dumps
+ from .sessions import SessionMixin
+ 
+ if t.TYPE_CHECKING:
++    from werkzeug.test import TestResponse
++
+     from .app import Flask
+-    from .wrappers import Response
+ 
+ 
+ class EnvironBuilder(werkzeug.test.EnvironBuilder):
+@@ -171,14 +172,15 @@ class FlaskClient(Client):
+             headers = resp.get_wsgi_headers(c.request.environ)
+             self.cookie_jar.extract_wsgi(c.request.environ, headers)
+ 
+-    def open(  # type: ignore
++    def open(
+         self,
+         *args: t.Any,
+-        as_tuple: bool = False,
+         buffered: bool = False,
+         follow_redirects: bool = False,
+         **kwargs: t.Any,
+-    ) -> "Response":
++    ) -> "TestResponse":
++        as_tuple = kwargs.pop("as_tuple", None)
++
+         # Same logic as super.open, but apply environ_base and preserve_context.
+         request = None
+ 
+@@ -213,12 +215,28 @@ class FlaskClient(Client):
+             finally:
+                 builder.close()
+ 
+-        return super().open(  # type: ignore
+-            request,
+-            as_tuple=as_tuple,
+-            buffered=buffered,
+-            follow_redirects=follow_redirects,
+-        )
++        if as_tuple is not None:
++            import warnings
++
++            warnings.warn(
++                "'as_tuple' is deprecated and will be removed in"
++                " Werkzeug 2.1 and Flask 2.1. Use"
++                " 'response.request.environ' instead.",
++                DeprecationWarning,
++                stacklevel=3,
++            )
++            return super().open(
++                request,
++                as_tuple=as_tuple,
++                buffered=buffered,
++                follow_redirects=follow_redirects,
++            )
++        else:
++            return super().open(
++                request,
++                buffered=buffered,
++                follow_redirects=follow_redirects,
++            )
+ 
+     def __enter__(self) -> "FlaskClient":
+         if self.preserve_context:
+@@ -272,7 +290,7 @@ class FlaskCliRunner(CliRunner):
+         :return: a :class:`~click.testing.Result` object.
+         """
+         if cli is None:
+-            cli = self.app.cli
++            cli = self.app.cli  # type: ignore
+ 
+         if "obj" not in kwargs:
+             kwargs["obj"] = ScriptInfo(create_app=lambda: self.app)
+
+diff --git a/src/flask/typing.py b/src/flask/typing.py
+index f1c8467..93896f8 100644
+--- a/src/flask/typing.py
++++ b/src/flask/typing.py
+@@ -46,11 +46,4 @@ TemplateGlobalCallable = t.Callable[..., t.Any]
+ TemplateTestCallable = t.Callable[..., bool]
+ URLDefaultCallable = t.Callable[[str, dict], None]
+ URLValuePreprocessorCallable = t.Callable[[t.Optional[str], t.Optional[dict]], None]
+-
+-
+-if t.TYPE_CHECKING:
+-    import typing_extensions as te
+-
+-    class ErrorHandlerCallable(te.Protocol[GenericException]):
+-        def __call__(self, error: GenericException) -> ResponseReturnValue:
+-            ...
++ErrorHandlerCallable = t.Callable[[GenericException], ResponseReturnValue]

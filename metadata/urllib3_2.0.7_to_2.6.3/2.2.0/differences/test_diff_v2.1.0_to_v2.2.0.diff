@@ -1,0 +1,3487 @@
+diff --git a/test/__init__.py b/test/__init__.py
+index 7eb50ef..bf4bb67 100644
+--- a/test/__init__.py
++++ b/test/__init__.py
+@@ -73,7 +73,7 @@ INVALID_SOURCE_ADDRESSES = [(("192.0.2.255", 0), False), (("2001:db8::1", 0), Tr
+ # 3. To test our timeout logic by using two different values, eg. by using different
+ #    values at the pool level and at the request level.
+ SHORT_TIMEOUT = 0.001
+-LONG_TIMEOUT = 0.01
++LONG_TIMEOUT = 0.1
+ if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS") == "true":
+     LONG_TIMEOUT = 0.5
+ 
+
+diff --git a/test/conftest.py b/test/conftest.py
+index 9aafdac..b71c7d9 100644
+--- a/test/conftest.py
++++ b/test/conftest.py
+@@ -1,25 +1,53 @@
+ from __future__ import annotations
+ 
+-import asyncio
+ import contextlib
+ import socket
+ import ssl
+ import typing
+ from pathlib import Path
+ 
++import hypercorn
+ import pytest
+ import trustme
+-from tornado import web
+ 
+-from dummyserver.handlers import TestingApp
+-from dummyserver.proxy import ProxyHandler
+-from dummyserver.server import HAS_IPV6, run_loop_in_thread, run_tornado_app
+-from dummyserver.testcase import HTTPSDummyServerTestCase
++import urllib3.http2
++from dummyserver.app import hypercorn_app
++from dummyserver.asgi_proxy import ProxyApp
++from dummyserver.hypercornserver import run_hypercorn_in_thread
++from dummyserver.socketserver import HAS_IPV6
++from dummyserver.testcase import HTTPSHypercornDummyServerTestCase
+ from urllib3.util import ssl_
++from urllib3.util.url import parse_url
+ 
+ from .tz_stub import stub_timezone_ctx
+ 
+ 
++def pytest_addoption(parser: pytest.Parser) -> None:
++    parser.addoption(
++        "--integration",
++        action="store_true",
++        default=False,
++        help="run integration tests only",
++    )
++
++
++def pytest_collection_modifyitems(
++    config: pytest.Config, items: list[pytest.Item]
++) -> None:
++    integration_mode = bool(config.getoption("--integration"))
++    skip_integration = pytest.mark.skip(
++        reason="skipping, need --integration option to run"
++    )
++    skip_normal = pytest.mark.skip(
++        reason="skipping non integration tests in --integration mode"
++    )
++    for item in items:
++        if "integration" in item.keywords and not integration_mode:
++            item.add_marker(skip_integration)
++        elif integration_mode and "integration" not in item.keywords:
++            item.add_marker(skip_normal)
++
++
+ class ServerConfig(typing.NamedTuple):
+     scheme: str
+     host: str
+@@ -53,17 +81,13 @@ def run_server_in_thread(
+     ca.cert_pem.write_to_path(ca_cert_path)
+     server_certs = _write_cert_to_dir(server_cert, tmpdir)
+ 
+-    with run_loop_in_thread() as io_loop:
+-
+-        async def run_app() -> int:
+-            app = web.Application([(r".*", TestingApp)])
+-            server, port = run_tornado_app(app, server_certs, scheme, host)
+-            return port
+-
+-        port = asyncio.run_coroutine_threadsafe(
+-            run_app(), io_loop.asyncio_loop  # type: ignore[attr-defined]
+-        ).result()
+-        yield ServerConfig("https", host, port, ca_cert_path)
++    config = hypercorn.Config()
++    config.certfile = server_certs["certfile"]
++    config.keyfile = server_certs["keyfile"]
++    config.bind = [f"{host}:0"]
++    with run_hypercorn_in_thread(config, hypercorn_app):
++        port = typing.cast(int, parse_url(config.bind[0]).port)
++        yield ServerConfig(scheme, host, port, ca_cert_path)
+ 
+ 
+ @contextlib.contextmanager
+@@ -81,26 +105,25 @@ def run_server_and_proxy_in_thread(
+     server_certs = _write_cert_to_dir(server_cert, tmpdir)
+     proxy_certs = _write_cert_to_dir(proxy_cert, tmpdir, "proxy")
+ 
+-    with run_loop_in_thread() as io_loop:
++    with contextlib.ExitStack() as stack:
++        server_config = hypercorn.Config()
++        server_config.certfile = server_certs["certfile"]
++        server_config.keyfile = server_certs["keyfile"]
++        server_config.bind = ["localhost:0"]
++        stack.enter_context(run_hypercorn_in_thread(server_config, hypercorn_app))
++        port = typing.cast(int, parse_url(server_config.bind[0]).port)
+ 
+-        async def run_app() -> tuple[ServerConfig, ServerConfig]:
+-            app = web.Application([(r".*", TestingApp)])
+-            server_app, port = run_tornado_app(app, server_certs, "https", "localhost")
+-            server_config = ServerConfig("https", "localhost", port, ca_cert_path)
++        proxy_config = hypercorn.Config()
++        proxy_config.certfile = proxy_certs["certfile"]
++        proxy_config.keyfile = proxy_certs["keyfile"]
++        proxy_config.bind = [f"{proxy_host}:0"]
++        stack.enter_context(run_hypercorn_in_thread(proxy_config, ProxyApp()))
++        proxy_port = typing.cast(int, parse_url(proxy_config.bind[0]).port)
+ 
+-            proxy = web.Application([(r".*", ProxyHandler)])
+-            proxy_app, proxy_port = run_tornado_app(
+-                proxy, proxy_certs, proxy_scheme, proxy_host
+-            )
+-            proxy_config = ServerConfig(
+-                proxy_scheme, proxy_host, proxy_port, ca_cert_path
+-            )
+-            return proxy_config, server_config
+-
+-        proxy_config, server_config = asyncio.run_coroutine_threadsafe(
+-            run_app(), io_loop.asyncio_loop  # type: ignore[attr-defined]
+-        ).result()
+-        yield (proxy_config, server_config)
++        yield (
++            ServerConfig(proxy_scheme, proxy_host, proxy_port, ca_cert_path),
++            ServerConfig("https", "localhost", port, ca_cert_path),
++        )
+ 
+ 
+ @pytest.fixture(params=["localhost", "127.0.0.1", "::1"])
+@@ -288,8 +311,8 @@ def supported_tls_versions() -> typing.AbstractSet[str | None]:
+     # disables TLSv1 and TLSv1.1.
+     tls_versions = set()
+ 
+-    _server = HTTPSDummyServerTestCase()
+-    _server._start_server()
++    _server = HTTPSHypercornDummyServerTestCase
++    _server.setup_class()
+     for _ssl_version_name, min_max_version in (
+         ("PROTOCOL_TLSv1", ssl.TLSVersion.TLSv1),
+         ("PROTOCOL_TLSv1_1", ssl.TLSVersion.TLSv1_1),
+@@ -314,7 +337,7 @@ def supported_tls_versions() -> typing.AbstractSet[str | None]:
+         else:
+             tls_versions.add(_sock.version())
+         _sock.close()
+-    _server._stop_server()
++    _server.teardown_class()
+     return tls_versions
+ 
+ 
+@@ -347,3 +370,14 @@ def requires_tlsv1_3(supported_tls_versions: typing.AbstractSet[str]) -> None:
+         or "TLSv1.3" not in supported_tls_versions
+     ):
+         pytest.skip("Test requires TLSv1.3")
++
++
++@pytest.fixture(params=["h11", "h2"])
++def http_version(request: pytest.FixtureRequest) -> typing.Generator[str, None, None]:
++    if request.param == "h2":
++        urllib3.http2.inject_into_urllib3()
++
++    yield request.param
++
++    if request.param == "h2":
++        urllib3.http2.extract_from_urllib3()
+
+diff --git a/test/contrib/emscripten/__init__.py b/test/contrib/emscripten/__init__.py
+new file mode 100644
+index 0000000..e69de29
+
+diff --git a/test/contrib/emscripten/conftest.py b/test/contrib/emscripten/conftest.py
+new file mode 100644
+index 0000000..ebe9092
+--- /dev/null
++++ b/test/contrib/emscripten/conftest.py
+@@ -0,0 +1,199 @@
++from __future__ import annotations
++
++import contextlib
++import os
++import random
++import textwrap
++import typing
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Generator
++
++import hypercorn
++import pytest
++
++from dummyserver.app import pyodide_testing_app
++from dummyserver.hypercornserver import run_hypercorn_in_thread
++from dummyserver.socketserver import DEFAULT_CERTS
++from urllib3.util.url import parse_url
++
++_coverage_count = 0
++
++
++def _get_coverage_filename(prefix: str) -> str:
++    global _coverage_count
++    _coverage_count += 1
++    rand_part = "".join([random.choice("1234567890") for x in range(20)])
++    return prefix + rand_part + f".{_coverage_count}"
++
++
++@pytest.fixture(scope="module")
++def testserver_http(
++    request: pytest.FixtureRequest,
++) -> Generator[PyodideServerInfo, None, None]:
++    pyodide_dist_dir = Path(os.getcwd(), request.config.getoption("--dist-dir"))
++    pyodide_testing_app.config["pyodide_dist_dir"] = str(pyodide_dist_dir)
++    http_host = "localhost"
++    with contextlib.ExitStack() as stack:
++        http_server_config = hypercorn.Config()
++        http_server_config.bind = [f"{http_host}:0"]
++        stack.enter_context(
++            run_hypercorn_in_thread(http_server_config, pyodide_testing_app)
++        )
++        http_port = typing.cast(int, parse_url(http_server_config.bind[0]).port)
++
++        https_server_config = hypercorn.Config()
++        https_server_config.certfile = DEFAULT_CERTS["certfile"]
++        https_server_config.keyfile = DEFAULT_CERTS["keyfile"]
++        https_server_config.verify_mode = DEFAULT_CERTS["cert_reqs"]
++        https_server_config.ca_certs = DEFAULT_CERTS["ca_certs"]
++        https_server_config.alpn_protocols = DEFAULT_CERTS["alpn_protocols"]
++        https_server_config.bind = [f"{http_host}:0"]
++        stack.enter_context(
++            run_hypercorn_in_thread(https_server_config, pyodide_testing_app)
++        )
++        https_port = typing.cast(int, parse_url(https_server_config.bind[0]).port)
++
++        yield PyodideServerInfo(
++            http_host=http_host,
++            http_port=http_port,
++            https_port=https_port,
++        )
++        print("Server teardown")
++
++
++@pytest.fixture()
++def selenium_coverage(selenium: Any) -> Generator[Any, None, None]:
++    def _install_coverage(self: Any) -> None:
++        self.run_js(
++            """
++            await pyodide.loadPackage("coverage")
++            await pyodide.runPythonAsync(`import coverage
++_coverage= coverage.Coverage(source_pkgs=['urllib3'])
++_coverage.start()
++        `
++        )"""
++        )
++
++    setattr(
++        selenium,
++        "_install_coverage",
++        _install_coverage.__get__(selenium, selenium.__class__),
++    )
++    selenium._install_coverage()
++    yield selenium
++    # on teardown, save _coverage output
++    coverage_out_binary = bytes(
++        selenium.run_js(
++            """
++return await pyodide.runPythonAsync(`
++_coverage.stop()
++_coverage.save()
++_coverage_datafile = open(".coverage","rb")
++_coverage_outdata = _coverage_datafile.read()
++# avoid polluting main namespace too much
++import js as _coverage_js
++# convert to js Array (as default conversion is TypedArray which does
++# bad things in firefox)
++_coverage_js.Array.from_(_coverage_outdata)
++`)
++    """
++        )
++    )
++    with open(f"{_get_coverage_filename('.coverage.emscripten.')}", "wb") as outfile:
++        outfile.write(coverage_out_binary)
++
++
++class ServerRunnerInfo:
++    def __init__(self, host: str, port: int, selenium: Any) -> None:
++        self.host = host
++        self.port = port
++        self.selenium = selenium
++
++    def run_webworker(self, code: str) -> Any:
++        if isinstance(code, str) and code.startswith("\n"):
++            # we have a multiline string, fix indentation
++            code = textwrap.dedent(code)
++            # add coverage collection to this code
++            code = (
++                textwrap.dedent(
++                    """
++            import coverage
++            _coverage= coverage.Coverage(source_pkgs=['urllib3'])
++            _coverage.start()
++            """
++                )
++                + code
++            )
++            code += textwrap.dedent(
++                """
++            _coverage.stop()
++            _coverage.save()
++            _coverage_datafile = open(".coverage","rb")
++            _coverage_outdata = _coverage_datafile.read()
++            # avoid polluting main namespace too much
++            import js as _coverage_js
++            # convert to js Array (as default conversion is TypedArray which does
++            # bad things in firefox)
++            _coverage_js.Array.from_(_coverage_outdata)
++            """
++            )
++
++        coverage_out_binary = bytes(
++            self.selenium.run_js(
++                f"""
++            let worker = new Worker('https://{self.host}:{self.port}/pyodide/webworker_dev.js');
++            let p = new Promise((res, rej) => {{
++                worker.onmessageerror = e => rej(e);
++                worker.onerror = e => rej(e);
++                worker.onmessage = e => {{
++                    if (e.data.results) {{
++                       res(e.data.results);
++                    }} else {{
++                       rej(e.data.error);
++                    }}
++                }};
++                worker.postMessage({{ python: {repr(code)} }});
++            }});
++            return await p;
++            """,
++                pyodide_checks=False,
++            )
++        )
++        with open(
++            f"{_get_coverage_filename('.coverage.emscripten.worker.')}", "wb"
++        ) as outfile:
++            outfile.write(coverage_out_binary)
++
++
++# run pyodide on our test server instead of on the default
++# pytest-pyodide one - this makes it so that
++# we are at the same origin as web requests to server_host
++@pytest.fixture()
++def run_from_server(
++    selenium_coverage: Any, testserver_http: PyodideServerInfo
++) -> Generator[ServerRunnerInfo, None, None]:
++    addr = f"https://{testserver_http.http_host}:{testserver_http.https_port}/pyodide/test.html"
++    selenium_coverage.goto(addr)
++    selenium_coverage.javascript_setup()
++    selenium_coverage.load_pyodide()
++    selenium_coverage.initialize_pyodide()
++    selenium_coverage.save_state()
++    selenium_coverage.restore_state()
++    # install the wheel, which is served at /wheel/*
++    selenium_coverage.run_js(
++        """
++await pyodide.loadPackage('/wheel/dist.whl')
++"""
++    )
++    selenium_coverage._install_coverage()
++    yield ServerRunnerInfo(
++        testserver_http.http_host, testserver_http.https_port, selenium_coverage
++    )
++
++
++@dataclass
++class PyodideServerInfo:
++    http_port: int
++    https_port: int
++    http_host: str
+
+diff --git a/test/contrib/emscripten/test_emscripten.py b/test/contrib/emscripten/test_emscripten.py
+new file mode 100644
+index 0000000..66f4cae
+--- /dev/null
++++ b/test/contrib/emscripten/test_emscripten.py
+@@ -0,0 +1,949 @@
++from __future__ import annotations
++
++import sys
++import typing
++
++import pytest
++
++from urllib3.fields import _TYPE_FIELD_VALUE_TUPLE
++
++from ...port_helpers import find_unused_port
++
++if sys.version_info < (3, 11):
++    # pyodide only works on 3.11+
++    pytest.skip(allow_module_level=True)
++
++# only run these tests if pytest_pyodide is installed
++# so we don't break non-emscripten pytest running
++pytest_pyodide = pytest.importorskip("pytest_pyodide")
++
++from pytest_pyodide import run_in_pyodide  # type: ignore[import] # noqa: E402
++from pytest_pyodide.decorator import (  # type: ignore[import] # noqa: E402
++    copy_files_to_pyodide,
++)
++
++from .conftest import PyodideServerInfo, ServerRunnerInfo  # noqa: E402
++
++# make our ssl certificates work in chrome
++pytest_pyodide.runner.CHROME_FLAGS.append("ignore-certificate-errors")
++
++
++# copy our wheel file to pyodide and install it
++def install_urllib3_wheel() -> (
++    typing.Callable[
++        [typing.Callable[..., typing.Any]], typing.Callable[..., typing.Any]
++    ]
++):
++    return copy_files_to_pyodide(  # type: ignore[no-any-return]
++        file_list=[("dist/*.whl", "/tmp")], install_wheels=True
++    )
++
++
++@install_urllib3_wheel()
++def test_index(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    @run_in_pyodide  # type: ignore[misc]
++    def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]
++        from urllib3.connection import HTTPConnection
++        from urllib3.response import BaseHTTPResponse
++
++        conn = HTTPConnection(host, port)
++        url = f"http://{host}:{port}/"
++        conn.request("GET", url)
++        response = conn.getresponse()
++        # check methods of response
++        assert isinstance(response, BaseHTTPResponse)
++        assert response.url == url
++        response.url = "http://woo"
++        assert response.url == "http://woo"
++        assert response.connection == conn
++        assert response.retries is None
++        data1 = response.data
++        decoded1 = data1.decode("utf-8")
++        data2 = response.data  # check that getting data twice works
++        decoded2 = data2.decode("utf-8")
++        assert decoded1 == decoded2 == "Dummy server!"
++
++    pyodide_test(
++        selenium_coverage, testserver_http.http_host, testserver_http.http_port
++    )
++
++
++@install_urllib3_wheel()
++def test_pool_requests(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    @run_in_pyodide  # type: ignore[misc]
++    def pyodide_test(selenium_coverage, host: str, port: int, https_port: int) -> None:  # type: ignore[no-untyped-def]
++        # first with PoolManager
++        import urllib3
++
++        http = urllib3.PoolManager()
++        resp = http.request("GET", f"http://{host}:{port}/")
++        assert resp.data.decode("utf-8") == "Dummy server!"
++
++        resp2 = http.request("GET", f"http://{host}:{port}/index")
++        assert resp2.data.decode("utf-8") == "Dummy server!"
++
++        # should all have come from one pool
++        assert len(http.pools) == 1
++
++        resp3 = http.request("GET", f"https://{host}:{https_port}/")
++        assert resp2.data.decode("utf-8") == "Dummy server!"
++
++        # one http pool + one https pool
++        assert len(http.pools) == 2
++
++        # now with ConnectionPool
++        # because block == True, this will fail if the connection isn't
++        # returned to the pool correctly after the first request
++        pool = urllib3.HTTPConnectionPool(host, port, maxsize=1, block=True)
++        resp3 = pool.urlopen("GET", "/index")
++        assert resp3.data.decode("utf-8") == "Dummy server!"
++
++        resp4 = pool.urlopen("GET", "/")
++        assert resp4.data.decode("utf-8") == "Dummy server!"
++
++        # now with manual release of connection
++        # first - connection should be released once all
++        # data is read
++        pool2 = urllib3.HTTPConnectionPool(host, port, maxsize=1, block=True)
++
++        resp5 = pool2.urlopen("GET", "/index", preload_content=False)
++        assert pool2.pool is not None
++        # at this point, the connection should not be in the pool
++        assert pool2.pool.qsize() == 0
++        assert resp5.data.decode("utf-8") == "Dummy server!"
++        # now we've read all the data, connection should be back to the pool
++        assert pool2.pool.qsize() == 1
++        resp6 = pool2.urlopen("GET", "/index", preload_content=False)
++        assert pool2.pool.qsize() == 0
++        # force it back to the pool
++        resp6.release_conn()
++        assert pool2.pool.qsize() == 1
++        read_str = resp6.read()
++        # for consistency with urllib3, this still returns the correct data even though
++        # we are in theory not using the connection any more
++        assert read_str.decode("utf-8") == "Dummy server!"
++
++    pyodide_test(
++        selenium_coverage,
++        testserver_http.http_host,
++        testserver_http.http_port,
++        testserver_http.https_port,
++    )
++
++
++# wrong protocol / protocol error etc. should raise an exception of http.client.HTTPException
++@install_urllib3_wheel()
++def test_wrong_protocol(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    @run_in_pyodide  # type: ignore[misc]
++    def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]
++        import http.client
++
++        import pytest
++
++        from urllib3.connection import HTTPConnection
++
++        conn = HTTPConnection(host, port)
++        with pytest.raises(http.client.HTTPException):
++            conn.request("GET", f"http://{host}:{port}/")
++
++    pyodide_test(
++        selenium_coverage, testserver_http.http_host, testserver_http.https_port
++    )
++
++
++# wrong protocol / protocol error etc. should raise an exception of http.client.HTTPException
++@install_urllib3_wheel()
++def test_bad_method(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    @run_in_pyodide(packages=("pytest",))  # type: ignore[misc]
++    def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]
++        import http.client
++
++        import pytest
++
++        from urllib3.connection import HTTPConnection
++
++        conn = HTTPConnection(host, port)
++        with pytest.raises(http.client.HTTPException):
++            conn.request("TRACE", f"http://{host}:{port}/")
++
++    pyodide_test(
++        selenium_coverage, testserver_http.http_host, testserver_http.https_port
++    )
++
++
++# no connection - should raise
++@install_urllib3_wheel()
++def test_no_response(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    @run_in_pyodide(packages=("pytest",))  # type: ignore[misc]
++    def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]
++        import http.client
++
++        import pytest
++
++        from urllib3.connection import HTTPConnection
++
++        conn = HTTPConnection(host, port)
++        with pytest.raises(http.client.HTTPException):
++            conn.request("GET", f"http://{host}:{port}/")
++            _ = conn.getresponse()
++
++    pyodide_test(selenium_coverage, testserver_http.http_host, find_unused_port())
++
++
++@install_urllib3_wheel()
++def test_404(selenium_coverage: typing.Any, testserver_http: PyodideServerInfo) -> None:
++    @run_in_pyodide  # type: ignore[misc]
++    def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]
++        from urllib3.connection import HTTPConnection
++        from urllib3.response import BaseHTTPResponse
++
++        conn = HTTPConnection(host, port)
++        conn.request("GET", f"http://{host}:{port}/status?status=404 NOT FOUND")
++        response = conn.getresponse()
++        assert isinstance(response, BaseHTTPResponse)
++        assert response.status == 404
++
++    pyodide_test(
++        selenium_coverage, testserver_http.http_host, testserver_http.http_port
++    )
++
++
++# setting timeout should show a warning to js console
++# if we're on the ui thread, because XMLHttpRequest doesn't
++# support timeout in async mode if globalThis == Window
++@install_urllib3_wheel()
++def test_timeout_warning(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    @run_in_pyodide()  # type: ignore[misc]
++    def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]
++        import js  # type: ignore[import]
++
++        import urllib3.contrib.emscripten.fetch
++        from urllib3.connection import HTTPConnection
++
++        old_log = js.console.warn
++        log_msgs = []
++
++        def capture_log(*args):  # type: ignore[no-untyped-def]
++            log_msgs.append(str(args))
++            old_log(*args)
++
++        js.console.warn = capture_log
++
++        conn = HTTPConnection(host, port, timeout=1.0)
++        conn.request("GET", f"http://{host}:{port}/")
++        conn.getresponse()
++        js.console.warn = old_log
++        # should have shown timeout warning exactly once by now
++        assert len([x for x in log_msgs if x.find("Warning: Timeout") != -1]) == 1
++        assert urllib3.contrib.emscripten.fetch._SHOWN_TIMEOUT_WARNING
++
++    pyodide_test(
++        selenium_coverage, testserver_http.http_host, testserver_http.http_port
++    )
++
++
++@install_urllib3_wheel()
++def test_timeout_in_worker_non_streaming(
++    selenium_coverage: typing.Any,
++    testserver_http: PyodideServerInfo,
++    run_from_server: ServerRunnerInfo,
++) -> None:
++    worker_code = f"""
++        import pyodide_js as pjs
++        await pjs.loadPackage('http://{testserver_http.http_host}:{testserver_http.http_port}/wheel/dist.whl',deps=False)
++        from urllib3.exceptions import TimeoutError
++        from urllib3.connection import HTTPConnection
++        conn = HTTPConnection("{testserver_http.http_host}", {testserver_http.http_port},timeout=1.0)
++        result=-1
++        try:
++            conn.request("GET","/slow")
++            _response = conn.getresponse()
++            result=-3
++        except TimeoutError as e:
++            result=1 # we've got the correct exception
++        except BaseException as e:
++            result=-2
++        assert result == 1
++"""
++    run_from_server.run_webworker(worker_code)
++
++
++@install_urllib3_wheel()
++def test_timeout_in_worker_streaming(
++    selenium_coverage: typing.Any,
++    testserver_http: PyodideServerInfo,
++    run_from_server: ServerRunnerInfo,
++) -> None:
++    worker_code = f"""
++        import pyodide_js as pjs
++        await pjs.loadPackage('http://{testserver_http.http_host}:{testserver_http.http_port}/wheel/dist.whl',deps=False)
++        import urllib3.contrib.emscripten.fetch
++        await urllib3.contrib.emscripten.fetch.wait_for_streaming_ready()
++        from urllib3.exceptions import TimeoutError
++        from urllib3.connection import HTTPConnection
++        conn = HTTPConnection("{testserver_http.http_host}", {testserver_http.http_port},timeout=1.0)
++        result=-1
++        try:
++            conn.request("GET","/slow",preload_content=False)
++            _response = conn.getresponse()
++            result=-3
++        except TimeoutError as e:
++            result=1 # we've got the correct exception
++        except BaseException as e:
++            result=-2
++        assert result == 1
++"""
++    run_from_server.run_webworker(worker_code)
++
++
++@install_urllib3_wheel()
++def test_index_https(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    @run_in_pyodide  # type: ignore[misc]
++    def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]
++        from urllib3.connection import HTTPSConnection
++        from urllib3.response import BaseHTTPResponse
++
++        conn = HTTPSConnection(host, port)
++        conn.request("GET", f"https://{host}:{port}/")
++        response = conn.getresponse()
++        assert isinstance(response, BaseHTTPResponse)
++        data = response.data
++        assert data.decode("utf-8") == "Dummy server!"
++
++    pyodide_test(
++        selenium_coverage, testserver_http.http_host, testserver_http.https_port
++    )
++
++
++@install_urllib3_wheel()
++def test_non_streaming_no_fallback_warning(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    @run_in_pyodide  # type: ignore[misc]
++    def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]
++        import js
++
++        import urllib3.contrib.emscripten.fetch
++        from urllib3.connection import HTTPSConnection
++        from urllib3.response import BaseHTTPResponse
++
++        log_msgs = []
++        old_log = js.console.warn
++
++        def capture_log(*args):  # type: ignore[no-untyped-def]
++            log_msgs.append(str(args))
++            old_log(*args)
++
++        js.console.warn = capture_log
++        conn = HTTPSConnection(host, port)
++        conn.request("GET", f"https://{host}:{port}/", preload_content=True)
++        response = conn.getresponse()
++        js.console.warn = old_log
++        assert isinstance(response, BaseHTTPResponse)
++        data = response.data
++        assert data.decode("utf-8") == "Dummy server!"
++        # no console warnings because we didn't ask it to stream the response
++        # check no log messages
++        assert (
++            len([x for x in log_msgs if x.find("Can't stream HTTP requests") != -1])
++            == 0
++        )
++        assert not urllib3.contrib.emscripten.fetch._SHOWN_STREAMING_WARNING
++
++    pyodide_test(
++        selenium_coverage, testserver_http.http_host, testserver_http.https_port
++    )
++
++
++@install_urllib3_wheel()
++def test_streaming_fallback_warning(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    @run_in_pyodide  # type: ignore[misc]
++    def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]
++        import js
++
++        import urllib3.contrib.emscripten.fetch
++        from urllib3.connection import HTTPSConnection
++        from urllib3.response import BaseHTTPResponse
++
++        # monkeypatch is_cross_origin_isolated so that it warns about that
++        # even if we're serving it so it is fine
++        urllib3.contrib.emscripten.fetch.is_cross_origin_isolated = lambda: False
++
++        log_msgs = []
++        old_log = js.console.warn
++
++        def capture_log(*args):  # type: ignore[no-untyped-def]
++            log_msgs.append(str(args))
++            old_log(*args)
++
++        js.console.warn = capture_log
++
++        conn = HTTPSConnection(host, port)
++        conn.request("GET", f"https://{host}:{port}/", preload_content=False)
++        response = conn.getresponse()
++        js.console.warn = old_log
++        assert isinstance(response, BaseHTTPResponse)
++        data = response.data
++        assert data.decode("utf-8") == "Dummy server!"
++        # check that it has warned about falling back to non-streaming fetch exactly once
++        assert (
++            len([x for x in log_msgs if x.find("Can't stream HTTP requests") != -1])
++            == 1
++        )
++        assert urllib3.contrib.emscripten.fetch._SHOWN_STREAMING_WARNING
++
++    pyodide_test(
++        selenium_coverage, testserver_http.http_host, testserver_http.https_port
++    )
++
++
++@install_urllib3_wheel()
++def test_specific_method(
++    selenium_coverage: typing.Any,
++    testserver_http: PyodideServerInfo,
++    run_from_server: ServerRunnerInfo,
++) -> None:
++    @run_in_pyodide  # type: ignore[misc]
++    def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]
++        from urllib3 import HTTPSConnectionPool
++
++        with HTTPSConnectionPool(host, port) as pool:
++            path = "/specific_method?method=POST"
++            response = pool.request("POST", path)
++            assert response.status == 200
++
++            response = pool.request("PUT", path)
++            assert response.status == 400
++
++    pyodide_test(
++        selenium_coverage, testserver_http.http_host, testserver_http.https_port
++    )
++
++
++@install_urllib3_wheel()
++def test_streaming_download(
++    selenium_coverage: typing.Any,
++    testserver_http: PyodideServerInfo,
++    run_from_server: ServerRunnerInfo,
++) -> None:
++    # test streaming download, which must be in a webworker
++    # as you can't do it on main thread
++
++    # this should return the 17mb big file, and
++    # should not log any warning about falling back
++    bigfile_url = (
++        f"http://{testserver_http.http_host}:{testserver_http.http_port}/bigfile"
++    )
++    worker_code = f"""
++            import pyodide_js as pjs
++            await pjs.loadPackage('http://{testserver_http.http_host}:{testserver_http.http_port}/wheel/dist.whl',deps=False)
++
++            import urllib3.contrib.emscripten.fetch
++            await urllib3.contrib.emscripten.fetch.wait_for_streaming_ready()
++            from urllib3.response import BaseHTTPResponse
++            from urllib3.connection import HTTPConnection
++
++            conn = HTTPConnection("{testserver_http.http_host}", {testserver_http.http_port})
++            conn.request("GET", "{bigfile_url}",preload_content=False)
++            response = conn.getresponse()
++            assert isinstance(response, BaseHTTPResponse)
++            assert urllib3.contrib.emscripten.fetch._SHOWN_STREAMING_WARNING==False
++            data=response.data.decode('utf-8')
++            assert len(data) == 17825792
++"""
++    run_from_server.run_webworker(worker_code)
++
++
++@install_urllib3_wheel()
++def test_streaming_close(
++    selenium_coverage: typing.Any,
++    testserver_http: PyodideServerInfo,
++    run_from_server: ServerRunnerInfo,
++) -> None:
++    # test streaming download, which must be in a webworker
++    # as you can't do it on main thread
++
++    # this should return the 17mb big file, and
++    # should not log any warning about falling back
++    url = f"http://{testserver_http.http_host}:{testserver_http.http_port}/"
++    worker_code = f"""
++            import pyodide_js as pjs
++            await pjs.loadPackage('http://{testserver_http.http_host}:{testserver_http.http_port}/wheel/dist.whl',deps=False)
++
++            import urllib3.contrib.emscripten.fetch
++            await urllib3.contrib.emscripten.fetch.wait_for_streaming_ready()
++            from urllib3.response import BaseHTTPResponse
++            from urllib3.connection import HTTPConnection
++            from io import RawIOBase
++
++            conn = HTTPConnection("{testserver_http.http_host}", {testserver_http.http_port})
++            conn.request("GET", "{url}",preload_content=False)
++            response = conn.getresponse()
++            # check body is a RawIOBase stream and isn't seekable, writeable
++            body_internal = response._response.body
++            assert(isinstance(body_internal,RawIOBase))
++            assert(body_internal.writable() is False)
++            assert(body_internal.seekable() is False)
++            assert(body_internal.readable() is True)
++            response.drain_conn()
++            x=response.read()
++            assert(not x)
++            response.close()
++            conn.close()
++            # try and make destructor be covered
++            # by killing everything
++            del response
++            del body_internal
++            del conn
++"""
++    run_from_server.run_webworker(worker_code)
++
++
++@install_urllib3_wheel()
++def test_streaming_bad_url(
++    selenium_coverage: typing.Any,
++    testserver_http: PyodideServerInfo,
++    run_from_server: ServerRunnerInfo,
++) -> None:
++    # this should cause an error
++    # because the protocol is bad
++    bad_url = f"hsffsdfttp://{testserver_http.http_host}:{testserver_http.http_port}/"
++    # this must be in a webworker
++    # as you can't do it on main thread
++    worker_code = f"""
++            import pytest
++            import pyodide_js as pjs
++            await pjs.loadPackage('http://{testserver_http.http_host}:{testserver_http.http_port}/wheel/dist.whl',deps=False)
++            import http.client
++            import urllib3.contrib.emscripten.fetch
++            await urllib3.contrib.emscripten.fetch.wait_for_streaming_ready()
++            from urllib3.response import BaseHTTPResponse
++            from urllib3.connection import HTTPConnection
++
++            conn = HTTPConnection("{testserver_http.http_host}", {testserver_http.http_port})
++            with pytest.raises(http.client.HTTPException):
++                conn.request("GET", "{bad_url}",preload_content=False)
++"""
++    run_from_server.run_webworker(worker_code)
++
++
++@install_urllib3_wheel()
++def test_streaming_bad_method(
++    selenium_coverage: typing.Any,
++    testserver_http: PyodideServerInfo,
++    run_from_server: ServerRunnerInfo,
++) -> None:
++    # this should cause an error
++    # because the protocol is bad
++    bad_url = f"http://{testserver_http.http_host}:{testserver_http.http_port}/"
++    # this must be in a webworker
++    # as you can't do it on main thread
++    worker_code = f"""
++            import pytest
++            import http.client
++            import pyodide_js as pjs
++            await pjs.loadPackage('http://{testserver_http.http_host}:{testserver_http.http_port}/wheel/dist.whl',deps=False)
++
++            import urllib3.contrib.emscripten.fetch
++            await urllib3.contrib.emscripten.fetch.wait_for_streaming_ready()
++            from urllib3.response import BaseHTTPResponse
++            from urllib3.connection import HTTPConnection
++
++            conn = HTTPConnection("{testserver_http.http_host}", {testserver_http.http_port})
++            with pytest.raises(http.client.HTTPException):
++                # TRACE method should throw SecurityError in Javascript
++                conn.request("TRACE", "{bad_url}",preload_content=False)
++"""
++    run_from_server.run_webworker(worker_code)
++
++
++@install_urllib3_wheel()
++def test_streaming_notready_warning(
++    selenium_coverage: typing.Any,
++    testserver_http: PyodideServerInfo,
++    run_from_server: ServerRunnerInfo,
++) -> None:
++    # test streaming download but don't wait for
++    # worker to be ready - should fallback to non-streaming
++    # and log a warning
++    file_url = f"http://{testserver_http.http_host}:{testserver_http.http_port}/"
++    worker_code = f"""
++        import pyodide_js as pjs
++        await pjs.loadPackage('http://{testserver_http.http_host}:{testserver_http.http_port}/wheel/dist.whl',deps=False)
++        import js
++        import urllib3
++        from urllib3.response import BaseHTTPResponse
++        from urllib3.connection import HTTPConnection
++
++        log_msgs=[]
++        old_log=js.console.warn
++        def capture_log(*args):
++            log_msgs.append(str(args))
++            old_log(*args)
++        js.console.warn=capture_log
++
++        conn = HTTPConnection("{testserver_http.http_host}", {testserver_http.http_port})
++        conn.request("GET", "{file_url}",preload_content=False)
++        js.console.warn=old_log
++        response = conn.getresponse()
++        assert isinstance(response, BaseHTTPResponse)
++        data=response.data.decode('utf-8')
++        assert len([x for x in log_msgs if x.find("Can't stream HTTP requests")!=-1])==1
++        assert urllib3.contrib.emscripten.fetch._SHOWN_STREAMING_WARNING==True
++        """
++    run_from_server.run_webworker(worker_code)
++
++
++@install_urllib3_wheel()
++def test_post_receive_json(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    @run_in_pyodide  # type: ignore[misc]
++    def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]
++        import json
++
++        from urllib3.connection import HTTPConnection
++        from urllib3.response import BaseHTTPResponse
++
++        json_data = {
++            "Bears": "like",
++            "to": {"eat": "buns", "with": ["marmalade", "and custard"]},
++        }
++        conn = HTTPConnection(host, port)
++        conn.request(
++            "POST",
++            f"http://{host}:{port}/echo_json",
++            body=json.dumps(json_data).encode("utf-8"),
++            headers={"Content-type": "application/json"},
++        )
++        response = conn.getresponse()
++        assert isinstance(response, BaseHTTPResponse)
++        data = response.json()
++        assert data == json_data
++
++    pyodide_test(
++        selenium_coverage, testserver_http.http_host, testserver_http.http_port
++    )
++
++
++@install_urllib3_wheel()
++def test_upload(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    @run_in_pyodide  # type: ignore[misc]
++    def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]
++        from urllib3 import HTTPConnectionPool
++
++        data = "I'm in ur multipart form-data, hazing a cheezburgr"
++        fields: dict[str, _TYPE_FIELD_VALUE_TUPLE] = {
++            "upload_param": "filefield",
++            "upload_filename": "lolcat.txt",
++            "filefield": ("lolcat.txt", data),
++        }
++        fields["upload_size"] = str(len(data))
++        with HTTPConnectionPool(host, port) as pool:
++            r = pool.request("POST", "/upload", fields=fields)
++            assert r.status == 200
++
++    pyodide_test(
++        selenium_coverage, testserver_http.http_host, testserver_http.http_port
++    )
++
++
++@install_urllib3_wheel()
++def test_streaming_not_ready_in_browser(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    # streaming ready should always be false
++    # if we're in the main browser thread
++    selenium_coverage.run_async(
++        """
++        import urllib3.contrib.emscripten.fetch
++        result=await urllib3.contrib.emscripten.fetch.wait_for_streaming_ready()
++        assert(result is False)
++        assert(urllib3.contrib.emscripten.fetch.streaming_ready() is None )
++        """
++    )
++
++
++@install_urllib3_wheel()
++def test_requests_with_micropip(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    # this can't be @run_in_pyodide because of the async code
++    selenium_coverage.run_async(
++        f"""
++        import micropip
++        await micropip.install("requests")
++        import requests
++        import json
++        r = requests.get("http://{testserver_http.http_host}:{testserver_http.http_port}/")
++        assert(r.status_code == 200)
++        assert(r.text == "Dummy server!")
++        json_data={{"woo":"yay"}}
++        # try posting some json with requests
++        r = requests.post("http://{testserver_http.http_host}:{testserver_http.http_port}/echo_json",json=json_data)
++        import js
++        assert(r.json() == json_data)
++    """
++    )
++
++
++@install_urllib3_wheel()
++def test_open_close(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    @run_in_pyodide  # type: ignore[misc]
++    def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]
++        from http.client import ResponseNotReady
++
++        import pytest
++
++        from urllib3.connection import HTTPConnection
++
++        conn = HTTPConnection(host, port)
++        # initially connection should be closed
++        assert conn.is_closed is True
++        # connection should have no response
++        with pytest.raises(ResponseNotReady):
++            response = conn.getresponse()
++        # now make the response
++        conn.request("GET", f"http://{host}:{port}/")
++        # we never connect to proxy (or if we do, browser handles it)
++        assert conn.has_connected_to_proxy is False
++        # now connection should be open
++        assert conn.is_closed is False
++        # and should have a response
++        response = conn.getresponse()
++        assert response is not None
++        conn.close()
++        # now it is closed
++        assert conn.is_closed is True
++        # closed connection shouldn't have any response
++        with pytest.raises(ResponseNotReady):
++            conn.getresponse()
++
++    pyodide_test(
++        selenium_coverage, testserver_http.http_host, testserver_http.http_port
++    )
++
++
++# check that various ways that the worker may be broken
++# throw exceptions nicely, by deliberately breaking things
++# this is for coverage
++@install_urllib3_wheel()
++def test_break_worker_streaming(
++    selenium_coverage: typing.Any,
++    testserver_http: PyodideServerInfo,
++    run_from_server: ServerRunnerInfo,
++) -> None:
++    worker_code = f"""
++        import pyodide_js as pjs
++        await pjs.loadPackage('http://{testserver_http.http_host}:{testserver_http.http_port}/wheel/dist.whl',deps=False)
++        import pytest
++        import urllib3.contrib.emscripten.fetch
++        import js
++        import http.client
++
++        await urllib3.contrib.emscripten.fetch.wait_for_streaming_ready()
++        from urllib3.exceptions import TimeoutError
++        from urllib3.connection import HTTPConnection
++        conn = HTTPConnection("{testserver_http.http_host}", {testserver_http.http_port},timeout=1.0)
++        # make the fetch worker return a bad response by:
++        # 1) Clearing the int buffer
++        #    in the receive stream
++        with pytest.raises(http.client.HTTPException):
++            conn.request("GET","/",preload_content=False)
++            response = conn.getresponse()
++            body_internal = response._response.body
++            assert(body_internal.int_buffer!=None)
++            body_internal.int_buffer=None
++            data=response.read()
++        # 2) Monkeypatch postMessage so that it just sets an
++        #    exception status
++        old_pm= body_internal.worker.postMessage
++        with pytest.raises(http.client.HTTPException):
++            conn.request("GET","/",preload_content=False)
++            response = conn.getresponse()
++            # make posted messages set an exception
++            body_internal = response._response.body
++            def set_exception(*args):
++                body_internal.worker.postMessage = old_pm
++                body_internal.int_buffer[1]=4
++                body_internal.byte_buffer[0]=ord("W")
++                body_internal.byte_buffer[1]=ord("O")
++                body_internal.byte_buffer[2]=ord("O")
++                body_internal.byte_buffer[3]=ord("!")
++                body_internal.byte_buffer[4]=0
++                js.Atomics.store(body_internal.int_buffer, 0, -4)
++                js.Atomics.notify(body_internal.int_buffer,0)
++            body_internal.worker.postMessage = set_exception
++            data=response.read()
++        # monkeypatch so it returns an unknown value for the magic number on initial fetch call
++        with pytest.raises(http.client.HTTPException):
++            # make posted messages set an exception
++            worker=urllib3.contrib.emscripten.fetch._fetcher.js_worker
++            def set_exception(self,*args):
++                array=js.Int32Array.new(args[0].buffer)
++                array[0]=-1234
++            worker.postMessage=set_exception.__get__(worker,worker.__class__)
++            conn.request("GET","/",preload_content=False)
++            response = conn.getresponse()
++            data=response.read()
++        urllib3.contrib.emscripten.fetch._fetcher.js_worker.postMessage=old_pm
++        # 3) Stopping the worker receiving any messages which should cause a timeout error
++        #    in the receive stream
++        with pytest.raises(TimeoutError):
++            conn.request("GET","/",preload_content=False)
++            response = conn.getresponse()
++            # make posted messages not be send
++            body_internal = response._response.body
++            def ignore_message(*args):
++                pass
++            old_pm= body_internal.worker.postMessage
++            body_internal.worker.postMessage = ignore_message
++            data=response.read()
++        body_internal.worker.postMessage = old_pm
++
++"""
++    run_from_server.run_webworker(worker_code)
++
++
++@install_urllib3_wheel()
++def test_response_init_length(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    @run_in_pyodide  # type: ignore[misc]
++    def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]
++        import pytest
++
++        import urllib3.exceptions
++        from urllib3.connection import HTTPConnection
++        from urllib3.response import BaseHTTPResponse
++
++        conn = HTTPConnection(host, port)
++        conn.request("GET", f"http://{host}:{port}/")
++        response = conn.getresponse()
++        assert isinstance(response, BaseHTTPResponse)
++        # head shouldn't have length
++        length = response._init_length("HEAD")
++        assert length == 0
++        # multiple inconsistent lengths - should raise invalid header
++        with pytest.raises(urllib3.exceptions.InvalidHeader):
++            response.headers["Content-Length"] = "4,5,6"
++            length = response._init_length("GET")
++        # non-numeric length - should return None
++        response.headers["Content-Length"] = "anna"
++        length = response._init_length("GET")
++        assert length is None
++        # numeric length - should return it
++        response.headers["Content-Length"] = "54"
++        length = response._init_length("GET")
++        assert length == 54
++        # negative length - should return None
++        response.headers["Content-Length"] = "-12"
++        length = response._init_length("GET")
++        assert length is None
++        # none -> None
++        del response.headers["Content-Length"]
++        length = response._init_length("GET")
++        assert length is None
++
++    pyodide_test(
++        selenium_coverage, testserver_http.http_host, testserver_http.http_port
++    )
++
++
++@install_urllib3_wheel()
++def test_response_close_connection(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    @run_in_pyodide  # type: ignore[misc]
++    def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]
++        from urllib3.connection import HTTPConnection
++        from urllib3.response import BaseHTTPResponse
++
++        conn = HTTPConnection(host, port)
++        conn.request("GET", f"http://{host}:{port}/")
++        response = conn.getresponse()
++        assert isinstance(response, BaseHTTPResponse)
++        response.close()
++        assert conn.is_closed
++
++    pyodide_test(
++        selenium_coverage, testserver_http.http_host, testserver_http.http_port
++    )
++
++
++@install_urllib3_wheel()
++def test_read_chunked(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    @run_in_pyodide  # type: ignore[misc]
++    def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]
++        from urllib3.connection import HTTPConnection
++
++        conn = HTTPConnection(host, port)
++        conn.request("GET", f"http://{host}:{port}/mediumfile", preload_content=False)
++        response = conn.getresponse()
++        count = 0
++        for x in response.read_chunked(512):
++            count += 1
++            if count < 10:
++                assert len(x) == 512
++
++    pyodide_test(
++        selenium_coverage, testserver_http.http_host, testserver_http.http_port
++    )
++
++
++@install_urllib3_wheel()
++def test_retries(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    @run_in_pyodide  # type: ignore[misc]
++    def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]
++        import pytest
++
++        import urllib3
++
++        pool = urllib3.HTTPConnectionPool(
++            host,
++            port,
++            maxsize=1,
++            block=True,
++            retries=urllib3.util.Retry(connect=5, read=5, redirect=5),
++        )
++
++        # monkeypatch connection class to count calls
++        old_request = urllib3.connection.HTTPConnection.request
++        count = 0
++
++        def count_calls(self, *args, **argv):  # type: ignore[no-untyped-def]
++            nonlocal count
++            count += 1
++            return old_request(self, *args, **argv)
++
++        urllib3.connection.HTTPConnection.request = count_calls  # type: ignore[method-assign]
++        with pytest.raises(urllib3.exceptions.MaxRetryError):
++            pool.urlopen("GET", "/")
++        # this should fail, but should have tried 6 times total
++        assert count == 6
++
++    pyodide_test(selenium_coverage, testserver_http.http_host, find_unused_port())
+
+diff --git a/test/contrib/test_socks.py b/test/contrib/test_socks.py
+index 2878cc8..c23e14b 100644
+--- a/test/contrib/test_socks.py
++++ b/test/contrib/test_socks.py
+@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
+ import pytest
+ import socks as py_socks  # type: ignore[import]
+ 
+-from dummyserver.server import DEFAULT_CA, DEFAULT_CERTS
++from dummyserver.socketserver import DEFAULT_CA, DEFAULT_CERTS
+ from dummyserver.testcase import IPV4SocketDummyServerTestCase
+ from urllib3.contrib import socks
+ from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
+
+diff --git a/test/test_collections.py b/test/test_collections.py
+index 8d0c1ce..ae896e2 100644
+--- a/test/test_collections.py
++++ b/test/test_collections.py
+@@ -282,7 +282,7 @@ class TestHTTPHeaderDict:
+         ]
+ 
+         assert list(d.items()) == expected_results
+-        # make sure the values persist over copys
++        # make sure the values persist over copies
+         assert list(d.copy().items()) == expected_results
+ 
+         other_dict = HTTPHeaderDict()
+@@ -385,7 +385,7 @@ class TestHTTPHeaderDict:
+         hdict = {
+             "Content-Length": "0",
+             "Content-type": "text/plain",
+-            "Server": "TornadoServer/1.2.3",
++            "Server": "Hypercorn/1.2.3",
+         }
+         h = dict(HTTPHeaderDict(hdict).items())
+         assert hdict == h
+
+diff --git a/test/test_connection.py b/test/test_connection.py
+index f49497b..a4bd873 100644
+--- a/test/test_connection.py
++++ b/test/test_connection.py
+@@ -19,6 +19,7 @@ from urllib3.connection import (  # type: ignore[attr-defined]
+ )
+ from urllib3.exceptions import HTTPError, ProxyError, SSLError
+ from urllib3.util import ssl_
++from urllib3.util.request import SKIP_HEADER
+ from urllib3.util.ssl_match_hostname import (
+     CertificateError as ImplementationCertificateError,
+ )
+@@ -265,3 +266,60 @@ class TestConnection:
+                 conn.connect()
+ 
+         context.wrap_socket.return_value.close.assert_called_once_with()
++
++    @pytest.mark.parametrize(
++        "accept_encoding",
++        [
++            "Accept-Encoding",
++            "accept-encoding",
++            b"Accept-Encoding",
++            b"accept-encoding",
++            None,
++        ],
++    )
++    @pytest.mark.parametrize("host", ["Host", "host", b"Host", b"host", None])
++    @pytest.mark.parametrize(
++        "user_agent", ["User-Agent", "user-agent", b"User-Agent", b"user-agent", None]
++    )
++    @pytest.mark.parametrize("chunked", [True, False])
++    def test_skip_header(
++        self,
++        accept_encoding: str | None,
++        host: str | None,
++        user_agent: str | None,
++        chunked: bool,
++    ) -> None:
++        headers = {}
++        if accept_encoding is not None:
++            headers[accept_encoding] = SKIP_HEADER
++        if host is not None:
++            headers[host] = SKIP_HEADER
++        if user_agent is not None:
++            headers[user_agent] = SKIP_HEADER
++
++        # When dropping support for Python 3.9, this can be rewritten to parenthesized
++        # context managers
++        with mock.patch("urllib3.util.connection.create_connection"):
++            with mock.patch(
++                "urllib3.connection._HTTPConnection.putheader"
++            ) as http_client_putheader:
++                conn = HTTPConnection("")
++                conn.request("GET", "/headers", headers=headers, chunked=chunked)
++
++        request_headers = {}
++        for call in http_client_putheader.call_args_list:
++            header, value = call.args
++            request_headers[header] = value
++
++        if accept_encoding is None:
++            assert "Accept-Encoding" in request_headers
++        else:
++            assert accept_encoding not in request_headers
++        if host is None:
++            assert "Host" in request_headers
++        else:
++            assert host not in request_headers
++        if user_agent is None:
++            assert "User-Agent" in request_headers
++        else:
++            assert user_agent not in request_headers
+
+diff --git a/test/test_connectionpool.py b/test/test_connectionpool.py
+index d81d33f..176fed4 100644
+--- a/test/test_connectionpool.py
++++ b/test/test_connectionpool.py
+@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
+ 
+ import pytest
+ 
+-from dummyserver.server import DEFAULT_CA
++from dummyserver.socketserver import DEFAULT_CA
+ from urllib3 import Retry
+ from urllib3.connection import HTTPConnection
+ from urllib3.connectionpool import (
+
+diff --git a/test/test_response.py b/test/test_response.py
+index 98ae544..199ca80 100644
+--- a/test/test_response.py
++++ b/test/test_response.py
+@@ -73,15 +73,48 @@ class TestBytesQueueBuffer:
+         assert buffer.get(4) == b"rbaz"
+         assert len(buffer) == 0
+ 
++    def test_get_all_empty(self) -> None:
++        q = BytesQueueBuffer()
++        assert q.get_all() == b""
++        assert len(q) == 0
++
++    def test_get_all_single(self) -> None:
++        q = BytesQueueBuffer()
++        q.put(b"a")
++        assert q.get_all() == b"a"
++        assert len(q) == 0
++
++    def test_get_all_many(self) -> None:
++        q = BytesQueueBuffer()
++        q.put(b"a")
++        q.put(b"b")
++        q.put(b"c")
++        assert q.get_all() == b"abc"
++        assert len(q) == 0
++
++    @pytest.mark.parametrize(
++        "get_func",
++        (lambda b: b.get(len(b)), lambda b: b.get_all()),
++        ids=("get", "get_all"),
++    )
+     @pytest.mark.limit_memory("12.5 MB")  # assert that we're not doubling memory usage
+-    def test_memory_usage(self) -> None:
++    def test_memory_usage(
++        self, get_func: typing.Callable[[BytesQueueBuffer], str]
++    ) -> None:
+         # Allocate 10 1MiB chunks
+         buffer = BytesQueueBuffer()
+         for i in range(10):
+             # This allocates 2MiB, putting the max at around 12MiB. Not sure why.
+             buffer.put(bytes(2**20))
+ 
+-        assert len(buffer.get(10 * 2**20)) == 10 * 2**20
++        assert len(get_func(buffer)) == 10 * 2**20
++
++    @pytest.mark.limit_memory("10.01 MB")
++    def test_get_all_memory_usage_single_chunk(self) -> None:
++        buffer = BytesQueueBuffer()
++        chunk = bytes(10 * 2**20)  # 10 MiB
++        buffer.put(chunk)
++        assert buffer.get_all() is chunk
+ 
+ 
+ # A known random (i.e, not-too-compressible) payload generated with:
+@@ -185,6 +218,39 @@ class TestResponse:
+         assert r.read() == b""
+         assert r.read() == b""
+ 
++    def test_reference_read1(self) -> None:
++        fp = BytesIO(b"foobar")
++        r = HTTPResponse(fp, preload_content=False)
++
++        assert r.read1(0) == b""
++        assert r.read1(1) == b"f"
++        assert r.read1(2) == b"oo"
++        assert r.read1() == b"bar"
++        assert r.read1() == b""
++
++    def test_reference_read1_nodecode(self) -> None:
++        fp = BytesIO(b"foobar")
++        r = HTTPResponse(fp, preload_content=False, decode_content=False)
++
++        assert r.read1(0) == b""
++        assert r.read1(1) == b"f"
++        assert r.read1(2) == b"oo"
++        assert r.read1() == b"bar"
++        assert r.read1() == b""
++
++    def test_decoding_read1(self) -> None:
++        data = zlib.compress(b"foobar")
++
++        fp = BytesIO(data)
++        r = HTTPResponse(
++            fp, headers={"content-encoding": "deflate"}, preload_content=False
++        )
++
++        assert r.read1(1) == b"f"
++        assert r.read1(2) == b"oo"
++        assert r.read1() == b"bar"
++        assert r.read1() == b""
++
+     def test_decode_deflate(self) -> None:
+         data = zlib.compress(b"foo")
+ 
+@@ -365,8 +431,13 @@ class TestResponse:
+                 break
+         assert ret == b"foobarbaz"
+ 
++    decode_param_set = [
++        b"foo",
++        b"x" * 100,
++    ]
++
+     @onlyZstd()
+-    @pytest.mark.parametrize("data", [b"foo", b"x" * 100])
++    @pytest.mark.parametrize("data", decode_param_set)
+     def test_decode_zstd_error(self, data: bytes) -> None:
+         fp = BytesIO(data)
+ 
+@@ -374,14 +445,66 @@ class TestResponse:
+             HTTPResponse(fp, headers={"content-encoding": "zstd"})
+ 
+     @onlyZstd()
+-    @pytest.mark.parametrize("data", [b"foo", b"x" * 100])
+-    def test_decode_zstd_incomplete(self, data: bytes) -> None:
++    @pytest.mark.parametrize("data", decode_param_set)
++    def test_decode_zstd_incomplete_preload_content(self, data: bytes) -> None:
+         data = zstd.compress(data)
+         fp = BytesIO(data[:-1])
+ 
+         with pytest.raises(DecodeError):
+             HTTPResponse(fp, headers={"content-encoding": "zstd"})
+ 
++    @onlyZstd()
++    @pytest.mark.parametrize("data", decode_param_set)
++    def test_decode_zstd_incomplete_read(self, data: bytes) -> None:
++        data = zstd.compress(data)
++        fp = BytesIO(data[:-1])  # shorten the data to trigger DecodeError
++
++        # create response object without(!) reading/decoding the content
++        r = HTTPResponse(
++            fp, headers={"content-encoding": "zstd"}, preload_content=False
++        )
++
++        # read/decode, expecting DecodeError
++        with pytest.raises(DecodeError):
++            r.read(decode_content=True)
++
++    @onlyZstd()
++    @pytest.mark.parametrize("data", decode_param_set)
++    def test_decode_zstd_incomplete_read1(self, data: bytes) -> None:
++        data = zstd.compress(data)
++        fp = BytesIO(data[:-1])
++
++        r = HTTPResponse(
++            fp, headers={"content-encoding": "zstd"}, preload_content=False
++        )
++
++        # read/decode via read1(!), expecting DecodeError
++        with pytest.raises(DecodeError):
++            amt_decoded = 0
++            # loop, as read1() may return just partial data
++            while amt_decoded < len(data):
++                part = r.read1(decode_content=True)
++                amt_decoded += len(part)
++
++    @onlyZstd()
++    @pytest.mark.parametrize("data", decode_param_set)
++    def test_decode_zstd_read1(self, data: bytes) -> None:
++        encoded_data = zstd.compress(data)
++        fp = BytesIO(encoded_data)
++
++        r = HTTPResponse(
++            fp, headers={"content-encoding": "zstd"}, preload_content=False
++        )
++
++        amt_decoded = 0
++        decoded_data = b""
++        # loop, as read1() may return just partial data
++        while amt_decoded < len(data):
++            part = r.read1(decode_content=True)
++            amt_decoded += len(part)
++            decoded_data += part
++        assert decoded_data == data
++
+     def test_multi_decoding_deflate_deflate(self) -> None:
+         data = zlib.compress(zlib.compress(b"foo"))
+ 
+@@ -490,7 +613,7 @@ class TestResponse:
+         with pytest.raises(IOError):
+             resp3.fileno()
+ 
+-    def test_io_closed_consistently(self, sock: socket.socket) -> None:
++    def test_io_closed_consistently_by_read(self, sock: socket.socket) -> None:
+         try:
+             hlr = httplib.HTTPResponse(sock)
+             hlr.fp = BytesIO(b"foo")  # type: ignore[assignment]
+@@ -510,6 +633,99 @@ class TestResponse:
+         finally:
+             hlr.close()
+ 
++    @pytest.mark.parametrize("read_amt", (None, 3))
++    @pytest.mark.parametrize("length_known", (True, False))
++    def test_io_closed_consistently_by_read1(
++        self, sock: socket.socket, length_known: bool, read_amt: int | None
++    ) -> None:
++        with httplib.HTTPResponse(sock) as hlr:
++            hlr.fp = BytesIO(b"foo")  # type: ignore[assignment]
++            hlr.chunked = 0  # type: ignore[assignment]
++            hlr.length = 3 if length_known else None
++            with HTTPResponse(hlr, preload_content=False) as resp:
++                if length_known:
++                    resp.length_remaining = 3
++                assert not resp.closed
++                assert resp._fp is not None
++                assert not resp._fp.isclosed()
++                assert not is_fp_closed(resp._fp)
++                assert not resp.isclosed()
++                resp.read1(read_amt)
++                # If content length is unknown, IO is not closed until
++                # the next read returning zero bytes.
++                if not length_known:
++                    assert not resp.closed
++                    assert resp._fp is not None
++                    assert not resp._fp.isclosed()
++                    assert not is_fp_closed(resp._fp)
++                    assert not resp.isclosed()
++                    resp.read1(read_amt)
++                assert resp.closed
++                assert resp._fp.isclosed()
++                assert is_fp_closed(resp._fp)
++                assert resp.isclosed()
++
++    @pytest.mark.parametrize("length_known", (True, False))
++    def test_io_not_closed_until_all_data_is_read(
++        self, sock: socket.socket, length_known: bool
++    ) -> None:
++        with httplib.HTTPResponse(sock) as hlr:
++            hlr.fp = BytesIO(b"foo")  # type: ignore[assignment]
++            hlr.chunked = 0  # type: ignore[assignment]
++            length_remaining = 3
++            hlr.length = length_remaining if length_known else None
++            with HTTPResponse(hlr, preload_content=False) as resp:
++                if length_known:
++                    resp.length_remaining = length_remaining
++                while length_remaining:
++                    assert not resp.closed
++                    assert resp._fp is not None
++                    assert not resp._fp.isclosed()
++                    assert not is_fp_closed(resp._fp)
++                    assert not resp.isclosed()
++                    data = resp.read(1)
++                    assert len(data) == 1
++                    length_remaining -= 1
++                # If content length is unknown, IO is not closed until
++                # the next read returning zero bytes.
++                if not length_known:
++                    assert not resp.closed
++                    assert resp._fp is not None
++                    assert not resp._fp.isclosed()
++                    assert not is_fp_closed(resp._fp)
++                    assert not resp.isclosed()
++                    data = resp.read(1)
++                    assert len(data) == 0
++                assert resp.closed
++                assert resp._fp.isclosed()  # type: ignore[union-attr]
++                assert is_fp_closed(resp._fp)
++                assert resp.isclosed()
++
++    @pytest.mark.parametrize("length_known", (True, False))
++    def test_io_not_closed_after_requesting_0_bytes(
++        self, sock: socket.socket, length_known: bool
++    ) -> None:
++        with httplib.HTTPResponse(sock) as hlr:
++            hlr.fp = BytesIO(b"foo")  # type: ignore[assignment]
++            hlr.chunked = 0  # type: ignore[assignment]
++            length_remaining = 3
++            hlr.length = length_remaining if length_known else None
++            with HTTPResponse(hlr, preload_content=False) as resp:
++                if length_known:
++                    resp.length_remaining = length_remaining
++                assert not resp.closed
++                assert resp._fp is not None
++                assert not resp._fp.isclosed()
++                assert not is_fp_closed(resp._fp)
++                assert not resp.isclosed()
++                data = resp.read(0)
++                assert data == b""
++                assert not resp.closed
++                assert resp._fp is not None
++                assert not resp._fp.isclosed()
++                assert not is_fp_closed(resp._fp)
++                assert not resp.isclosed()
++
+     def test_io_bufferedreader(self) -> None:
+         fp = BytesIO(b"foo")
+         resp = HTTPResponse(fp, preload_content=False)
+@@ -624,6 +840,35 @@ class TestResponse:
+         ):
+             resp.read(decode_content=False)
+ 
++    def test_read1_with_illegal_mix_decode_toggle(self) -> None:
++        data = zlib.compress(b"foo")
++
++        fp = BytesIO(data)
++
++        resp = HTTPResponse(
++            fp, headers={"content-encoding": "deflate"}, preload_content=False
++        )
++
++        assert resp.read1(1) == b"f"
++
++        with pytest.raises(
++            RuntimeError,
++            match=(
++                r"Calling read1\(decode_content=False\) is not supported after "
++                r"read1\(decode_content=True\) was called"
++            ),
++        ):
++            resp.read1(1, decode_content=False)
++
++        with pytest.raises(
++            RuntimeError,
++            match=(
++                r"Calling read1\(decode_content=False\) is not supported after "
++                r"read1\(decode_content=True\) was called"
++            ),
++        ):
++            resp.read1(decode_content=False)
++
+     def test_read_with_mix_decode_toggle(self) -> None:
+         data = zlib.compress(b"foo")
+ 
+@@ -726,6 +971,9 @@ class TestResponse:
+                     return self.payloads.pop(0)
+                 return b""
+ 
++            def read1(self, amt: int) -> bytes:  # type: ignore[override]
++                return self.read(amt)
++
+         uncompressed_data = zlib.decompress(ZLIB_PAYLOAD)
+ 
+         payload_part_size = len(ZLIB_PAYLOAD) // NUMBER_OF_READS
+@@ -748,7 +996,7 @@ class TestResponse:
+         assert uncompressed_data == payload
+ 
+         # Check that the positions in the stream are correct
+-        # It is difficult to determine programatically what the positions
++        # It is difficult to determine programmatically what the positions
+         # returned by `tell` will be because the `HTTPResponse.read` method may
+         # call socket `read` a couple of times if it doesn't have enough data
+         # in the buffer or not call socket `read` at all if it has enough. All
+@@ -809,12 +1057,18 @@ class TestResponse:
+             next(stream)
+ 
+     @pytest.mark.parametrize(
+-        "preload_content, amt",
+-        [(True, None), (False, None), (False, 10 * 2**20)],
++        "preload_content, amt, read_meth",
++        [
++            (True, None, "read"),
++            (False, None, "read"),
++            (False, 10 * 2**20, "read"),
++            (False, None, "read1"),
++            (False, 10 * 2**20, "read1"),
++        ],
+     )
+     @pytest.mark.limit_memory("25 MB")
+     def test_buffer_memory_usage_decode_one_chunk(
+-        self, preload_content: bool, amt: int
++        self, preload_content: bool, amt: int, read_meth: str
+     ) -> None:
+         content_length = 10 * 2**20  # 10 MiB
+         fp = BytesIO(zlib.compress(bytes(content_length)))
+@@ -823,21 +1077,27 @@ class TestResponse:
+             preload_content=preload_content,
+             headers={"content-encoding": "deflate"},
+         )
+-        data = resp.data if preload_content else resp.read(amt)
++        data = resp.data if preload_content else getattr(resp, read_meth)(amt)
+         assert len(data) == content_length
+ 
+     @pytest.mark.parametrize(
+-        "preload_content, amt",
+-        [(True, None), (False, None), (False, 10 * 2**20)],
++        "preload_content, amt, read_meth",
++        [
++            (True, None, "read"),
++            (False, None, "read"),
++            (False, 10 * 2**20, "read"),
++            (False, None, "read1"),
++            (False, 10 * 2**20, "read1"),
++        ],
+     )
+     @pytest.mark.limit_memory("10.5 MB")
+     def test_buffer_memory_usage_no_decoding(
+-        self, preload_content: bool, amt: int
++        self, preload_content: bool, amt: int, read_meth: str
+     ) -> None:
+         content_length = 10 * 2**20  # 10 MiB
+         fp = BytesIO(bytes(content_length))
+         resp = HTTPResponse(fp, preload_content=preload_content, decode_content=False)
+-        data = resp.data if preload_content else resp.read(amt)
++        data = resp.data if preload_content else getattr(resp, read_meth)(amt)
+         assert len(data) == content_length
+ 
+     def test_length_no_header(self) -> None:
+@@ -922,6 +1182,9 @@ class TestResponse:
+ 
+                 return data
+ 
++            def read1(self, amt: int) -> bytes:
++                return self.read(1)
++
+             def close(self) -> None:
+                 self.fp = None
+ 
+@@ -1294,6 +1557,9 @@ class MockChunkedEncodingResponse:
+     def read(self, amt: int = -1) -> bytes:
+         return self.pop_current_chunk(amt)
+ 
++    def read1(self, amt: int = -1) -> bytes:
++        return self.pop_current_chunk(amt)
++
+     def flush(self) -> None:
+         # Python 3 wants this method.
+         pass
+
+diff --git a/test/test_ssl.py b/test/test_ssl.py
+index c886d4e..43073cb 100644
+--- a/test/test_ssl.py
++++ b/test/test_ssl.py
+@@ -108,13 +108,28 @@ class TestSSL:
+                 ssl_.ssl_wrap_socket(sock, tls_in_tls=True)
+ 
+     @pytest.mark.parametrize(
+-        ["pha", "expected_pha"], [(None, None), (False, True), (True, True)]
++        ["pha", "expected_pha", "cert_reqs"],
++        [
++            (None, None, None),
++            (None, None, ssl.CERT_NONE),
++            (None, None, ssl.CERT_OPTIONAL),
++            (None, None, ssl.CERT_REQUIRED),
++            (False, True, None),
++            (False, True, ssl.CERT_NONE),
++            (False, True, ssl.CERT_OPTIONAL),
++            (False, True, ssl.CERT_REQUIRED),
++            (True, True, None),
++            (True, True, ssl.CERT_NONE),
++            (True, True, ssl.CERT_OPTIONAL),
++            (True, True, ssl.CERT_REQUIRED),
++        ],
+     )
+     def test_create_urllib3_context_pha(
+         self,
+         monkeypatch: pytest.MonkeyPatch,
+         pha: bool | None,
+         expected_pha: bool | None,
++        cert_reqs: int | None,
+     ) -> None:
+         context = mock.create_autospec(ssl_.SSLContext)
+         context.set_ciphers = mock.Mock()
+@@ -122,7 +137,7 @@ class TestSSL:
+         context.post_handshake_auth = pha
+         monkeypatch.setattr(ssl_, "SSLContext", lambda *_, **__: context)
+ 
+-        assert ssl_.create_urllib3_context() is context
++        assert ssl_.create_urllib3_context(cert_reqs=cert_reqs) is context
+ 
+         assert context.post_handshake_auth == expected_pha
+ 
+
+diff --git a/test/test_ssltransport.py b/test/test_ssltransport.py
+index 2a7a038..4cce4de 100644
+--- a/test/test_ssltransport.py
++++ b/test/test_ssltransport.py
+@@ -9,7 +9,7 @@ from unittest import mock
+ 
+ import pytest
+ 
+-from dummyserver.server import DEFAULT_CA, DEFAULT_CERTS
++from dummyserver.socketserver import DEFAULT_CA, DEFAULT_CERTS
+ from dummyserver.testcase import SocketDummyServerTestCase, consume_socket
+ from urllib3.util import ssl_
+ from urllib3.util.ssltransport import SSLTransport
+@@ -184,33 +184,32 @@ class SingleTLSLayerTestCase(SocketDummyServerTestCase):
+         """
+ 
+         def shutdown_handler(listener: socket.socket) -> None:
+-            sock = listener.accept()[0]
+-            ssl_sock = self.server_context.wrap_socket(sock, server_side=True)
+-
+-            request = consume_socket(ssl_sock)
+-            validate_request(request)
+-            ssl_sock.sendall(sample_response())
++            with listener.accept()[0] as sock, self.server_context.wrap_socket(
++                sock, server_side=True
++            ) as ssl_sock:
++                request = consume_socket(ssl_sock)
++                validate_request(request)
++                ssl_sock.sendall(sample_response())
++
++                with ssl_sock.unwrap() as unwrapped_sock:
++                    request = consume_socket(unwrapped_sock)
++                    validate_request(request)
++                    unwrapped_sock.sendall(sample_response())
+ 
+-            unwrapped_sock = ssl_sock.unwrap()
++        self.start_dummy_server(shutdown_handler)
++        with socket.create_connection((self.host, self.port)) as sock:
++            ssock = SSLTransport(sock, self.client_context, server_hostname="localhost")
+ 
+-            request = consume_socket(unwrapped_sock)
+-            validate_request(request)
+-            unwrapped_sock.sendall(sample_response())
++            # request/response over TLS.
++            ssock.sendall(sample_request())
++            response = consume_socket(ssock)
++            validate_response(response)
+ 
+-        self.start_dummy_server(shutdown_handler)
+-        sock = socket.create_connection((self.host, self.port))
+-        ssock = SSLTransport(sock, self.client_context, server_hostname="localhost")
+-
+-        # request/response over TLS.
+-        ssock.sendall(sample_request())
+-        response = consume_socket(ssock)
+-        validate_response(response)
+-
+-        # request/response over plaintext after unwrap.
+-        ssock.unwrap()
+-        sock.sendall(sample_request())
+-        response = consume_socket(sock)
+-        validate_response(response)
++            # request/response over plaintext after unwrap.
++            ssock.unwrap()
++            sock.sendall(sample_request())
++            response = consume_socket(sock)
++            validate_response(response)
+ 
+     @pytest.mark.timeout(PER_TEST_TIMEOUT)
+     def test_ssl_object_attributes(self) -> None:
+
+diff --git a/test/with_dummyserver/test_connection.py b/test/with_dummyserver/test_connection.py
+index 2442c8a..29f3786 100644
+--- a/test/with_dummyserver/test_connection.py
++++ b/test/with_dummyserver/test_connection.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import contextlib
+ import sys
+ import typing
+ from http.client import ResponseNotReady
+@@ -7,7 +8,7 @@ from unittest import mock
+ 
+ import pytest
+ 
+-from dummyserver.testcase import HTTPDummyServerTestCase as server
++from dummyserver.testcase import HypercornDummyServerTestCase as server
+ from urllib3 import HTTPConnectionPool
+ from urllib3.response import HTTPResponse
+ 
+@@ -23,78 +24,59 @@ def pool() -> typing.Generator[HTTPConnectionPool, None, None]:
+ 
+ 
+ def test_returns_urllib3_HTTPResponse(pool: HTTPConnectionPool) -> None:
+-    conn = pool._get_conn()
+-
+-    method = "GET"
+-    path = "/"
+-
+-    conn.request(method, path)
+-
+-    response = conn.getresponse()
+-
+-    assert isinstance(response, HTTPResponse)
++    with contextlib.closing(pool._get_conn()) as conn:
++        conn.request("GET", "/")
++        response = conn.getresponse()
++        assert isinstance(response, HTTPResponse)
+ 
+ 
+ @pytest.mark.skipif(not hasattr(sys, "audit"), reason="requires python 3.8+")
+ @mock.patch("urllib3.connection.sys.audit")
+ def test_audit_event(audit_mock: mock.Mock, pool: HTTPConnectionPool) -> None:
+-    conn = pool._get_conn()
+-    conn.request("GET", "/")
+-    audit_mock.assert_any_call("http.client.connect", conn, conn.host, conn.port)
+-    # Ensure the event is raised only once.
+-    connect_events = [
+-        call for call in audit_mock.mock_calls if call.args[0] == "http.client.connect"
+-    ]
+-    assert len(connect_events) == 1
++    with contextlib.closing(pool._get_conn()) as conn:
++        conn.request("GET", "/")
++        audit_mock.assert_any_call("http.client.connect", conn, conn.host, conn.port)
++        # Ensure the event is raised only once.
++        connect_events = [
++            call
++            for call in audit_mock.mock_calls
++            if call.args[0] == "http.client.connect"
++        ]
++        assert len(connect_events) == 1
+ 
+ 
+ def test_does_not_release_conn(pool: HTTPConnectionPool) -> None:
+-    conn = pool._get_conn()
+-
+-    method = "GET"
+-    path = "/"
++    with contextlib.closing(pool._get_conn()) as conn:
++        conn.request("GET", "/")
++        response = conn.getresponse()
+ 
+-    conn.request(method, path)
+-
+-    response = conn.getresponse()
+-
+-    response.release_conn()
+-    assert pool.pool.qsize() == 0  # type: ignore[union-attr]
++        response.release_conn()
++        assert pool.pool.qsize() == 0  # type: ignore[union-attr]
+ 
+ 
+ def test_releases_conn(pool: HTTPConnectionPool) -> None:
+-    conn = pool._get_conn()
+-    assert conn is not None
+-
+-    method = "GET"
+-    path = "/"
+-
+-    conn.request(method, path)
++    with contextlib.closing(pool._get_conn()) as conn:
++        conn.request("GET", "/")
++        response = conn.getresponse()
+ 
+-    response = conn.getresponse()
+-    # If these variables are set by the pool
+-    # then the response can release the connection
+-    # back into the pool.
+-    response._pool = pool  # type: ignore[attr-defined]
+-    response._connection = conn  # type: ignore[attr-defined]
++        # If these variables are set by the pool
++        # then the response can release the connection
++        # back into the pool.
++        response._pool = pool  # type: ignore[attr-defined]
++        response._connection = conn  # type: ignore[attr-defined]
+ 
+-    response.release_conn()
+-    assert pool.pool.qsize() == 1  # type: ignore[union-attr]
++        response.release_conn()
++        assert pool.pool.qsize() == 1  # type: ignore[union-attr]
+ 
+ 
+ def test_double_getresponse(pool: HTTPConnectionPool) -> None:
+-    conn = pool._get_conn()
+-
+-    method = "GET"
+-    path = "/"
+-
+-    conn.request(method, path)
+-
+-    _ = conn.getresponse()
++    with contextlib.closing(pool._get_conn()) as conn:
++        conn.request("GET", "/")
++        _ = conn.getresponse()
+ 
+-    # Calling getrepsonse() twice should cause an error
+-    with pytest.raises(ResponseNotReady):
+-        conn.getresponse()
++        # Calling getrepsonse() twice should cause an error
++        with pytest.raises(ResponseNotReady):
++            conn.getresponse()
+ 
+ 
+ def test_connection_state_properties(pool: HTTPConnectionPool) -> None:
+
+diff --git a/test/with_dummyserver/test_connectionpool.py b/test/with_dummyserver/test_connectionpool.py
+index c0f4d9d..4fbe6a4 100644
+--- a/test/with_dummyserver/test_connectionpool.py
++++ b/test/with_dummyserver/test_connectionpool.py
+@@ -12,8 +12,8 @@ from urllib.parse import urlencode
+ 
+ import pytest
+ 
+-from dummyserver.server import HAS_IPV6_AND_DNS, NoIPv6Warning
+-from dummyserver.testcase import HTTPDummyServerTestCase, SocketDummyServerTestCase
++from dummyserver.socketserver import NoIPv6Warning
++from dummyserver.testcase import HypercornDummyServerTestCase, SocketDummyServerTestCase
+ from urllib3 import HTTPConnectionPool, encode_multipart_formdata
+ from urllib3._collections import HTTPHeaderDict
+ from urllib3.connection import _get_default_user_agent
+@@ -104,7 +104,7 @@ class TestConnectionPoolTimeouts(SocketDummyServerTestCase):
+             delta = time.time() - now
+ 
+             message = "timeout was pool-level SHORT_TIMEOUT rather than request-level LONG_TIMEOUT"
+-            assert delta >= LONG_TIMEOUT, message
++            assert delta >= (LONG_TIMEOUT - 1e-5), message
+             block_event.set()  # Release request
+ 
+             # Timeout passed directly to request should raise a request timeout
+@@ -198,7 +198,7 @@ class TestConnectionPoolTimeouts(SocketDummyServerTestCase):
+                 conn.connect()
+ 
+ 
+-class TestConnectionPool(HTTPDummyServerTestCase):
++class TestConnectionPool(HypercornDummyServerTestCase):
+     def test_get(self) -> None:
+         with HTTPConnectionPool(self.host, self.port) as pool:
+             r = pool.request("GET", "/specific_method", fields={"method": "GET"})
+@@ -231,7 +231,7 @@ class TestConnectionPool(HTTPDummyServerTestCase):
+             "upload_filename": "lolcat.txt",
+             "filefield": ("lolcat.txt", data),
+         }
+-        fields["upload_size"] = len(data)  # type: ignore
++        fields["upload_size"] = len(data)  # type: ignore[assignment]
+ 
+         with HTTPConnectionPool(self.host, self.port) as pool:
+             r = pool.request("POST", "/upload", fields=fields)
+@@ -270,7 +270,7 @@ class TestConnectionPool(HTTPDummyServerTestCase):
+             "upload_filename": filename,
+             fieldname: (filename, data),
+         }
+-        fields["upload_size"] = size  # type: ignore
++        fields["upload_size"] = size  # type: ignore[assignment]
+         with HTTPConnectionPool(self.host, self.port) as pool:
+             r = pool.request("POST", "/upload", fields=fields)
+             assert r.status == 200, r.data
+@@ -780,7 +780,9 @@ class TestConnectionPool(HTTPDummyServerTestCase):
+ 
+     def test_source_address(self) -> None:
+         for addr, is_ipv6 in VALID_SOURCE_ADDRESSES:
+-            if is_ipv6 and not HAS_IPV6_AND_DNS:
++            if is_ipv6:
++                # TODO enable if HAS_IPV6_AND_DNS when this is fixed:
++                # https://github.com/pgjones/hypercorn/issues/160
+                 warnings.warn("No IPv6 support: skipping.", NoIPv6Warning)
+                 continue
+             with HTTPConnectionPool(
+@@ -890,7 +892,7 @@ class TestConnectionPool(HTTPDummyServerTestCase):
+         """ConnectionPool preserves dot segments in the URI"""
+         with HTTPConnectionPool(self.host, self.port) as pool:
+             response = pool.request("GET", "/echo_uri/seg0/../seg2")
+-            assert response.data == b"/echo_uri/seg0/../seg2"
++            assert response.data == b"/echo_uri/seg0/../seg2?"
+ 
+     def test_default_user_agent_header(self) -> None:
+         """ConnectionPool has a default user agent"""
+@@ -974,54 +976,6 @@ class TestConnectionPool(HTTPDummyServerTestCase):
+             assert no_ua_headers["User-Agent"] == SKIP_HEADER
+             assert pool_headers.get("User-Agent") == custom_ua
+ 
+-    @pytest.mark.parametrize(
+-        "accept_encoding",
+-        [
+-            "Accept-Encoding",
+-            "accept-encoding",
+-            b"Accept-Encoding",
+-            b"accept-encoding",
+-            None,
+-        ],
+-    )
+-    @pytest.mark.parametrize("host", ["Host", "host", b"Host", b"host", None])
+-    @pytest.mark.parametrize(
+-        "user_agent", ["User-Agent", "user-agent", b"User-Agent", b"user-agent", None]
+-    )
+-    @pytest.mark.parametrize("chunked", [True, False])
+-    def test_skip_header(
+-        self,
+-        accept_encoding: str | None,
+-        host: str | None,
+-        user_agent: str | None,
+-        chunked: bool,
+-    ) -> None:
+-        headers = {}
+-
+-        if accept_encoding is not None:
+-            headers[accept_encoding] = SKIP_HEADER
+-        if host is not None:
+-            headers[host] = SKIP_HEADER
+-        if user_agent is not None:
+-            headers[user_agent] = SKIP_HEADER
+-
+-        with HTTPConnectionPool(self.host, self.port) as pool:
+-            r = pool.request("GET", "/headers", headers=headers, chunked=chunked)
+-        request_headers = r.json()
+-
+-        if accept_encoding is None:
+-            assert "Accept-Encoding" in request_headers
+-        else:
+-            assert accept_encoding not in request_headers
+-        if host is None:
+-            assert "Host" in request_headers
+-        else:
+-            assert host not in request_headers
+-        if user_agent is None:
+-            assert "User-Agent" in request_headers
+-        else:
+-            assert user_agent not in request_headers
+-
+     @pytest.mark.parametrize("header", ["Content-Length", "content-length"])
+     @pytest.mark.parametrize("chunked", [True, False])
+     def test_skip_header_non_supported(self, header: str, chunked: bool) -> None:
+@@ -1061,6 +1015,8 @@ class TestConnectionPool(HTTPDummyServerTestCase):
+             else:
+                 conn = pool._get_conn()
+                 conn.request("GET", "/headers", chunked=chunked)
++                conn.getresponse().close()
++                conn.close()
+ 
+             assert pool.headers == {"key": "val"}
+             assert type(pool.headers) is header_type
+@@ -1071,6 +1027,8 @@ class TestConnectionPool(HTTPDummyServerTestCase):
+             else:
+                 conn = pool._get_conn()
+                 conn.request("GET", "/headers", headers=headers, chunked=chunked)
++                conn.getresponse().close()
++                conn.close()
+ 
+             assert headers == {"key": "val"}
+ 
+@@ -1090,6 +1048,7 @@ class TestConnectionPool(HTTPDummyServerTestCase):
+             resp = conn.getresponse()
+             assert resp.status == 200
+             assert resp.json()["Transfer-Encoding"] == "chunked"
++            conn.close()
+ 
+     def test_bytes_header(self) -> None:
+         with HTTPConnectionPool(self.host, self.port) as pool:
+@@ -1114,7 +1073,7 @@ class TestConnectionPool(HTTPDummyServerTestCase):
+             assert request_headers["User-Agent"] == "Schönefeld/1.18.0"
+ 
+ 
+-class TestRetry(HTTPDummyServerTestCase):
++class TestRetry(HypercornDummyServerTestCase):
+     def test_max_retry(self) -> None:
+         with HTTPConnectionPool(self.host, self.port) as pool:
+             with pytest.raises(MaxRetryError):
+@@ -1278,7 +1237,7 @@ class TestRetry(HTTPDummyServerTestCase):
+             assert actual == expected
+ 
+ 
+-class TestRetryAfter(HTTPDummyServerTestCase):
++class TestRetryAfter(HypercornDummyServerTestCase):
+     def test_retry_after(self) -> None:
+         # Request twice in a second to get a 429 response.
+         with HTTPConnectionPool(self.host, self.port) as pool:
+@@ -1364,10 +1323,10 @@ class TestRetryAfter(HTTPDummyServerTestCase):
+             assert delta < 1
+ 
+ 
+-class TestFileBodiesOnRetryOrRedirect(HTTPDummyServerTestCase):
++class TestFileBodiesOnRetryOrRedirect(HypercornDummyServerTestCase):
+     def test_retries_put_filehandle(self) -> None:
+         """HTTP PUT retry with a file-like object should not timeout"""
+-        with HTTPConnectionPool(self.host, self.port, timeout=0.1) as pool:
++        with HTTPConnectionPool(self.host, self.port, timeout=LONG_TIMEOUT) as pool:
+             retry = Retry(total=3, status_forcelist=[418])
+             # httplib reads in 8k chunks; use a larger content length
+             content_length = 65535
+@@ -1390,7 +1349,7 @@ class TestFileBodiesOnRetryOrRedirect(HTTPDummyServerTestCase):
+ 
+     def test_redirect_put_file(self) -> None:
+         """PUT with file object should work with a redirection response"""
+-        with HTTPConnectionPool(self.host, self.port, timeout=0.1) as pool:
++        with HTTPConnectionPool(self.host, self.port, timeout=LONG_TIMEOUT) as pool:
+             retry = Retry(total=3, status_forcelist=[418])
+             # httplib reads in 8k chunks; use a larger content length
+             content_length = 65535
+@@ -1425,14 +1384,14 @@ class TestFileBodiesOnRetryOrRedirect(HTTPDummyServerTestCase):
+         # httplib uses fileno if Content-Length isn't supplied,
+         # which is unsupported by BytesIO.
+         headers = {"Content-Length": "8"}
+-        with HTTPConnectionPool(self.host, self.port, timeout=0.1) as pool:
++        with HTTPConnectionPool(self.host, self.port, timeout=LONG_TIMEOUT) as pool:
+             with pytest.raises(
+                 UnrewindableBodyError, match="Unable to record file position for"
+             ):
+                 pool.urlopen("PUT", url, headers=headers, body=body)
+ 
+ 
+-class TestRetryPoolSize(HTTPDummyServerTestCase):
++class TestRetryPoolSize(HypercornDummyServerTestCase):
+     def test_pool_size_retry(self) -> None:
+         retries = Retry(total=1, raise_on_status=False, status_forcelist=[404])
+         with HTTPConnectionPool(
+@@ -1442,7 +1401,7 @@ class TestRetryPoolSize(HTTPDummyServerTestCase):
+             assert pool.num_connections == 1
+ 
+ 
+-class TestRedirectPoolSize(HTTPDummyServerTestCase):
++class TestRedirectPoolSize(HypercornDummyServerTestCase):
+     def test_pool_size_redirect(self) -> None:
+         retries = Retry(
+             total=1, raise_on_status=False, status_forcelist=[404], redirect=True
+
+diff --git a/test/with_dummyserver/test_https.py b/test/with_dummyserver/test_https.py
+index da3f630..aa22f11 100644
+--- a/test/with_dummyserver/test_https.py
++++ b/test/with_dummyserver/test_https.py
+@@ -23,13 +23,13 @@ import trustme
+ 
+ import urllib3.util as util
+ import urllib3.util.ssl_
+-from dummyserver.server import (
++from dummyserver.socketserver import (
+     DEFAULT_CA,
+     DEFAULT_CA_KEY,
+     DEFAULT_CERTS,
+     encrypt_key_pem,
+ )
+-from dummyserver.testcase import HTTPSDummyServerTestCase
++from dummyserver.testcase import HTTPSHypercornDummyServerTestCase
+ from urllib3 import HTTPSConnectionPool
+ from urllib3.connection import RECENT_DATE, HTTPSConnection, VerifiedHTTPSConnection
+ from urllib3.exceptions import (
+@@ -65,7 +65,7 @@ PASSWORD_CLIENT_KEYFILE = "client_password.key"
+ CLIENT_CERT = CLIENT_INTERMEDIATE_PEM
+ 
+ 
+-class TestHTTPS(HTTPSDummyServerTestCase):
++class TestHTTPS(HTTPSHypercornDummyServerTestCase):
+     tls_protocol_name: str | None = None
+ 
+     def tls_protocol_not_default(self) -> bool:
+@@ -129,7 +129,7 @@ class TestHTTPS(HTTPSDummyServerTestCase):
+ 
+         shutil.rmtree(cls.certs_dir)
+ 
+-    def test_simple(self) -> None:
++    def test_simple(self, http_version: str) -> None:
+         with HTTPSConnectionPool(
+             self.host,
+             self.port,
+@@ -138,6 +138,8 @@ class TestHTTPS(HTTPSDummyServerTestCase):
+         ) as https_pool:
+             r = https_pool.request("GET", "/")
+             assert r.status == 200, r.data
++            assert r.headers["server"] == f"hypercorn-{http_version}"
++            assert r.data == b"Dummy server!"
+ 
+     @resolvesLocalhostFQDN()
+     def test_dotted_fqdn(self) -> None:
+@@ -223,8 +225,8 @@ class TestHTTPS(HTTPSDummyServerTestCase):
+             ca_certs=DEFAULT_CA,
+             ssl_minimum_version=self.tls_version(),
+         ) as https_pool:
+-            conn = https_pool._new_conn()
+-            assert conn.__class__ == VerifiedHTTPSConnection
++            with contextlib.closing(https_pool._new_conn()) as conn:
++                assert conn.__class__ == VerifiedHTTPSConnection
+ 
+             with warnings.catch_warnings(record=True) as w:
+                 r = https_pool.request("GET", "/")
+@@ -238,8 +240,8 @@ class TestHTTPS(HTTPSDummyServerTestCase):
+         )
+         ctx.load_verify_locations(cafile=DEFAULT_CA)
+         with HTTPSConnectionPool(self.host, self.port, ssl_context=ctx) as https_pool:
+-            conn = https_pool._new_conn()
+-            assert conn.__class__ == VerifiedHTTPSConnection
++            with contextlib.closing(https_pool._new_conn()) as conn:
++                assert conn.__class__ == VerifiedHTTPSConnection
+ 
+             with mock.patch("warnings.warn") as warn:
+                 r = https_pool.request("GET", "/")
+@@ -253,8 +255,8 @@ class TestHTTPS(HTTPSDummyServerTestCase):
+         with HTTPSConnectionPool(
+             self.host, self.port, ca_certs=DEFAULT_CA, ssl_context=ctx
+         ) as https_pool:
+-            conn = https_pool._new_conn()
+-            assert conn.__class__ == VerifiedHTTPSConnection
++            with contextlib.closing(https_pool._new_conn()) as conn:
++                assert conn.__class__ == VerifiedHTTPSConnection
+ 
+             with mock.patch("warnings.warn") as warn:
+                 r = https_pool.request("GET", "/")
+@@ -274,8 +276,8 @@ class TestHTTPS(HTTPSDummyServerTestCase):
+             ca_cert_dir=str(tmp_path),
+             ssl_minimum_version=self.tls_version(),
+         ) as https_pool:
+-            conn = https_pool._new_conn()
+-            assert conn.__class__ == VerifiedHTTPSConnection
++            with contextlib.closing(https_pool._new_conn()) as conn:
++                assert conn.__class__ == VerifiedHTTPSConnection
+ 
+             with warnings.catch_warnings(record=True) as w:
+                 r = https_pool.request("GET", "/")
+@@ -323,14 +325,11 @@ class TestHTTPS(HTTPSDummyServerTestCase):
+             ca_certs=self.bad_ca_path,
+             ssl_minimum_version=self.tls_version(),
+         ) as https_pool:
+-            conn = https_pool._get_conn()
+-            try:
++            with contextlib.closing(https_pool._get_conn()) as conn:
+                 with pytest.raises(ssl.SSLError):
+                     conn.connect()
+ 
+                 assert conn.sock is not None  # type: ignore[attr-defined]
+-            finally:
+-                conn.close()
+ 
+     def test_verified_without_ca_certs(self) -> None:
+         # default is cert_reqs=None which is ssl.CERT_NONE
+@@ -447,6 +446,8 @@ class TestHTTPS(HTTPSDummyServerTestCase):
+             # the python ssl module).
+             if hasattr(conn.sock, "server_hostname"):  # type: ignore[attr-defined]
+                 assert conn.sock.server_hostname == "localhost"  # type: ignore[attr-defined]
++            conn.getresponse().close()
++            conn.close()
+ 
+     def test_assert_fingerprint_md5(self) -> None:
+         with HTTPSConnectionPool(
+@@ -612,8 +613,7 @@ class TestHTTPS(HTTPSDummyServerTestCase):
+             cert_reqs="CERT_NONE",
+             ssl_minimum_version=self.tls_version(),
+         ) as https_pool:
+-            conn = https_pool._new_conn()
+-            try:
++            with contextlib.closing(https_pool._new_conn()) as conn:
+                 conn.set_tunnel(self.host, self.port)
+                 with mock.patch.object(
+                     conn, "_tunnel", create=True, return_value=None
+@@ -621,8 +621,6 @@ class TestHTTPS(HTTPSDummyServerTestCase):
+                     with pytest.warns(InsecureRequestWarning):
+                         https_pool._make_request(conn, "GET", "/")
+                 conn_tunnel.assert_called_once_with()
+-            finally:
+-                conn.close()
+ 
+     @requires_network()
+     def test_enhanced_timeout(self) -> None:
+@@ -633,14 +631,11 @@ class TestHTTPS(HTTPSDummyServerTestCase):
+             retries=False,
+             cert_reqs="CERT_REQUIRED",
+         ) as https_pool:
+-            conn = https_pool._new_conn()
+-            try:
++            with contextlib.closing(https_pool._new_conn()) as conn:
+                 with pytest.raises(ConnectTimeoutError):
+                     https_pool.request("GET", "/")
+                 with pytest.raises(ConnectTimeoutError):
+                     https_pool._make_request(conn, "GET", "/")
+-            finally:
+-                conn.close()
+ 
+         with HTTPSConnectionPool(
+             TARPIT_HOST,
+@@ -659,14 +654,11 @@ class TestHTTPS(HTTPSDummyServerTestCase):
+             retries=False,
+             cert_reqs="CERT_REQUIRED",
+         ) as https_pool:
+-            conn = https_pool._new_conn()
+-            try:
++            with contextlib.closing(https_pool._new_conn()) as conn:
+                 with pytest.raises(ConnectTimeoutError):
+                     https_pool.request(
+                         "GET", "/", timeout=Timeout(total=None, connect=SHORT_TIMEOUT)
+                     )
+-            finally:
+-                conn.close()
+ 
+     def test_enhanced_ssl_connection(self) -> None:
+         fingerprint = "72:8B:55:4C:9A:FC:1E:88:A1:1C:AD:1B:B2:E7:CC:3E:DB:C8:F9:8A"
+@@ -794,15 +786,13 @@ class TestHTTPS(HTTPSDummyServerTestCase):
+             self.port,
+             ca_certs=DEFAULT_CA,
+             ssl_minimum_version=self.tls_version(),
++            ssl_maximum_version=self.tls_version(),
+         ) as https_pool:
+-            conn = https_pool._get_conn()
+-            try:
++            with contextlib.closing(https_pool._get_conn()) as conn:
+                 conn.connect()
+                 if not hasattr(conn.sock, "version"):  # type: ignore[attr-defined]
+                     pytest.skip("SSLSocket.version() not available")
+                 assert conn.sock.version() == self.tls_protocol_name  # type: ignore[attr-defined]
+-            finally:
+-                conn.close()
+ 
+     def test_ssl_version_is_deprecated(self) -> None:
+         if self.tls_protocol_name is None:
+@@ -811,12 +801,9 @@ class TestHTTPS(HTTPSDummyServerTestCase):
+         with HTTPSConnectionPool(
+             self.host, self.port, ca_certs=DEFAULT_CA, ssl_version=self.ssl_version()
+         ) as https_pool:
+-            conn = https_pool._get_conn()
+-            try:
++            with contextlib.closing(https_pool._get_conn()) as conn:
+                 with pytest.warns(DeprecationWarning) as w:
+                     conn.connect()
+-            finally:
+-                conn.close()
+ 
+         assert len(w) >= 1
+         assert any(x.category == DeprecationWarning for x in w)
+@@ -845,12 +832,9 @@ class TestHTTPS(HTTPSDummyServerTestCase):
+         with HTTPSConnectionPool(
+             self.host, self.port, ca_certs=DEFAULT_CA, ssl_version=ssl_version
+         ) as https_pool:
+-            conn = https_pool._get_conn()
+-            try:
++            with contextlib.closing(https_pool._get_conn()) as conn:
+                 with warnings.catch_warnings(record=True) as w:
+                     conn.connect()
+-            finally:
+-                conn.close()
+ 
+         assert [str(wm) for wm in w if wm.category != ResourceWarning] == []
+ 
+@@ -866,12 +850,9 @@ class TestHTTPS(HTTPSDummyServerTestCase):
+             ca_certs=DEFAULT_CA,
+             ssl_context=ctx,
+         ) as https_pool:
+-            conn = https_pool._get_conn()
+-            try:
++            with contextlib.closing(https_pool._get_conn()) as conn:
+                 with warnings.catch_warnings(record=True) as w:
+                     conn.connect()
+-            finally:
+-                conn.close()
+ 
+         assert [str(wm) for wm in w if wm.category != ResourceWarning] == []
+ 
+@@ -898,7 +879,11 @@ class TestHTTPS(HTTPSDummyServerTestCase):
+                 conn = https_pool._get_conn()
+                 try:
+                     conn.connect()
+-                    assert conn.sock.version() == self.tls_protocol_name  # type: ignore[attr-defined]
++                    if maximum_version == TLSVersion.MAXIMUM_SUPPORTED:
++                        # A higher protocol than tls_protocol_name could be negotiated
++                        assert conn.sock.version() >= self.tls_protocol_name  # type: ignore[attr-defined]
++                    else:
++                        assert conn.sock.version() == self.tls_protocol_name  # type: ignore[attr-defined]
+                 finally:
+                     conn.close()
+ 
+@@ -1147,7 +1132,7 @@ class TestHTTPS_IPV4SAN:
+ class TestHTTPS_IPV6SAN:
+     @pytest.mark.parametrize("host", ["::1", "[::1]"])
+     def test_can_validate_ipv6_san(
+-        self, ipv6_san_server: ServerConfig, host: str
++        self, ipv6_san_server: ServerConfig, host: str, http_version: str
+     ) -> None:
+         """Ensure that urllib3 can validate SANs with IPv6 addresses in them."""
+         with HTTPSConnectionPool(
+@@ -1158,3 +1143,4 @@ class TestHTTPS_IPV6SAN:
+         ) as https_pool:
+             r = https_pool.request("GET", "/")
+             assert r.status == 200
++            assert r.headers["server"] == f"hypercorn-{http_version}"
+
+diff --git a/test/with_dummyserver/test_no_ssl.py b/test/with_dummyserver/test_no_ssl.py
+index b89f703..9a28119 100644
+--- a/test/with_dummyserver/test_no_ssl.py
++++ b/test/with_dummyserver/test_no_ssl.py
+@@ -8,20 +8,23 @@ from __future__ import annotations
+ import pytest
+ 
+ import urllib3
+-from dummyserver.testcase import HTTPDummyServerTestCase, HTTPSDummyServerTestCase
++from dummyserver.testcase import (
++    HTTPSHypercornDummyServerTestCase,
++    HypercornDummyServerTestCase,
++)
+ from urllib3.exceptions import InsecureRequestWarning
+ 
+ from ..test_no_ssl import TestWithoutSSL
+ 
+ 
+-class TestHTTPWithoutSSL(HTTPDummyServerTestCase, TestWithoutSSL):
++class TestHTTPWithoutSSL(HypercornDummyServerTestCase, TestWithoutSSL):
+     def test_simple(self) -> None:
+         with urllib3.HTTPConnectionPool(self.host, self.port) as pool:
+             r = pool.request("GET", "/")
+             assert r.status == 200, r.data
+ 
+ 
+-class TestHTTPSWithoutSSL(HTTPSDummyServerTestCase, TestWithoutSSL):
++class TestHTTPSWithoutSSL(HTTPSHypercornDummyServerTestCase, TestWithoutSSL):
+     def test_simple(self) -> None:
+         with urllib3.HTTPSConnectionPool(
+             self.host, self.port, cert_reqs="NONE"
+
+diff --git a/test/with_dummyserver/test_poolmanager.py b/test/with_dummyserver/test_poolmanager.py
+index ab0111e..4fa9ec8 100644
+--- a/test/with_dummyserver/test_poolmanager.py
++++ b/test/with_dummyserver/test_poolmanager.py
+@@ -7,8 +7,11 @@ from unittest import mock
+ 
+ import pytest
+ 
+-from dummyserver.server import HAS_IPV6
+-from dummyserver.testcase import HTTPDummyServerTestCase, IPv6HTTPDummyServerTestCase
++from dummyserver.socketserver import HAS_IPV6
++from dummyserver.testcase import (
++    HypercornDummyServerTestCase,
++    IPv6HypercornDummyServerTestCase,
++)
+ from urllib3 import HTTPHeaderDict, HTTPResponse, request
+ from urllib3.connectionpool import port_by_scheme
+ from urllib3.exceptions import MaxRetryError, URLSchemeUnknown
+@@ -16,7 +19,7 @@ from urllib3.poolmanager import PoolManager
+ from urllib3.util.retry import Retry
+ 
+ 
+-class TestPoolManager(HTTPDummyServerTestCase):
++class TestPoolManager(HypercornDummyServerTestCase):
+     @classmethod
+     def setup_class(cls) -> None:
+         super().setup_class()
+@@ -449,7 +452,7 @@ class TestPoolManager(HTTPDummyServerTestCase):
+                 encode_multipart=True,
+             )
+             returned_headers = r.json()["headers"]
+-            assert returned_headers[4:] == [
++            assert returned_headers[5:] == [
+                 ["Multi", "1"],
+                 ["Multi", "2"],
+                 ["Content-Type", "multipart/form-data; boundary=b"],
+@@ -467,7 +470,7 @@ class TestPoolManager(HTTPDummyServerTestCase):
+                 encode_multipart=True,
+             )
+             returned_headers = r.json()["headers"]
+-            assert returned_headers[4:] == [
++            assert returned_headers[5:] == [
+                 ["Multi", "1"],
+                 ["Multi", "2"],
+                 # Uses the set value, not the one that would be generated.
+@@ -497,10 +500,12 @@ class TestPoolManager(HTTPDummyServerTestCase):
+     @pytest.mark.parametrize(
+         ["target", "expected_target"],
+         [
++            # annoyingly quart.request.full_path adds a stray `?`
++            ("/echo_uri", b"/echo_uri?"),
+             ("/echo_uri?q=1#fragment", b"/echo_uri?q=1"),
+             ("/echo_uri?#", b"/echo_uri?"),
+-            ("/echo_uri#?", b"/echo_uri"),
+-            ("/echo_uri#?#", b"/echo_uri"),
++            ("/echo_uri#!", b"/echo_uri?"),
++            ("/echo_uri#!#", b"/echo_uri?"),
+             ("/echo_uri??#", b"/echo_uri??"),
+             ("/echo_uri?%3f#", b"/echo_uri?%3F"),
+             ("/echo_uri?%3F#", b"/echo_uri?%3F"),
+@@ -614,18 +619,20 @@ class TestPoolManager(HTTPDummyServerTestCase):
+         ],
+     )
+     def test_request_with_json(self, headers: HTTPHeaderDict) -> None:
++        old_headers = None if headers is None else headers.copy()
+         body = {"attribute": "value"}
+         r = request(
+             method="POST", url=f"{self.base_url}/echo_json", headers=headers, json=body
+         )
+         assert r.status == 200
+         assert r.json() == body
+-        if headers is not None and "application/json" not in headers.values():
+-            assert "text/plain" in r.headers["Content-Type"].replace(" ", "").split(",")
+-        else:
+-            assert "application/json" in r.headers["Content-Type"].replace(
+-                " ", ""
+-            ).split(",")
++        content_type = HTTPHeaderDict(old_headers).get(
++            "Content-Type", "application/json"
++        )
++        assert content_type in r.headers["Content-Type"].replace(" ", "").split(",")
++
++        # Ensure the header argument itself is not modified in-place.
++        assert headers == old_headers
+ 
+     def test_top_level_request_with_json_with_httpheaderdict(self) -> None:
+         body = {"attribute": "value"}
+@@ -662,7 +669,7 @@ class TestPoolManager(HTTPDummyServerTestCase):
+ 
+ 
+ @pytest.mark.skipif(not HAS_IPV6, reason="IPv6 is not supported on this system")
+-class TestIPv6PoolManager(IPv6HTTPDummyServerTestCase):
++class TestIPv6PoolManager(IPv6HypercornDummyServerTestCase):
+     @classmethod
+     def setup_class(cls) -> None:
+         super().setup_class()
+
+diff --git a/test/with_dummyserver/test_proxy_poolmanager.py b/test/with_dummyserver/test_proxy_poolmanager.py
+index 1f7365b..397181a 100644
+--- a/test/with_dummyserver/test_proxy_poolmanager.py
++++ b/test/with_dummyserver/test_proxy_poolmanager.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import binascii
++import contextlib
+ import hashlib
+ import ipaddress
+ import os.path
+@@ -9,15 +10,18 @@ import shutil
+ import socket
+ import ssl
+ import tempfile
+-from test import LONG_TIMEOUT, SHORT_TIMEOUT, withPyOpenSSL
++from test import LONG_TIMEOUT, SHORT_TIMEOUT, resolvesLocalhostFQDN, withPyOpenSSL
+ from test.conftest import ServerConfig
+ 
+ import pytest
+ import trustme
+ 
+ import urllib3.exceptions
+-from dummyserver.server import DEFAULT_CA, HAS_IPV6, get_unreachable_address
+-from dummyserver.testcase import HTTPDummyProxyTestCase, IPv6HTTPDummyProxyTestCase
++from dummyserver.socketserver import DEFAULT_CA, HAS_IPV6, get_unreachable_address
++from dummyserver.testcase import (
++    HypercornDummyProxyTestCase,
++    IPv6HypercornDummyProxyTestCase,
++)
+ from urllib3 import HTTPResponse
+ from urllib3._collections import HTTPHeaderDict
+ from urllib3.connection import VerifiedHTTPSConnection
+@@ -39,7 +43,17 @@ from urllib3.util.timeout import Timeout
+ from .. import TARPIT_HOST, requires_network
+ 
+ 
+-class TestHTTPProxyManager(HTTPDummyProxyTestCase):
++def assert_is_verified(pm: ProxyManager, *, proxy: bool, target: bool) -> None:
++    pool = list(pm.pools._container.values())[-1]  # retrieve last pool entry
++    connection = (
++        pool.pool.queue[-1] if pool.pool is not None else None
++    )  # retrieve last connection entry
++
++    assert connection.proxy_is_verified is proxy
++    assert connection.is_verified is target
++
++
++class TestHTTPProxyManager(HypercornDummyProxyTestCase):
+     @classmethod
+     def setup_class(cls) -> None:
+         super().setup_class()
+@@ -47,6 +61,7 @@ class TestHTTPProxyManager(HTTPDummyProxyTestCase):
+         cls.http_url_alt = f"http://{cls.http_host_alt}:{int(cls.http_port)}"
+         cls.https_url = f"https://{cls.https_host}:{int(cls.https_port)}"
+         cls.https_url_alt = f"https://{cls.https_host_alt}:{int(cls.https_port)}"
++        cls.https_url_fqdn = f"https://{cls.https_host}.:{int(cls.https_port)}"
+         cls.proxy_url = f"http://{cls.proxy_host}:{int(cls.proxy_port)}"
+         cls.https_proxy_url = f"https://{cls.proxy_host}:{int(cls.https_proxy_port)}"
+ 
+@@ -78,6 +93,30 @@ class TestHTTPProxyManager(HTTPDummyProxyTestCase):
+             r = https.request("GET", f"{self.http_url}/")
+             assert r.status == 200
+ 
++    def test_is_verified_http_proxy_to_http_target(self) -> None:
++        with proxy_from_url(self.proxy_url, ca_certs=DEFAULT_CA) as http:
++            r = http.request("GET", f"{self.http_url}/")
++            assert r.status == 200
++            assert_is_verified(http, proxy=False, target=False)
++
++    def test_is_verified_http_proxy_to_https_target(self) -> None:
++        with proxy_from_url(self.proxy_url, ca_certs=DEFAULT_CA) as http:
++            r = http.request("GET", f"{self.https_url}/")
++            assert r.status == 200
++            assert_is_verified(http, proxy=False, target=True)
++
++    def test_is_verified_https_proxy_to_http_target(self) -> None:
++        with proxy_from_url(self.https_proxy_url, ca_certs=DEFAULT_CA) as https:
++            r = https.request("GET", f"{self.http_url}/")
++            assert r.status == 200
++            assert_is_verified(https, proxy=True, target=False)
++
++    def test_is_verified_https_proxy_to_https_target(self) -> None:
++        with proxy_from_url(self.https_proxy_url, ca_certs=DEFAULT_CA) as https:
++            r = https.request("GET", f"{self.https_url}/")
++            assert r.status == 200
++            assert_is_verified(https, proxy=True, target=True)
++
+     def test_http_and_https_kwarg_ca_cert_data_proxy(self) -> None:
+         with open(DEFAULT_CA) as pem_file:
+             pem_file_data = pem_file.read()
+@@ -131,7 +170,7 @@ class TestHTTPProxyManager(HTTPDummyProxyTestCase):
+             hc2 = http.connection_from_host(self.http_host, self.http_port)
+             conn = hc2._get_conn()
+             try:
+-                hc2._make_request(conn, "GET", "/")
++                hc2._make_request(conn, "GET", f"{self.http_url}/")
+                 tcp_nodelay_setting = conn.sock.getsockopt(  # type: ignore[attr-defined]
+                     socket.IPPROTO_TCP, socket.TCP_NODELAY
+                 )
+@@ -173,13 +212,21 @@ class TestHTTPProxyManager(HTTPDummyProxyTestCase):
+             r = http.request("GET", f"{self.https_url}/")
+             assert r.status == 200
+ 
++    @resolvesLocalhostFQDN()
++    def test_proxy_https_fqdn(self) -> None:
++        with proxy_from_url(self.proxy_url, ca_certs=DEFAULT_CA) as http:
++            r = http.request("GET", f"{self.https_url_fqdn}/")
++            assert r.status == 200
++
+     def test_proxy_verified(self) -> None:
+         with proxy_from_url(
+             self.proxy_url, cert_reqs="REQUIRED", ca_certs=self.bad_ca_path
+         ) as http:
+-            https_pool = http._new_pool("https", self.https_host, self.https_port)
+-            with pytest.raises(MaxRetryError) as e:
+-                https_pool.request("GET", "/", retries=0)
++            with http._new_pool(
++                "https", self.https_host, self.https_port
++            ) as https_pool:
++                with pytest.raises(MaxRetryError) as e:
++                    https_pool.request("GET", "/", retries=0)
+             assert isinstance(e.value.reason, SSLError)
+             assert (
+                 "certificate verify failed" in str(e.value.reason)
+@@ -190,22 +237,26 @@ class TestHTTPProxyManager(HTTPDummyProxyTestCase):
+             http = proxy_from_url(
+                 self.proxy_url, cert_reqs="REQUIRED", ca_certs=DEFAULT_CA
+             )
+-            https_pool = http._new_pool("https", self.https_host, self.https_port)
+-
+-            conn = https_pool._new_conn()
+-            assert conn.__class__ == VerifiedHTTPSConnection
+-            https_pool.request("GET", "/")  # Should succeed without exceptions.
++            with http._new_pool(
++                "https", self.https_host, self.https_port
++            ) as https_pool2:
++                with contextlib.closing(https_pool._new_conn()) as conn:
++                    assert conn.__class__ == VerifiedHTTPSConnection
++                    https_pool2.request(
++                        "GET", "/"
++                    )  # Should succeed without exceptions.
+ 
+             http = proxy_from_url(
+                 self.proxy_url, cert_reqs="REQUIRED", ca_certs=DEFAULT_CA
+             )
+-            https_fail_pool = http._new_pool("https", "127.0.0.1", self.https_port)
+-
+-            with pytest.raises(
+-                MaxRetryError, match="doesn't match|IP address mismatch"
+-            ) as e:
+-                https_fail_pool.request("GET", "/", retries=0)
+-            assert isinstance(e.value.reason, SSLError)
++            with http._new_pool(
++                "https", "127.0.0.1", self.https_port
++            ) as https_fail_pool:
++                with pytest.raises(
++                    MaxRetryError, match="doesn't match|IP address mismatch"
++                ) as e:
++                    https_fail_pool.request("GET", "/", retries=0)
++                assert isinstance(e.value.reason, SSLError)
+ 
+     def test_redirect(self) -> None:
+         with proxy_from_url(self.proxy_url) as http:
+@@ -478,6 +529,9 @@ class TestHTTPProxyManager(HTTPDummyProxyTestCase):
+             # target so we put the blame on the target.
+             assert isinstance(e.value.reason, ReadTimeoutError)
+ 
++    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
++    # see https://github.com/python/cpython/issues/103472
++    @pytest.mark.filterwarnings("default::ResourceWarning")
+     @requires_network()
+     @pytest.mark.parametrize(
+         ["proxy_scheme", "target_scheme"], [("http", "https"), ("https", "https")]
+@@ -498,6 +552,9 @@ class TestHTTPProxyManager(HTTPDummyProxyTestCase):
+ 
+             assert isinstance(e.value.reason, ReadTimeoutError)
+ 
++    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
++    # see https://github.com/python/cpython/issues/103472
++    @pytest.mark.filterwarnings("default::ResourceWarning")
+     @requires_network()
+     @pytest.mark.parametrize(
+         ["proxy_scheme", "target_scheme", "use_forwarding_for_https"],
+@@ -526,6 +583,9 @@ class TestHTTPProxyManager(HTTPDummyProxyTestCase):
+             assert isinstance(e.value.reason, ProxyError)
+             assert isinstance(e.value.reason.original_error, ConnectTimeoutError)
+ 
++    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
++    # see https://github.com/python/cpython/issues/103472
++    @pytest.mark.filterwarnings("default::ResourceWarning")
+     @requires_network()
+     @pytest.mark.parametrize(
+         ["proxy_scheme", "target_scheme"], [("http", "https"), ("https", "https")]
+@@ -545,6 +605,9 @@ class TestHTTPProxyManager(HTTPDummyProxyTestCase):
+             assert isinstance(e.value.reason, ProxyError)
+             assert isinstance(e.value.reason.original_error, ConnectTimeoutError)
+ 
++    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
++    # see https://github.com/python/cpython/issues/103472
++    @pytest.mark.filterwarnings("default::ResourceWarning")
+     @requires_network()
+     @pytest.mark.parametrize(
+         ["target_scheme", "use_forwarding_for_https"],
+@@ -569,6 +632,9 @@ class TestHTTPProxyManager(HTTPDummyProxyTestCase):
+             assert isinstance(e.value.reason, ProxyError)
+             assert isinstance(e.value.reason.original_error, SSLError)
+ 
++    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
++    # see https://github.com/python/cpython/issues/103472
++    @pytest.mark.filterwarnings("default::ResourceWarning")
+     @requires_network()
+     @pytest.mark.parametrize(
+         ["proxy_scheme", "use_forwarding_for_https"],
+@@ -599,6 +665,9 @@ class TestHTTPProxyManager(HTTPDummyProxyTestCase):
+                 proxy.request("GET", self.https_url)
+             assert isinstance(e.value.reason, SSLError)
+ 
++    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
++    # see https://github.com/python/cpython/issues/103472
++    @pytest.mark.filterwarnings("default::ResourceWarning")
+     def test_scheme_host_case_insensitive(self) -> None:
+         """Assert that upper-case schemes and hosts are normalized."""
+         with proxy_from_url(self.proxy_url.upper(), ca_certs=DEFAULT_CA) as http:
+@@ -625,22 +694,28 @@ class TestHTTPProxyManager(HTTPDummyProxyTestCase):
+             ),
+         ],
+     )
++    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
++    # see https://github.com/python/cpython/issues/103472
++    @pytest.mark.filterwarnings("default::ResourceWarning")
+     def test_invalid_schema(self, url: str, error_msg: str) -> None:
+         with pytest.raises(ProxySchemeUnknown, match=error_msg):
+             proxy_from_url(url)
+ 
+ 
+ @pytest.mark.skipif(not HAS_IPV6, reason="Only runs on IPv6 systems")
+-class TestIPv6HTTPProxyManager(IPv6HTTPDummyProxyTestCase):
++class TestIPv6HTTPProxyManager(IPv6HypercornDummyProxyTestCase):
+     @classmethod
+     def setup_class(cls) -> None:
+-        HTTPDummyProxyTestCase.setup_class()
++        super().setup_class()
+         cls.http_url = f"http://{cls.http_host}:{int(cls.http_port)}"
+         cls.http_url_alt = f"http://{cls.http_host_alt}:{int(cls.http_port)}"
+         cls.https_url = f"https://{cls.https_host}:{int(cls.https_port)}"
+         cls.https_url_alt = f"https://{cls.https_host_alt}:{int(cls.https_port)}"
+         cls.proxy_url = f"http://[{cls.proxy_host}]:{int(cls.proxy_port)}"
+ 
++    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
++    # see https://github.com/python/cpython/issues/103472
++    @pytest.mark.filterwarnings("default::ResourceWarning")
+     def test_basic_ipv6_proxy(self) -> None:
+         with proxy_from_url(self.proxy_url, ca_certs=DEFAULT_CA) as http:
+             r = http.request("GET", f"{self.http_url}/")
+@@ -672,6 +747,9 @@ class TestHTTPSProxyVerification:
+         # Transform ipv6 like '::1' to 0:0:0:0:0:0:0:1 via '0000:0000:0000:0000:0000:0000:0000:0001'
+         return addr.exploded.replace("0000", "0").replace("000", "")
+ 
++    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
++    # see https://github.com/python/cpython/issues/103472
++    @pytest.mark.filterwarnings("default::ResourceWarning")
+     def test_https_proxy_assert_fingerprint_md5(
+         self, no_san_proxy_with_server: tuple[ServerConfig, ServerConfig]
+     ) -> None:
+@@ -687,6 +765,9 @@ class TestHTTPSProxyVerification:
+         ) as https:
+             https.request("GET", destination_url)
+ 
++    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
++    # see https://github.com/python/cpython/issues/103472
++    @pytest.mark.filterwarnings("default::ResourceWarning")
+     def test_https_proxy_assert_fingerprint_md5_non_matching(
+         self, no_san_proxy_with_server: tuple[ServerConfig, ServerConfig]
+     ) -> None:
+@@ -708,6 +789,9 @@ class TestHTTPSProxyVerification:
+ 
+             assert "Fingerprints did not match" in str(e)
+ 
++    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
++    # see https://github.com/python/cpython/issues/103472
++    @pytest.mark.filterwarnings("default::ResourceWarning")
+     def test_https_proxy_assert_hostname(
+         self, san_proxy_with_server: tuple[ServerConfig, ServerConfig]
+     ) -> None:
+@@ -719,6 +803,9 @@ class TestHTTPSProxyVerification:
+         ) as https:
+             https.request("GET", destination_url)
+ 
++    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
++    # see https://github.com/python/cpython/issues/103472
++    @pytest.mark.filterwarnings("default::ResourceWarning")
+     def test_https_proxy_assert_hostname_non_matching(
+         self, san_proxy_with_server: tuple[ServerConfig, ServerConfig]
+     ) -> None:
+@@ -738,6 +825,9 @@ class TestHTTPSProxyVerification:
+             msg = f"hostname \\'{proxy_hostname}\\' doesn\\'t match \\'{proxy_host}\\'"
+             assert msg in str(e)
+ 
++    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
++    # see https://github.com/python/cpython/issues/103472
++    @pytest.mark.filterwarnings("default::ResourceWarning")
+     def test_https_proxy_hostname_verification(
+         self, no_localhost_san_server: ServerConfig
+     ) -> None:
+@@ -767,6 +857,9 @@ class TestHTTPSProxyVerification:
+                 ssl_error
+             ) or "Hostname mismatch" in str(ssl_error)
+ 
++    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
++    # see https://github.com/python/cpython/issues/103472
++    @pytest.mark.filterwarnings("default::ResourceWarning")
+     def test_https_proxy_ipv4_san(
+         self, ipv4_san_proxy_with_server: tuple[ServerConfig, ServerConfig]
+     ) -> None:
+
+diff --git a/test/with_dummyserver/test_socketlevel.py b/test/with_dummyserver/test_socketlevel.py
+index 5935888..69d8070 100644
+--- a/test/with_dummyserver/test_socketlevel.py
++++ b/test/with_dummyserver/test_socketlevel.py
+@@ -11,9 +11,7 @@ import select
+ import shutil
+ import socket
+ import ssl
+-import sys
+ import tempfile
+-import time
+ import typing
+ import zlib
+ from collections import OrderedDict
+@@ -25,7 +23,7 @@ from unittest import mock
+ import pytest
+ import trustme
+ 
+-from dummyserver.server import (
++from dummyserver.socketserver import (
+     DEFAULT_CA,
+     DEFAULT_CERTS,
+     encrypt_key_pem,
+@@ -1269,35 +1267,34 @@ class TestProxyManager(SocketDummyServerTestCase):
+ class TestSSL(SocketDummyServerTestCase):
+     def test_ssl_failure_midway_through_conn(self) -> None:
+         def socket_handler(listener: socket.socket) -> None:
+-            sock = listener.accept()[0]
+-            sock2 = sock.dup()
+-            ssl_sock = original_ssl_wrap_socket(
+-                sock,
+-                server_side=True,
+-                keyfile=DEFAULT_CERTS["keyfile"],
+-                certfile=DEFAULT_CERTS["certfile"],
+-                ca_certs=DEFAULT_CA,
+-            )
++            with listener.accept()[0] as sock, sock.dup() as sock2:
++                ssl_sock = original_ssl_wrap_socket(
++                    sock,
++                    server_side=True,
++                    keyfile=DEFAULT_CERTS["keyfile"],
++                    certfile=DEFAULT_CERTS["certfile"],
++                    ca_certs=DEFAULT_CA,
++                )
+ 
+-            buf = b""
+-            while not buf.endswith(b"\r\n\r\n"):
+-                buf += ssl_sock.recv(65536)
++                buf = b""
++                while not buf.endswith(b"\r\n\r\n"):
++                    buf += ssl_sock.recv(65536)
+ 
+-            # Deliberately send from the non-SSL socket.
+-            sock2.send(
+-                b"HTTP/1.1 200 OK\r\n"
+-                b"Content-Type: text/plain\r\n"
+-                b"Content-Length: 2\r\n"
+-                b"\r\n"
+-                b"Hi"
+-            )
+-            sock2.close()
+-            ssl_sock.close()
++                # Deliberately send from the non-SSL socket.
++                sock2.send(
++                    b"HTTP/1.1 200 OK\r\n"
++                    b"Content-Type: text/plain\r\n"
++                    b"Content-Length: 2\r\n"
++                    b"\r\n"
++                    b"Hi"
++                )
++                ssl_sock.close()
+ 
+         self._start_server(socket_handler)
+         with HTTPSConnectionPool(self.host, self.port, ca_certs=DEFAULT_CA) as pool:
+             with pytest.raises(
+-                SSLError, match=r"(wrong version number|record overflow)"
++                SSLError,
++                match=r"(wrong version number|record overflow|record layer failure)",
+             ):
+                 pool.request("GET", "/", retries=False)
+ 
+@@ -1355,19 +1352,21 @@ class TestSSL(SocketDummyServerTestCase):
+                         certfile=DEFAULT_CERTS["certfile"],
+                         ca_certs=DEFAULT_CA,
+                     )
+-                except (ssl.SSLError, ConnectionResetError):
+-                    if i == 1:
+-                        raise
+-                    return
++                except (ssl.SSLError, ConnectionResetError, ConnectionAbortedError):
++                    pass
+ 
+-                ssl_sock.send(
+-                    b"HTTP/1.1 200 OK\r\n"
+-                    b"Content-Type: text/plain\r\n"
+-                    b"Content-Length: 5\r\n\r\n"
+-                    b"Hello"
+-                )
++                else:
++                    with ssl_sock:
++                        try:
++                            ssl_sock.send(
++                                b"HTTP/1.1 200 OK\r\n"
++                                b"Content-Type: text/plain\r\n"
++                                b"Content-Length: 5\r\n\r\n"
++                                b"Hello"
++                            )
++                        except (ssl.SSLEOFError, ConnectionResetError, BrokenPipeError):
++                            pass
+ 
+-                ssl_sock.close()
+                 sock.close()
+ 
+         self._start_server(socket_handler)
+@@ -1376,7 +1375,10 @@ class TestSSL(SocketDummyServerTestCase):
+ 
+         def request() -> None:
+             pool = HTTPSConnectionPool(
+-                self.host, self.port, assert_fingerprint=fingerprint
++                self.host,
++                self.port,
++                assert_fingerprint=fingerprint,
++                cert_reqs="CERT_NONE",
+             )
+             try:
+                 timeout = Timeout(connect=LONG_TIMEOUT, read=SHORT_TIMEOUT)
+@@ -1390,9 +1392,20 @@ class TestSSL(SocketDummyServerTestCase):
+         with pytest.raises(MaxRetryError) as cm:
+             request()
+         assert type(cm.value.reason) is SSLError
++        assert str(cm.value.reason) == (
++            "Fingerprints did not match. Expected "
++            '"a0c4a74600eda72dc0becb9a8cb607ca58ee745e", got '
++            '"728b554c9afc1e88a11cad1bb2e7cc3edbc8f98a"'
++        )
+         # Should not hang, see https://github.com/urllib3/urllib3/issues/529
+-        with pytest.raises(MaxRetryError):
++        with pytest.raises(MaxRetryError) as cm2:
+             request()
++        assert type(cm2.value.reason) is SSLError
++        assert str(cm2.value.reason) == (
++            "Fingerprints did not match. Expected "
++            '"a0c4a74600eda72dc0becb9a8cb607ca58ee745e", got '
++            '"728b554c9afc1e88a11cad1bb2e7cc3edbc8f98a"'
++        )
+ 
+     def test_retry_ssl_error(self) -> None:
+         def socket_handler(listener: socket.socket) -> None:
+@@ -1477,6 +1490,17 @@ class TestSSL(SocketDummyServerTestCase):
+         context.load_default_certs = mock.Mock()
+         context.options = 0
+ 
++        class MockSSLSocket:
++            def __init__(
++                self, sock: socket.socket, *args: object, **kwargs: object
++            ) -> None:
++                self._sock = sock
++
++            def close(self) -> None:
++                self._sock.close()
++
++        context.wrap_socket = MockSSLSocket
++
+         with mock.patch("urllib3.util.ssl_.SSLContext", lambda *_, **__: context):
+             self._start_server(socket_handler)
+             with HTTPSConnectionPool(self.host, self.port) as pool:
+@@ -1519,6 +1543,17 @@ class TestSSL(SocketDummyServerTestCase):
+         context.load_default_certs = mock.Mock()
+         context.options = 0
+ 
++        class MockSSLSocket:
++            def __init__(
++                self, sock: socket.socket, *args: object, **kwargs: object
++            ) -> None:
++                self._sock = sock
++
++            def close(self) -> None:
++                self._sock.close()
++
++        context.wrap_socket = MockSSLSocket
++
+         with mock.patch("urllib3.util.ssl_.SSLContext", lambda *_, **__: context):
+             for kwargs in [
+                 {"ca_certs": "/a"},
+@@ -1584,15 +1619,47 @@ class TestSSL(SocketDummyServerTestCase):
+                 pool.request("GET", "/", retries=False, timeout=LONG_TIMEOUT)
+         assert server_closed.wait(LONG_TIMEOUT), "The socket was not terminated"
+ 
+-    @pytest.mark.skipif(
+-        os.environ.get("CI") == "true" and sys.implementation.name == "pypy",
+-        reason="too slow to run in CI",
+-    )
++    def _run_preload(self, pool: HTTPSConnectionPool, content_length: int) -> None:
++        response = pool.request("GET", "/")
++        assert len(response.data) == content_length
++
++    def _run_read_None(self, pool: HTTPSConnectionPool, content_length: int) -> None:
++        response = pool.request("GET", "/", preload_content=False)
++        assert len(response.read(None)) == content_length
++        assert response.read(None) == b""
++
++    def _run_read_amt(self, pool: HTTPSConnectionPool, content_length: int) -> None:
++        response = pool.request("GET", "/", preload_content=False)
++        assert len(response.read(content_length)) == content_length
++        assert response.read(5) == b""
++
++    def _run_read1_None(self, pool: HTTPSConnectionPool, content_length: int) -> None:
++        response = pool.request("GET", "/", preload_content=False)
++        remaining = content_length
++        while True:
++            chunk = response.read1(None)
++            if not chunk:
++                break
++            remaining -= len(chunk)
++        assert remaining == 0
++
++    def _run_read1_amt(self, pool: HTTPSConnectionPool, content_length: int) -> None:
++        response = pool.request("GET", "/", preload_content=False)
++        remaining = content_length
++        while True:
++            chunk = response.read1(content_length)
++            if not chunk:
++                break
++            remaining -= len(chunk)
++        assert remaining == 0
++
++    @pytest.mark.integration
+     @pytest.mark.parametrize(
+-        "preload_content,read_amt", [(True, None), (False, None), (False, 2**31)]
++        "method",
++        [_run_preload, _run_read_None, _run_read_amt, _run_read1_None, _run_read1_amt],
+     )
+     def test_requesting_large_resources_via_ssl(
+-        self, preload_content: bool, read_amt: int | None
++        self, method: typing.Callable[[typing.Any, HTTPSConnectionPool, int], None]
+     ) -> None:
+         """
+         Ensure that it is possible to read 2 GiB or more via an SSL
+@@ -1634,9 +1701,7 @@ class TestSSL(SocketDummyServerTestCase):
+         with HTTPSConnectionPool(
+             self.host, self.port, ca_certs=DEFAULT_CA, retries=False
+         ) as pool:
+-            response = pool.request("GET", "/", preload_content=preload_content)
+-            data = response.data if preload_content else response.read(read_amt)
+-            assert len(data) == content_length
++            method(self, pool, content_length)
+ 
+ 
+ class TestErrorWrapping(SocketDummyServerTestCase):
+@@ -1811,13 +1876,16 @@ class TestHeaders(SocketDummyServerTestCase):
+         body: None | bytes | io.BytesIO
+         if body_type is None:
+             body = None
++            expected = b"\r\n\r\n"
+         elif body_type == "bytes":
+             body = b"my-body"
++            expected = b"\r\n\r\nmy-body"
+         elif body_type == "bytes-io":
+             body = io.BytesIO(b"bytes-io-body")
+             body.seek(0, 0)
++            expected = b"bytes-io-body\r\n0\r\n\r\n"
+         else:
+-            raise ValueError("Unknonw body type")
++            raise ValueError("Unknown body type")
+ 
+         buffer: bytes = b""
+ 
+@@ -1826,12 +1894,9 @@ class TestHeaders(SocketDummyServerTestCase):
+             sock = listener.accept()[0]
+             sock.settimeout(0)
+ 
+-            start = time.time()
+-            while time.time() - start < (LONG_TIMEOUT / 2):
+-                try:
++            while expected not in buffer:
++                with contextlib.suppress(BlockingIOError):
+                     buffer += sock.recv(65536)
+-                except OSError:
+-                    continue
+ 
+             sock.sendall(
+                 b"HTTP/1.1 200 OK\r\n"
+@@ -2244,18 +2309,16 @@ class TestContentFraming(SocketDummyServerTestCase):
+         self, method: str, chunked: bool, body_type: str
+     ) -> None:
+         buffer = bytearray()
++        expected_bytes = b"\r\n\r\na\r\nxxxxxxxxxx\r\n0\r\n\r\n"
+ 
+         def socket_handler(listener: socket.socket) -> None:
+             nonlocal buffer
+             sock = listener.accept()[0]
+             sock.settimeout(0)
+ 
+-            start = time.time()
+-            while time.time() - start < (LONG_TIMEOUT / 2):
+-                try:
++            while expected_bytes not in buffer:
++                with contextlib.suppress(BlockingIOError):
+                     buffer += sock.recv(65536)
+-                except OSError:
+-                    continue
+ 
+             sock.sendall(
+                 b"HTTP/1.1 200 OK\r\n"
+@@ -2294,7 +2357,7 @@ class TestContentFraming(SocketDummyServerTestCase):
+         assert b"Transfer-Encoding: chunked\r\n" in sent_bytes
+         assert b"User-Agent: python-urllib3/" in sent_bytes
+         assert b"content-length" not in sent_bytes.lower()
+-        assert b"\r\n\r\na\r\nxxxxxxxxxx\r\n0\r\n\r\n" in sent_bytes
++        assert expected_bytes in sent_bytes
+ 
+     @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
+     @pytest.mark.parametrize(
+@@ -2302,29 +2365,9 @@ class TestContentFraming(SocketDummyServerTestCase):
+     )
+     def test_chunked_not_specified(self, method: str, body_type: str) -> None:
+         buffer = bytearray()
+-
+-        def socket_handler(listener: socket.socket) -> None:
+-            nonlocal buffer
+-            sock = listener.accept()[0]
+-            sock.settimeout(0)
+-
+-            start = time.time()
+-            while time.time() - start < (LONG_TIMEOUT / 2):
+-                try:
+-                    buffer += sock.recv(65536)
+-                except OSError:
+-                    continue
+-
+-            sock.sendall(
+-                b"HTTP/1.1 200 OK\r\n"
+-                b"Server: example.com\r\n"
+-                b"Content-Length: 0\r\n\r\n"
+-            )
+-            sock.close()
+-
+-        self._start_server(socket_handler)
+-
++        expected_bytes: bytes
+         body: typing.Any
++
+         if body_type == "generator":
+ 
+             def body_generator() -> typing.Generator[bytes, None, None]:
+@@ -2332,25 +2375,44 @@ class TestContentFraming(SocketDummyServerTestCase):
+ 
+             body = body_generator()
+             should_be_chunked = True
+-
+         elif body_type == "file":
+             body = io.BytesIO(b"x" * 10)
+             body.seek(0, 0)
+             should_be_chunked = True
+-
+         elif body_type == "file_text":
+             body = io.StringIO("x" * 10)
+             body.seek(0, 0)
+             should_be_chunked = True
+-
+         elif body_type == "bytearray":
+             body = bytearray(b"x" * 10)
+             should_be_chunked = False
+-
+         else:
+             body = b"x" * 10
+             should_be_chunked = False
+ 
++        if should_be_chunked:
++            expected_bytes = b"\r\n\r\na\r\nxxxxxxxxxx\r\n0\r\n\r\n"
++        else:
++            expected_bytes = b"\r\n\r\nxxxxxxxxxx"
++
++        def socket_handler(listener: socket.socket) -> None:
++            nonlocal buffer
++            sock = listener.accept()[0]
++            sock.settimeout(0)
++
++            while expected_bytes not in buffer:
++                with contextlib.suppress(BlockingIOError):
++                    buffer += sock.recv(65536)
++
++            sock.sendall(
++                b"HTTP/1.1 200 OK\r\n"
++                b"Server: example.com\r\n"
++                b"Content-Length: 0\r\n\r\n"
++            )
++            sock.close()
++
++        self._start_server(socket_handler)
++
+         with HTTPConnectionPool(
+             self.host, self.port, timeout=LONG_TIMEOUT, retries=False
+         ) as pool:
+@@ -2366,12 +2428,12 @@ class TestContentFraming(SocketDummyServerTestCase):
+         if should_be_chunked:
+             assert b"content-length" not in sent_bytes.lower()
+             assert b"Transfer-Encoding: chunked\r\n" in sent_bytes
+-            assert b"\r\n\r\na\r\nxxxxxxxxxx\r\n0\r\n\r\n" in sent_bytes
++            assert expected_bytes in sent_bytes
+ 
+         else:
+             assert b"Content-Length: 10\r\n" in sent_bytes
+             assert b"transfer-encoding" not in sent_bytes.lower()
+-            assert sent_bytes.endswith(b"\r\n\r\nxxxxxxxxxx")
++            assert sent_bytes.endswith(expected_bytes)
+ 
+     @pytest.mark.parametrize(
+         "header_transform",
+@@ -2402,12 +2464,9 @@ class TestContentFraming(SocketDummyServerTestCase):
+             sock = listener.accept()[0]
+             sock.settimeout(0)
+ 
+-            start = time.time()
+-            while time.time() - start < (LONG_TIMEOUT / 2):
+-                try:
++            while expected not in buffer:
++                with contextlib.suppress(BlockingIOError):
+                     buffer += sock.recv(65536)
+-                except OSError:
+-                    continue
+ 
+             sock.sendall(
+                 b"HTTP/1.1 200 OK\r\n"

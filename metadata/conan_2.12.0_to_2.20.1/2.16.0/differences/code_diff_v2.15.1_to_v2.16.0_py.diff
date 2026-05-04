@@ -1,0 +1,2560 @@
+diff --git a/conan/__init__.py b/conan/__init__.py
+index 019c594..b83cd38 100644
+--- a/conan/__init__.py
++++ b/conan/__init__.py
+@@ -2,5 +2,5 @@ from conan.internal.model.conan_file import ConanFile
+ from conan.internal.model.workspace import Workspace
+ from conan.internal.model.version import Version
+ 
+-__version__ = '2.15.1'
++__version__ = '2.16.0'
+ conan_version = Version(__version__)
+
+diff --git a/conan/api/output.py b/conan/api/output.py
+index 6989abc..cf291ec 100644
+--- a/conan/api/output.py
++++ b/conan/api/output.py
+@@ -207,9 +207,9 @@ class ConanOutput:
+             self._write_message(msg, fg=Color.BLUE)
+         return self
+ 
+-    def debug(self, msg):
++    def debug(self, msg, fg=Color.MAGENTA, bg=None):
+         if self._conan_output_level <= LEVEL_DEBUG:
+-            self._write_message(msg, fg=Color.MAGENTA)
++            self._write_message(msg, fg=fg, bg=bg)
+         return self
+ 
+     def verbose(self, msg, fg=None, bg=None):
+
+diff --git a/conan/api/subapi/audit.py b/conan/api/subapi/audit.py
+index 34f2d28..30e9202 100644
+--- a/conan/api/subapi/audit.py
++++ b/conan/api/subapi/audit.py
+@@ -160,3 +160,5 @@ def _load_providers(providers_path):
+ 
+ def _save_providers(providers_path, providers):
+     save(providers_path, json.dumps(providers, indent=4))
++    # Make readable & writeable only by current user
++    os.chmod(providers_path, 0o600)
+
+diff --git a/conan/api/subapi/cache.py b/conan/api/subapi/cache.py
+index b427150..c188f5f 100644
+--- a/conan/api/subapi/cache.py
++++ b/conan/api/subapi/cache.py
+@@ -24,7 +24,7 @@ class CacheAPI:
+ 
+     def export_path(self, ref: RecipeReference):
+         cache = PkgCache(self.conan_api.cache_folder, self.conan_api.config.global_conf)
+-        ref.revision = None if ref.revision == "latest" else ref.revision
++        ref = _resolve_latest_ref(cache, ref)
+         ref_layout = cache.recipe_layout(ref)
+         return _check_folder_existence(ref, "export", ref_layout.export())
+ 
+@@ -36,13 +36,13 @@ class CacheAPI:
+ 
+     def export_source_path(self, ref: RecipeReference):
+         cache = PkgCache(self.conan_api.cache_folder, self.conan_api.config.global_conf)
+-        ref.revision = None if ref.revision == "latest" else ref.revision
++        ref = _resolve_latest_ref(cache, ref)
+         ref_layout = cache.recipe_layout(ref)
+         return _check_folder_existence(ref, "export_sources", ref_layout.export_sources())
+ 
+     def source_path(self, ref: RecipeReference):
+         cache = PkgCache(self.conan_api.cache_folder, self.conan_api.config.global_conf)
+-        ref.revision = None if ref.revision == "latest" else ref.revision
++        ref = _resolve_latest_ref(cache, ref)
+         ref_layout = cache.recipe_layout(ref)
+         return _check_folder_existence(ref, "source", ref_layout.source())
+ 
+
+diff --git a/conan/api/subapi/graph.py b/conan/api/subapi/graph.py
+index d3998e9..007bae9 100644
+--- a/conan/api/subapi/graph.py
++++ b/conan/api/subapi/graph.py
+@@ -5,6 +5,7 @@ from conans.client.graph.graph import Node, RECIPE_CONSUMER, CONTEXT_HOST, RECIP
+     CONTEXT_BUILD, BINARY_MISSING
+ from conans.client.graph.graph_binaries import GraphBinariesAnalyzer
+ from conans.client.graph.graph_builder import DepsGraphBuilder
++from conans.client.graph.install_graph import InstallGraph, ProfileArgs
+ from conans.client.graph.profile_node_definer import initialize_conanfile_profile, consumer_definer
+ from conan.errors import ConanException
+ from conan.api.model import RecipeReference
+@@ -212,3 +213,27 @@ class GraphAPI:
+                     or (missing and ref_matches(node.ref, missing, is_consumer=None))):
+                 return node.ref, node.conanfile.info
+         raise ConanException("There is no missing binary")
++
++    @staticmethod
++    def build_order(deps_graph, order_by="recipe", reduce=False, profile_args=None):
++        install_graph = InstallGraph(deps_graph, order_by=order_by,
++                                     profile_args=ProfileArgs.from_args(profile_args))
++        if reduce:
++            if order_by is None:
++                raise ConanException("--reduce needs --order-by argument defined")
++            install_graph.reduce()
++        return install_graph
++
++    @staticmethod
++    def build_order_merge(files, reduce=False):
++        result = InstallGraph.load(files[0])
++        if result.reduced:
++            raise ConanException(f"Reduced build-order file cannot be merged: {files[0]}")
++        for f in files[1:]:
++            install_graph = InstallGraph.load(f)
++            if install_graph.reduced:
++                raise ConanException(f"Reduced build-order file cannot be merged: {f}")
++            result.merge(install_graph)
++        if reduce:
++            result.reduce()
++        return result
+
+diff --git a/conan/api/subapi/new.py b/conan/api/subapi/new.py
+index addec4c..494da6e 100644
+--- a/conan/api/subapi/new.py
++++ b/conan/api/subapi/new.py
+@@ -1,10 +1,12 @@
+ import fnmatch
+ import os
++import shutil
+ 
+ from jinja2 import Template, StrictUndefined, UndefinedError, Environment, meta
+ 
++from conan.api.output import ConanOutput
+ from conan.errors import ConanException
+-from conans.util.files import load
++from conans.util.files import load, save
+ from conan import __version__
+ 
+ 
+@@ -14,6 +16,69 @@ class NewAPI:
+     def __init__(self, conan_api):
+         self.conan_api = conan_api
+ 
++    def save_template(self, template, defines=None, output_folder=None, force=False):
++        """
++        Save the 'template' files in the output_folder, replacing the template variables
++        with the 'defines'
++        :param template: The name of the template to use
++        :param defines: A list with the 'k=v' variables to replace in the template
++        :param output_folder: The folder where the template files will be saved, cwd if None
++        :param force: If True, overwrite the files if they already exist, otherwise raise an error
++        """
++        # Manually parsing the remainder
++        definitions = {}
++        for u in defines or []:
++            try:
++                k, v = u.split("=", 1)
++            except ValueError:
++                raise ConanException(f"Template definitions must be 'key=value', received {u}")
++            k = k.replace("-", "")  # Remove possible "--name=value"
++            # For variables that only show up once, no need for list to keep compatible behaviour
++            if k in definitions:
++                if isinstance(definitions[k], list):
++                    definitions[k].append(v)
++                else:
++                    definitions[k] = [definitions[k], v]
++            else:
++                definitions[k] = v
++
++        files = self.get_template(template)  # First priority: user folder
++        is_builtin = False
++        if not files:  # then, try the templates in the Conan home
++            files = self.get_home_template(template)
++        if files:
++            template_files, non_template_files = files
++        else:
++            template_files = self.get_builtin_template(template)
++            non_template_files = {}
++            is_builtin = True
++
++        if not template_files and not non_template_files:
++            raise ConanException(f"Template doesn't exist or not a folder: {template}")
++
++        if is_builtin and template == "workspace":  # hardcoded for the workspace special case
++            definitions["name"] = "liba"
++        template_files = self.render(template_files, definitions)
++
++        # Saving the resulting files
++        output = ConanOutput()
++        output_folder = output_folder or os.getcwd()
++        # Making sure they don't overwrite existing files
++        for f, v in sorted(template_files.items()):
++            path = os.path.join(output_folder, f)
++            if os.path.exists(path) and not force:
++                raise ConanException(f"File '{f}' already exists, and --force not defined, aborting")
++            save(path, v)
++            output.success("File saved: %s" % f)
++
++        # copy non-templates
++        for f, v in sorted(non_template_files.items()):
++            path = os.path.join(output_folder, f)
++            if os.path.exists(path) and not force:
++                raise ConanException(f"File '{f}' already exists, and --force not defined, aborting")
++            shutil.copy2(v, path)
++            output.success("File saved: %s" % f)
++
+     @staticmethod
+     def get_builtin_template(template_name):
+         from conan.internal.api.new.basic import basic_file
+
+diff --git a/conan/api/subapi/remotes.py b/conan/api/subapi/remotes.py
+index 1bb5566..65409cc 100644
+--- a/conan/api/subapi/remotes.py
++++ b/conan/api/subapi/remotes.py
+@@ -1,6 +1,7 @@
+ import fnmatch
+ import json
+ import os
++from collections import OrderedDict
+ from urllib.parse import urlparse
+ 
+ from conan.api.model import Remote, LOCAL_RECIPES_INDEX
+@@ -8,6 +9,7 @@ from conan.api.output import ConanOutput
+ from conan.internal.cache.home_paths import HomePaths
+ from conan.internal.conan_app import ConanBasicApp
+ from conans.client.rest.conan_requester import ConanRequester
++from conans.client.rest.remote_credentials import RemoteCredentials
+ from conans.client.rest_client_local_recipe_index import add_local_recipes_index_remote, \
+     remove_local_recipes_index_remote
+ from conan.internal.api.remotes.localdb import LocalDB
+@@ -29,14 +31,14 @@ class RemotesAPI:
+ 
+     def __init__(self, conan_api):
+         # This method is private, the subapi is not instantiated by users
+-        self.conan_api = conan_api
++        self._conan_api = conan_api
+         self._home_folder = conan_api.home_folder
+         self._remotes_file = HomePaths(self._home_folder).remotes_path
+         # Wraps an http_requester to inject proxies, certs, etc
+-        self._requester = ConanRequester(self.conan_api.config.global_conf, self.conan_api.cache_folder)
++        self._requester = ConanRequester(self._conan_api.config.global_conf, self._conan_api.cache_folder)
+ 
+     def reinit(self):
+-        self._requester = ConanRequester(self.conan_api.config.global_conf, self.conan_api.cache_folder)
++        self._requester = ConanRequester(self._conan_api.config.global_conf, self._conan_api.cache_folder)
+ 
+     def list(self, pattern=None, only_enabled=True):
+         """
+@@ -224,9 +226,29 @@ class RemotesAPI:
+         :param username: the user login as ``str``
+         :param password: password ``str``
+         """
+-        app = ConanBasicApp(self.conan_api)
++        app = ConanBasicApp(self._conan_api)
+         app.remote_manager.authenticate(remote, username, password)
+ 
++    def login(self, remotes, username=None, password=None):
++        creds = RemoteCredentials(self._conan_api.cache_folder, self._conan_api.config.global_conf)
++
++        ret = OrderedDict()
++        for r in remotes:
++            previous_info = self.user_info(r)
++
++            if username is not None and password is not None:
++                user, password = username, password
++            else:
++                user, password, _ = creds.auth(r, username)
++                if username is not None and username != user:
++                    raise ConanException(f"User '{username}' doesn't match user '{user}' in "
++                                         f"credentials.json or environment variables")
++
++            self.user_login(r, user, password)
++            info = self.user_info(r)
++            ret[r.name] = {"previous_info": previous_info, "info": info}
++        return ret
++
+     def user_logout(self, remote: Remote):
+         """
+         Logout from the given :ref:`Remote <conan.api.model.Remote>`
+@@ -247,7 +269,7 @@ class RemotesAPI:
+     def user_auth(self, remote: Remote, with_user=False, force=False):
+         # TODO: Review
+         localdb = LocalDB(self._home_folder)
+-        app = ConanBasicApp(self.conan_api)
++        app = ConanBasicApp(self._conan_api)
+         if with_user:
+             user, token, _ = localdb.get_login(remote.url)
+             if not user:
+
+diff --git a/conan/cli/cli.py b/conan/cli/cli.py
+index 6c94be4..4a9ed3e 100644
+--- a/conan/cli/cli.py
++++ b/conan/cli/cli.py
+@@ -45,6 +45,7 @@ class Cli:
+             Cli._builtin_commands = self._commands.copy()
+         else:
+             self._commands = Cli._builtin_commands.copy()
++            self._groups = defaultdict(list)
+             for k, v in self._commands.items():  # Fill groups data too
+                 self._groups[v.group].append(k)
+ 
+
+diff --git a/conan/cli/commands/audit.py b/conan/cli/commands/audit.py
+index 2288353..04adcc0 100644
+--- a/conan/cli/commands/audit.py
++++ b/conan/cli/commands/audit.py
+@@ -20,10 +20,31 @@ def _add_provider_arg(subparser):
+     subparser.add_argument("-p", "--provider", help="Provider to use for scanning")
+ 
+ 
++def _parse_error_threshold(result: dict, error_level: float) -> None:
++    """Mark the result as error if any of the vulnerabilities has a severity greater than or equal to
++       The error_level reflects the severity level configured by the user. As it uses float and CVSS
++       score is limited to 10.0, users can use any higher number to skip it.
++
++       :param result: Conan audit scan result. It's expected to find cvss there
++       :param error_level: Threshold to raise an error in case of matching the severity level
++       :return: None
++    """
++    if "conan_error" not in result:
++        for ref in result["data"]:
++            for edge in result["data"][ref]["vulnerabilities"]["edges"]:
++                preferred_base_score = float(edge["node"]["cvss"].get("preferredBaseScore", 0.0))
++                if preferred_base_score >= error_level:
++                    result.update(
++                        {"conan_error":
++                             f"The package {ref} has a CVSS score {preferred_base_score} and "
++                             f"exceeded the threshold severity level {error_level}."})
++                    break
++
++
+ @conan_subcommand(formatters={"text": text_vuln_formatter,
+                               "json": json_vuln_formatter,
+                               "html": html_vuln_formatter})
+-def audit_scan(conan_api: ConanAPI, parser, subparser, *args):
++def audit_scan(conan_api: ConanAPI, parser, subparser, *args) -> dict:
+     """
+     Scan a given recipe for vulnerabilities in its dependencies.
+     """
+@@ -32,6 +53,10 @@ def audit_scan(conan_api: ConanAPI, parser, subparser, *args):
+     # TODO: Do we then want to hide it in the --help?
+     subparser.add_argument("--build-require", action='store_true', default=False,
+                            help='Whether the provided reference is a build-require')
++    subparser.add_argument("-sl", "--severity-level", action="store", default=9.0, type=float,
++                           help="Set threshold for severity level to raise an error. "
++                                "By default raises an error for any critical CVSS (9.0 or higher). "
++                                " Use 100.0 to disable it.")
+ 
+     _add_provider_arg(subparser)
+     args = parser.parse_args(*args)
+@@ -65,11 +90,13 @@ def audit_scan(conan_api: ConanAPI, parser, subparser, *args):
+     deps_graph.report_graph_error()
+ 
+     if deps_graph.error:
+-        return {"error": deps_graph.error}
++        return {"conan_error": deps_graph.error}
+ 
+     provider = conan_api.audit.get_provider(args.provider or CONAN_CENTER_AUDIT_PROVIDER_NAME)
+ 
+-    return conan_api.audit.scan(deps_graph, provider)
++    scan_result = conan_api.audit.scan(deps_graph, provider)
++    _parse_error_threshold(scan_result, args.severity_level)
++    return scan_result
+ 
+ 
+ @conan_subcommand(formatters={"text": text_vuln_formatter,
+
+diff --git a/conan/cli/commands/graph.py b/conan/cli/commands/graph.py
+index 40b27cc..290bac5 100644
+--- a/conan/cli/commands/graph.py
++++ b/conan/cli/commands/graph.py
+@@ -12,7 +12,6 @@ from conan.cli.formatters.graph.graph_info_text import format_graph_info
+ from conan.cli.printers import print_profiles
+ from conan.cli.printers.graph import print_graph_packages, print_graph_basic
+ from conan.errors import ConanException
+-from conans.client.graph.install_graph import InstallGraph, ProfileArgs
+ 
+ 
+ def explain_formatter_text(data):
+@@ -111,13 +110,8 @@ def graph_build_order(conan_api, parser, subparser, *args):
+ 
+     out = ConanOutput()
+     out.title("Computing the build order")
+-
+-    install_graph = InstallGraph(deps_graph, order_by=args.order_by,
+-                                 profile_args=ProfileArgs.from_args(args))
+-    if args.reduce:
+-        if args.order_by is None:
+-            raise ConanException("--reduce needs --order-by argument defined")
+-        install_graph.reduce()
++    install_graph = conan_api.graph.build_order(deps_graph, args.order_by, args.reduce,
++                                                profile_args=args)
+     install_order_serialized = install_graph.install_build_order()
+     if args.order_by is None:  # legacy
+         install_order_serialized = install_order_serialized["order"]
+@@ -144,21 +138,12 @@ def graph_build_order_merge(conan_api, parser, subparser, *args):  # noqa
+     if not args.file or len(args.file) < 2:
+         raise ConanException("At least 2 files are needed to be merged")
+ 
+-    result = InstallGraph.load(make_abs_path(args.file[0]))
+-    if result.reduced:
+-        raise ConanException(f"Reduced build-order file cannot be merged: {args.file[0]}")
+-    for f in args.file[1:]:
+-        install_graph = InstallGraph.load(make_abs_path(f))
+-        if install_graph.reduced:
+-            raise ConanException(f"Reduced build-order file cannot be merged: {f}")
+-        result.merge(install_graph)
+-
+-    if args.reduce:
+-        result.reduce()
++    files = [make_abs_path(f) for f in args.file]
++    result = conan_api.graph.build_order_merge(files, args.reduce)
++
+     install_order_serialized = result.install_build_order()
+     if getattr(result, "legacy"):
+         install_order_serialized = install_order_serialized["order"]
+-
+     return {"build_order": install_order_serialized,
+             "conan_error": result.get_errors()}
+ 
+@@ -236,13 +221,22 @@ def graph_info(conan_api, parser, subparser, *args):
+             base_folder = args.deployer_folder or os.getcwd()
+             conan_api.install.deploy(deps_graph, args.deployer, None, base_folder)
+ 
++    warn_msg = None
++    missing = set(str(n.ref.name) for n in deps_graph.nodes if n.binary == "Missing")
++    invalid = set(str(n.ref.name) for n in deps_graph.nodes if n.binary == "Invalid")
++    if missing or invalid:
++        warn_msg = "There are some error(s) in the graph:"
++        if missing:
++            warn_msg += f"\n    - Missing packages: {', '.join(missing)}"
++        if invalid:
++            warn_msg += f"\n    - Invalid packages: {', '.join(invalid)}"
++
+     return {"graph": deps_graph,
+             "field_filter": args.filter,
+             "package_filter": args.package_filter,
+             "conan_api": conan_api,
+             "conan_error": str(deps_graph.error) if deps_graph.error else None,
+-            # Do not compute graph errors if there are dependency errors
+-            "conan_warning": InstallGraph(deps_graph).get_errors() if not deps_graph.error else None}
++            "conan_warning": warn_msg}
+ 
+ 
+ @conan_subcommand(formatters={"text": explain_formatter_text,
+
+diff --git a/conan/cli/commands/list.py b/conan/cli/commands/list.py
+index addfb68..6b5100b 100644
+--- a/conan/cli/commands/list.py
++++ b/conan/cli/commands/list.py
+@@ -1,4 +1,5 @@
+ import json
++import datetime
+ 
+ from conan.api.conan_api import ConanAPI
+ from conan.api.model import ListPattern, MultiPackagesList
+@@ -7,7 +8,6 @@ from conan.cli import make_abs_path
+ from conan.cli.command import conan_command, OnceArgument
+ from conan.cli.formatters.list import list_packages_html
+ from conan.errors import ConanException
+-from conans.util.dates import timestamp_to_str
+ 
+ # Keep them so we don't break other commands that import them, but TODO: Remove later
+ remote_color = Color.BRIGHT_BLUE
+@@ -19,6 +19,12 @@ field_color = Color.BRIGHT_YELLOW
+ value_color = Color.CYAN
+ 
+ 
++def _format_timestamp_human(timestamp):
++    # used by ref.repr_humantime() to print human readable time
++    return datetime.datetime.fromtimestamp(int(timestamp),
++                                           datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
++
++
+ def print_serial(item, indent=None, color_index=None):
+     indent = "" if indent is None else (indent + "  ")
+     color_index = 0 if color_index is None else (color_index + 1)
+@@ -78,7 +84,7 @@ def print_list_text(results):
+             for k, v in item.items():
+                 if isinstance(v, dict) and v.get("timestamp"):
+                     timestamp = v.pop("timestamp")
+-                    k = f"{k} ({timestamp_to_str(timestamp)})"
++                    k = f"{k} ({_format_timestamp_human(timestamp)})"
+                 result[k] = format_timestamps(v)
+             return result
+         return item
+@@ -108,7 +114,7 @@ def prepare_pkglist_compact(pkglist):
+             new_rrev = f"{ref}#{rrev}"
+             timestamp = rrev_info.pop("timestamp", None)
+             if timestamp:
+-                new_rrev += f"%{timestamp} ({timestamp_to_str(timestamp)})"
++                new_rrev += f"%{timestamp} ({_format_timestamp_human(timestamp)})"
+ 
+             packages = rrev_info.pop("packages", None)
+             if packages:
+
+diff --git a/conan/cli/commands/new.py b/conan/cli/commands/new.py
+index a4ea59b..2e46fe5 100644
+--- a/conan/cli/commands/new.py
++++ b/conan/cli/commands/new.py
+@@ -1,10 +1,6 @@
+ import os
+-import shutil
+ 
+-from conan.api.output import ConanOutput
+ from conan.cli.command import conan_command
+-from conan.errors import ConanException
+-from conans.util.files import save
+ 
+ 
+ @conan_command(group="Creator")
+@@ -23,61 +19,10 @@ def new(conan_api, parser, *args):
+                         )
+     parser.add_argument("-d", "--define", action="append",
+                         help="Define a template argument as key=value, e.g., -d name=mypkg")
+-    parser.add_argument("-f", "--force", action='store_true', help="Overwrite file if it already exists")
++    parser.add_argument("-f", "--force", action='store_true',
++                        help="Overwrite file if it already exists")
+     parser.add_argument("-o", "--output", help="Output folder for the generated files",
+                         default=os.getcwd())
+ 
+     args = parser.parse_args(*args)
+-    # Manually parsing the remainder
+-    definitions = {}
+-    for u in args.define or []:
+-        try:
+-            k, v = u.split("=", 1)
+-        except ValueError:
+-            raise ConanException(f"Template definitions must be 'key=value', received {u}")
+-        k = k.replace("-", "")  # Remove possible "--name=value"
+-        # For variables that only show up once, no need for list to keep compatible behaviour
+-        if k in definitions:
+-            if isinstance(definitions[k], list):
+-                definitions[k].append(v)
+-            else:
+-                definitions[k] = [definitions[k], v]
+-        else:
+-            definitions[k] = v
+-
+-    files = conan_api.new.get_template(args.template)  # First priority: user folder
+-    is_builtin = False
+-    if not files:  # then, try the templates in the Conan home
+-        files = conan_api.new.get_home_template(args.template)
+-    if files:
+-        template_files, non_template_files = files
+-    else:
+-        template_files = conan_api.new.get_builtin_template(args.template)
+-        non_template_files = {}
+-        is_builtin = True
+-
+-    if not template_files and not non_template_files:
+-        raise ConanException("Template doesn't exist or not a folder: {}".format(args.template))
+-
+-    if is_builtin and args.template == "workspace":  # hardcoded for the workspace special case
+-        definitions["name"] = "liba"
+-    template_files = conan_api.new.render(template_files, definitions)
+-
+-    # Saving the resulting files
+-    output = ConanOutput()
+-    output_folder = args.output
+-    # Making sure they don't overwrite existing files
+-    for f, v in sorted(template_files.items()):
+-        path = os.path.join(output_folder, f)
+-        if os.path.exists(path) and not args.force:
+-            raise ConanException(f"File '{f}' already exists, and --force not defined, aborting")
+-        save(path, v)
+-        output.success("File saved: %s" % f)
+-
+-    # copy non-templates
+-    for f, v in sorted(non_template_files.items()):
+-        path = os.path.join(output_folder, f)
+-        if os.path.exists(path) and not args.force:
+-            raise ConanException(f"File '{f}' already exists, and --force not defined, aborting")
+-        shutil.copy2(v, path)
+-        output.success("File saved: %s" % f)
++    conan_api.new.save_template(args.template, args.define, args.output, args.force)
+
+diff --git a/conan/cli/commands/profile.py b/conan/cli/commands/profile.py
+index 16457a1..68c32b9 100644
+--- a/conan/cli/commands/profile.py
++++ b/conan/cli/commands/profile.py
+@@ -6,7 +6,6 @@ from conan.cli.command import conan_command, conan_subcommand
+ from conan.cli.formatters import default_json_formatter
+ from conan.cli.args import add_profiles_args
+ from conan.errors import ConanException
+-from conans.util.files import save
+ 
+ 
+ def _print_profiles(profiles):
+@@ -92,11 +91,15 @@ def profile_detect(conan_api, parser, subparser, *args):
+                           "change in future Conan versions.")
+     ConanOutput().warning("Use your own profile files for stability.")
+     ConanOutput().success(f"Saving detected profile to {profile_pathname}")
+-    save(profile_pathname, contents)
++    dir_path = os.path.dirname(profile_pathname)
++    if dir_path:
++        os.makedirs(dir_path, exist_ok=True)
++    with open(profile_pathname, "w", encoding="utf-8", newline="") as f:
++        f.write(contents)
+ 
+ 
+ @conan_subcommand(formatters={"text": profiles_list_cli_output, "json": default_json_formatter})
+-def profile_list(conan_api, parser, subparser, *args):
++def profile_list(conan_api, parser, subparser, *args):  # noqa
+     """
+     List all profiles in the cache.
+     """
+@@ -105,7 +108,7 @@ def profile_list(conan_api, parser, subparser, *args):
+ 
+ 
+ @conan_command(group="Consumer")
+-def profile(conan_api, parser, *args):
++def profile(conan_api, parser, *args):  # noqa
+     """
+     Manage profiles.
+     """
+
+diff --git a/conan/cli/commands/remote.py b/conan/cli/commands/remote.py
+index a22529f..83eec7f 100644
+--- a/conan/cli/commands/remote.py
++++ b/conan/cli/commands/remote.py
+@@ -10,22 +10,21 @@ from conan.cli.command import conan_command, conan_subcommand, OnceArgument
+ from conan.cli.commands.list import remote_color, error_color, recipe_color, \
+     reference_color
+ from conan.errors import ConanException
+-from conans.client.rest.remote_credentials import RemoteCredentials
+ 
+ 
+-def formatter_remote_list_json(remotes):
++def _print_remotes_json(remotes):
+     info = [{"name": r.name, "url": r.url, "verify_ssl": r.verify_ssl, "enabled": not r.disabled}
+             for r in remotes]
+     cli_out_write(json.dumps(info, indent=4))
+ 
+ 
+-def print_remote_list(remotes):
++def _print_remote_list(remotes):
+     for r in remotes:
+         output_str = str(r)
+         cli_out_write(output_str)
+ 
+ 
+-def print_remote_user_list(results):
++def _print_remote_user_list(results):
+     for remote_name, result in results.items():
+         cli_out_write(f"{remote_name}:", fg=remote_color)
+         if result["user_name"] is None:
+@@ -37,7 +36,7 @@ def print_remote_user_list(results):
+             cli_out_write(result["authenticated"], fg=reference_color)
+ 
+ 
+-def print_remote_user_set(results):
++def _print_remote_user_set(results):
+     for remote_name, result in results.items():
+         from_user = "'{}'".format(result["previous_info"]["user_name"])
+         from_user += " (anonymous)" \
+@@ -49,12 +48,12 @@ def print_remote_user_set(results):
+         cli_out_write(message)
+ 
+ 
+-def output_remotes_json(results):
++def _print_remotes_users_json(results):
+     cli_out_write(json.dumps(list(results.values())))
+ 
+ 
+-@conan_subcommand(formatters={"text": print_remote_list, "json": formatter_remote_list_json})
+-def remote_list(conan_api: ConanAPI, parser, subparser, *args):
++@conan_subcommand(formatters={"text": _print_remote_list, "json": _print_remotes_json})
++def remote_list(conan_api: ConanAPI, parser, subparser, *args):  # noqa
+     """
+     List current remotes.
+     """
+@@ -92,7 +91,7 @@ def remote_add(conan_api, parser, subparser, *args):
+     conan_api.remotes.add(r, force=args.force, index=args.index)
+ 
+ 
+-@conan_subcommand(formatters={"text": print_remote_list})
++@conan_subcommand(formatters={"text": _print_remote_list})
+ def remote_remove(conan_api, parser, subparser, *args):
+     """
+     Remove remotes.
+@@ -138,7 +137,7 @@ def remote_rename(conan_api, parser, subparser, *args):
+     conan_api.remotes.rename(args.remote, args.new_name)
+ 
+ 
+-@conan_subcommand(formatters={"text": print_remote_list, "json": formatter_remote_list_json})
++@conan_subcommand(formatters={"text": _print_remote_list, "json": _print_remotes_json})
+ def remote_enable(conan_api, parser, subparser, *args):
+     """
+     Enable all the remotes matching a pattern.
+@@ -149,7 +148,7 @@ def remote_enable(conan_api, parser, subparser, *args):
+     return conan_api.remotes.enable(args.remote)
+ 
+ 
+-@conan_subcommand(formatters={"text": print_remote_list, "json": formatter_remote_list_json})
++@conan_subcommand(formatters={"text": _print_remote_list, "json": _print_remotes_json})
+ def remote_disable(conan_api, parser, subparser, *args):
+     """
+     Disable all the remotes matching a pattern.
+@@ -162,8 +161,8 @@ def remote_disable(conan_api, parser, subparser, *args):
+ 
+ # ### User related commands
+ 
+-@conan_subcommand(formatters={"text": print_remote_user_list, "json": output_remotes_json})
+-def remote_list_users(conan_api, parser, subparser, *args):
++@conan_subcommand(formatters={"text": _print_remote_user_list, "json": _print_remotes_users_json})
++def remote_list_users(conan_api, parser, subparser, *args):  # noqa
+     """
+     List the users logged into all the remotes.
+     """
+@@ -177,7 +176,7 @@ def remote_list_users(conan_api, parser, subparser, *args):
+     return ret
+ 
+ 
+-@conan_subcommand(formatters={"text": print_remote_user_set, "json": output_remotes_json})
++@conan_subcommand(formatters={"text": _print_remote_user_set, "json": _print_remotes_users_json})
+ def remote_login(conan_api, parser, subparser, *args):
+     """
+     Login into the specified remotes matching a pattern.
+@@ -194,29 +193,10 @@ def remote_login(conan_api, parser, subparser, *args):
+     remotes = conan_api.remotes.list(pattern=args.remote, only_enabled=False)
+     if not remotes:
+         raise ConanException("There are no remotes matching the '{}' pattern".format(args.remote))
++    return conan_api.remotes.login(remotes, args.username, args.password)
+ 
+-    creds = RemoteCredentials(conan_api.cache_folder, conan_api.config.global_conf)
+ 
+-    ret = OrderedDict()
+-    for r in remotes:
+-        previous_info = conan_api.remotes.user_info(r)
+-
+-        if args.username is not None and args.password is not None:
+-            user, password = args.username, args.password
+-        else:
+-            user, password, _ = creds.auth(r, args.username)
+-            if args.username is not None and args.username != user:
+-                raise ConanException(f"User '{args.username}' doesn't match user '{user}' in "
+-                                     f"credentials.json or environment variables")
+-
+-        conan_api.remotes.user_login(r, user, password)
+-        info = conan_api.remotes.user_info(r)
+-        ret[r.name] = {"previous_info": previous_info, "info": info}
+-
+-    return ret
+-
+-
+-@conan_subcommand(formatters={"text": print_remote_user_set, "json": output_remotes_json})
++@conan_subcommand(formatters={"text": _print_remote_user_set, "json": _print_remotes_users_json})
+ def remote_set_user(conan_api, parser, subparser, *args):
+     """
+     Associate a username with a remote matching a pattern without performing the authentication.
+@@ -240,7 +220,7 @@ def remote_set_user(conan_api, parser, subparser, *args):
+     return ret
+ 
+ 
+-@conan_subcommand(formatters={"text": print_remote_user_set, "json": output_remotes_json})
++@conan_subcommand(formatters={"text": _print_remote_user_set, "json": _print_remotes_users_json})
+ def remote_logout(conan_api, parser, subparser, *args):
+     """
+     Clear the existing credentials for the specified remotes matching a pattern.
+@@ -261,7 +241,7 @@ def remote_logout(conan_api, parser, subparser, *args):
+     return ret
+ 
+ 
+-def print_auth(remotes):
++def _print_auth(remotes):
+     for remote_name, msg in remotes.items():
+         if msg is None:
+             cli_out_write(f"{remote_name}: No user defined")
+@@ -271,11 +251,11 @@ def print_auth(remotes):
+                 cli_out_write(f"    {k}: {v}", fg=Color.BRIGHT_RED if k == "error" else Color.WHITE)
+ 
+ 
+-def print_auth_json(results):
++def _print_auth_json(results):
+     cli_out_write(json.dumps(results))
+ 
+ 
+-@conan_subcommand(formatters={"text": print_auth, "json": print_auth_json})
++@conan_subcommand(formatters={"text": _print_auth, "json": _print_auth_json})
+ def remote_auth(conan_api, parser, subparser, *args):
+     """
+     Authenticate in the defined remotes. Use CONAN_LOGIN_USERNAME* and CONAN_PASSWORD* variables if available.
+@@ -310,7 +290,7 @@ def remote_auth(conan_api, parser, subparser, *args):
+ 
+ 
+ @conan_command(group="Consumer")
+-def remote(conan_api, parser, *args):
++def remote(conan_api, parser, *args):  # noqa
+     """
+     Manage the remote list and the users authenticated on them.
+     """
+
+diff --git a/conan/cli/formatters/audit/vulnerabilities.py b/conan/cli/formatters/audit/vulnerabilities.py
+index f0c45c4..bd78dd0 100644
+--- a/conan/cli/formatters/audit/vulnerabilities.py
++++ b/conan/cli/formatters/audit/vulnerabilities.py
+@@ -2,7 +2,8 @@ import json
+ 
+ from jinja2 import select_autoescape, Template
+ 
+-from conan.api.output import cli_out_write, Color, ConanOutput
++from conan.api.output import cli_out_write, Color
++from conan.errors import ConanException
+ 
+ severity_order = {
+     "Critical": 4,
+@@ -13,9 +14,6 @@ severity_order = {
+ 
+ 
+ def text_vuln_formatter(result):
+-    from conan.api.output import cli_out_write, Color
+-
+-    response, errors_in_response = result
+ 
+     severity_colors = {
+         "Critical": Color.BRIGHT_RED,
+@@ -38,15 +36,10 @@ def text_vuln_formatter(result):
+         lines.append(" " * indent + txt)
+         return "\n".join(lines)
+ 
+-    if not response or "data" not in response or not response["data"]:
+-        if not errors_in_response:
+-            cli_out_write("No vulnerabilities found.\n", fg=Color.BRIGHT_GREEN)
+-        return
+-
+     total_vulns = 0
+     summary_lines = []
+ 
+-    for ref, pkg_info in response["data"].items():
++    for ref, pkg_info in result["data"].items():
+         edges = pkg_info.get("vulnerabilities", {}).get("edges", [])
+         count = len(edges)
+ 
+@@ -55,10 +48,14 @@ def text_vuln_formatter(result):
+         cli_out_write(f"* {ref} *", fg=Color.BRIGHT_WHITE)
+         cli_out_write(border_line, fg=Color.BRIGHT_WHITE)
+ 
++        if "error" in pkg_info:
++            details = pkg_info["error"].get("details", "")
++            cli_out_write(f"\n{details}\n", fg=Color.BRIGHT_YELLOW)
++            continue
++
+         if not count:
+-            if not errors_in_response:
+-                cli_out_write("\nNo vulnerabilities found.\n", fg=Color.BRIGHT_GREEN)
+-                continue
++            cli_out_write("\nNo vulnerabilities found.\n", fg=Color.BRIGHT_GREEN)
++            continue
+ 
+         total_vulns += count
+         summary_lines.append(
+@@ -91,6 +88,7 @@ def text_vuln_formatter(result):
+             cli_out_write("")
+ 
+     color_for_total = Color.BRIGHT_RED if total_vulns else Color.BRIGHT_GREEN
++
+     cli_out_write(f"Total vulnerabilities found: {total_vulns}\n", fg=color_for_total)
+ 
+     if total_vulns > 0:
+@@ -102,18 +100,17 @@ def text_vuln_formatter(result):
+                       "through patches applied in the recipe.\nTo verify if a patch has been applied, check the recipe in Conan Center.\n",
+                       fg=Color.BRIGHT_YELLOW)
+ 
+-    cli_out_write("\nVulnerability information provided by JFrog Advanced Security. Please check "
+-                  "https://jfrog.com/advanced-security/ for more information.\n",
+-                  fg=Color.BRIGHT_GREEN)
+-    cli_out_write("You can send questions and report issues about "
+-                  "the returned vulnerabilities to conan-research@jfrog.com.\n",
+-                  fg=Color.BRIGHT_GREEN)
++    if total_vulns > 0 or not "error" in result:
++        cli_out_write("\nVulnerability information provided by JFrog Advanced Security. Please check "
++                      "https://jfrog.com/advanced-security/ for more information.\n",
++                      fg=Color.BRIGHT_GREEN)
++        cli_out_write("You can send questions and report issues about "
++                      "the returned vulnerabilities to conan-research@jfrog.com.\n",
++                      fg=Color.BRIGHT_GREEN)
+ 
+ 
+ def json_vuln_formatter(result):
+-    response, errors_in_response = result
+-    if not errors_in_response or response["data"]:
+-        cli_out_write(json.dumps(response, indent=4))
++    cli_out_write(json.dumps(result, indent=4))
+ 
+ 
+ def _render_vulns(vulns, template):
+@@ -132,17 +129,17 @@ vuln_html = """
+     body { margin: 0; padding: 0; font-family: Arial, sans-serif; background: #333; color: #ffffff; }
+     .container { width: 80%; margin: 40px auto; padding: 20px; background: #222; box-shadow: 0 2px 5px rgba(0,0,0,0.1); border-radius: 8px; }
+     h1 { text-align: center; margin-bottom: 20px; }
+-    table { width: 100%; border-collapse: collapse; margin-bottom: 20px; table-layout: auto; padding-top: 10px;}
+-    col.pkg-col { min-width: 100px; }
+-    col.id-col { min-width: 160px; }
+-    col.sev-col { min-width: 100px; }
+-    col.score-col { min-width: 120px; }
+-    col.desc-col { }
++    table { width: 100%; border-collapse: collapse; margin-bottom: 20px; table-layout: fixed; padding-top: 10px;}
++    col.pkg-col   { width: 15%; }
++    col.id-col    { width: 15%; }
++    col.sev-col   { width: 15%; }
++    col.score-col { width: 15%; }
++    col.desc-col  { width: 40%; }
+     thead { background: #333; color: #fff; }
+     thead th { padding: 12px; text-align: left; }
+     tbody tr { border-bottom: 1px solid #ddd; }
+     tbody tr:hover { background: #f0f0f0; }
+-    td { padding: 10px; vertical-align: top; white-space: normal; word-wrap: break-word; overflow-wrap: break-word; }
++    td { padding: 10px; vertical-align: top; white-space: normal; word-wrap: break-word; overflow-wrap: break-word; word-break: break-word;}
+     .severity-badge { padding: 4px 8px; border-radius: 4px; color: #fff; font-weight: bold; display: inline-block; }
+     .severity-Critical { background: #d9534f; animation: pulse 2s infinite; }
+     @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(217,83,79,0.7); } 70% { box-shadow: 0 0 0 12px rgba(217,83,79,0); } 100% { box-shadow: 0 0 0 0 rgba(217,83,79,0); } }
+@@ -196,8 +193,9 @@ vuln_html = """
+           <td>{{ vuln.package }}</td>
+           <td>{{ vuln.vuln_id }}</td>
+           <td>
++            <span style="display: none">{% if severity_id == 'N/A' %}-1{% else %}{{ severity_id }}{% endif %}</span>
+             {% if vuln.severity not in ['N/A', ''] %}
+-              <span class="severity-badge severity-{{ severity_label }}"><span style="display: none">{{ severity_id }}</span>{{ severity_label }}</span>
++              <span class="severity-badge severity-{{ severity_label }}">{{ severity_label }}</span>
+             {% else %}
+               {{ vuln.severity }}
+             {% endif %}
+@@ -232,18 +230,18 @@ vuln_html = """
+ """
+ 
+ def html_vuln_formatter(result):
+-    response, errors_in_response = result
+     vulns = []
+-    for ref, pkg_info in response["data"].items():
++    for ref, pkg_info in result["data"].items():
+         edges = pkg_info.get("vulnerabilities", {}).get("edges", [])
+         if not edges:
++            description = "No vulnerabilities found." if not "error" in pkg_info else pkg_info["error"].get("details", "")
+             vulns.append({
+                 "package": ref,
+                 "vuln_id": "-",
+                 "aliases": [],
+                 "severity": "N/A",
+                 "score": "-",
+-                "description": "No vulnerabilities found.",
++                "description": description,
+                 "references": []
+             })
+         else:
+@@ -267,5 +265,5 @@ def html_vuln_formatter(result):
+                     "description": desc,
+                     "references": references,
+                 })
+-    if not errors_in_response or response["data"]:
+-        cli_out_write(_render_vulns(vulns, vuln_html))
++
++    cli_out_write(_render_vulns(vulns, vuln_html))
+
+diff --git a/conan/cli/formatters/graph/graph.py b/conan/cli/formatters/graph/graph.py
+index 06a51d9..70063d0 100644
+--- a/conan/cli/formatters/graph/graph.py
++++ b/conan/cli/formatters/graph/graph.py
+@@ -7,14 +7,13 @@ from conan.api.output import cli_out_write
+ from conan.cli.formatters.graph.graph_info_text import filter_graph
+ from conan.cli.formatters.graph.info_graph_dot import graph_info_dot
+ from conan.cli.formatters.graph.info_graph_html import graph_info_html
+-from conans.client.graph.graph_error import GraphConflictError
+ 
+ 
+-def _render_graph(graph, error, template, template_folder):
++def _render_graph(graph, template, template_folder):
+     deps_graph = graph.serialize()
+     from conan import __version__
+     template = Template(template, autoescape=select_autoescape(['html', 'xml']))
+-    return template.render(deps_graph=deps_graph, error=error,
++    return template.render(deps_graph=deps_graph,
+                            base_template_path=template_folder, version=__version__)
+ 
+ 
+@@ -28,15 +27,7 @@ def format_graph_html(result):
+     if os.path.isfile(user_template):
+         with open(user_template, 'r', encoding="utf-8", newline="") as handle:
+             template = handle.read()
+-    error = {
+-        "type": "unknown",
+-        "context": graph.error,
+-        "should_highlight_node": lambda node: False
+-    }
+-    if isinstance(graph.error, GraphConflictError):
+-        error["type"] = "conflict"
+-        error["should_highlight_node"] = lambda node: node.id == graph.error.node.id
+-    cli_out_write(_render_graph(graph, error, template, template_folder))
++    cli_out_write(_render_graph(graph, template, template_folder))
+ 
+ 
+ def format_graph_dot(result):
+@@ -49,7 +40,7 @@ def format_graph_dot(result):
+     if os.path.isfile(user_template):
+         with open(user_template, 'r', encoding="utf-8", newline="") as handle:
+             template = handle.read()
+-    cli_out_write(_render_graph(graph, None, template, template_folder))
++    cli_out_write(_render_graph(graph, template, template_folder))
+ 
+ 
+ def format_graph_json(result):
+
+diff --git a/conan/cli/printers/graph.py b/conan/cli/printers/graph.py
+index e0bd79e..d860ad3 100644
+--- a/conan/cli/printers/graph.py
++++ b/conan/cli/printers/graph.py
+@@ -1,7 +1,4 @@
+-from conan.api.output import ConanOutput, Color, LEVEL_VERBOSE
+-from conans.client.graph.graph import BINARY_INVALID, BINARY_MISSING, RECIPE_CONSUMER, \
+-    RECIPE_VIRTUAL, CONTEXT_BUILD, BINARY_SKIP, \
+-    BINARY_PLATFORM, BINARY_BUILD
++from conan.api.output import ConanOutput, Color, LEVEL_VERBOSE, LEVEL_DEBUG
+ 
+ 
+ def print_graph_basic(graph):
+@@ -20,9 +17,9 @@ def print_graph_basic(graph):
+         if hasattr(node.conanfile, "python_requires"):
+             for _, r in node.conanfile.python_requires.items():
+                 python_requires[r.ref] = r.recipe, r.remote
+-        if node.recipe in (RECIPE_CONSUMER, RECIPE_VIRTUAL):
++        if node.recipe in ("Consumer", "Cli"):
+             continue
+-        if node.context == CONTEXT_BUILD:
++        if node.context == "build":
+             build_requires[node.ref] = node.recipe, node.remote
+         else:
+             if node.test:
+@@ -113,33 +110,37 @@ def print_graph_packages(graph):
+     skipped_requires = []
+     tab = "    "
+     for node in graph.nodes:
+-        if node.recipe in (RECIPE_CONSUMER, RECIPE_VIRTUAL):
++        if node.recipe in ("Consumer", "Cli"):
+             continue
+-        if node.context == CONTEXT_BUILD:
+-            existing = build_requires.setdefault(node.pref, [node.binary, node.binary_remote])
++        node_info = node.conanfile.info
++        if node.context == "build":
++            existing = build_requires.setdefault(node.pref,
++                                                 [node.binary, node.binary_remote, node_info])
+         else:
+             if node.test:
+-                existing = test_requires.setdefault(node.pref, [node.binary, node.binary_remote])
++                existing = test_requires.setdefault(node.pref,
++                                                    [node.binary, node.binary_remote, node_info])
+             else:
+-                existing = requires.setdefault(node.pref, [node.binary, node.binary_remote])
++                existing = requires.setdefault(node.pref,
++                                               [node.binary, node.binary_remote, node_info])
+         # TO avoid showing as "skip" something that is used in other node of the graph
+-        if existing[0] == BINARY_SKIP:
++        if existing[0] == "Skip":
+             existing[0] = node.binary
+ 
+     def _format_requires(title, reqs_to_print):
+         if not reqs_to_print:
+             return
+         output.info(title, Color.BRIGHT_YELLOW)
+-        for pref, (status, remote) in sorted(reqs_to_print.items(), key=repr):
+-            name = pref.repr_notime() if status != BINARY_PLATFORM else str(pref.ref)
++        for pref, (status, remote, info) in sorted(reqs_to_print.items(), key=repr):
++            name = pref.repr_notime() if status != "Platform" else str(pref.ref)
+             msg = f"{tab}{name} - "
+-            if status == BINARY_SKIP:
++            if status == "Skip":
+                 skipped_requires.append(str(pref.ref))
+                 output.verbose(f"{msg}{status}", Color.BRIGHT_CYAN)
+-            elif status == BINARY_MISSING or status == BINARY_INVALID:
++            elif status == "Missing" or status == "Invalid":
+                 output.write(msg, Color.BRIGHT_CYAN)
+                 output.writeln(status, Color.BRIGHT_RED)
+-            elif status == BINARY_BUILD:
++            elif status == "Build":
+                 output.write(msg, Color.BRIGHT_CYAN)
+                 output.writeln(status, Color.BRIGHT_YELLOW)
+             else:
+@@ -148,6 +149,10 @@ def print_graph_packages(graph):
+                 if remote:
+                     msg += f" ({remote.name})"
+                 output.info(msg, Color.BRIGHT_CYAN)
++            if output.level_allowed(LEVEL_DEBUG):
++                compact_dumps = info.summarize_compact()
++                for line in compact_dumps:
++                    output.debug(f"{tab}{tab}{line}", Color.BRIGHT_GREEN)
+ 
+     _format_requires("Requirements", requires)
+     _format_requires("Test requirements", test_requires)
+
+diff --git a/conan/internal/api/audit/providers.py b/conan/internal/api/audit/providers.py
+index aa19b66..6d7e491 100644
+--- a/conan/internal/api/audit/providers.py
++++ b/conan/internal/api/audit/providers.py
+@@ -4,17 +4,23 @@ from conan.api.output import Color, ConanOutput
+ from conan.errors import ConanException
+ 
+ 
++def _build_headers(token):
++    return {"Content-Type": "application/json",
++            "Accept": "application/json",
++            "Authorization": f"Bearer {token}"}
++
++
+ class ConanCenterProvider:
+     def __init__(self, conan_api, name, provider_data):
+         self.name = name
+         self.url = provider_data["url"]
+         self.type = provider_data["type"]
+-        self.token = provider_data.get("token")
++        self._token = provider_data.get("token")
+         self._session = conan_api.remotes.requester
+         self._query_url = urljoin(self.url, "api/v1/query")
+ 
+     def get_cves(self, refs):
+-        if not self.token:
++        if not self._token:
+             from conan.api.subapi.audit import CONAN_CENTER_AUDIT_PROVIDER_NAME
+             if self.name == CONAN_CENTER_AUDIT_PROVIDER_NAME:
+                 output = ConanOutput()
+@@ -34,26 +40,21 @@ class ConanCenterProvider:
+ 
+             raise ConanException("Missing authentication token. Please authenticate and retry.")
+ 
+-        headers = {"Content-Type": "application/json",
+-                   "Accept": "application/json",
+-                   "Authorization": f"Bearer {self.token}"}
++        result = {"data": {}, "error": None}
+ 
+-        result = {"data": {}}
+-        errors_in_response = False
+         for ref in refs:
+             ConanOutput().info(f"Requesting vulnerability info for: {ref}")
+-            response = self._session.post(self._query_url, headers=headers,
++            response = self._session.post(self._query_url, headers=_build_headers(self._token),
+                                           json={"reference": str(ref)})
+             if response.status_code == 200:
+-                result["data"].setdefault(str(ref), {}).update(response.json()["data"]["query"])
++                result["data"][str(ref)] = response.json().get("data", {}).get("query", {})
+             elif response.status_code == 400:
+                 ConanOutput().warning(f"Package '{ref}' not found.\n"
+                                       f"Only libraries available in Conan Center can be queried for vulnerabilities.\n"
+                                       f"Please ensure the package exists in the official repository: https://conan.io/center\n"
+                                       f"If the package exists in the repository, please report it to conan-research@jfrog.com.\n")
+-                # errors_in_response = True
++                result["data"][str(ref)] = {"error": {"details": f"Package '{ref}' not scanned: Not found."}}
+                 continue
+-
+             elif response.status_code == 403:
+                 # TODO: How to report auth error to the user
+                 ConanOutput().error(f"Authentication error ({response.status_code}).\n"
+@@ -61,7 +62,7 @@ class ConanCenterProvider:
+                                     f" - Set a valid token using: 'conan audit provider auth {self.name} --token=<your_token>'\n"
+                                     f" - If you don’t have a token, register at: https://audit.conan.io/register")
+ 
+-                errors_in_response = True
++                result["conan_error"] = f"Authentication error ({response.status_code})."
+                 break
+             elif response.status_code == 429:
+                 reset_seconds = int(response.headers.get("retry-after", 0))
+@@ -92,19 +93,17 @@ class ConanCenterProvider:
+                 output.write("https://jfrog.com/devops-native-security/", newline=True,
+                              fg=Color.BRIGHT_BLUE)
+                 output.write("\n")
+-                ConanOutput().error("Rate limit exceeded.\n")
+-                errors_in_response = True
++
++                result["conan_error"] = "Rate limit exceeded."
+                 break
+             elif response.status_code == 500:
+                 # TODO: How to report internal server error to the user
+-                ConanOutput().error(f"Internal server error ({response.status_code})")
+-                errors_in_response = True
++                result["conan_error"] = f"Internal server error ({response.status_code})"
+                 break
+             else:
+-                ConanOutput().error(f"Error in {ref} ({response.status_code})")
+-                errors_in_response = True
++                result["conan_error"] = f"Error in {ref} ({response.status_code})"
+                 break
+-        return result, errors_in_response
++        return result
+ 
+ 
+ class PrivateProvider:
+@@ -112,20 +111,29 @@ class PrivateProvider:
+         self.name = name
+         self.url = provider_data["url"]
+         self.type = provider_data["type"]
+-        self.data = provider_data
++        self._token = provider_data.get("token")
+         self._session = conan_api.remotes.requester
+         self._query_url = urljoin(self.url, "catalog/api/v0/public/graphql")
+ 
+     def get_cves(self, refs):
+-        result = {"data": {}}
++        if not self._token:
++            raise ConanException(f"Missing authentication token for '{self.name}' provider.\n"
++                                 f"Please authenticate using 'conan audit provider auth' and retry.")
++
++        result = {"data": {}, "error": None}
++
+         for ref in refs:
+-            response = self._get(ref)
+-            if "error" in response:
+-                ConanOutput().error(f"Error: {response['error']['details']}")
+-                result["error"] = response["error"]
+-                return result, True
+-            result["data"].setdefault(str(ref), {}).update(response["data"]["query"])
+-        return result, False
++            try:
++                response = self._get(ref)
++                if "error" in response:
++                    result["data"][str(ref)] = {"error": {"details": response["error"]}}
++                else:
++                    result["data"][str(ref)] = response.get("data",{}).get("query",{})
++            except Exception as e:
++                result["conan_error"] = str(e)
++                break
++
++        return result
+ 
+     @staticmethod
+     def _build_query(ref):
+@@ -169,32 +177,35 @@ class PrivateProvider:
+ 
+         def _replace_message(message):
+             if "not found" in message:
+-                return f"{ref} was not found in the catalog"
++                return f"Package '{ref}' not scanned: Not found."
+             return None
+ 
+         error_msgs = filter(bool, [_replace_message(error["message"]) for error in errors])
+-        return {"details": next(error_msgs, "Unknown error")}
++        return next(error_msgs, "Unknown error")
+ 
+     def _get(self, ref):
+         full_query = self._build_query(ref)
+         try:
+-            headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+-            if self.data.get("token"):
+-                headers["Authorization"] = f"Bearer {self.data['token']}"
+-            elif self.data.get("user") and self.data.get("password"):
+-                headers["Authorization"] = f"Basic {self.data['user']}:{self.data['password']}"
+-
+             response = self._session.post(
+                 self._query_url,
+-                headers=headers,
++                headers=_build_headers(self._token),
+                 json={
+                     "query": textwrap.dedent(full_query)
+                 }
+             )
++
++            if response.status_code == 404:
++                ConanOutput().write("\n")
++                ConanOutput().warning(
++                    f"An error occurred while connecting to the '{self.name}' provider.\n"
++                    "This is likely because your JFrog Platform instance does not have JFrog Curation.\n"
++                    "For more information, visit: https://audit.conan.io/missing-curation\n"
++                )
++
+             # Raises if some HTTP error was found
+             response.raise_for_status()
+         except Exception as e:
+-            return {"error": {"details": f"Something went wrong: {e}"}}
++            raise e
+ 
+         response_json = response.json()
+         # filter the extensions key with graphql data
+
+diff --git a/conan/internal/api/uploader.py b/conan/internal/api/uploader.py
+index ce05789..8a01473 100644
+--- a/conan/internal/api/uploader.py
++++ b/conan/internal/api/uploader.py
+@@ -82,9 +82,9 @@ class PackagePreparator:
+         self._app = app
+         self._global_conf = global_conf
+ 
+-    def prepare(self, upload_bundle, enabled_remotes):
++    def prepare(self, pkg_list, enabled_remotes):
+         local_url = self._global_conf.get("core.scm:local_url", choices=["allow", "block"])
+-        for ref, bundle in upload_bundle.refs().items():
++        for ref, bundle in pkg_list.refs().items():
+             layout = self._app.cache.recipe_layout(ref)
+             conanfile_path = layout.conanfile()
+             conanfile = self._app.loader.load_basic(conanfile_path)
+@@ -97,7 +97,7 @@ class PackagePreparator:
+ 
+             if bundle.get("upload"):
+                 self._prepare_recipe(ref, bundle, conanfile, enabled_remotes)
+-            for pref, prev_bundle in upload_bundle.prefs(ref, bundle).items():
++            for pref, prev_bundle in pkg_list.prefs(ref, bundle).items():
+                 if prev_bundle.get("upload"):
+                     self._prepare_package(pref, prev_bundle)
+ 
+
+diff --git a/conan/internal/cache/cache.py b/conan/internal/cache/cache.py
+index 8363cc4..bf7d64d 100644
+--- a/conan/internal/cache/cache.py
++++ b/conan/internal/cache/cache.py
+@@ -111,10 +111,8 @@ class PkgCache:
+     def recipe_layout(self, ref: RecipeReference):
+         """ the revision must exists, the folder must exist
+         """
+-        if ref.revision is None:  # Latest one
+-            ref_data = self._db.get_latest_recipe(ref)
+-        else:
+-            ref_data = self._db.get_recipe(ref)
++        assert ref.revision is not None
++        ref_data = self._db.get_recipe(ref)
+         ref_path = ref_data.get("path")
+         ref = ref_data.get("ref")  # new revision with timestamp
+         return RecipeLayout(ref, os.path.join(self._base_folder, ref_path))
+
+diff --git a/conan/internal/cache/integrity_check.py b/conan/internal/cache/integrity_check.py
+index 58dec88..b1148e6 100644
+--- a/conan/internal/cache/integrity_check.py
++++ b/conan/internal/cache/integrity_check.py
+@@ -20,11 +20,11 @@ class IntegrityChecker:
+     def __init__(self, cache):
+         self._cache = cache
+ 
+-    def check(self, upload_data):
++    def check(self, pkg_list):
+         corrupted = False
+-        for ref, recipe_bundle in upload_data.refs().items():
++        for ref, recipe_bundle in pkg_list.refs().items():
+             corrupted = self._recipe_corrupted(ref) or corrupted
+-            for pref, prev_bundle in upload_data.prefs(ref, recipe_bundle).items():
++            for pref, prev_bundle in pkg_list.prefs(ref, recipe_bundle).items():
+                 corrupted = self._package_corrupted(pref) or corrupted
+         if corrupted:
+             raise ConanException("There are corrupted artifacts, check the error logs")
+
+diff --git a/conan/internal/default_settings.py b/conan/internal/default_settings.py
+index 51b2b5d..fc8a85e 100644
+--- a/conan/internal/default_settings.py
++++ b/conan/internal/default_settings.py
+@@ -26,10 +26,10 @@ os:
+                     "18.0", "18.1", "18.2", "18.3", "18.4"]
+         sdk: ["iphoneos", "iphonesimulator"]
+         sdk_version: [null, "11.3", "11.4", "12.0", "12.1", "12.2", "12.4",
+-                        "13.0", "13.1", "13.2", "13.4", "13.5", "13.6", "13.7",
++                        "13.0", "13.1", "13.2", "13.3", "13.4", "13.5", "13.6", "13.7",
+                         "14.0", "14.1", "14.2", "14.3", "14.4", "14.5", "15.0", "15.2", "15.4",
+                         "15.5", "16.0", "16.1", "16.2", "16.4", "17.0", "17.1", "17.2", "17.4", "17.5",
+-                        "18.0", "18.1", "18.2", "18.3", "18.4"]
++                        "18.0", "18.1", "18.2", "18.4"]
+     watchOS:
+         version: ["4.0", "4.1", "4.2", "4.3", "5.0", "5.1", "5.2", "5.3", "6.0", "6.1", "6.2", "6.3",
+                     "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6",
+@@ -39,9 +39,9 @@ os:
+                     "11.0", "11.1", "11.2", "11.3", "11.4"]
+         sdk: ["watchos", "watchsimulator"]
+         sdk_version: [null, "4.3", "5.0", "5.1", "5.2", "5.3", "6.0", "6.1", "6.2",
+-                        "7.0", "7.1", "7.2", "7.4", "8.0", "8.0.1", "8.3", "8.5", "9.0", "9.1",
++                        "7.0", "7.1", "7.2", "7.3", "7.4", "8.0", "8.0.1", "8.3", "8.5", "9.0", "9.1",
+                         "9.4", "10.0", "10.1", "10.2", "10.4", "10.5",
+-                        "11.0", "11.1", "11.2", "11.3", "11.4"]
++                        "11.0", "11.1", "11.2", "11.4"]
+     tvOS:
+         version: ["11.0", "11.1", "11.2", "11.3", "11.4",
+                     "12.0", "12.1", "12.2", "12.3", "12.4",
+@@ -53,13 +53,13 @@ os:
+                     "18.0", "18.1", "18.2", "18.3", "18.4"]
+         sdk: ["appletvos", "appletvsimulator"]
+         sdk_version: [null, "11.3", "11.4", "12.0", "12.1", "12.2", "12.4",
+-                        "13.0", "13.1", "13.2", "13.4", "14.0", "14.2", "14.3", "14.5", "15.0",
+-                        "15.2", "15.4", "16.0", "16.1", "16.4", "17.0", "17.1", "17.2", "17.4", "17.5",
+-                        "18.0", "18.1", "18.2", "18.3", "18.4"]
++                        "13.0", "13.2", "13.3", "13.4", "14.0", "14.2", "14.3", "14.4", "14.5", "15.0",
++                        "15.2", "15.4", "15.5", "16.0", "16.1", "16.4", "17.0", "17.1", "17.2", "17.4", "17.5",
++                        "18.0", "18.1", "18.2", "18.4"]
+     visionOS:
+-        version: ["1.0", "1.1", "1.2", "2.0", "2.1", "2.2", "2.3", "2.4"]
++        version: ["1.0", "1.1", "1.2", "1.3", "2.0", "2.1", "2.2", "2.3", "2.4"]
+         sdk: ["xros", "xrsimulator"]
+-        sdk_version: [null, "1.0", "1.1", "1.2", "2.0", "2.1", "2.2", "2.3", "2.4"]
++        sdk_version: [null, "1.0", "1.1", "1.2", "1.3", "2.0", "2.1", "2.2", "2.4"]
+     Macos:
+         version: [null, "10.6", "10.7", "10.8", "10.9", "10.10", "10.11", "10.12", "10.13", "10.14", "10.15",
+                     "11.0", "11.1", "11.2", "11.3", "11.4", "11.5", "11.6", "11.7",
+@@ -67,9 +67,9 @@ os:
+                     "13.0", "13.1", "13.2", "13.3", "13.4", "13.5", "13.6", "13.7",
+                     "14.0", "14.1", "14.2", "14.3", "14.4", "14.5", "14.6", "14.7",
+                     "15.0", "15.1", "15.2", "15.3", "15.4"]
+-        sdk_version: [null, "10.13", "10.14", "10.15", "11.0", "11.1", "11.3", "12.0", "12.1",
+-                        "12.3", "13.0", "13.1", "13.3", "14.0", "14.2", "14.4", "14.5",
+-                        "15.0", "15.1", "15.2", "15.3", "15.4"]
++        sdk_version: [null, "10.13", "10.14", "10.15", "11.0", "11.1", "11.2", "11.3", "12.0", "12.1",
++                        "12.3", "12.4", "13.0", "13.1", "13.3", "14.0", "14.2", "14.4", "14.5",
++                        "15.0", "15.1", "15.2", "15.4"]
+         subsystem:
+             null:
+             catalyst:
+@@ -112,7 +112,8 @@ compiler:
+                     "11", "11.1", "11.2", "11.3", "11.4", "11.5",
+                     "12", "12.1", "12.2", "12.3",  "12.4",
+                     "13", "13.1", "13.2", "13.3",
+-                    "14", "14.1", "14.2"]
++                    "14", "14.1", "14.2",
++                    "15.1"]
+         libcxx: [libstdc++, libstdc++11]
+         threads: [null, posix, win32, mcf]  # Windows MinGW
+         exception: [null, dwarf2, sjlj, seh]  # Windows MinGW
+@@ -146,7 +147,8 @@ compiler:
+         cstd: [null, 99, gnu99, 11, gnu11, 17, gnu17, 23, gnu23]
+     intel-cc:
+         version: ["2021.1", "2021.2", "2021.3", "2021.4", "2022.1", "2022.2",
+-                  "2022.3", "2023.0", "2023.1", "2023.2", "2024.0",]
++                  "2022.3", "2023.0", "2023.1", "2023.2", "2024.0", "2024.1",
++                  "2025.0", "2025.1"]
+         update: [null, ANY]
+         mode: ["icx", "classic", "dpcpp"]
+         libcxx: [null, libstdc++, libstdc++11, libc++]
+
+diff --git a/conan/internal/model/conf.py b/conan/internal/model/conf.py
+index 3e3e959..4cb9d7c 100644
+--- a/conan/internal/model/conf.py
++++ b/conan/internal/model/conf.py
+@@ -7,7 +7,9 @@ import fnmatch
+ from collections import OrderedDict
+ 
+ from conan.errors import ConanException
++from conan.internal.model.options import _PackageOption
+ from conan.internal.model.recipe_ref import ref_matches
++from conan.internal.model.settings import SettingsItem
+ 
+ BUILT_IN_CONFS = {
+     "core:required_conan_version": "Raise if current version does not match the defined range.",
+@@ -155,7 +157,7 @@ class _ConfVarPlaceHolder:
+     pass
+ 
+ 
+-class _ConfValue(object):
++class _ConfValue:
+ 
+     def __init__(self, name, value, path=False, update=None):
+         if name != name.lower():
+@@ -163,6 +165,8 @@ class _ConfValue(object):
+         self._name = name
+         self._value = value
+         self._value_type = type(value)
++        if isinstance(value, (_PackageOption, SettingsItem)):
++            raise ConanException(f"Invalid 'conf' type, please use Python types (int, str, ...)")
+         self._path = path
+         self._update = update
+ 
+@@ -220,6 +224,8 @@ class _ConfValue(object):
+         if isinstance(value, list):
+             self._value.extend(value)
+         else:
++            if isinstance(value, (_PackageOption, SettingsItem)):
++                raise ConanException(f"Invalid 'conf' type, please use Python types (int, str, ...)")
+             self._value.append(value)
+ 
+     def prepend(self, value):
+@@ -229,6 +235,8 @@ class _ConfValue(object):
+         if isinstance(value, list):
+             self._value = value + self._value
+         else:
++            if isinstance(value, (_PackageOption, SettingsItem)):
++                raise ConanException(f"Invalid 'conf' type, please use Python types (int, str, ...)")
+             self._value.insert(0, value)
+ 
+     def compose_conf_value(self, other):
+
+diff --git a/conan/internal/model/cpp_info.py b/conan/internal/model/cpp_info.py
+index 325269a..5bc7642 100644
+--- a/conan/internal/model/cpp_info.py
++++ b/conan/internal/model/cpp_info.py
+@@ -826,8 +826,9 @@ class CppInfo:
+ 
+         result = CppInfo()  # clone it
+         if self.libs and len(self.libs) > 1:  # expand in multiple components
+-            ConanOutput().warning(f"{conanfile}: The 'cpp_info.libs' contain more than 1 library. "
+-                                  "Define 'cpp_info.components' instead.")
++            ConanOutput(scope=str(conanfile)).warning(
++                "The 'cpp_info.libs' contain more than 1 library. "
++                "Define 'cpp_info.components' instead.", warn_tag="deprecated")
+             assert not self.components, f"{conanfile} cpp_info shouldn't have .libs and .components"
+             common = self._package.clone()
+             common.libs = []
+@@ -846,7 +847,30 @@ class CppInfo:
+         else:
+             result._package = self._package.clone()
+             result.default_components = self.default_components
+-            result.components = {k: v.clone() for k, v in self.components.items()}
++            new_components = {}
++            for k, v in self.components.items():
++                if v.libs and len(v.libs) > 1:
++                    ConanOutput(scope=str(conanfile)).warning(
++                        f"The 'cpp_info.components[{k}] contains more than 1 library. "
++                        "Define 1 component for each library instead.", warn_tag="deprecated")
++                    # Now the root, empty one
++                    common = v.clone()
++                    common.libs = []
++                    common.type = str(PackageType.HEADER)  # the type of components is a string!
++                    new_components[k] = common
++
++                    for lib in v.libs:
++                        c = _Component()
++                        c.type = v.type
++                        c.includedirs = v.includedirs
++                        c.libdirs = v.libdirs
++                        c.bindirs = v.bindirs
++                        c.libs = [lib]
++                        new_components[f"_{k}_{lib}"] = c
++                        common.requires.append(f"_{k}_{lib}")
++                else:
++                    new_components[k] = v.clone()
++            result.components = new_components
+ 
+         result._package.deduce_locations(conanfile)
+         for comp_name, comp in result.components.items():
+
+diff --git a/conan/internal/model/info.py b/conan/internal/model/info.py
+index 2319ba7..2cadf1e 100644
+--- a/conan/internal/model/info.py
++++ b/conan/internal/model/info.py
+@@ -432,6 +432,18 @@ class ConanInfo:
+         result.append("")  # Append endline so file ends with LF
+         return '\n'.join(result)
+ 
++    def summarize_compact(self):
++        result = []
++        serialized = self.serialize()
++
++        for key, values in serialized.items():
++            if isinstance(values, dict):
++                result.append(f"{key}: " + " ".join(f"{k}={v}" for k, v in values.items()))
++            elif isinstance(values, type([])):
++                result.append(f"{key}: {' '.join(values)}")
++
++        return result
++
+     def dump_diff(self, compatible):
+         self_dump = self.dumps()
+         compatible_dump = compatible.dumps()
+
+diff --git a/conan/internal/model/layout.py b/conan/internal/model/layout.py
+index 5ddacf5..f03c42e 100644
+--- a/conan/internal/model/layout.py
++++ b/conan/internal/model/layout.py
+@@ -32,7 +32,7 @@ class Layouts(object):
+         self.package = PartialLayout()
+ 
+ 
+-class Folders(object):
++class Folders:
+ 
+     def __init__(self):
+         self._base_source = None
+@@ -60,9 +60,6 @@ class Folders(object):
+         self.subproject = None
+         self.build_folder_vars = None
+ 
+-    def __repr__(self):
+-        return str(self.__dict__)
+-
+     def set_base_folders(self, conanfile_folder, output_folder):
+         """ this methods can be used for defining all the base folders in the
+         local flow (conan install, source, build), where only the current conanfile location
+
+diff --git a/conan/internal/model/requires.py b/conan/internal/model/requires.py
+index b5fc44c..4a02d9e 100644
+--- a/conan/internal/model/requires.py
++++ b/conan/internal/model/requires.py
+@@ -1,5 +1,3 @@
+-from collections import OrderedDict
+-
+ from conan.errors import ConanException
+ from conan.internal.model.pkg_type import PackageType
+ from conan.api.model import RecipeReference
+@@ -11,7 +9,7 @@ class Requirement:
+     """
+     def __init__(self, ref, *, headers=None, libs=None, build=False, run=None, visible=None,
+                  transitive_headers=None, transitive_libs=None, test=None, package_id_mode=None,
+-                 force=None, override=None, direct=None, options=None):
++                 force=None, override=None, direct=None, options=None, no_skip=False):
+         # * prevents the usage of more positional parameters, always ref + **kwargs
+         # By default this is a generic library requirement
+         self.ref = ref
+@@ -38,6 +36,7 @@ class Requirement:
+         self.is_test = test  # to store that it was a test, even if used as regular requires too
+         self.skip = False
+         self.required_nodes = set()  # store which intermediate nodes are required, to compute "Skip"
++        self.no_skip = no_skip
+ 
+     @property
+     def files(self):  # require needs some files in dependency package
+@@ -438,7 +437,7 @@ class Requirements:
+     """
+     def __init__(self, declared=None, declared_build=None, declared_test=None,
+                  declared_build_tool=None):
+-        self._requires = OrderedDict()
++        self._requires = {}
+         # Construct from the class definitions
+         if declared is not None:
+             if isinstance(declared, str):
+@@ -489,7 +488,7 @@ class Requirements:
+         as a result of an "alternative" replacement of the package name, otherwise the dictionary
+         gets broken by modified key
+         """
+-        result = OrderedDict()
++        result = {}
+         for k, v in self._requires.items():
+             if k is require:
+                 k.ref.name = new_name
+
+diff --git a/conan/test/utils/tools.py b/conan/test/utils/tools.py
+index 27fdb20..ac819dc 100644
+--- a/conan/test/utils/tools.py
++++ b/conan/test/utils/tools.py
+@@ -700,6 +700,8 @@ class TestClient:
+ 
+     def get_latest_ref_layout(self, ref) -> RecipeLayout:
+         """Get the latest RecipeLayout given a file reference"""
++        if not ref.revision:
++            ref = self.cache.get_latest_recipe_reference(ref)
+         ref_layout = self.cache.recipe_layout(ref)
+         return ref_layout
+ 
+
+diff --git a/conan/tools/apple/apple.py b/conan/tools/apple/apple.py
+index 4b02718..e7f76a7 100644
+--- a/conan/tools/apple/apple.py
++++ b/conan/tools/apple/apple.py
+@@ -80,8 +80,8 @@ def apple_min_version_flag(conanfile):
+         "watchsimulator": f"-mwatchos-simulator-version-min={os_version}",
+         "appletvos": f"-mtvos-version-min={os_version}",
+         "appletvsimulator": f"-mtvos-simulator-version-min={os_version}",
+-        "xros": f"-target arm64-apple-xros{os_version}",
+-        "xrsimulator": f"-target arm64-apple-xros{os_version}-simulator",
++        "xros": f"--target=arm64-apple-xros{os_version}",
++        "xrsimulator": f"--target=arm64-apple-xros{os_version}-simulator",
+     }.get(os_sdk, "")
+ 
+ 
+@@ -328,3 +328,28 @@ def fix_apple_shared_install_name(conanfile):
+     # there is nothing to do.
+     if substitutions:
+         _fix_executables(conanfile, substitutions)
++
++
++def apple_extra_flags(conanfile):
++    if not is_apple_os(conanfile):
++        return []
++    enable_bitcode = conanfile.conf.get("tools.apple:enable_bitcode", check_type=bool)
++    enable_arc = conanfile.conf.get("tools.apple:enable_arc", check_type=bool)
++    enable_visibility = conanfile.conf.get("tools.apple:enable_visibility", check_type=bool)
++    is_debug = conanfile.settings.get_safe('build_type') == "Debug"
++
++    flags = []
++    if enable_bitcode:
++        if is_debug:
++            flags.append("-fembed-bitcode-marker")
++        else:
++            flags.append("-fembed-bitcode")
++    if enable_arc:
++        flags.append("-fobjc-arc")
++    if enable_arc is False:
++        flags.append("-fno-objc-arc")
++    if enable_visibility:
++        flags.append("-fvisibility=default")
++    if enable_visibility is False:
++        flags.extend(["-fvisibility=hidden", "-fvisibility-inlines-hidden"])
++    return flags
+
+diff --git a/conan/tools/cmake/cmakedeps2/cmakedeps.py b/conan/tools/cmake/cmakedeps2/cmakedeps.py
+index 3030b98..a02e4ff 100644
+--- a/conan/tools/cmake/cmakedeps2/cmakedeps.py
++++ b/conan/tools/cmake/cmakedeps2/cmakedeps.py
+@@ -174,6 +174,7 @@ class _PathGenerator:
+             "libdirs": "CMAKE_LIBRARY_PATH",
+             "includedirs": "CMAKE_INCLUDE_PATH",
+             "frameworkdirs": "CMAKE_FRAMEWORK_PATH",
++            "builddirs": "CMAKE_MODULE_PATH"
+         }
+         for req, dep in requirements:
+             cppinfo = dep.cpp_info.aggregated_components()
+@@ -210,6 +211,10 @@ class _PathGenerator:
+         {% if cmake_framework_path %}
+         list(PREPEND CMAKE_FRAMEWORK_PATH {{ cmake_framework_path }})
+         {% endif %}
++        # Definition of CMAKE_MODULE_PATH to be able to include(module)
++        {% if cmake_module_path %}
++        list(PREPEND CMAKE_MODULE_PATH {{ cmake_module_path }})
++        {% endif %}
+         """)
+         host_req = self._conanfile.dependencies.host
+         build_req = self._conanfile.dependencies.direct_build
+@@ -251,13 +256,15 @@ class _PathGenerator:
+         cmake_library_path = self._get_cmake_paths(host_test_reqs, "libdirs")
+         cmake_include_path = self._get_cmake_paths(host_test_reqs, "includedirs")
+         cmake_framework_path = self._get_cmake_paths(host_test_reqs, "frameworkdirs")
++        cmake_module_path = self._get_cmake_paths(all_reqs, "builddirs")
+         context = {"host_runtime_dirs": self._get_host_runtime_dirs(),
+                    "pkg_paths": pkg_paths,
+                    "cmake_program_path": _join_paths(self._conanfile, cmake_program_path),
+                    "cmake_library_path": _join_paths(self._conanfile, cmake_library_path),
+                    "cmake_include_path": _join_paths(self._conanfile, cmake_include_path),
+                    "cmake_framework_path": _join_paths(self._conanfile, cmake_framework_path),
+-        }
++                   "cmake_module_path": _join_paths(self._conanfile, cmake_module_path)
++                   }
+         content = Template(template, trim_blocks=True, lstrip_blocks=True).render(context)
+         save(self._conanfile, self._conan_cmakedeps_paths, content)
+ 
+
+diff --git a/conan/tools/cmake/cmakedeps2/target_configuration.py b/conan/tools/cmake/cmakedeps2/target_configuration.py
+index 4e483d2..c72a136 100644
+--- a/conan/tools/cmake/cmakedeps2/target_configuration.py
++++ b/conan/tools/cmake/cmakedeps2/target_configuration.py
+@@ -80,7 +80,7 @@ class TargetConfigurationTemplate2:
+                         assert required_pkg == required_comp
+                         comp = None
+                         default_target = f"{dep.ref.name}::{dep.ref.name}"  # replace_requires
+-                        link = pkg_type is not PackageType.SHARED 
++                        link = pkg_type is not PackageType.SHARED
+                     else:
+                         comp = required_comp
+                         default_target = f"{required_pkg}::{required_comp}"
+@@ -364,6 +364,8 @@ class TargetConfigurationTemplate2:
+         set_property(TARGET {{lib}} APPEND PROPERTY IMPORTED_CONFIGURATIONS {{config}})
+         set_target_properties({{lib}} PROPERTIES IMPORTED_LOCATION_{{config}}
+                               "{{lib_info["location"]}}")
++        {% elif lib_info.get("type") == "INTERFACE" %}
++        set_property(TARGET {{lib}} APPEND PROPERTY IMPORTED_CONFIGURATIONS {{config}})
+         {% endif %}
+         {% if lib_info.get("link_location") %}
+         set_target_properties({{lib}} PROPERTIES IMPORTED_IMPLIB_{{config}}
+
+diff --git a/conan/tools/cmake/toolchain/blocks.py b/conan/tools/cmake/toolchain/blocks.py
+index 5372c85..694f3a3 100644
+--- a/conan/tools/cmake/toolchain/blocks.py
++++ b/conan/tools/cmake/toolchain/blocks.py
+@@ -15,7 +15,7 @@ from conan.tools.build.cross_building import cross_building
+ from conan.tools.cmake.toolchain import CONAN_TOOLCHAIN_FILENAME
+ from conan.tools.cmake.utils import is_multi_configuration
+ from conan.tools.intel import IntelCC
+-from conan.tools.microsoft.visual import msvc_version_to_toolset_version
++from conan.tools.microsoft.visual import msvc_version_to_toolset_version, msvc_platform_from_arch
+ from conan.internal.api.install.generators import relativize_path
+ from conans.client.subsystems import deduce_subsystem, WINDOWS
+ from conan.errors import ConanException
+@@ -991,11 +991,7 @@ class GenericSystemBlock(Block):
+             return settings.get_safe("os.platform")
+ 
+         if compiler in ("msvc", "clang") and generator and "Visual" in generator:
+-            return {"x86": "Win32",
+-                    "x86_64": "x64",
+-                    "armv7": "ARM",
+-                    "armv8": "ARM64",
+-                    "arm64ec": "ARM64EC"}.get(arch)
++            return msvc_platform_from_arch(arch)
+         return None
+ 
+     def _get_generic_system_name(self):
+
+diff --git a/conan/tools/gnu/autotoolstoolchain.py b/conan/tools/gnu/autotoolstoolchain.py
+index e2daf56..cced955 100644
+--- a/conan/tools/gnu/autotoolstoolchain.py
++++ b/conan/tools/gnu/autotoolstoolchain.py
+@@ -3,7 +3,7 @@ import os
+ from conan.errors import ConanException
+ from conan.internal import check_duplicated_generator
+ from conan.internal.internal_tools import raise_on_universal_arch
+-from conan.tools.apple.apple import is_apple_os, resolve_apple_flags
++from conan.tools.apple.apple import is_apple_os, resolve_apple_flags, apple_extra_flags
+ from conan.tools.build import cmd_args_to_string, save_toolchain_args
+ from conan.tools.build.cross_building import cross_building
+ from conan.tools.build.flags import architecture_flag, build_type_flags, cppstd_flag, \
+@@ -84,9 +84,9 @@ class AutotoolsToolchain:
+         sysroot = sysroot.replace("\\", "/") if sysroot is not None else None
+         self.sysroot_flag = "--sysroot {}".format(sysroot) if sysroot else None
+ 
+-        self.configure_args = self._default_configure_shared_flags() + \
+-                              self._default_configure_install_flags() + \
+-                              self._get_triplets()
++        self.configure_args = (self._default_configure_shared_flags() +
++                               self._default_configure_install_flags() +
++                               self._get_triplets())
+         self.autoreconf_args = self._default_autoreconf_flags()
+         self.make_args = []
+         # Apple stuff
+@@ -101,6 +101,7 @@ class AutotoolsToolchain:
+         # -isysroot makes all includes for your library relative to the build directory
+         self.apple_isysroot_flag = isysroot_flag
+         self.apple_min_version_flag = min_flag
++        self.apple_extra_flags = apple_extra_flags(self._conanfile)
+ 
+     def _resolve_android_cross_compilation(self):
+         # Issue related: https://github.com/conan-io/conan/issues/13443
+@@ -134,11 +135,10 @@ class AutotoolsToolchain:
+                 'WindowsCE': 'windows',
+                 'WindowsStore': 'windows'
+             }.get(os_build, "linux")
++            ext = ".cmd" if os_build == "Windows" else ""
+             ndk_bin = os.path.join(ndk_path, "toolchains", "llvm", "prebuilt",
+                                    f"{ndk_os_folder}-x86_64", "bin")
+             android_api_level = self._conanfile.settings.get_safe("os.api_level")
+-            os_build = self._conanfile.settings_build.get_safe('os')
+-            ext = ".cmd" if os_build == "Windows" else ""
+             conan_vars = {
+                 "CC": os.path.join(ndk_bin, f"{android_target}{android_api_level}-clang{ext}"),
+                 "CXX": os.path.join(ndk_bin, f"{android_target}{android_api_level}-clang++{ext}"),
+@@ -188,6 +188,7 @@ class AutotoolsToolchain:
+         ret = [self.libcxx, self.cppstd, self.arch_flag, fpic, self.msvc_runtime_flag,
+                self.sysroot_flag]
+         apple_flags = [self.apple_isysroot_flag, self.apple_arch_flag, self.apple_min_version_flag]
++        apple_flags += self.apple_extra_flags
+         conf_flags = self._conanfile.conf.get("tools.build:cxxflags", default=[], check_type=list)
+         vs_flag = self._add_msvc_flags(self.extra_cxxflags)
+         ret = ret + self.build_type_flags + apple_flags + self.extra_cxxflags + vs_flag + conf_flags
+@@ -198,6 +199,7 @@ class AutotoolsToolchain:
+         fpic = "-fPIC" if self.fpic else None
+         ret = [self.cstd, self.arch_flag, fpic, self.msvc_runtime_flag, self.sysroot_flag]
+         apple_flags = [self.apple_isysroot_flag, self.apple_arch_flag, self.apple_min_version_flag]
++        apple_flags += self.apple_extra_flags
+         conf_flags = self._conanfile.conf.get("tools.build:cflags", default=[], check_type=list)
+         vs_flag = self._add_msvc_flags(self.extra_cflags)
+         ret = ret + self.build_type_flags + apple_flags + self.extra_cflags + vs_flag + conf_flags
+@@ -207,6 +209,7 @@ class AutotoolsToolchain:
+     def ldflags(self):
+         ret = [self.arch_flag, self.sysroot_flag]
+         apple_flags = [self.apple_isysroot_flag, self.apple_arch_flag, self.apple_min_version_flag]
++        apple_flags += self.apple_extra_flags
+         conf_flags = self._conanfile.conf.get("tools.build:sharedlinkflags", default=[],
+                                               check_type=list)
+         conf_flags.extend(self._conanfile.conf.get("tools.build:exelinkflags", default=[],
+
+diff --git a/conan/tools/gnu/gnutoolchain.py b/conan/tools/gnu/gnutoolchain.py
+index 1b22240..aa28970 100644
+--- a/conan/tools/gnu/gnutoolchain.py
++++ b/conan/tools/gnu/gnutoolchain.py
+@@ -2,13 +2,13 @@ import os
+ 
+ from conan.internal import check_duplicated_generator
+ from conan.internal.internal_tools import raise_on_universal_arch
+-from conan.tools.apple.apple import is_apple_os, resolve_apple_flags
++from conan.tools.apple.apple import is_apple_os, resolve_apple_flags, apple_extra_flags
+ from conan.tools.build import cmd_args_to_string, save_toolchain_args
+ from conan.tools.build.cross_building import cross_building
+ from conan.tools.build.flags import architecture_flag, build_type_flags, cppstd_flag, \
+     build_type_link_flags, \
+     libcxx_flags
+-from conan.tools.env import Environment
++from conan.tools.env import Environment, VirtualBuildEnv
+ from conan.tools.gnu.get_gnu_triplet import _get_gnu_triplet
+ from conan.tools.microsoft import VCVars, msvc_runtime_flag, unix_path, check_min_vs, is_msvc
+ from conan.errors import ConanException
+@@ -104,6 +104,7 @@ class GnuToolchain:
+         # -isysroot makes all includes for your library relative to the build directory
+         self.apple_isysroot_flag = isysroot_flag
+         self.apple_min_version_flag = min_flag
++        self.apple_extra_flags = apple_extra_flags(conanfile)
+         # Default initial environment flags
+         self._initialize_default_extra_env()
+ 
+@@ -126,14 +127,18 @@ class GnuToolchain:
+         ret = {}
+         if not self._is_cross_building or not self._conanfile.settings.get_safe("os") == "Android":
+             return ret
+-
++        # Setting host if it was not already defined yet
++        arch = self._conanfile.settings.get_safe("arch")
++        android_target = {'armv7': 'armv7a-linux-androideabi',
++                          'armv8': 'aarch64-linux-android',
++                          'x86': 'i686-linux-android',
++                          'x86_64': 'x86_64-linux-android'}.get(arch)
++        if self.triplets_info["host"]["triplet"] is None:
++            self.triplets_info["host"]["triplet"] = android_target
++        # Automatic guessing made by Conan (need the NDK path variable defined)
++        conan_vars = {}
+         ndk_path = self._conanfile.conf.get("tools.android:ndk_path", check_type=str)
+-        if not ndk_path:
+-            raise ConanException("You must provide a NDK path. Use 'tools.android:ndk_path' "
+-                                 "configuration field.")
+-
+         if ndk_path:
+-            arch = self._conanfile.settings.get_safe("arch")
+             os_build = self._conanfile.settings_build.get_safe("os")
+             ndk_os_folder = {
+                 'Macos': 'darwin',
+@@ -147,16 +152,11 @@ class GnuToolchain:
+                 'WindowsCE': 'windows',
+                 'WindowsStore': 'windows'
+             }.get(os_build, "linux")
++            ext = ".cmd" if os_build == "Windows" else ""
+             ndk_bin = os.path.join(ndk_path, "toolchains", "llvm", "prebuilt",
+                                    f"{ndk_os_folder}-x86_64", "bin")
+             android_api_level = self._conanfile.settings.get_safe("os.api_level")
+-            android_target = {'armv7': 'armv7a-linux-androideabi',
+-                              'armv8': 'aarch64-linux-android',
+-                              'x86': 'i686-linux-android',
+-                              'x86_64': 'x86_64-linux-android'}.get(arch)
+-            os_build = self._conanfile.settings_build.get_safe('os')
+-            ext = ".cmd" if os_build == "Windows" else ""
+-            ret = {
++            conan_vars = {
+                 "CC": os.path.join(ndk_bin, f"{android_target}{android_api_level}-clang{ext}"),
+                 "CXX": os.path.join(ndk_bin, f"{android_target}{android_api_level}-clang++{ext}"),
+                 "LD": os.path.join(ndk_bin, "ld"),
+@@ -164,9 +164,19 @@ class GnuToolchain:
+                 "RANLIB": os.path.join(ndk_bin, "llvm-ranlib"),
+                 "AS": os.path.join(ndk_bin, f"{android_target}{android_api_level}-clang{ext}"),
+                 "AR": os.path.join(ndk_bin, "llvm-ar"),
++                "ADDR2LINE": os.path.join(ndk_bin, "llvm-addr2line"),
++                "NM": os.path.join(ndk_bin, "llvm-nm"),
++                "OBJCOPY": os.path.join(ndk_bin, "llvm-objcopy"),
++                "OBJDUMP": os.path.join(ndk_bin, "llvm-objdump"),
++                "READELF": os.path.join(ndk_bin, "llvm-readelf"),
++                "ELFEDIT": os.path.join(ndk_bin, "llvm-elfedit")
+             }
+-            # Overriding host triplet
+-            self.triplets_info["host"]["triplet"] = android_target
++        build_env = VirtualBuildEnv(self._conanfile, auto_generate=True).vars()
++        for var_name, var_path in conan_vars.items():
++            # User variables have more priority than Conan ones, so if it was defined within
++            # the build env then do nothing
++            if build_env.get(var_name) is None:
++                ret[var_name] = var_path
+         return ret
+ 
+     def _resolve_compilers_mapping_variables(self):
+@@ -185,16 +195,6 @@ class GnuToolchain:
+                     # https://github.com/conan-io/conan/issues/13780
+                     compiler = unix_path(self._conanfile, compiler)
+                     ret[env_var] = compiler  # User/tools ones have precedence
+-        # Issue related: https://github.com/conan-io/conan/issues/15486
+-        if self._is_cross_building and self._conanfile.conf_build:
+-            compilers_build_mapping = (
+-                self._conanfile.conf_build.get("tools.build:compiler_executables", default={},
+-                                               check_type=dict)
+-            )
+-            if "c" in compilers_build_mapping:
+-                ret["CC_FOR_BUILD"] = compilers_build_mapping["c"]
+-            if "cpp" in compilers_build_mapping:
+-                ret["CXX_FOR_BUILD"] = compilers_build_mapping["cpp"]
+         return ret
+ 
+     def _initialize_default_extra_env(self):
+@@ -213,7 +213,16 @@ class GnuToolchain:
+                                   "RANLIB": ":",
+                                   "STRIP": ":"}
+             extra_env_vars.update(self._resolve_compilers_mapping_variables())
+-
++        # Issue related: https://github.com/conan-io/conan/issues/15486
++        if self._is_cross_building and self._conanfile.conf_build:
++            compilers_build_mapping = (
++                self._conanfile.conf_build.get("tools.build:compiler_executables", default={},
++                                               check_type=dict)
++            )
++            if "c" in compilers_build_mapping:
++                extra_env_vars["CC_FOR_BUILD"] = compilers_build_mapping["c"]
++            if "cpp" in compilers_build_mapping:
++                extra_env_vars["CXX_FOR_BUILD"] = compilers_build_mapping["cpp"]
+         # Update the extra_env attribute with all the compiler values
+         for env_var, env_value in extra_env_vars.items():
+             self.extra_env.define(env_var, env_value)
+@@ -245,6 +254,7 @@ class GnuToolchain:
+         ret = [self.libcxx, self.cppstd, self.arch_flag, fpic, self.msvc_runtime_flag,
+                self.sysroot_flag]
+         apple_flags = [self.apple_isysroot_flag, self.apple_arch_flag, self.apple_min_version_flag]
++        apple_flags += self.apple_extra_flags
+         conf_flags = self._conanfile.conf.get("tools.build:cxxflags", default=[], check_type=list)
+         vs_flag = self._add_msvc_flags(self.extra_cxxflags)
+         ret = ret + self.build_type_flags + apple_flags + self.extra_cxxflags + vs_flag + conf_flags
+@@ -255,6 +265,7 @@ class GnuToolchain:
+         fpic = "-fPIC" if self.fpic else None
+         ret = [self.arch_flag, fpic, self.msvc_runtime_flag, self.sysroot_flag]
+         apple_flags = [self.apple_isysroot_flag, self.apple_arch_flag, self.apple_min_version_flag]
++        apple_flags += self.apple_extra_flags
+         conf_flags = self._conanfile.conf.get("tools.build:cflags", default=[], check_type=list)
+         vs_flag = self._add_msvc_flags(self.extra_cflags)
+         ret = ret + self.build_type_flags + apple_flags + self.extra_cflags + vs_flag + conf_flags
+@@ -264,6 +275,7 @@ class GnuToolchain:
+     def ldflags(self):
+         ret = [self.arch_flag, self.sysroot_flag]
+         apple_flags = [self.apple_isysroot_flag, self.apple_arch_flag, self.apple_min_version_flag]
++        apple_flags += self.apple_extra_flags
+         conf_flags = self._conanfile.conf.get("tools.build:sharedlinkflags", default=[],
+                                               check_type=list)
+         conf_flags.extend(self._conanfile.conf.get("tools.build:exelinkflags", default=[],
+
+diff --git a/conan/tools/meson/toolchain.py b/conan/tools/meson/toolchain.py
+index 88bbc9b..d923d06 100644
+--- a/conan/tools/meson/toolchain.py
++++ b/conan/tools/meson/toolchain.py
+@@ -7,7 +7,7 @@ from conan.errors import ConanException
+ from conan.internal import check_duplicated_generator
+ from conan.internal.internal_tools import raise_on_universal_arch
+ from conan.tools.apple.apple import is_apple_os, apple_min_version_flag, \
+-    resolve_apple_flags
++    resolve_apple_flags, apple_extra_flags
+ from conan.tools.build.cross_building import cross_building
+ from conan.tools.build.flags import libcxx_flags, architecture_flag
+ from conan.tools.env import VirtualBuildEnv
+@@ -338,6 +338,8 @@ class MesonToolchain:
+         self.apple_isysroot_flag = []
+         #: Apple minimum binary version flag as a list, e.g., ``["-mios-version-min", "10.8"]``
+         self.apple_min_version_flag = []
++        #: Apple bitcode, visibility and arc flags
++        self.apple_extra_flags = apple_extra_flags(self._conanfile)
+         #: Defines the Meson ``objc`` variable. Defaulted to ``None``, if if any Apple OS ``clang``
+         self.objc = None
+         #: Defines the Meson ``objcpp`` variable. Defaulted to ``None``, if if any Apple OS ``clang++``
+@@ -443,6 +445,10 @@ class MesonToolchain:
+         defines = self._conanfile_conf.get("tools.build:defines", default=[], check_type=list)
+         sys_root = [f"--sysroot={self._sys_root}"] if self._sys_root else [""]
+         ld = sharedlinkflags + exelinkflags + linker_script_flags + sys_root + self.extra_ldflags
++        # Apple extra flags from confs (visibilty, bitcode, arc)
++        cxxflags += self.apple_extra_flags
++        cflags += self.apple_extra_flags
++        ld += self.apple_extra_flags
+         return {
+             "cxxflags": [self.arch_flag] + cxxflags + sys_root + self.extra_cxxflags,
+             "cflags": [self.arch_flag] + cflags + sys_root + self.extra_cflags,
+
+diff --git a/conan/tools/microsoft/layout.py b/conan/tools/microsoft/layout.py
+index 6ac491f..006d5b2 100644
+--- a/conan/tools/microsoft/layout.py
++++ b/conan/tools/microsoft/layout.py
+@@ -1,7 +1,7 @@
+ import os
+ 
+-from conan.tools.microsoft.msbuild import msbuild_arch
+ from conan.errors import ConanException
++from conan.tools.microsoft.visual import msvc_platform_from_arch
+ 
+ 
+ def vs_layout(conanfile):
+@@ -26,11 +26,11 @@ def vs_layout(conanfile):
+         raise ConanException("The 'vs_layout' requires the 'arch' setting")
+ 
+     if arch != "None" and arch != "x86":
+-        arch = msbuild_arch(arch)
+-        if not arch:
+-            raise ConanException("The 'vs_layout' doesn't "
+-                                 "work with the arch '{}'".format(arch))
+-        bindirs = os.path.join(arch, build_type)
++        msvc_arch = msvc_platform_from_arch(arch)
++        if not msvc_arch:
++            raise ConanException(f"The 'vs_layout' doesn't work with the arch '{arch}'. "
++                                 "Accepted architectures: 'x86', 'x86_64', 'armv7', 'armv8'")
++        bindirs = os.path.join(msvc_arch, build_type)
+     else:
+         bindirs = build_type
+ 
+
+diff --git a/conan/tools/microsoft/msbuild.py b/conan/tools/microsoft/msbuild.py
+index e8efb27..4f4dd52 100644
+--- a/conan/tools/microsoft/msbuild.py
++++ b/conan/tools/microsoft/msbuild.py
+@@ -1,4 +1,5 @@
+ from conan.errors import ConanException
++from conan.tools.microsoft.visual import msvc_platform_from_arch
+ 
+ 
+ def msbuild_verbosity_cmd_line_arg(conanfile):
+@@ -13,18 +14,11 @@ def msbuild_verbosity_cmd_line_arg(conanfile):
+             "quiet": "Quiet",
+             "verbose": "Detailed",
+         }.get(verbosity)
+-        return f'/verbosity:{verbosity}'
++        return f'-verbosity:{verbosity}'
+     return ""
+ 
+ 
+-def msbuild_arch(arch):
+-    return {'x86': 'x86',
+-            'x86_64': 'x64',
+-            'armv7': 'ARM',
+-            'armv8': 'ARM64'}.get(str(arch))
+-
+-
+-class MSBuild(object):
++class MSBuild:
+     """
+     MSBuild build helper class
+     """
+@@ -39,23 +33,24 @@ class MSBuild(object):
+         # if platforms:
+         #    msvc_arch.update(platforms)
+         arch = conanfile.settings.get_safe("arch")
+-        msvc_arch = msbuild_arch(arch)
++        # MSVC default platform for VS projects is "x86", not "Win32" (but CMake default is "Win32")
++        msvc_platform = msvc_platform_from_arch(arch) if arch != "x86" else "x86"
+         if conanfile.settings.get_safe("os") == "WindowsCE":
+-            msvc_arch = conanfile.settings.get_safe("os.platform")
++            msvc_platform = conanfile.settings.get_safe("os.platform")
+         #: Defines the platform name, e.g., ``ARM`` if ``settings.arch == "armv7"``.
+-        self.platform = msvc_arch
++        self.platform = msvc_platform
+ 
+     def command(self, sln, targets=None):
+         """
+         Gets the ``msbuild`` command line. For instance,
+-        :command:`msbuild "MyProject.sln" /p:Configuration=<conf> /p:Platform=<platform>`.
++        :command:`msbuild.exe "MyProject.sln" -p:Configuration=<conf> -p:Platform=<platform>`.
+ 
+         :param sln: ``str`` name of Visual Studio ``*.sln`` file
+         :param targets: ``targets`` is an optional argument, defaults to ``None``, and otherwise it is a list of targets to build
+         :return: ``str`` msbuild command line.
+         """
+         # TODO: Enable output_binary_log via config
+-        cmd = ('msbuild "%s" /p:Configuration="%s" /p:Platform=%s'
++        cmd = ('msbuild.exe "%s" -p:Configuration="%s" -p:Platform=%s'
+                % (sln, self.build_type, self.platform))
+ 
+         verbosity = msbuild_verbosity_cmd_line_arg(self._conanfile)
+@@ -65,12 +60,12 @@ class MSBuild(object):
+         maxcpucount = self._conanfile.conf.get("tools.microsoft.msbuild:max_cpu_count",
+                                                check_type=int)
+         if maxcpucount is not None:
+-            cmd += f" /m:{maxcpucount}" if maxcpucount > 0 else " /m"
++            cmd += f" -m:{maxcpucount}" if maxcpucount > 0 else " -m"
+ 
+         if targets:
+             if not isinstance(targets, list):
+                 raise ConanException("targets argument should be a list")
+-            cmd += " /target:{}".format(";".join(targets))
++            cmd += " -target:{}".format(";".join(targets))
+ 
+         return cmd
+ 
+
+diff --git a/conan/tools/microsoft/msbuilddeps.py b/conan/tools/microsoft/msbuilddeps.py
+index ad2c89c..4ea1b73 100644
+--- a/conan/tools/microsoft/msbuilddeps.py
++++ b/conan/tools/microsoft/msbuilddeps.py
+@@ -10,6 +10,7 @@ from conan.internal import check_duplicated_generator
+ from conan.errors import ConanException
+ from conan.internal.api.install.generators import relativize_path
+ from conan.internal.model.dependencies import get_transitive_requires
++from conan.tools.microsoft.visual import msvc_platform_from_arch
+ from conans.util.files import load, save
+ 
+ VALID_LIB_EXTENSIONS = (".so", ".lib", ".a", ".dylib", ".bc")
+@@ -94,18 +95,17 @@ class MSBuildDeps:
+         :param conanfile: ``< ConanFile object >`` The current recipe object. Always use ``self``.
+         """
+         self._conanfile = conanfile
+-        #: Defines the build type. By default, ``settings.build_type``.
++        #: Defines the build type. By default, the value of ``settings.build_type``.
+         self.configuration = conanfile.settings.build_type
+-        #: Defines the configuration key used to conditionate on which property sheet to import.
++        #: Defines the configuration key used to conditionally select which property sheet to
++        #: import (defaults to ``"Configuration"``).
+         self.configuration_key = "Configuration"
+         # TODO: This platform is not exactly the same as ``msbuild_arch``, because it differs
+         # in x86=>Win32
+         #: Platform name, e.g., ``Win32`` if ``settings.arch == "x86"``.
+-        self.platform = {'x86': 'Win32',
+-                         'x86_64': 'x64',
+-                         'armv7': 'ARM',
+-                         'armv8': 'ARM64'}.get(str(conanfile.settings.arch))
+-        #: Defines the platform key used to conditionate on which property sheet to import.
++        self.platform = msvc_platform_from_arch(str(conanfile.settings.arch))
++        #: Defines the platform key used to conditionally select which property sheet to
++        #: import (defaults to ``"Platform"``).
+         self.platform_key = "Platform"
+         ca_exclude = "tools.microsoft.msbuilddeps:exclude_code_analysis"
+         #: List of packages names patterns to add Visual Studio ``CAExcludePath`` property
+
+diff --git a/conan/tools/microsoft/toolchain.py b/conan/tools/microsoft/toolchain.py
+index f7fb621..74a84bf 100644
+--- a/conan/tools/microsoft/toolchain.py
++++ b/conan/tools/microsoft/toolchain.py
+@@ -7,7 +7,8 @@ from jinja2 import Template
+ from conan.internal import check_duplicated_generator
+ from conan.tools.build import build_jobs
+ from conan.tools.intel.intel_cc import IntelCC
+-from conan.tools.microsoft.visual import VCVars, msvs_toolset, msvc_runtime_flag
++from conan.tools.microsoft.visual import VCVars, msvs_toolset, msvc_runtime_flag, \
++    msvc_platform_from_arch
+ from conan.errors import ConanException
+ from conans.util.files import save, load
+ 
+@@ -77,13 +78,9 @@ class MSBuildToolchain(object):
+         self.properties = {}
+ 
+     def _name_condition(self, settings):
++        platform = msvc_platform_from_arch(settings.get_safe("arch"))
+         props = [("Configuration", self.configuration),
+-                 # TODO: refactor, put in common with MSBuildDeps. Beware this is != msbuild_arch
+-                 #  because of Win32
+-                 ("Platform", {'x86': 'Win32',
+-                               'x86_64': 'x64',
+-                               'armv7': 'ARM',
+-                               'armv8': 'ARM64'}.get(settings.get_safe("arch")))]
++                 ("Platform", platform)]
+ 
+         name = "".join("_%s" % v for _, v in props if v is not None)
+         condition = " And ".join("'$(%s)' == '%s'" % (k, v) for k, v in props if v is not None)
+
+diff --git a/conan/tools/microsoft/visual.py b/conan/tools/microsoft/visual.py
+index 3a0c9e3..507c768 100644
+--- a/conan/tools/microsoft/visual.py
++++ b/conan/tools/microsoft/visual.py
+@@ -12,6 +12,14 @@ from conans.util.files import save
+ CONAN_VCVARS = "conanvcvars"
+ 
+ 
++def msvc_platform_from_arch(arch):
++    return {"x86": "Win32",
++            "x86_64": "x64",
++            "armv7": "ARM",
++            "armv8": "ARM64",
++            "arm64ec": "ARM64EC"}.get(arch)
++
++
+ def check_min_vs(conanfile, version, raise_invalid=True):
+     """
+     This is a helper method to allow the migration of 1.X -> 2.0 and VisualStudio -> msvc settings
+
+diff --git a/conan/tools/sbom/__init__.py b/conan/tools/sbom/__init__.py
+index 1f1641e..8d8cd91 100644
+--- a/conan/tools/sbom/__init__.py
++++ b/conan/tools/sbom/__init__.py
+@@ -1 +1 @@
+-from conan.tools.sbom.cyclonedx import cyclonedx_1_4
++from conan.tools.sbom.cyclonedx import cyclonedx_1_4, cyclonedx_1_6
+
+diff --git a/conan/tools/sbom/cyclonedx.py b/conan/tools/sbom/cyclonedx.py
+index bca937a..e24aca9 100644
+--- a/conan/tools/sbom/cyclonedx.py
++++ b/conan/tools/sbom/cyclonedx.py
+@@ -1,4 +1,4 @@
+-
++from conan import conan_version
+ 
+ def cyclonedx_1_4(conanfile, name=None, add_build=False, add_tests=False, **kwargs):
+     """
+@@ -19,7 +19,7 @@ def cyclonedx_1_4(conanfile, name=None, add_build=False, add_tests=False, **kwar
+ 
+     Example usage:
+     ```
+-    cyclonedx(conanfile, name="custom_name", add_build=True, add_test=True, **kwargs)
++    cyclonedx_1_4(conanfile, name="custom_name", add_build=True, add_test=True, **kwargs)
+     ```
+ 
+     """
+@@ -73,7 +73,7 @@ def cyclonedx_1_4(conanfile, name=None, add_build=False, add_tests=False, **kwar
+             **({"licenses": _calculate_licenses(node)} if node.conanfile.license else {}),
+             "name": node.name,
+             "purl": f"pkg:conan/{node.name}@{node.ref.version}",
+-            "type": "library",
++            "type": "application" if node.conanfile.package_type == "application" else "library",
+             "version": str(node.ref.version),
+         } for node in nodes]} if nodes else {}),
+         **({"dependencies": dependencies} if dependencies else {}),
+@@ -82,7 +82,7 @@ def cyclonedx_1_4(conanfile, name=None, add_build=False, add_tests=False, **kwar
+                 "author": conanfile.author or "Unknown",
+                 "bom-ref": special_id if has_special_root_node else f"pkg:conan/{conanfile.name}@{conanfile.ref.version}?rref={conanfile.ref.revision}",
+                 "name": name if name else name_default,
+-                "type": "library"
++                "type": "application" if conanfile.package_type == "application" else "library",
+             },
+             "timestamp": f"{datetime.fromtimestamp(time.time(), tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+             "tools": [{
+@@ -99,3 +99,103 @@ def cyclonedx_1_4(conanfile, name=None, add_build=False, add_tests=False, **kwar
+         "version": 1,
+     }
+     return sbom_cyclonedx_1_4
++
++def cyclonedx_1_6(conanfile, name=None, add_build=False, add_tests=False, **kwargs):
++    """
++    (Experimental) Generate cyclone 1.6 SBOM with JSON format
++
++    Creates a CycloneDX 1.6 Software Bill of Materials (SBOM) from a given dependency graph.
++
++
++
++    Parameters:
++        conanfile: The conanfile instance.
++        name (str, optional): Custom name for the metadata field.
++        add_build (bool, optional, default=False): Include build dependencies.
++        add_tests (bool, optional, default=False): Include test dependencies.
++
++    Returns:
++        The generated CycloneDX 1.6 document as a string.
++
++    Example usage:
++    ```
++    cyclonedx_1_6(conanfile, name="custom_name", add_build=True, add_test=True, **kwargs)
++    ```
++
++    """
++    import uuid
++    import time
++    from datetime import datetime, timezone
++    graph = conanfile.subgraph
++
++    has_special_root_node = not (getattr(graph.root.ref, "name", False) and getattr(graph.root.ref, "version", False) and getattr(graph.root.ref, "revision", False))
++    special_id = str(uuid.uuid4())
++
++    name_default = getattr(graph.root.ref, "name", False) or "conan-sbom"
++    name_default += f"/{graph.root.ref.version}" if bool(getattr(graph.root.ref, "version", False)) else ""
++    nodes = [node for node in graph.nodes if (node.context == "host" or add_build) and (not node.test or add_tests)]
++    if has_special_root_node:
++        nodes = nodes[1:]
++
++    dependencies = []
++    if has_special_root_node:
++        deps = {"ref": special_id,
++                "dependsOn": [f"pkg:conan/{d.dst.name}@{d.dst.ref.version}?rref={d.dst.ref.revision}"
++                              for d in graph.root.dependencies]}
++        dependencies.append(deps)
++    for c in nodes:
++        deps = {"ref": f"pkg:conan/{c.name}@{c.ref.version}?rref={c.ref.revision}"}
++        dep = [d for d in c.dependencies if (d.dst.context == "host" or add_build) and (not d.dst.test or add_tests)]
++
++        depends_on = [f"pkg:conan/{d.dst.name}@{d.dst.ref.version}?rref={d.dst.ref.revision}" for d in dep]
++        if depends_on:
++            deps["dependsOn"] = depends_on
++        dependencies.append(deps)
++
++    def _calculate_licenses(component):
++        if isinstance(component.conanfile.license, str): # Just one license
++            return [{"license": {
++                        "id": component.conanfile.license
++                    }}]
++        return [{"license": {
++                    "id": l
++                }} for l in component.conanfile.license]
++
++    sbom_cyclonedx_1_6 = {
++        **({"components": [{
++            **({"authors": [node.conanfile.author]} if node.conanfile.author else {}),
++            "bom-ref": special_id if has_special_root_node else f"pkg:conan/{node.name}@{node.ref.version}?rref={node.ref.revision}",
++            "description": node.conanfile.description,
++            **({"externalReferences": [{
++                "type": "website",
++                "url": node.conanfile.homepage
++            }]} if node.conanfile.homepage else {}),
++            **({"licenses": _calculate_licenses(node)} if node.conanfile.license else {}),
++            "name": node.name,
++            "purl": f"pkg:conan/{node.name}@{node.ref.version}",
++            "type": "application" if node.conanfile.package_type == "application" else "library",
++            "version": str(node.ref.version),
++        } for node in nodes]} if nodes else {}),
++        **({"dependencies": dependencies} if dependencies else {}),
++        "metadata": {
++            "component": {
++                **({"authors": [conanfile.author]} if conanfile.author else {}),
++                "bom-ref": special_id if has_special_root_node else f"pkg:conan/{conanfile.name}@{conanfile.ref.version}?rref={conanfile.ref.revision}",
++                "name": name if name else name_default,
++                "type": "application" if conanfile.package_type == "application" else "library"
++            },
++            "timestamp": f"{datetime.fromtimestamp(time.time(), tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
++            "tools": {
++                "components":[{
++                    "type": "application",
++                    "name": "Conan-io",
++                    "version": str(conan_version),
++                }]
++            },
++        },
++        "serialNumber": f"urn:uuid:{uuid.uuid4()}",
++        "bomFormat": "CycloneDX",
++        "specVersion": "1.6",
++        "version": 1,
++    }
++    return sbom_cyclonedx_1_6
+
+diff --git a/conan/tools/scm/git.py b/conan/tools/scm/git.py
+index c7bcb6f..a8a7dd0 100644
+--- a/conan/tools/scm/git.py
++++ b/conan/tools/scm/git.py
+@@ -277,8 +277,9 @@ class Git:
+     def checkout_from_conandata_coordinates(self):
+         """
+         Reads the "scm" field from the ``conandata.yml``, that must contain at least "url" and
+-        "commit" and then do a ``clone(url, target=".")`` followed by a ``checkout(commit)``.
++        "commit" and then do a ``clone(url, target=".")``, ``fetch <commit>``, followed by a ``checkout(commit)``.
+         """
+         sources = self._conanfile.conan_data["scm"]
+-        self.clone(url=sources["url"], target=".")
++        self.clone(url=sources["url"], target=".", args=["--origin=origin"])
++        self.run(f"fetch origin {sources['commit']}")
+         self.checkout(commit=sources["commit"])
+
+diff --git a/conans/client/graph/graph.py b/conans/client/graph/graph.py
+index 1c8efc7..7222096 100644
+--- a/conans/client/graph/graph.py
++++ b/conans/client/graph/graph.py
+@@ -41,7 +41,7 @@ class TransitiveRequirement:
+         return "Require: {}, Node: {}".format(repr(self.require), repr(self.node))
+ 
+ 
+-class Node(object):
++class Node:
+     def __init__(self, ref, conanfile, context, recipe=None, path=None, test=False):
+         self.ref = ref
+         self.path = path  # path to the consumer conanfile.xx for consumer, None otherwise
+@@ -291,7 +291,7 @@ class Node(object):
+         return Overrides.create(nodes)
+ 
+ 
+-class Edge(object):
++class Edge:
+     def __init__(self, src, dst, require):
+         self.src = src
+         self.dst = dst
+@@ -354,7 +354,7 @@ class Overrides:
+         return result
+ 
+ 
+-class DepsGraph(object):
++class DepsGraph:
+     def __init__(self):
+         self.nodes = []
+         self.aliased = {}
+
+diff --git a/conans/client/graph/graph_binaries.py b/conans/client/graph/graph_binaries.py
+index cc4334b..1d05c96 100644
+--- a/conans/client/graph/graph_binaries.py
++++ b/conans/client/graph/graph_binaries.py
+@@ -503,7 +503,8 @@ class GraphBinariesAnalyzer:
+ 
+                 # Finally accumulate all needed nodes for marking binaries as SKIP download
+                 news_req = [r for r in deps_required
+-                            if r.binary in (BINARY_BUILD, BINARY_EDITABLE_BUILD, BINARY_EDITABLE)
++                            if (r.binary in (BINARY_BUILD, BINARY_EDITABLE_BUILD, BINARY_EDITABLE)
++                                or any(req.no_skip for req in r.transitive_deps))
+                             if r not in required_nodes]  # Avoid already expanded before
+                 new_root_nodes.update(news_req)  # For expanding the next iteration
+                 required_nodes.update(deps_required)
+
+diff --git a/conans/client/graph/install_graph.py b/conans/client/graph/install_graph.py
+index 4a0fdaf..b68dec9 100644
+--- a/conans/client/graph/install_graph.py
++++ b/conans/client/graph/install_graph.py
+@@ -66,7 +66,7 @@ class _InstallPackageReference:
+         self.nodes.append(node)
+ 
+     def _build_args(self):
+-        if self.binary != BINARY_BUILD:
++        if self.binary not in (BINARY_BUILD, BINARY_EDITABLE_BUILD):
+             return None
+         cmd = f"--requires={self.ref}" if self.context == "host" else f"--tool-requires={self.ref}"
+         compatible = "compatible:" if self.info and self.info.get("compatibility_delta") else ""
+@@ -290,7 +290,7 @@ class _InstallConfiguration:
+                     self.depends.append(dep.dst.pref)
+ 
+     def _build_args(self):
+-        if self.binary != BINARY_BUILD:
++        if self.binary not in (BINARY_BUILD, BINARY_EDITABLE_BUILD):
+             return None
+         cmd = f"--requires={self.ref}" if self.context == "host" else f"--tool-requires={self.ref}"
+         compatible = "compatible:" if self.info and self.info.get("compatibility_delta") else ""
+
+diff --git a/conans/client/graph/proxy.py b/conans/client/graph/proxy.py
+index 72b9275..c2d4164 100644
+--- a/conans/client/graph/proxy.py
++++ b/conans/client/graph/proxy.py
+@@ -38,7 +38,9 @@ class ConanProxy:
+ 
+         # check if it there's any revision of this recipe in the local cache
+         try:
+-            recipe_layout = self._cache.recipe_layout(reference)
++            cache_ref = self._cache.get_latest_recipe_reference(reference) \
++                if reference.revision is None else reference
++            recipe_layout = self._cache.recipe_layout(cache_ref)
+             ref = recipe_layout.reference  # latest revision if it was not defined
+         except ConanException:
+             # NOT in disk, must be retrieved from remotes
+
+diff --git a/conans/client/installer.py b/conans/client/installer.py
+index d661ac5..5119796 100644
+--- a/conans/client/installer.py
++++ b/conans/client/installer.py
+@@ -2,7 +2,7 @@ import os
+ import shutil
+ from multiprocessing.pool import ThreadPool
+ 
+-from conan.api.output import ConanOutput
++from conan.api.output import ConanOutput, Color
+ from conan.internal.methods import run_build_method, run_package_method
+ from conan.internal.api.install.generators import write_generators
+ from conans.client.graph.graph import BINARY_BUILD, BINARY_CACHE, BINARY_DOWNLOAD, BINARY_EDITABLE, \
+@@ -309,6 +309,9 @@ class BinaryInstaller:
+             ConanOutput(scope=str(pref.ref))\
+                 .highlight("Building from source")\
+                 .info(f"Package {pref}")
++            compact_dumps = package.nodes[0].conanfile.info.summarize_compact()
++            for line in compact_dumps:
++                ConanOutput(scope=str(pref.ref)).info(line, fg=Color.BRIGHT_GREEN)
+             package_layout = self._cache.create_build_pkg_layout(pref)
+             self._handle_node_build(package, package_layout)
+             # Just in case it was recomputed
+
+diff --git a/conans/client/rest/auth_manager.py b/conans/client/rest/auth_manager.py
+index e79fd40..bb1b4cf 100644
+--- a/conans/client/rest/auth_manager.py
++++ b/conans/client/rest/auth_manager.py
+@@ -23,13 +23,14 @@ class _RemoteCreds:
+     def __init__(self, localdb):
+         self._localdb = localdb
+ 
+-    def get(self, remote):
++    def get(self, remote, msg=True):
+         creds = getattr(remote, "_creds", None)
+         if creds is None:
+             user, token, _ = self._localdb.get_login(remote.url)
+             creds = user, token
+-            usermsg = f"with user '{user}'" if user else "anonymously"
+-            ConanOutput().info(f"Connecting to remote '{remote.name}' {usermsg}")
++            if msg:
++                usermsg = f"with user '{user}'" if user else "anonymously"
++                ConanOutput().info(f"Connecting to remote '{remote.name}' {usermsg}")
+             setattr(remote, "_creds", creds)
+         return creds
+ 
+@@ -49,7 +50,7 @@ class ConanApiAuthManager:
+ 
+     def call_rest_api_method(self, remote, method_name, *args, **kwargs):
+         """Handles AuthenticationException and request user to input a user and a password"""
+-        user, token = self._creds.get(remote)
++        user, token = self._creds.get(remote, msg=(method_name != "authenticate"))
+         rest_client = RestApiClient(remote, token, self._requester, self._global_conf)
+ 
+         if method_name == "authenticate":
+
+diff --git a/conans/client/rest_client_local_recipe_index.py b/conans/client/rest_client_local_recipe_index.py
+index 3a4e65d..a5f896d 100644
+--- a/conans/client/rest_client_local_recipe_index.py
++++ b/conans/client/rest_client_local_recipe_index.py
+@@ -134,11 +134,6 @@ class RestApiClientLocalRecipesIndex:
+ 
+     def get_recipe_revision_reference(self, ref):
+         new_ref = self._export_recipe(ref)
+-        if new_ref != ref:
+-            ConanOutput().warning(f"A specific revision '{ref.repr_notime()}' was requested, but it "
+-                                  "doesn't match the current available revision in source. The "
+-                                  "local-recipes-index can't provide a specific revision")
+-            raise RecipeNotFoundException(ref)
+         return new_ref
+ 
+     def get_package_revision_reference(self, pref):
+@@ -162,6 +157,13 @@ class RestApiClientLocalRecipesIndex:
+             sys.stderr = original_stderr
+             ConanOutput(scope="local-recipes-index").debug(f"Internal export for {ref}:\n"
+                                                            f"{textwrap.indent(export_err, '    ')}")
++        if new_ref.user != ref.user or new_ref.channel != ref.channel:
++            raise RecipeNotFoundException(ref)
++        if ref.revision is not None and new_ref.revision != ref.revision:
++            ConanOutput().warning(f"A specific revision '{ref.repr_notime()}' was requested, but it "
++                                  "doesn't match the current available revision in source. The "
++                                  "local-recipes-index can't provide a specific revision")
++            raise RecipeNotFoundException(ref)
+         return new_ref
+ 
+     @staticmethod
+
+diff --git a/conans/model/package_ref.py b/conans/model/package_ref.py
+index 0669fc4..55fe086 100644
+--- a/conans/model/package_ref.py
++++ b/conans/model/package_ref.py
+@@ -17,7 +17,8 @@ class PkgReference(_PkgReference):
+ 
+     def __init__(self, *args, **kwargs):
+         if PkgReference.usage_counter == 0:
+-            ConanOutput().warning(_msg.format("from conans.model.package_ref import PkgReference"))
++            ConanOutput().warning(_msg.format("from conans.model.package_ref import PkgReference"),
++                                  warn_tag="deprecated")
+         PkgReference.usage_counter += 1
+         super(PkgReference, self).__init__(*args, **kwargs)
+ 

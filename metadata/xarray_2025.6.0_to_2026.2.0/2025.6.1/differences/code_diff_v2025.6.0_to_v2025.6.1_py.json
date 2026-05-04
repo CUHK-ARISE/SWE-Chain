@@ -1,0 +1,215 @@
+{
+  "old_dir": ".packages/xarray/2025.6.0",
+  "new_dir": ".packages/xarray/2025.6.1",
+  "extracted_at": "2026-03-26T21:24:58.821490",
+  "diff_file": "metadata/xarray_upgrade/v2025.6.0_v2025.6.1/code_diff_v2025.6.0_to_v2025.6.1_py.diff",
+  "diff_content": "diff --git a/properties/test_pandas_roundtrip.py b/properties/test_pandas_roundtrip.py\nindex 8fc32e7..ade2869 100644\n--- a/properties/test_pandas_roundtrip.py\n+++ b/properties/test_pandas_roundtrip.py\n@@ -15,6 +15,7 @@ import hypothesis.extra.numpy as npst  # isort:skip\n import hypothesis.extra.pandas as pdst  # isort:skip\n import hypothesis.strategies as st  # isort:skip\n from hypothesis import given  # isort:skip\n+from xarray.tests import has_pyarrow\n \n numeric_dtypes = st.one_of(\n     npst.unsigned_integer_dtypes(endianness=\"=\"),\n@@ -134,10 +135,39 @@ def test_roundtrip_pandas_dataframe_datetime(df) -> None:\n     xr.testing.assert_identical(dataset, roundtripped.to_xarray())\n \n \n-def test_roundtrip_1d_pandas_extension_array() -> None:\n-    df = pd.DataFrame({\"cat\": pd.Categorical([\"a\", \"b\", \"c\"])})\n-    arr = xr.Dataset.from_dataframe(df)[\"cat\"]\n+@pytest.mark.parametrize(\n+    \"extension_array\",\n+    [\n+        pd.Categorical([\"a\", \"b\", \"c\"]),\n+        pd.array([\"a\", \"b\", \"c\"], dtype=\"string\"),\n+        pd.arrays.IntervalArray(\n+            [pd.Interval(0, 1), pd.Interval(1, 5), pd.Interval(2, 6)]\n+        ),\n+        pd.arrays.TimedeltaArray._from_sequence(pd.TimedeltaIndex([\"1h\", \"2h\", \"3h\"])),\n+        pd.arrays.DatetimeArray._from_sequence(\n+            pd.DatetimeIndex([\"2023-01-01\", \"2023-01-02\", \"2023-01-03\"], freq=\"D\")\n+        ),\n+        np.array([1, 2, 3], dtype=\"int64\"),\n+    ]\n+    + ([pd.array([1, 2, 3], dtype=\"int64[pyarrow]\")] if has_pyarrow else []),\n+    ids=[\"cat\", \"string\", \"interval\", \"timedelta\", \"datetime\", \"numpy\"]\n+    + ([\"pyarrow\"] if has_pyarrow else []),\n+)\n+@pytest.mark.parametrize(\"is_index\", [True, False])\n+def test_roundtrip_1d_pandas_extension_array(extension_array, is_index) -> None:\n+    df = pd.DataFrame({\"arr\": extension_array})\n+    if is_index:\n+        df = df.set_index(\"arr\")\n+    arr = xr.Dataset.from_dataframe(df)[\"arr\"]\n     roundtripped = arr.to_pandas()\n-    assert (df[\"cat\"] == roundtripped).all()\n-    assert df[\"cat\"].dtype == roundtripped.dtype\n-    xr.testing.assert_identical(arr, roundtripped.to_xarray())\n+    df_arr_to_test = df.index if is_index else df[\"arr\"]\n+    assert (df_arr_to_test == roundtripped).all()\n+    # `NumpyExtensionArray` types are not roundtripped, including `StringArray` which subtypes.\n+    if isinstance(extension_array, pd.arrays.NumpyExtensionArray):  # type: ignore[attr-defined]\n+        assert isinstance(arr.data, np.ndarray)\n+    else:\n+        assert (\n+            df_arr_to_test.dtype\n+            == (roundtripped.index if is_index else roundtripped).dtype\n+        )\n+        xr.testing.assert_identical(arr, roundtripped.to_xarray())\n\ndiff --git a/xarray/coding/variables.py b/xarray/coding/variables.py\nindex 96413da..662fec4 100644\n--- a/xarray/coding/variables.py\n+++ b/xarray/coding/variables.py\n@@ -520,9 +520,9 @@ class CFScaleOffsetCoder(VariableCoder):\n \n             scale_factor = pop_to(attrs, encoding, \"scale_factor\", name=name)\n             add_offset = pop_to(attrs, encoding, \"add_offset\", name=name)\n-            if np.ndim(scale_factor) > 0:\n+            if duck_array_ops.ndim(scale_factor) > 0:\n                 scale_factor = np.asarray(scale_factor).item()\n-            if np.ndim(add_offset) > 0:\n+            if duck_array_ops.ndim(add_offset) > 0:\n                 add_offset = np.asarray(add_offset).item()\n             # if we have a _FillValue/masked_value in encoding we already have the wanted\n             # floating point dtype here (via CFMaskCoder), so no check is necessary\n\ndiff --git a/xarray/core/accessor_dt.py b/xarray/core/accessor_dt.py\nindex 0a5f34a..c78b38c 100644\n--- a/xarray/core/accessor_dt.py\n+++ b/xarray/core/accessor_dt.py\n@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Generic\n \n import numpy as np\n import pandas as pd\n-from typing_extensions import Self\n \n from xarray.coding.calendar_ops import _decimal_year\n from xarray.coding.times import infer_calendar_name\n@@ -21,12 +20,19 @@ from xarray.core.variable import IndexVariable, Variable\n from xarray.namedarray.utils import is_duck_dask_array\n \n if TYPE_CHECKING:\n+    import sys\n+\n     from numpy.typing import DTypeLike\n \n     from xarray.core.dataarray import DataArray\n     from xarray.core.dataset import Dataset\n     from xarray.core.types import CFCalendar\n \n+    if sys.version_info >= (3, 11):\n+        from typing import Self\n+    else:\n+        from typing_extensions import Self\n+\n \n def _season_from_months(months):\n     \"\"\"Compute season (DJF, MAM, JJA, SON) from month ordinal\"\"\"\n\ndiff --git a/xarray/core/dataset.py b/xarray/core/dataset.py\nindex 657fb02..367da2f 100644\n--- a/xarray/core/dataset.py\n+++ b/xarray/core/dataset.py\n@@ -99,6 +99,7 @@ from xarray.core.utils import (\n     parse_dims_as_set,\n )\n from xarray.core.variable import (\n+    UNSUPPORTED_EXTENSION_ARRAY_TYPES,\n     IndexVariable,\n     Variable,\n     as_variable,\n@@ -7281,7 +7282,7 @@ class Dataset(\n         extension_arrays = []\n         for k, v in dataframe.items():\n             if not is_extension_array_dtype(v) or isinstance(\n-                v.array, pd.arrays.DatetimeArray | pd.arrays.TimedeltaArray\n+                v.array, UNSUPPORTED_EXTENSION_ARRAY_TYPES\n             ):\n                 arrays.append((k, np.asarray(v)))\n             else:\n\ndiff --git a/xarray/core/duck_array_ops.py b/xarray/core/duck_array_ops.py\nindex 51ebfdd..e98ac0f 100644\n--- a/xarray/core/duck_array_ops.py\n+++ b/xarray/core/duck_array_ops.py\n@@ -796,6 +796,12 @@ def _nd_cum_func(cum_func, array, axis, **kwargs):\n     return out\n \n \n+def ndim(array) -> int:\n+    # Required part of the duck array and the array-api, but we fall back in case\n+    # https://docs.xarray.dev/en/latest/internals/duck-arrays-integration.html#duck-array-requirements\n+    return array.ndim if hasattr(array, \"ndim\") else np.ndim(array)\n+\n+\n def cumprod(array, axis=None, **kwargs):\n     \"\"\"N-dimensional version of cumprod.\"\"\"\n     return _nd_cum_func(cumprod_1d, array, axis, **kwargs)\n\ndiff --git a/xarray/core/extension_array.py b/xarray/core/extension_array.py\nindex 0e77bc5..7cc9db9 100644\n--- a/xarray/core/extension_array.py\n+++ b/xarray/core/extension_array.py\n@@ -66,6 +66,11 @@ def __extension_duck_array__where(\n     return cast(T_ExtensionArray, pd.Series(x).where(condition, pd.Series(y)).array)\n \n \n+@implements(np.ndim)\n+def __extension_duck_array__ndim(x: PandasExtensionArray) -> int:\n+    return x.ndim\n+\n+\n @implements(np.reshape)\n def __extension_duck_array__reshape(\n     arr: T_ExtensionArray, shape: tuple\n@@ -93,6 +98,13 @@ class PandasExtensionArray(Generic[T_ExtensionArray], NDArrayMixin):\n     def __post_init__(self):\n         if not isinstance(self.array, pd.api.extensions.ExtensionArray):\n             raise TypeError(f\"{self.array} is not an pandas ExtensionArray.\")\n+        # This does not use the UNSUPPORTED_EXTENSION_ARRAY_TYPES whitelist because\n+        # we do support extension arrays from datetime, for example, that need\n+        # duck array support internally via this class.\n+        if isinstance(self.array, pd.arrays.NumpyExtensionArray):\n+            raise TypeError(\n+                \"`NumpyExtensionArray` should be converted to a numpy array in `xarray` internally.\"\n+            )\n \n     def __array_function__(self, func, types, args, kwargs):\n         def replace_duck_with_extension_array(args) -> list:\n\ndiff --git a/xarray/core/indexing.py b/xarray/core/indexing.py\nindex 1bccc51..e14543e 100644\n--- a/xarray/core/indexing.py\n+++ b/xarray/core/indexing.py\n@@ -769,14 +769,15 @@ class LazilyVectorizedIndexedArray(ExplicitlyIndexedNDArrayMixin):\n \n def _wrap_numpy_scalars(array):\n     \"\"\"Wrap NumPy scalars in 0d arrays.\"\"\"\n-    if np.ndim(array) == 0 and (\n+    ndim = duck_array_ops.ndim(array)\n+    if ndim == 0 and (\n         isinstance(array, np.generic)\n         or not (is_duck_array(array) or isinstance(array, NDArrayMixin))\n     ):\n         return np.array(array)\n     elif hasattr(array, \"dtype\"):\n         return array\n-    elif np.ndim(array) == 0:\n+    elif ndim == 0:\n         return np.array(array)\n     else:\n         return array\n@@ -1802,8 +1803,12 @@ class PandasIndexingAdapter(ExplicitlyIndexedNDArrayMixin):\n \n     def get_duck_array(self) -> np.ndarray | PandasExtensionArray:\n         # We return an PandasExtensionArray wrapper type that satisfies\n-        # duck array protocols. This is what's needed for tests to pass.\n-        if pd.api.types.is_extension_array_dtype(self.array):\n+        # duck array protocols.\n+        # `NumpyExtensionArray` is excluded\n+        if pd.api.types.is_extension_array_dtype(self.array) and not isinstance(\n+            self.array.array,\n+            pd.arrays.NumpyExtensionArray,  # type: ignore[attr-defined]\n+        ):\n             from xarray.core.extension_array import PandasExtensionArray\n \n             return PandasExtensionArray(self.array.array)\n\ndiff --git a/xarray/core/variable.py b/xarray/core/variable.py\nindex 190da4b..9c753a2 100644\n--- a/xarray/core/variable.py\n+++ b/xarray/core/variable.py\n@@ -63,6 +63,11 @@ NON_NUMPY_SUPPORTED_ARRAY_TYPES = (\n )\n # https://github.com/python/mypy/issues/224\n BASIC_INDEXING_TYPES = integer_types + (slice,)\n+UNSUPPORTED_EXTENSION_ARRAY_TYPES = (\n+    pd.arrays.DatetimeArray,\n+    pd.arrays.TimedeltaArray,\n+    pd.arrays.NumpyExtensionArray,  # type: ignore[attr-defined]\n+)\n \n if TYPE_CHECKING:\n     from xarray.core.types import (\n@@ -190,6 +195,8 @@ def _maybe_wrap_data(data):\n     \"\"\"\n     if isinstance(data, pd.Index):\n         return PandasIndexingAdapter(data)\n+    if isinstance(data, UNSUPPORTED_EXTENSION_ARRAY_TYPES):\n+        return data.to_numpy()\n     if isinstance(data, pd.api.extensions.ExtensionArray):\n         return PandasExtensionArray(data)\n     return data\n@@ -251,7 +258,14 @@ def as_compatible_data(\n \n     # we don't want nested self-described arrays\n     if isinstance(data, pd.Series | pd.DataFrame):\n-        pandas_data = data.values\n+        if (\n+            isinstance(data, pd.Series)\n+            and pd.api.types.is_extension_array_dtype(data)\n+            and not isinstance(data.array, UNSUPPORTED_EXTENSION_ARRAY_TYPES)\n+        ):\n+            pandas_data = data.array\n+        else:\n+            pandas_data = data.values  # type: ignore[assignment]\n         if isinstance(pandas_data, NON_NUMPY_SUPPORTED_ARRAY_TYPES):\n             return convert_non_numpy_type(pandas_data)\n         else:\n\ndiff --git a/xarray/indexes/range_index.py b/xarray/indexes/range_index.py\nindex b04c86e..2b9a5e5 100644\n--- a/xarray/indexes/range_index.py\n+++ b/xarray/indexes/range_index.py\n@@ -5,6 +5,7 @@ from typing import Any\n import numpy as np\n import pandas as pd\n \n+from xarray.core import duck_array_ops\n from xarray.core.coordinate_transform import CoordinateTransform\n from xarray.core.dataarray import DataArray\n from xarray.core.indexes import CoordinateTransformIndex, Index, PandasIndex\n@@ -320,7 +321,9 @@ class RangeIndex(CoordinateTransformIndex):\n \n         if isinstance(idxer, slice):\n             return RangeIndex(self.transform.slice(idxer))\n-        elif (isinstance(idxer, Variable) and idxer.ndim > 1) or np.ndim(idxer) == 0:\n+        elif (isinstance(idxer, Variable) and idxer.ndim > 1) or duck_array_ops.ndim(\n+            idxer\n+        ) == 0:\n             return None\n         else:\n             values = self.transform.forward({self.dim: np.asarray(idxer)})[\n",
+  "structured_diff": {
+    "properties/test_pandas_roundtrip.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -15,6 +15,7 @@",
+          "snippet": " import hypothesis.extra.numpy as npst  # isort:skip\n import hypothesis.extra.pandas as pdst  # isort:skip\n import hypothesis.strategies as st  # isort:skip\n from hypothesis import given  # isort:skip\n+from xarray.tests import has_pyarrow\n \n numeric_dtypes = st.one_of(\n     npst.unsigned_integer_dtypes(endianness=\"=\"),",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "properties/test_pandas_roundtrip.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -134,10 +135,39 @@",
+          "snippet": " def test_roundtrip_pandas_dataframe_datetime(df) -> None:\n     xr.testing.assert_identical(dataset, roundtripped.to_xarray())\n \n \n-def test_roundtrip_1d_pandas_extension_array() -> None:\n-    df = pd.DataFrame({\"cat\": pd.Categorical([\"a\", \"b\", \"c\"])})\n-    arr = xr.Dataset.from_dataframe(df)[\"cat\"]\n+@pytest.mark.parametrize(\n+    \"extension_array\",\n+    [\n+        pd.Categorical([\"a\", \"b\", \"c\"]),\n+        pd.array([\"a\", \"b\", \"c\"], dtype=\"string\"),\n+        pd.arrays.IntervalArray(\n+            [pd.Interval(0, 1), pd.Interval(1, 5), pd.Interval(2, 6)]\n+        ),\n+        pd.arrays.TimedeltaArray._from_sequence(pd.TimedeltaIndex([\"1h\", \"2h\", \"3h\"])),\n+        pd.arrays.DatetimeArray._from_sequence(\n+            pd.DatetimeIndex([\"2023-01-01\", \"2023-01-02\", \"2023-01-03\"], freq=\"D\")\n+        ),\n+        np.array([1, 2, 3], dtype=\"int64\"),\n+    ]\n+    + ([pd.array([1, 2, 3], dtype=\"int64[pyarrow]\")] if has_pyarrow else []),\n+    ids=[\"cat\", \"string\", \"interval\", \"timedelta\", \"datetime\", \"numpy\"]\n+    + ([\"pyarrow\"] if has_pyarrow else []),\n+)\n+@pytest.mark.parametrize(\"is_index\", [True, False])\n+def test_roundtrip_1d_pandas_extension_array(extension_array, is_index) -> None:\n+    df = pd.DataFrame({\"arr\": extension_array})\n+    if is_index:\n+        df = df.set_index(\"arr\")\n+    arr = xr.Dataset.from_dataframe(df)[\"arr\"]\n     roundtripped = arr.to_pandas()\n-    assert (df[\"cat\"] == roundtripped).all()\n-    assert df[\"cat\"].dtype == roundtripped.dtype\n-    xr.testing.assert_identical(arr, roundtripped.to_xarray())\n+    df_arr_to_test = df.index if is_index else df[\"arr\"]\n+    assert (df_arr_to_test == roundtripped).all()\n+    # `NumpyExtensionArray` types are not roundtripped, including `StringArray` which subtypes.\n+    if isinstance(extension_array, pd.arrays.NumpyExtensionArray):  # type: ignore[attr-defined]\n+        assert isinstance(arr.data, np.ndarray)\n+    else:\n+        assert (\n+            df_arr_to_test.dtype\n+            == (roundtripped.index if is_index else roundtripped).dtype\n+        )\n+        xr.testing.assert_identical(arr, roundtripped.to_xarray())\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "properties/test_pandas_roundtrip.py::test_roundtrip_1d_pandas_extension_array"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/coding/variables.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -520,9 +520,9 @@",
+          "snippet": " class CFScaleOffsetCoder(VariableCoder):\n \n             scale_factor = pop_to(attrs, encoding, \"scale_factor\", name=name)\n             add_offset = pop_to(attrs, encoding, \"add_offset\", name=name)\n-            if np.ndim(scale_factor) > 0:\n+            if duck_array_ops.ndim(scale_factor) > 0:\n                 scale_factor = np.asarray(scale_factor).item()\n-            if np.ndim(add_offset) > 0:\n+            if duck_array_ops.ndim(add_offset) > 0:\n                 add_offset = np.asarray(add_offset).item()\n             # if we have a _FillValue/masked_value in encoding we already have the wanted\n             # floating point dtype here (via CFMaskCoder), so no check is necessary\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/coding/variables.py::CFScaleOffsetCoder::decode"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/accessor_dt.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -5,7 +5,6 @@",
+          "snippet": " from typing import TYPE_CHECKING, Generic\n \n import numpy as np\n import pandas as pd\n-from typing_extensions import Self\n \n from xarray.coding.calendar_ops import _decimal_year\n from xarray.coding.times import infer_calendar_name",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/core/accessor_dt.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -21,12 +20,19 @@",
+          "snippet": " from xarray.core.variable import IndexVariable, Variable\n from xarray.namedarray.utils import is_duck_dask_array\n \n if TYPE_CHECKING:\n+    import sys\n+\n     from numpy.typing import DTypeLike\n \n     from xarray.core.dataarray import DataArray\n     from xarray.core.dataset import Dataset\n     from xarray.core.types import CFCalendar\n \n+    if sys.version_info >= (3, 11):\n+        from typing import Self\n+    else:\n+        from typing_extensions import Self\n+\n \n def _season_from_months(months):\n     \"\"\"Compute season (DJF, MAM, JJA, SON) from month ordinal\"\"\"\n",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/core/accessor_dt.py::<module>"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/dataset.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -99,6 +99,7 @@",
+          "snippet": " from xarray.core.utils import (\n     parse_dims_as_set,\n )\n from xarray.core.variable import (\n+    UNSUPPORTED_EXTENSION_ARRAY_TYPES,\n     IndexVariable,\n     Variable,\n     as_variable,",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/core/dataset.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -7281,7 +7282,7 @@",
+          "snippet": " class Dataset(\n         extension_arrays = []\n         for k, v in dataframe.items():\n             if not is_extension_array_dtype(v) or isinstance(\n-                v.array, pd.arrays.DatetimeArray | pd.arrays.TimedeltaArray\n+                v.array, UNSUPPORTED_EXTENSION_ARRAY_TYPES\n             ):\n                 arrays.append((k, np.asarray(v)))\n             else:\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/dataset.py::Dataset::from_dataframe"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/duck_array_ops.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -796,6 +796,12 @@",
+          "snippet": " def _nd_cum_func(cum_func, array, axis, **kwargs):\n     return out\n \n \n+def ndim(array) -> int:\n+    # Required part of the duck array and the array-api, but we fall back in case\n+    # https://docs.xarray.dev/en/latest/internals/duck-arrays-integration.html#duck-array-requirements\n+    return array.ndim if hasattr(array, \"ndim\") else np.ndim(array)\n+\n+\n def cumprod(array, axis=None, **kwargs):\n     \"\"\"N-dimensional version of cumprod.\"\"\"\n     return _nd_cum_func(cumprod_1d, array, axis, **kwargs)\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/duck_array_ops.py::ndim"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/extension_array.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -66,6 +66,11 @@",
+          "snippet": " def __extension_duck_array__where(\n     return cast(T_ExtensionArray, pd.Series(x).where(condition, pd.Series(y)).array)\n \n \n+@implements(np.ndim)\n+def __extension_duck_array__ndim(x: PandasExtensionArray) -> int:\n+    return x.ndim\n+\n+\n @implements(np.reshape)\n def __extension_duck_array__reshape(\n     arr: T_ExtensionArray, shape: tuple",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/extension_array.py::__extension_duck_array__ndim"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -93,6 +98,13 @@",
+          "snippet": " class PandasExtensionArray(Generic[T_ExtensionArray], NDArrayMixin):\n     def __post_init__(self):\n         if not isinstance(self.array, pd.api.extensions.ExtensionArray):\n             raise TypeError(f\"{self.array} is not an pandas ExtensionArray.\")\n+        # This does not use the UNSUPPORTED_EXTENSION_ARRAY_TYPES whitelist because\n+        # we do support extension arrays from datetime, for example, that need\n+        # duck array support internally via this class.\n+        if isinstance(self.array, pd.arrays.NumpyExtensionArray):\n+            raise TypeError(\n+                \"`NumpyExtensionArray` should be converted to a numpy array in `xarray` internally.\"\n+            )\n \n     def __array_function__(self, func, types, args, kwargs):\n         def replace_duck_with_extension_array(args) -> list:\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/extension_array.py::PandasExtensionArray::__post_init__"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/indexing.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -769,14 +769,15 @@",
+          "snippet": " class LazilyVectorizedIndexedArray(ExplicitlyIndexedNDArrayMixin):\n \n def _wrap_numpy_scalars(array):\n     \"\"\"Wrap NumPy scalars in 0d arrays.\"\"\"\n-    if np.ndim(array) == 0 and (\n+    ndim = duck_array_ops.ndim(array)\n+    if ndim == 0 and (\n         isinstance(array, np.generic)\n         or not (is_duck_array(array) or isinstance(array, NDArrayMixin))\n     ):\n         return np.array(array)\n     elif hasattr(array, \"dtype\"):\n         return array\n-    elif np.ndim(array) == 0:\n+    elif ndim == 0:\n         return np.array(array)\n     else:\n         return array",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/indexing.py::_wrap_numpy_scalars"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1802,8 +1803,12 @@",
+          "snippet": " class PandasIndexingAdapter(ExplicitlyIndexedNDArrayMixin):\n \n     def get_duck_array(self) -> np.ndarray | PandasExtensionArray:\n         # We return an PandasExtensionArray wrapper type that satisfies\n-        # duck array protocols. This is what's needed for tests to pass.\n-        if pd.api.types.is_extension_array_dtype(self.array):\n+        # duck array protocols.\n+        # `NumpyExtensionArray` is excluded\n+        if pd.api.types.is_extension_array_dtype(self.array) and not isinstance(\n+            self.array.array,\n+            pd.arrays.NumpyExtensionArray,  # type: ignore[attr-defined]\n+        ):\n             from xarray.core.extension_array import PandasExtensionArray\n \n             return PandasExtensionArray(self.array.array)\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::PandasIndexingAdapter::get_duck_array"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/variable.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -63,6 +63,11 @@",
+          "snippet": " NON_NUMPY_SUPPORTED_ARRAY_TYPES = (\n )\n # https://github.com/python/mypy/issues/224\n BASIC_INDEXING_TYPES = integer_types + (slice,)\n+UNSUPPORTED_EXTENSION_ARRAY_TYPES = (\n+    pd.arrays.DatetimeArray,\n+    pd.arrays.TimedeltaArray,\n+    pd.arrays.NumpyExtensionArray,  # type: ignore[attr-defined]\n+)\n \n if TYPE_CHECKING:\n     from xarray.core.types import (",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "xarray/core/variable.py::UNSUPPORTED_EXTENSION_ARRAY_TYPES"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -190,6 +195,8 @@",
+          "snippet": " def _maybe_wrap_data(data):\n     \"\"\"\n     if isinstance(data, pd.Index):\n         return PandasIndexingAdapter(data)\n+    if isinstance(data, UNSUPPORTED_EXTENSION_ARRAY_TYPES):\n+        return data.to_numpy()\n     if isinstance(data, pd.api.extensions.ExtensionArray):\n         return PandasExtensionArray(data)\n     return data",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/variable.py::_maybe_wrap_data"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -251,7 +258,14 @@",
+          "snippet": " def as_compatible_data(\n \n     # we don't want nested self-described arrays\n     if isinstance(data, pd.Series | pd.DataFrame):\n-        pandas_data = data.values\n+        if (\n+            isinstance(data, pd.Series)\n+            and pd.api.types.is_extension_array_dtype(data)\n+            and not isinstance(data.array, UNSUPPORTED_EXTENSION_ARRAY_TYPES)\n+        ):\n+            pandas_data = data.array\n+        else:\n+            pandas_data = data.values  # type: ignore[assignment]\n         if isinstance(pandas_data, NON_NUMPY_SUPPORTED_ARRAY_TYPES):\n             return convert_non_numpy_type(pandas_data)\n         else:\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/variable.py::as_compatible_data"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/indexes/range_index.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -5,6 +5,7 @@",
+          "snippet": " from typing import Any\n import numpy as np\n import pandas as pd\n \n+from xarray.core import duck_array_ops\n from xarray.core.coordinate_transform import CoordinateTransform\n from xarray.core.dataarray import DataArray\n from xarray.core.indexes import CoordinateTransformIndex, Index, PandasIndex",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/indexes/range_index.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -320,7 +321,9 @@",
+          "snippet": " class RangeIndex(CoordinateTransformIndex):\n \n         if isinstance(idxer, slice):\n             return RangeIndex(self.transform.slice(idxer))\n-        elif (isinstance(idxer, Variable) and idxer.ndim > 1) or np.ndim(idxer) == 0:\n+        elif (isinstance(idxer, Variable) and idxer.ndim > 1) or duck_array_ops.ndim(\n+            idxer\n+        ) == 0:\n             return None\n         else:\n             values = self.transform.forward({self.dim: np.asarray(idxer)})[",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/indexes/range_index.py::RangeIndex::isel"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

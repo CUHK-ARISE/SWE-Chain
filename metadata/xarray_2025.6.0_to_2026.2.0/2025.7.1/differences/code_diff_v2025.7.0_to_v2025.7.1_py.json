@@ -1,0 +1,998 @@
+{
+  "old_dir": ".packages/xarray/2025.7.0",
+  "new_dir": ".packages/xarray/2025.7.1",
+  "extracted_at": "2026-03-26T21:25:01.002696",
+  "diff_file": "metadata/xarray_upgrade/v2025.7.0_v2025.7.1/code_diff_v2025.7.0_to_v2025.7.1_py.diff",
+  "diff_content": "diff --git a/asv_bench/benchmarks/repr.py b/asv_bench/benchmarks/repr.py\nindex aa4b6cb..68a082f 100644\n--- a/asv_bench/benchmarks/repr.py\n+++ b/asv_bench/benchmarks/repr.py\n@@ -57,3 +57,31 @@ class ReprMultiIndex:\n \n     def time_repr_html(self):\n         self.da._repr_html_()\n+\n+\n+class ReprPandasRangeIndex:\n+    # display a memory-saving pandas.RangeIndex shouldn't trigger memory\n+    # expensive conversion into a numpy array\n+    def setup(self):\n+        index = xr.indexes.PandasIndex(pd.RangeIndex(1_000_000), \"x\")\n+        self.ds = xr.Dataset(coords=xr.Coordinates.from_xindex(index))\n+\n+    def time_repr(self):\n+        repr(self.ds.x)\n+\n+    def time_repr_html(self):\n+        self.ds.x._repr_html_()\n+\n+\n+class ReprXarrayRangeIndex:\n+    # display an Xarray RangeIndex shouldn't trigger memory expensive conversion\n+    # of its lazy coordinate into a numpy array\n+    def setup(self):\n+        index = xr.indexes.RangeIndex.arange(1_000_000, dim=\"x\")\n+        self.ds = xr.Dataset(coords=xr.Coordinates.from_xindex(index))\n+\n+    def time_repr(self):\n+        repr(self.ds.x)\n+\n+    def time_repr_html(self):\n+        self.ds.x._repr_html_()\n\ndiff --git a/xarray/backends/api.py b/xarray/backends/api.py\nindex b80ec92..cfd3ff7 100644\n--- a/xarray/backends/api.py\n+++ b/xarray/backends/api.py\n@@ -36,6 +36,7 @@ from xarray.backends.common import (\n from xarray.backends.locks import _get_scheduler\n from xarray.coders import CFDatetimeCoder, CFTimedeltaCoder\n from xarray.core import indexing\n+from xarray.core.coordinates import Coordinates\n from xarray.core.dataarray import DataArray\n from xarray.core.dataset import Dataset\n from xarray.core.datatree import DataTree\n@@ -379,6 +380,15 @@ def _chunk_ds(\n     return backend_ds._replace(variables)\n \n \n+def _maybe_create_default_indexes(ds):\n+    to_index = {\n+        name: coord.variable\n+        for name, coord in ds.coords.items()\n+        if coord.dims == (name,) and name not in ds.xindexes\n+    }\n+    return ds.assign_coords(Coordinates(to_index))\n+\n+\n def _dataset_from_backend_dataset(\n     backend_ds,\n     filename_or_obj,\n@@ -389,6 +399,7 @@ def _dataset_from_backend_dataset(\n     inline_array,\n     chunked_array_type,\n     from_array_kwargs,\n+    create_default_indexes,\n     **extra_tokens,\n ):\n     if not isinstance(chunks, int | dict) and chunks not in {None, \"auto\"}:\n@@ -397,11 +408,15 @@ def _dataset_from_backend_dataset(\n         )\n \n     _protect_dataset_variables_inplace(backend_ds, cache)\n-    if chunks is None:\n-        ds = backend_ds\n+\n+    if create_default_indexes:\n+        ds = _maybe_create_default_indexes(backend_ds)\n     else:\n+        ds = backend_ds\n+\n+    if chunks is not None:\n         ds = _chunk_ds(\n-            backend_ds,\n+            ds,\n             filename_or_obj,\n             engine,\n             chunks,\n@@ -434,6 +449,7 @@ def _datatree_from_backend_datatree(\n     inline_array,\n     chunked_array_type,\n     from_array_kwargs,\n+    create_default_indexes,\n     **extra_tokens,\n ):\n     if not isinstance(chunks, int | dict) and chunks not in {None, \"auto\"}:\n@@ -442,9 +458,11 @@ def _datatree_from_backend_datatree(\n         )\n \n     _protect_datatree_variables_inplace(backend_tree, cache)\n-    if chunks is None:\n-        tree = backend_tree\n+    if create_default_indexes:\n+        tree = backend_tree.map_over_datasets(_maybe_create_default_indexes)\n     else:\n+        tree = backend_tree\n+    if chunks is not None:\n         tree = DataTree.from_dict(\n             {\n                 path: _chunk_ds(\n@@ -459,11 +477,12 @@ def _datatree_from_backend_datatree(\n                     node=path,\n                     **extra_tokens,\n                 )\n-                for path, [node] in group_subtrees(backend_tree)\n+                for path, [node] in group_subtrees(tree)\n             },\n-            name=backend_tree.name,\n+            name=tree.name,\n         )\n \n+    if create_default_indexes or chunks is not None:\n         for path, [node] in group_subtrees(backend_tree):\n             tree[path].set_close(node._close)\n \n@@ -497,6 +516,7 @@ def open_dataset(\n     concat_characters: bool | Mapping[str, bool] | None = None,\n     decode_coords: Literal[\"coordinates\", \"all\"] | bool | None = None,\n     drop_variables: str | Iterable[str] | None = None,\n+    create_default_indexes: bool = True,\n     inline_array: bool = False,\n     chunked_array_type: str | None = None,\n     from_array_kwargs: dict[str, Any] | None = None,\n@@ -610,6 +630,13 @@ def open_dataset(\n         A variable or list of variables to exclude from being parsed from the\n         dataset. This may be useful to drop variables with problems or\n         inconsistent values.\n+    create_default_indexes : bool, default: True\n+        If True, create pandas indexes for :term:`dimension coordinates <dimension coordinate>`,\n+        which loads the coordinate data into memory. Set it to False if you want to avoid loading\n+        data into memory.\n+\n+        Note that backends can still choose to create other indexes. If you want to control that,\n+        please refer to the backend's documentation.\n     inline_array: bool, default: False\n         How to include the array in the dask task graph.\n         By default(``inline_array=False``) the array is included in a task by\n@@ -702,6 +729,7 @@ def open_dataset(\n         chunked_array_type,\n         from_array_kwargs,\n         drop_variables=drop_variables,\n+        create_default_indexes=create_default_indexes,\n         **decoders,\n         **kwargs,\n     )\n@@ -725,6 +753,7 @@ def open_dataarray(\n     concat_characters: bool | None = None,\n     decode_coords: Literal[\"coordinates\", \"all\"] | bool | None = None,\n     drop_variables: str | Iterable[str] | None = None,\n+    create_default_indexes: bool = True,\n     inline_array: bool = False,\n     chunked_array_type: str | None = None,\n     from_array_kwargs: dict[str, Any] | None = None,\n@@ -833,6 +862,13 @@ def open_dataarray(\n         A variable or list of variables to exclude from being parsed from the\n         dataset. This may be useful to drop variables with problems or\n         inconsistent values.\n+    create_default_indexes : bool, default: True\n+        If True, create pandas indexes for :term:`dimension coordinates <dimension coordinate>`,\n+        which loads the coordinate data into memory. Set it to False if you want to avoid loading\n+        data into memory.\n+\n+        Note that backends can still choose to create other indexes. If you want to control that,\n+        please refer to the backend's documentation.\n     inline_array: bool, default: False\n         How to include the array in the dask task graph.\n         By default(``inline_array=False``) the array is included in a task by\n@@ -890,6 +926,7 @@ def open_dataarray(\n         chunks=chunks,\n         cache=cache,\n         drop_variables=drop_variables,\n+        create_default_indexes=create_default_indexes,\n         inline_array=inline_array,\n         chunked_array_type=chunked_array_type,\n         from_array_kwargs=from_array_kwargs,\n@@ -946,6 +983,7 @@ def open_datatree(\n     concat_characters: bool | Mapping[str, bool] | None = None,\n     decode_coords: Literal[\"coordinates\", \"all\"] | bool | None = None,\n     drop_variables: str | Iterable[str] | None = None,\n+    create_default_indexes: bool = True,\n     inline_array: bool = False,\n     chunked_array_type: str | None = None,\n     from_array_kwargs: dict[str, Any] | None = None,\n@@ -1055,6 +1093,13 @@ def open_datatree(\n         A variable or list of variables to exclude from being parsed from the\n         dataset. This may be useful to drop variables with problems or\n         inconsistent values.\n+    create_default_indexes : bool, default: True\n+        If True, create pandas indexes for :term:`dimension coordinates <dimension coordinate>`,\n+        which loads the coordinate data into memory. Set it to False if you want to avoid loading\n+        data into memory.\n+\n+        Note that backends can still choose to create other indexes. If you want to control that,\n+        please refer to the backend's documentation.\n     inline_array: bool, default: False\n         How to include the array in the dask task graph.\n         By default(``inline_array=False``) the array is included in a task by\n@@ -1148,6 +1193,7 @@ def open_datatree(\n         chunked_array_type,\n         from_array_kwargs,\n         drop_variables=drop_variables,\n+        create_default_indexes=create_default_indexes,\n         **decoders,\n         **kwargs,\n     )\n@@ -1175,6 +1221,7 @@ def open_groups(\n     concat_characters: bool | Mapping[str, bool] | None = None,\n     decode_coords: Literal[\"coordinates\", \"all\"] | bool | None = None,\n     drop_variables: str | Iterable[str] | None = None,\n+    create_default_indexes: bool = True,\n     inline_array: bool = False,\n     chunked_array_type: str | None = None,\n     from_array_kwargs: dict[str, Any] | None = None,\n@@ -1286,6 +1333,13 @@ def open_groups(\n         A variable or list of variables to exclude from being parsed from the\n         dataset. This may be useful to drop variables with problems or\n         inconsistent values.\n+    create_default_indexes : bool, default: True\n+        If True, create pandas indexes for :term:`dimension coordinates <dimension coordinate>`,\n+        which loads the coordinate data into memory. Set it to False if you want to avoid loading\n+        data into memory.\n+\n+        Note that backends can still choose to create other indexes. If you want to control that,\n+        please refer to the backend's documentation.\n     inline_array: bool, default: False\n         How to include the array in the dask task graph.\n         By default(``inline_array=False``) the array is included in a task by\n@@ -1381,6 +1435,7 @@ def open_groups(\n             chunked_array_type,\n             from_array_kwargs,\n             drop_variables=drop_variables,\n+            create_default_indexes=create_default_indexes,\n             **decoders,\n             **kwargs,\n         )\n\ndiff --git a/xarray/backends/common.py b/xarray/backends/common.py\nindex f478c2b..8b56c8a 100644\n--- a/xarray/backends/common.py\n+++ b/xarray/backends/common.py\n@@ -560,11 +560,10 @@ def _infer_dtype(array, name=None):\n \n     native_dtypes = set(np.vectorize(type, otypes=[object])(array.ravel()))\n     if len(native_dtypes) > 1 and native_dtypes != {bytes, str}:\n+        native_dtype_names = \", \".join(x.__name__ for x in native_dtypes)\n         raise ValueError(\n-            \"unable to infer dtype on variable {!r}; object array \"\n-            \"contains mixed native types: {}\".format(\n-                name, \", \".join(x.__name__ for x in native_dtypes)\n-            )\n+            f\"unable to infer dtype on variable {name!r}; object array \"\n+            f\"contains mixed native types: {native_dtype_names}\"\n         )\n \n     element = array[(0,) * array.ndim]\n\ndiff --git a/xarray/backends/store.py b/xarray/backends/store.py\nindex b1b3956..de52aa1 100644\n--- a/xarray/backends/store.py\n+++ b/xarray/backends/store.py\n@@ -9,6 +9,7 @@ from xarray.backends.common import (\n     AbstractDataStore,\n     BackendEntrypoint,\n )\n+from xarray.core.coordinates import Coordinates\n from xarray.core.dataset import Dataset\n \n if TYPE_CHECKING:\n@@ -36,6 +37,7 @@ class StoreBackendEntrypoint(BackendEntrypoint):\n         concat_characters=True,\n         decode_coords=True,\n         drop_variables: str | Iterable[str] | None = None,\n+        set_indexes: bool = True,\n         use_cftime=None,\n         decode_timedelta=None,\n     ) -> Dataset:\n@@ -56,8 +58,19 @@ class StoreBackendEntrypoint(BackendEntrypoint):\n             decode_timedelta=decode_timedelta,\n         )\n \n-        ds = Dataset(vars, attrs=attrs)\n-        ds = ds.set_coords(coord_names.intersection(vars))\n+        # split data and coordinate variables (promote dimension coordinates)\n+        data_vars = {}\n+        coord_vars = {}\n+        for name, var in vars.items():\n+            if name in coord_names or var.dims == (name,):\n+                coord_vars[name] = var\n+            else:\n+                data_vars[name] = var\n+\n+        # explicit Coordinates object with no index passed\n+        coords = Coordinates(coord_vars, indexes={})\n+\n+        ds = Dataset(data_vars, coords=coords, attrs=attrs)\n         ds.set_close(filename_or_obj.close)\n         ds.encoding = encoding\n \n\ndiff --git a/xarray/backends/zarr.py b/xarray/backends/zarr.py\nindex 48405b9..8b26a6b 100644\n--- a/xarray/backends/zarr.py\n+++ b/xarray/backends/zarr.py\n@@ -1347,6 +1347,7 @@ def open_zarr(\n     use_zarr_fill_value_as_mask=None,\n     chunked_array_type: str | None = None,\n     from_array_kwargs: dict[str, Any] | None = None,\n+    create_default_indexes=True,\n     **kwargs,\n ):\n     \"\"\"Load and decode a dataset from a Zarr store.\n@@ -1457,6 +1458,13 @@ def open_zarr(\n         chunked arrays, via whichever chunk manager is specified through the ``chunked_array_type`` kwarg.\n         Defaults to ``{'manager': 'dask'}``, meaning additional kwargs will be passed eventually to\n         :py:func:`dask.array.from_array`. Experimental API that should not be relied upon.\n+    create_default_indexes : bool, default: True\n+        If True, create pandas indexes for :term:`dimension coordinates <dimension coordinate>`,\n+        which loads the coordinate data into memory. Set it to False if you want to avoid loading\n+        data into memory.\n+\n+        Note that backends can still choose to create other indexes. If you want to control that,\n+        please refer to the backend's documentation.\n \n     Returns\n     -------\n@@ -1513,6 +1521,7 @@ def open_zarr(\n         engine=\"zarr\",\n         chunks=chunks,\n         drop_variables=drop_variables,\n+        create_default_indexes=create_default_indexes,\n         chunked_array_type=chunked_array_type,\n         from_array_kwargs=from_array_kwargs,\n         backend_kwargs=backend_kwargs,\n\ndiff --git a/xarray/coding/variables.py b/xarray/coding/variables.py\nindex 3b7be89..eff08c7 100644\n--- a/xarray/coding/variables.py\n+++ b/xarray/coding/variables.py\n@@ -164,10 +164,8 @@ def _check_fill_values(attrs, name, dtype):\n     Issue SerializationWarning if appropriate.\n     \"\"\"\n     raw_fill_dict = {}\n-    [\n+    for attr in (\"missing_value\", \"_FillValue\"):\n         pop_to(attrs, raw_fill_dict, attr, name=name)\n-        for attr in (\"missing_value\", \"_FillValue\")\n-    ]\n     encoded_fill_values = set()\n     for k in list(raw_fill_dict):\n         v = raw_fill_dict[k]\n@@ -376,11 +374,9 @@ class CFMaskCoder(VariableCoder):\n \n         dims, data, attrs, encoding = unpack_for_decoding(variable)\n \n-        # Even if _Unsigned is use, retain on-disk _FillValue\n-        [\n+        # Even if _Unsigned is used, retain on-disk _FillValue\n+        for attr, value in raw_fill_dict.items():\n             safe_setitem(encoding, attr, value, name=name)\n-            for attr, value in raw_fill_dict.items()\n-        ]\n \n         if \"_Unsigned\" in attrs:\n             unsigned = pop_to(attrs, encoding, \"_Unsigned\")\n\ndiff --git a/xarray/computation/apply_ufunc.py b/xarray/computation/apply_ufunc.py\nindex 678c702..00a06e1 100644\n--- a/xarray/computation/apply_ufunc.py\n+++ b/xarray/computation/apply_ufunc.py\n@@ -141,8 +141,13 @@ class _UFuncSignature:\n         return f\"{type(self).__name__}({list(self.input_core_dims)!r}, {list(self.output_core_dims)!r})\"\n \n     def __str__(self):\n-        lhs = \",\".join(\"({})\".format(\",\".join(dims)) for dims in self.input_core_dims)\n-        rhs = \",\".join(\"({})\".format(\",\".join(dims)) for dims in self.output_core_dims)\n+        comma_separated = \",\".join\n+        lhs = comma_separated(\n+            f\"({comma_separated(dims)})\" for dims in self.input_core_dims\n+        )\n+        rhs = comma_separated(\n+            f\"({comma_separated(dims)})\" for dims in self.output_core_dims\n+        )\n         return f\"{lhs}->{rhs}\"\n \n     def to_gufunc_string(self, exclude_dims=frozenset()):\n\ndiff --git a/xarray/computation/rolling.py b/xarray/computation/rolling.py\nindex e771856..adb8a5e 100644\n--- a/xarray/computation/rolling.py\n+++ b/xarray/computation/rolling.py\n@@ -132,7 +132,7 @@ class Rolling(Generic[T_Xarray]):\n         \"\"\"provide a nice str repr of our rolling object\"\"\"\n \n         attrs = \",\".join(\n-            \"{k}->{v}{c}\".format(k=k, v=w, c=\"(center)\" if c else \"\")\n+            f\"{k}->{w}{'(center)' if c else ''}\"\n             for k, w, c in zip(self.dim, self.window, self.center, strict=True)\n         )\n         return f\"{self.__class__.__name__} [{attrs}]\"\n\ndiff --git a/xarray/core/accessor_str.py b/xarray/core/accessor_str.py\nindex 0bab929..f16dbe0 100644\n--- a/xarray/core/accessor_str.py\n+++ b/xarray/core/accessor_str.py\n@@ -662,10 +662,11 @@ class StringAccessor(Generic[T_DataArray]):\n         \"\"\"\n         args = tuple(self._stringify(x) for x in args)\n         kwargs = {key: self._stringify(val) for key, val in kwargs.items()}\n-        func = lambda x, *args, **kwargs: self._obj.dtype.type.format(\n-            x, *args, **kwargs\n+        return self._apply(\n+            func=self._obj.dtype.type.format,\n+            func_args=args,\n+            func_kwargs={\"kwargs\": kwargs},\n         )\n-        return self._apply(func=func, func_args=args, func_kwargs={\"kwargs\": kwargs})\n \n     def capitalize(self) -> T_DataArray:\n         \"\"\"\n\ndiff --git a/xarray/core/coordinate_transform.py b/xarray/core/coordinate_transform.py\nindex 94b3b10..02cbbc1 100644\n--- a/xarray/core/coordinate_transform.py\n+++ b/xarray/core/coordinate_transform.py\n@@ -9,8 +9,9 @@ import numpy as np\n class CoordinateTransform:\n     \"\"\"Abstract coordinate transform with dimension & coordinate names.\n \n-    EXPERIMENTAL (not ready for public use yet).\n-\n+    .. caution::\n+        This API is experimental and subject to change. Please report any bugs or surprising\n+        behaviour you encounter.\n     \"\"\"\n \n     coord_names: tuple[Hashable, ...]\n@@ -80,7 +81,7 @@ class CoordinateTransform:\n         Parameters\n         ----------\n         other : CoordinateTransform\n-            The other Index object to compare with this object.\n+            The other CoordinateTransform object to compare with this object.\n         exclude : frozenset of hashable, optional\n             Dimensions excluded from checking. It is None by default, (i.e.,\n             when this method is not called in the context of alignment). For a\n\ndiff --git a/xarray/core/dataarray.py b/xarray/core/dataarray.py\nindex 0bfb0b7..73b0eb1 100644\n--- a/xarray/core/dataarray.py\n+++ b/xarray/core/dataarray.py\n@@ -6915,7 +6915,7 @@ class DataArray(\n         :ref:`groupby`\n             Users guide explanation of how to group and bin data.\n \n-        :doc:`xarray-tutorial:intermediate/01-high-level-computation-patterns`\n+        :doc:`xarray-tutorial:intermediate/computation/01-high-level-computation-patterns`\n             Tutorial on :py:func:`~xarray.DataArray.Groupby` for windowed computation\n \n         :doc:`xarray-tutorial:fundamentals/03.2_groupby_with_xarray`\n\ndiff --git a/xarray/core/dataset.py b/xarray/core/dataset.py\nindex 6de626a..0f2dd26 100644\n--- a/xarray/core/dataset.py\n+++ b/xarray/core/dataset.py\n@@ -4940,6 +4940,20 @@ class Dataset(\n         if isinstance(index, PandasMultiIndex):\n             coord_names = [index.dim] + list(coord_names)\n \n+        # Check for extra variables that don't match the coordinate names\n+        extra_vars = set(new_coord_vars) - set(coord_names)\n+        if extra_vars:\n+            extra_vars_str = \", \".join(f\"'{name}'\" for name in extra_vars)\n+            coord_names_str = \", \".join(f\"'{name}'\" for name in coord_names)\n+            raise ValueError(\n+                f\"The index created extra variables {extra_vars_str} that are not \"\n+                f\"in the list of coordinates {coord_names_str}. \"\n+                f\"Use a factory method pattern instead:\\n\"\n+                f\"  index = {index_cls.__name__}.from_variables(ds, {list(coord_names)!r})\\n\"\n+                f\"  coords = xr.Coordinates.from_xindex(index)\\n\"\n+                f\"  ds = ds.assign_coords(coords)\"\n+            )\n+\n         variables: dict[Hashable, Variable]\n         indexes: dict[Hashable, Index]\n \n@@ -9941,7 +9955,7 @@ class Dataset(\n         :ref:`groupby`\n             Users guide explanation of how to group and bin data.\n \n-        :doc:`xarray-tutorial:intermediate/01-high-level-computation-patterns`\n+        :doc:`xarray-tutorial:intermediate/computation/01-high-level-computation-patterns`\n             Tutorial on :py:func:`~xarray.Dataset.Groupby` for windowed computation.\n \n         :doc:`xarray-tutorial:fundamentals/03.2_groupby_with_xarray`\n\ndiff --git a/xarray/core/formatting.py b/xarray/core/formatting.py\nindex 14e70b0..3a06cf1 100644\n--- a/xarray/core/formatting.py\n+++ b/xarray/core/formatting.py\n@@ -20,7 +20,11 @@ from pandas.errors import OutOfBoundsDatetime\n from xarray.core.datatree_render import RenderDataTree\n from xarray.core.duck_array_ops import array_all, array_any, array_equiv, astype, ravel\n from xarray.core.extension_array import PandasExtensionArray\n-from xarray.core.indexing import MemoryCachedArray\n+from xarray.core.indexing import (\n+    BasicIndexer,\n+    ExplicitlyIndexed,\n+    MemoryCachedArray,\n+)\n from xarray.core.options import OPTIONS, _get_boolean_with_default\n from xarray.core.treenode import group_subtrees\n from xarray.core.utils import is_duck_array\n@@ -87,6 +91,8 @@ def first_n_items(array, n_desired):\n \n     if n_desired < array.size:\n         indexer = _get_indexer_at_least_n_items(array.shape, n_desired, from_end=False)\n+        if isinstance(array, ExplicitlyIndexed):\n+            indexer = BasicIndexer(indexer)\n         array = array[indexer]\n \n     # We pass variable objects in to handle indexing\n@@ -111,6 +117,8 @@ def last_n_items(array, n_desired):\n \n     if n_desired < array.size:\n         indexer = _get_indexer_at_least_n_items(array.shape, n_desired, from_end=True)\n+        if isinstance(array, ExplicitlyIndexed):\n+            indexer = BasicIndexer(indexer)\n         array = array[indexer]\n \n     # We pass variable objects in to handle indexing\n@@ -340,17 +348,17 @@ def summarize_variable(\n         first_col = pretty_print(first_col, col_width)\n \n     if variable.dims:\n-        dims_str = \"({}) \".format(\", \".join(map(str, variable.dims)))\n+        dims_str = \", \".join(map(str, variable.dims))\n+        dims_str = f\"({dims_str}) \"\n     else:\n         dims_str = \"\"\n \n-    nbytes_str = f\" {render_human_readable_nbytes(variable.nbytes)}\"\n-    front_str = f\"{first_col}{dims_str}{variable.dtype}{nbytes_str} \"\n+    front_str = f\"{first_col}{dims_str}{variable.dtype} {render_human_readable_nbytes(variable.nbytes)} \"\n \n     values_width = max_width - len(front_str)\n     values_str = inline_variable_array_repr(variable, values_width)\n \n-    return front_str + values_str\n+    return f\"{front_str}{values_str}\"\n \n \n def summarize_attr(key, value, col_width=None):\n@@ -659,6 +667,7 @@ def short_array_repr(array):\n def short_data_repr(array):\n     \"\"\"Format \"data\" for DataArray and Variable.\"\"\"\n     internal_data = getattr(array, \"variable\", array)._data\n+\n     if isinstance(array, np.ndarray):\n         return short_array_repr(array)\n     elif is_duck_array(internal_data):\n@@ -989,9 +998,10 @@ def diff_array_repr(a, b, compat):\n         ):\n             summary.append(coords_diff)\n \n-    if compat == \"identical\":\n-        if attrs_diff := diff_attrs_repr(a.attrs, b.attrs, compat):\n-            summary.append(attrs_diff)\n+    if compat == \"identical\" and (\n+        attrs_diff := diff_attrs_repr(a.attrs, b.attrs, compat)\n+    ):\n+        summary.append(attrs_diff)\n \n     return \"\\n\".join(summary)\n \n@@ -1029,9 +1039,10 @@ def diff_dataset_repr(a, b, compat):\n     ):\n         summary.append(data_diff)\n \n-    if compat == \"identical\":\n-        if attrs_diff := diff_attrs_repr(a.attrs, b.attrs, compat):\n-            summary.append(attrs_diff)\n+    if compat == \"identical\" and (\n+        attrs_diff := diff_attrs_repr(a.attrs, b.attrs, compat)\n+    ):\n+        summary.append(attrs_diff)\n \n     return \"\\n\".join(summary)\n \n\ndiff --git a/xarray/core/indexes.py b/xarray/core/indexes.py\nindex 1756fb5..c233c69 100644\n--- a/xarray/core/indexes.py\n+++ b/xarray/core/indexes.py\n@@ -768,10 +768,12 @@ class PandasIndex(Index):\n \n         if not indexes:\n             coord_dtype = None\n-        elif len(set(idx.coord_dtype for idx in indexes)) == 1:\n-            coord_dtype = indexes[0].coord_dtype\n         else:\n-            coord_dtype = np.result_type(*[idx.coord_dtype for idx in indexes])\n+            indexes_coord_dtypes = {idx.coord_dtype for idx in indexes}\n+            if len(indexes_coord_dtypes) == 1:\n+                coord_dtype = next(iter(indexes_coord_dtypes))\n+            else:\n+                coord_dtype = np.result_type(*indexes_coord_dtypes)\n \n         return cls(new_pd_index, dim=dim, coord_dtype=coord_dtype)\n \n@@ -1247,7 +1249,7 @@ class PandasMultiIndex(PandasIndex):\n                 level = name\n                 dtype = self.level_coords_dtype[name]  # type: ignore[index]  # TODO: are Hashables ok?\n \n-            var = variables.get(name, None)\n+            var = variables.get(name)\n             if var is not None:\n                 attrs = var.attrs\n                 encoding = var.encoding\n@@ -1453,14 +1455,15 @@ class PandasMultiIndex(PandasIndex):\n class CoordinateTransformIndex(Index):\n     \"\"\"Helper class for creating Xarray indexes based on coordinate transforms.\n \n-    EXPERIMENTAL (not ready for public use yet).\n-\n     - wraps a :py:class:`CoordinateTransform` instance\n     - takes care of creating the index (lazy) coordinates\n     - supports point-wise label-based selection\n     - supports exact alignment only, by comparing indexes based on their transform\n       (not on their explicit coordinate labels)\n \n+    .. caution::\n+        This API is experimental and subject to change. Please report any bugs or surprising\n+        behaviour you encounter.\n     \"\"\"\n \n     transform: CoordinateTransform\n\ndiff --git a/xarray/core/indexing.py b/xarray/core/indexing.py\nindex 35278ef..8e4458f 100644\n--- a/xarray/core/indexing.py\n+++ b/xarray/core/indexing.py\n@@ -9,7 +9,6 @@ from collections.abc import Callable, Hashable, Iterable, Mapping\n from contextlib import suppress\n from dataclasses import dataclass, field\n from datetime import timedelta\n-from html import escape\n from typing import TYPE_CHECKING, Any, cast, overload\n \n import numpy as np\n@@ -20,7 +19,6 @@ from packaging.version import Version\n from xarray.core import duck_array_ops\n from xarray.core.coordinate_transform import CoordinateTransform\n from xarray.core.nputils import NumpyVIndexAdapter\n-from xarray.core.options import OPTIONS\n from xarray.core.types import T_Xarray\n from xarray.core.utils import (\n     NDArrayMixin,\n@@ -1775,10 +1773,25 @@ class PandasIndexingAdapter(ExplicitlyIndexedNDArrayMixin):\n         else:\n             self._dtype = np.dtype(cast(DTypeLike, dtype))\n \n+    @property\n+    def _in_memory(self) -> bool:\n+        # prevent costly conversion of a memory-saving pd.RangeIndex into a\n+        # large numpy array.\n+        return not isinstance(self.array, pd.RangeIndex)\n+\n     @property\n     def dtype(self) -> np.dtype | pd.api.extensions.ExtensionDtype:  # type: ignore[override]\n         return self._dtype\n \n+    def _get_numpy_dtype(self, dtype: np.typing.DTypeLike | None = None) -> np.dtype:\n+        if dtype is None:\n+            if is_valid_numpy_dtype(self.dtype):\n+                return cast(np.dtype, self.dtype)\n+            else:\n+                return get_valid_numpy_dtype(self.array)\n+        else:\n+            return np.dtype(dtype)\n+\n     def __array__(\n         self,\n         dtype: np.typing.DTypeLike | None = None,\n@@ -1786,11 +1799,9 @@ class PandasIndexingAdapter(ExplicitlyIndexedNDArrayMixin):\n         *,\n         copy: bool | None = None,\n     ) -> np.ndarray:\n-        if dtype is None and is_valid_numpy_dtype(self.dtype):\n-            dtype = cast(np.dtype, self.dtype)\n-        else:\n-            dtype = get_valid_numpy_dtype(self.array)\n+        dtype = self._get_numpy_dtype(dtype)\n         array = self.array\n+\n         if isinstance(array, pd.PeriodIndex):\n             with suppress(AttributeError):\n                 # this might not be public API\n@@ -1834,98 +1845,61 @@ class PandasIndexingAdapter(ExplicitlyIndexedNDArrayMixin):\n             # numpy fails to convert pd.Timestamp to np.datetime64[ns]\n             item = np.asarray(item.to_datetime64())\n         elif self.dtype != object:\n-            dtype = self.dtype\n-            if pd.api.types.is_extension_array_dtype(dtype):\n-                dtype = get_valid_numpy_dtype(self.array)\n-            item = np.asarray(item, dtype=cast(np.dtype, dtype))\n+            dtype = self._get_numpy_dtype()\n+            item = np.asarray(item, dtype=dtype)\n \n         # as for numpy.ndarray indexing, we always want the result to be\n         # a NumPy array.\n         return to_0d_array(item)\n \n-    def _prepare_key(self, key: Any | tuple[Any, ...]) -> tuple[Any, ...]:\n-        if isinstance(key, tuple) and len(key) == 1:\n+    def _index_get(\n+        self, indexer: ExplicitIndexer, func_name: str\n+    ) -> PandasIndexingAdapter | np.ndarray:\n+        key = indexer.tuple\n+\n+        if len(key) == 1:\n             # unpack key so it can index a pandas.Index object (pandas.Index\n             # objects don't like tuples)\n             (key,) = key\n \n-        return key\n+        # if multidimensional key, convert the index to numpy array and index the latter\n+        if getattr(key, \"ndim\", 0) > 1:\n+            indexable = NumpyIndexingAdapter(np.asarray(self))\n+            return getattr(indexable, func_name)(indexer)\n+\n+        # otherwise index the pandas index then re-wrap or convert the result\n+        result = self.array[key]\n \n-    def _handle_result(\n-        self, result: Any\n-    ) -> (\n-        PandasIndexingAdapter\n-        | NumpyIndexingAdapter\n-        | np.ndarray\n-        | np.datetime64\n-        | np.timedelta64\n-    ):\n         if isinstance(result, pd.Index):\n             return type(self)(result, dtype=self.dtype)\n         else:\n             return self._convert_scalar(result)\n \n-    def _oindex_get(\n-        self, indexer: OuterIndexer\n-    ) -> (\n-        PandasIndexingAdapter\n-        | NumpyIndexingAdapter\n-        | np.ndarray\n-        | np.datetime64\n-        | np.timedelta64\n-    ):\n-        key = self._prepare_key(indexer.tuple)\n-\n-        if getattr(key, \"ndim\", 0) > 1:  # Return np-array if multidimensional\n-            indexable = NumpyIndexingAdapter(np.asarray(self))\n-            return indexable.oindex[indexer]\n-\n-        result = self.array[key]\n-\n-        return self._handle_result(result)\n+    def _oindex_get(self, indexer: OuterIndexer) -> PandasIndexingAdapter | np.ndarray:\n+        return self._index_get(indexer, \"_oindex_get\")\n \n     def _vindex_get(\n         self, indexer: VectorizedIndexer\n-    ) -> (\n-        PandasIndexingAdapter\n-        | NumpyIndexingAdapter\n-        | np.ndarray\n-        | np.datetime64\n-        | np.timedelta64\n-    ):\n+    ) -> PandasIndexingAdapter | np.ndarray:\n         _assert_not_chunked_indexer(indexer.tuple)\n-        key = self._prepare_key(indexer.tuple)\n-\n-        if getattr(key, \"ndim\", 0) > 1:  # Return np-array if multidimensional\n-            indexable = NumpyIndexingAdapter(np.asarray(self))\n-            return indexable.vindex[indexer]\n-\n-        result = self.array[key]\n-\n-        return self._handle_result(result)\n+        return self._index_get(indexer, \"_vindex_get\")\n \n     def __getitem__(\n         self, indexer: ExplicitIndexer\n-    ) -> (\n-        PandasIndexingAdapter\n-        | NumpyIndexingAdapter\n-        | np.ndarray\n-        | np.datetime64\n-        | np.timedelta64\n-    ):\n-        key = self._prepare_key(indexer.tuple)\n-\n-        if getattr(key, \"ndim\", 0) > 1:  # Return np-array if multidimensional\n-            indexable = NumpyIndexingAdapter(np.asarray(self))\n-            return indexable[indexer]\n-\n-        result = self.array[key]\n-\n-        return self._handle_result(result)\n+    ) -> PandasIndexingAdapter | np.ndarray:\n+        return self._index_get(indexer, \"__getitem__\")\n \n     def transpose(self, order) -> pd.Index:\n         return self.array  # self.array should be always one-dimensional\n \n+    def _repr_inline_(self, max_width: int) -> str:\n+        # we want to display values in the inline repr for lazy coordinates too\n+        # (pd.RangeIndex and pd.MultiIndex). `format_array_flat` prevents loading\n+        # the whole array in memory.\n+        from xarray.core.formatting import format_array_flat\n+\n+        return format_array_flat(self, max_width)\n+\n     def __repr__(self) -> str:\n         return f\"{type(self).__name__}(array={self.array!r}, dtype={self.dtype!r})\"\n \n@@ -1944,7 +1918,9 @@ class PandasIndexingAdapter(ExplicitlyIndexedNDArrayMixin):\n     def nbytes(self) -> int:\n         if pd.api.types.is_extension_array_dtype(self.dtype):\n             return self.array.nbytes\n-        return cast(np.dtype, self.dtype).itemsize * len(self.array)\n+\n+        dtype = self._get_numpy_dtype()\n+        return dtype.itemsize * len(self.array)\n \n \n class PandasMultiIndexingAdapter(PandasIndexingAdapter):\n@@ -1977,8 +1953,8 @@ class PandasMultiIndexingAdapter(PandasIndexingAdapter):\n         *,\n         copy: bool | None = None,\n     ) -> np.ndarray:\n-        if dtype is None:\n-            dtype = cast(np.dtype, self.dtype)\n+        dtype = self._get_numpy_dtype(dtype)\n+\n         if self.level is not None:\n             return np.asarray(\n                 self.array.get_level_values(self.level).values, dtype=dtype\n@@ -1986,47 +1962,28 @@ class PandasMultiIndexingAdapter(PandasIndexingAdapter):\n         else:\n             return super().__array__(dtype, copy=copy)\n \n-    def _convert_scalar(self, item):\n+    @property\n+    def _in_memory(self) -> bool:\n+        # The pd.MultiIndex's data is fully in memory, but it has a different\n+        # layout than the level and dimension coordinate arrays. Marking this\n+        # adapter class as a \"lazy\" array will prevent costly conversion when,\n+        # e.g., formatting the Xarray reprs.\n+        return False\n+\n+    def _convert_scalar(self, item: Any):\n         if isinstance(item, tuple) and self.level is not None:\n             idx = tuple(self.array.names).index(self.level)\n             item = item[idx]\n         return super()._convert_scalar(item)\n \n-    def _oindex_get(\n-        self, indexer: OuterIndexer\n-    ) -> (\n-        PandasIndexingAdapter\n-        | NumpyIndexingAdapter\n-        | np.ndarray\n-        | np.datetime64\n-        | np.timedelta64\n-    ):\n-        result = super()._oindex_get(indexer)\n-        if isinstance(result, type(self)):\n-            result.level = self.level\n-        return result\n-\n-    def _vindex_get(\n-        self, indexer: VectorizedIndexer\n-    ) -> (\n-        PandasIndexingAdapter\n-        | NumpyIndexingAdapter\n-        | np.ndarray\n-        | np.datetime64\n-        | np.timedelta64\n-    ):\n-        result = super()._vindex_get(indexer)\n+    def _index_get(\n+        self, indexer: ExplicitIndexer, func_name: str\n+    ) -> PandasIndexingAdapter | np.ndarray:\n+        result = super()._index_get(indexer, func_name)\n         if isinstance(result, type(self)):\n             result.level = self.level\n         return result\n \n-    def __getitem__(self, indexer: ExplicitIndexer):\n-        result = super().__getitem__(indexer)\n-        if isinstance(result, type(self)):\n-            result.level = self.level\n-\n-        return result\n-\n     def __repr__(self) -> str:\n         if self.level is None:\n             return super().__repr__()\n@@ -2036,31 +1993,11 @@ class PandasMultiIndexingAdapter(PandasIndexingAdapter):\n             )\n             return f\"{type(self).__name__}{props}\"\n \n-    def _get_array_subset(self) -> np.ndarray:\n-        # used to speed-up the repr for big multi-indexes\n-        threshold = max(100, OPTIONS[\"display_values_threshold\"] + 2)\n-        if self.size > threshold:\n-            pos = threshold // 2\n-            indices = np.concatenate([np.arange(0, pos), np.arange(-pos, 0)])\n-            subset = self[OuterIndexer((indices,))]\n-        else:\n-            subset = self\n-\n-        return np.asarray(subset)\n-\n     def _repr_inline_(self, max_width: int) -> str:\n-        from xarray.core.formatting import format_array_flat\n-\n         if self.level is None:\n             return \"MultiIndex\"\n         else:\n-            return format_array_flat(self._get_array_subset(), max_width)\n-\n-    def _repr_html_(self) -> str:\n-        from xarray.core.formatting import short_array_repr\n-\n-        array_repr = short_array_repr(self._get_array_subset())\n-        return f\"<pre>{escape(array_repr)}</pre>\"\n+            return super()._repr_inline_(max_width=max_width)\n \n     def copy(self, deep: bool = True) -> Self:\n         # see PandasIndexingAdapter.copy\n@@ -2097,6 +2034,10 @@ class CoordinateTransformIndexingAdapter(ExplicitlyIndexedNDArrayMixin):\n     def shape(self) -> tuple[int, ...]:\n         return tuple(self._transform.dim_size.values())\n \n+    @property\n+    def _in_memory(self) -> bool:\n+        return False\n+\n     def get_duck_array(self) -> np.ndarray:\n         all_coords = self._transform.generate_coords(dims=self._dims)\n         return np.asarray(all_coords[self._coord_name])\n@@ -2157,23 +2098,9 @@ class CoordinateTransformIndexingAdapter(ExplicitlyIndexedNDArrayMixin):\n     def __repr__(self: Any) -> str:\n         return f\"{type(self).__name__}(transform={self._transform!r})\"\n \n-    def _get_array_subset(self) -> np.ndarray:\n-        threshold = max(100, OPTIONS[\"display_values_threshold\"] + 2)\n-        if self.size > threshold:\n-            pos = threshold // 2\n-            flat_indices = np.concatenate(\n-                [np.arange(0, pos), np.arange(self.size - pos, self.size)]\n-            )\n-            subset = self.vindex[\n-                VectorizedIndexer(np.unravel_index(flat_indices, self.shape))\n-            ]\n-        else:\n-            subset = self\n-\n-        return np.asarray(subset)\n-\n     def _repr_inline_(self, max_width: int) -> str:\n-        \"\"\"Good to see some labels even for a lazy coordinate.\"\"\"\n+        # we want to display values in the inline repr for this lazy coordinate\n+        # `format_array_flat` prevents loading the whole array in memory.\n         from xarray.core.formatting import format_array_flat\n \n-        return format_array_flat(self._get_array_subset(), max_width)\n+        return format_array_flat(self, max_width)\n\ndiff --git a/xarray/core/resample_cftime.py b/xarray/core/resample_cftime.py\nindex 210cea2..9b636f6 100644\n--- a/xarray/core/resample_cftime.py\n+++ b/xarray/core/resample_cftime.py\n@@ -84,22 +84,16 @@ class CFTimeGrouper:\n         self.freq = to_offset(freq)\n         self.origin = origin\n \n-        if isinstance(self.freq, MonthEnd | QuarterEnd | YearEnd):\n-            if closed is None:\n-                self.closed = \"right\"\n-            else:\n-                self.closed = closed\n-            if label is None:\n-                self.label = \"right\"\n-            else:\n-                self.label = label\n-        # The backward resample sets ``closed`` to ``'right'`` by default\n-        # since the last value should be considered as the edge point for\n-        # the last bin. When origin in \"end\" or \"end_day\", the value for a\n-        # specific ``cftime.datetime`` index stands for the resample result\n-        # from the current ``cftime.datetime`` minus ``freq`` to the current\n-        # ``cftime.datetime`` with a right close.\n-        elif self.origin in [\"end\", \"end_day\"]:\n+        if isinstance(self.freq, MonthEnd | QuarterEnd | YearEnd) or self.origin in [\n+            \"end\",\n+            \"end_day\",\n+        ]:\n+            # The backward resample sets ``closed`` to ``'right'`` by default\n+            # since the last value should be considered as the edge point for\n+            # the last bin. When origin in \"end\" or \"end_day\", the value for a\n+            # specific ``cftime.datetime`` index stands for the resample result\n+            # from the current ``cftime.datetime`` minus ``freq`` to the current\n+            # ``cftime.datetime`` with a right close.\n             if closed is None:\n                 self.closed = \"right\"\n             else:\n\ndiff --git a/xarray/core/treenode.py b/xarray/core/treenode.py\nindex df58f7a..a38ec6b 100644\n--- a/xarray/core/treenode.py\n+++ b/xarray/core/treenode.py\n@@ -752,7 +752,7 @@ class NamedNode(TreeNode, Generic[Tree]):\n             )\n \n         this_path = NodePath(self.path)\n-        if other.path in list(parent.path for parent in (self, *self.parents)):\n+        if any(other.path == parent.path for parent in (self, *self.parents)):\n             return str(this_path.relative_to(other.path))\n         else:\n             common_ancestor = self.find_common_ancestor(other)\n\ndiff --git a/xarray/core/variable.py b/xarray/core/variable.py\nindex 00d97e8..bcc2ca4 100644\n--- a/xarray/core/variable.py\n+++ b/xarray/core/variable.py\n@@ -23,6 +23,7 @@ from xarray.core.common import AbstractArray\n from xarray.core.extension_array import PandasExtensionArray\n from xarray.core.indexing import (\n     BasicIndexer,\n+    CoordinateTransformIndexingAdapter,\n     OuterIndexer,\n     PandasIndexingAdapter,\n     VectorizedIndexer,\n@@ -403,10 +404,15 @@ class Variable(NamedArray, AbstractArray, VariableArithmetic):\n             return cls_(dims_, data, attrs_)\n \n     @property\n-    def _in_memory(self):\n+    def _in_memory(self) -> bool:\n+        if isinstance(\n+            self._data, PandasIndexingAdapter | CoordinateTransformIndexingAdapter\n+        ):\n+            return self._data._in_memory\n+\n         return isinstance(\n             self._data,\n-            np.ndarray | np.number | PandasIndexingAdapter | PandasExtensionArray,\n+            np.ndarray | np.number | PandasExtensionArray,\n         ) or (\n             isinstance(self._data, indexing.MemoryCachedArray)\n             and isinstance(self._data.array, indexing.NumpyIndexingAdapter)\n\ndiff --git a/xarray/groupers.py b/xarray/groupers.py\nindex 3a27d72..4424c65 100644\n--- a/xarray/groupers.py\n+++ b/xarray/groupers.py\n@@ -617,10 +617,10 @@ def season_to_month_tuple(seasons: Sequence[str]) -> tuple[tuple[int, ...], ...]\n     ((12, 1, 2, 3), (9, 10, 11, 12))\n     \"\"\"\n     initials = \"JFMAMJJASOND\"\n-    starts = dict(\n-        (\"\".join(s), i + 1)\n+    starts = {\n+        \"\".join(s): i + 1\n         for s, i in zip(sliding_window(2, initials + \"J\"), range(12), strict=True)\n-    )\n+    }\n     result: list[tuple[int, ...]] = []\n     for i, season in enumerate(seasons):\n         if len(season) == 1:\n@@ -701,25 +701,23 @@ def find_independent_seasons(seasons: Sequence[str]) -> Sequence[SeasonsGroup]:\n     grouped = defaultdict(list)\n     codes = defaultdict(list)\n     seen: set[tuple[int, ...]] = set()\n-    idx = 0\n     # This is quadratic, but the number of seasons is at most 12\n     for i, current in enumerate(season_inds):\n         # Start with a group\n         if current not in seen:\n-            grouped[idx].append(current)\n-            codes[idx].append(i)\n+            grouped[i].append(current)\n+            codes[i].append(i)\n             seen.add(current)\n \n         # Loop through remaining groups, and look for overlaps\n         for j, second in enumerate(season_inds[i:]):\n-            if not (set(chain(*grouped[idx])) & set(second)) and second not in seen:\n-                grouped[idx].append(second)\n-                codes[idx].append(j + i)\n+            if not (set(chain(*grouped[i])) & set(second)) and second not in seen:\n+                grouped[i].append(second)\n+                codes[i].append(j + i)\n                 seen.add(second)\n         if len(seen) == len(seasons):\n             break\n-        # found all non-overlapping groups for this row, increment and start over\n-        idx += 1\n+        # found all non-overlapping groups for this row start over\n \n     grouped_ints = tuple(tuple(idx) for idx in grouped.values() if idx)\n     return [\n\ndiff --git a/xarray/indexes/__init__.py b/xarray/indexes/__init__.py\nindex c53a4b8..20aa5a7 100644\n--- a/xarray/indexes/__init__.py\n+++ b/xarray/indexes/__init__.py\n@@ -10,13 +10,16 @@ from xarray.core.indexes import (\n     PandasIndex,\n     PandasMultiIndex,\n )\n+from xarray.indexes.nd_point_index import NDPointIndex, TreeAdapter\n from xarray.indexes.range_index import RangeIndex\n \n __all__ = [\n     \"CoordinateTransform\",\n     \"CoordinateTransformIndex\",\n     \"Index\",\n+    \"NDPointIndex\",\n     \"PandasIndex\",\n     \"PandasMultiIndex\",\n     \"RangeIndex\",\n+    \"TreeAdapter\",\n ]\n\ndiff --git a/xarray/indexes/nd_point_index.py b/xarray/indexes/nd_point_index.py\nnew file mode 100644\nindex 0000000..95af1dd\n--- /dev/null\n+++ b/xarray/indexes/nd_point_index.py\n@@ -0,0 +1,398 @@\n+from __future__ import annotations\n+\n+import abc\n+from collections.abc import Hashable, Iterable, Mapping\n+from typing import TYPE_CHECKING, Any, Generic, TypeVar\n+\n+import numpy as np\n+\n+from xarray.core.dataarray import DataArray\n+from xarray.core.indexes import Index\n+from xarray.core.indexing import IndexSelResult\n+from xarray.core.utils import is_scalar\n+from xarray.core.variable import Variable\n+from xarray.structure.alignment import broadcast\n+\n+if TYPE_CHECKING:\n+    from scipy.spatial import KDTree\n+\n+    from xarray.core.types import Self\n+\n+\n+class TreeAdapter(abc.ABC):\n+    \"\"\"Lightweight adapter abstract class for plugging in 3rd-party structures\n+    like :py:class:`scipy.spatial.KDTree` or :py:class:`sklearn.neighbors.KDTree`\n+    into :py:class:`~xarray.indexes.NDPointIndex`.\n+\n+    \"\"\"\n+\n+    @abc.abstractmethod\n+    def __init__(self, points: np.ndarray, *, options: Mapping[str, Any]):\n+        \"\"\"\n+        Parameters\n+        ----------\n+        points : ndarray of shape (n_points, n_coordinates)\n+            Two-dimensional array of points/samples (rows) and their\n+            corresponding coordinate labels (columns) to index.\n+        \"\"\"\n+        ...\n+\n+    @abc.abstractmethod\n+    def query(self, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:\n+        \"\"\"Query points.\n+\n+        Parameters\n+        ----------\n+        points: ndarray of shape (n_points, n_coordinates)\n+            Two-dimensional array of points/samples (rows) and their\n+            corresponding coordinate labels (columns) to query.\n+\n+        Returns\n+        -------\n+        distances : ndarray of shape (n_points)\n+            Distances to the nearest neighbors.\n+        indices : ndarray of shape (n_points)\n+            Indices of the nearest neighbors in the array of the indexed\n+            points.\n+        \"\"\"\n+        ...\n+\n+    def equals(self, other: Self) -> bool:\n+        \"\"\"Check equality with another TreeAdapter of the same kind.\n+\n+        Parameters\n+        ----------\n+        other :\n+            The other TreeAdapter object to compare with this object.\n+\n+        \"\"\"\n+        raise NotImplementedError\n+\n+\n+class ScipyKDTreeAdapter(TreeAdapter):\n+    \"\"\":py:class:`scipy.spatial.KDTree` adapter for :py:class:`~xarray.indexes.NDPointIndex`.\"\"\"\n+\n+    _kdtree: KDTree\n+\n+    def __init__(self, points: np.ndarray, options: Mapping[str, Any]):\n+        from scipy.spatial import KDTree\n+\n+        self._kdtree = KDTree(points, **options)\n+\n+    def query(self, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:\n+        return self._kdtree.query(points)\n+\n+    def equals(self, other: Self) -> bool:\n+        return np.array_equal(self._kdtree.data, other._kdtree.data)\n+\n+\n+def get_points(coords: Iterable[Variable | Any]) -> np.ndarray:\n+    \"\"\"Re-arrange data from a sequence of xarray coordinate variables or\n+    labels into a 2-d array of shape (n_points, n_coordinates).\n+\n+    \"\"\"\n+    data = [c.values if isinstance(c, Variable | DataArray) else c for c in coords]\n+    return np.stack([np.ravel(d) for d in data]).T\n+\n+\n+T_TreeAdapter = TypeVar(\"T_TreeAdapter\", bound=TreeAdapter)\n+\n+\n+class NDPointIndex(Index, Generic[T_TreeAdapter]):\n+    \"\"\"Xarray index for irregular, n-dimensional data.\n+\n+    This index may be associated with a set of coordinate variables representing\n+    the arbitrary location of data points in an n-dimensional space. All\n+    coordinates must have the same shape and dimensions. The number of\n+    associated coordinate variables must correspond to the number of dimensions\n+    of the space.\n+\n+    This index supports label-based selection (nearest neighbor lookup). It also\n+    has limited support for alignment.\n+\n+    By default, this index relies on :py:class:`scipy.spatial.KDTree` for fast\n+    lookup.\n+\n+    Do not use :py:meth:`~xarray.indexes.NDPointIndex.__init__` directly. Instead\n+    use :py:meth:`xarray.Dataset.set_xindex` or\n+    :py:meth:`xarray.DataArray.set_xindex` to create and set the index from\n+    existing coordinates (see the example below).\n+\n+    Examples\n+    --------\n+    An example using a dataset with 2-dimensional coordinates.\n+\n+    >>> xx = [[1.0, 2.0], [3.0, 0.0]]\n+    >>> yy = [[11.0, 21.0], [29.0, 9.0]]\n+    >>> ds = xr.Dataset(coords={\"xx\": ((\"y\", \"x\"), xx), \"yy\": ((\"y\", \"x\"), yy)})\n+    >>> ds\n+    <xarray.Dataset> Size: 64B\n+    Dimensions:  (y: 2, x: 2)\n+    Coordinates:\n+        xx       (y, x) float64 32B 1.0 2.0 3.0 0.0\n+        yy       (y, x) float64 32B 11.0 21.0 29.0 9.0\n+    Dimensions without coordinates: y, x\n+    Data variables:\n+        *empty*\n+\n+    Creation of a NDPointIndex from the \"xx\" and \"yy\" coordinate variables:\n+\n+    >>> ds = ds.set_xindex((\"xx\", \"yy\"), xr.indexes.NDPointIndex)\n+    >>> ds\n+    <xarray.Dataset> Size: 64B\n+    Dimensions:  (y: 2, x: 2)\n+    Coordinates:\n+      * xx       (y, x) float64 32B 1.0 2.0 3.0 0.0\n+      * yy       (y, x) float64 32B 11.0 21.0 29.0 9.0\n+    Dimensions without coordinates: y, x\n+    Data variables:\n+        *empty*\n+    Indexes:\n+      ┌ xx       NDPointIndex (ScipyKDTreeAdapter)\n+      └ yy\n+\n+    Point-wise (nearest-neighbor) data selection using Xarray's advanced\n+    indexing, i.e., using arbitrary dimension(s) for the Variable objects passed\n+    as labels:\n+\n+    >>> ds.sel(\n+    ...     xx=xr.Variable(\"points\", [1.9, 0.1]),\n+    ...     yy=xr.Variable(\"points\", [13.0, 8.0]),\n+    ...     method=\"nearest\",\n+    ... )\n+    <xarray.Dataset> Size: 32B\n+    Dimensions:  (points: 2)\n+    Coordinates:\n+        xx       (points) float64 16B 1.0 0.0\n+        yy       (points) float64 16B 11.0 9.0\n+    Dimensions without coordinates: points\n+    Data variables:\n+        *empty*\n+\n+    Data selection with scalar labels:\n+\n+    >>> ds.sel(xx=1.9, yy=13.0, method=\"nearest\")\n+    <xarray.Dataset> Size: 16B\n+    Dimensions:  ()\n+    Coordinates:\n+        xx       float64 8B 1.0\n+        yy       float64 8B 11.0\n+    Data variables:\n+        *empty*\n+\n+    Data selection with broadcasting the input labels:\n+\n+    >>> ds.sel(xx=1.9, yy=xr.Variable(\"points\", [13.0, 8.0]), method=\"nearest\")\n+    <xarray.Dataset> Size: 32B\n+    Dimensions:  (points: 2)\n+    Coordinates:\n+        xx       (points) float64 16B 1.0 0.0\n+        yy       (points) float64 16B 11.0 9.0\n+    Dimensions without coordinates: points\n+    Data variables:\n+        *empty*\n+\n+    >>> da = xr.DataArray(\n+    ...     [[45.1, 53.3], [65.4, 78.2]],\n+    ...     coords={\"u\": [1.9, 0.1], \"v\": [13.0, 8.0]},\n+    ...     dims=(\"u\", \"v\"),\n+    ... )\n+    >>> ds.sel(xx=da.u, yy=da.v, method=\"nearest\")\n+    <xarray.Dataset> Size: 64B\n+    Dimensions:  (u: 2, v: 2)\n+    Coordinates:\n+        xx       (u, v) float64 32B 1.0 0.0 1.0 0.0\n+        yy       (u, v) float64 32B 11.0 9.0 11.0 9.0\n+    Dimensions without coordinates: u, v\n+    Data variables:\n+        *empty*\n+\n+    Data selection with array-like labels (implicit dimensions):\n+\n+    >>> ds.sel(xx=[[1.9], [0.1]], yy=[[13.0], [8.0]], method=\"nearest\")\n+    <xarray.Dataset> Size: 32B\n+    Dimensions:  (y: 2, x: 1)\n+    Coordinates:\n+        xx       (y, x) float64 16B 1.0 0.0\n+        yy       (y, x) float64 16B 11.0 9.0\n+    Dimensions without coordinates: y, x\n+    Data variables:\n+        *empty*\n+\n+    \"\"\"\n+\n+    _tree_obj: T_TreeAdapter\n+    _coord_names: tuple[Hashable, ...]\n+    _dims: tuple[Hashable, ...]\n+    _shape: tuple[int, ...]\n+\n+    def __init__(\n+        self,\n+        tree_obj: T_TreeAdapter,\n+        *,\n+        coord_names: tuple[Hashable, ...],\n+        dims: tuple[Hashable, ...],\n+        shape: tuple[int, ...],\n+    ):\n+        # this constructor is \"private\"\n+        assert isinstance(tree_obj, TreeAdapter)\n+        self._tree_obj = tree_obj\n+\n+        assert len(coord_names) == len(dims) == len(shape)\n+        self._coord_names = coord_names\n+        self._dims = dims\n+        self._shape = shape\n+\n+    @classmethod\n+    def from_variables(\n+        cls,\n+        variables: Mapping[Any, Variable],\n+        *,\n+        options: Mapping[str, Any],\n+    ) -> Self:\n+        if len({var.dims for var in variables.values()}) > 1:\n+            var_names = \",\".join(vn for vn in variables)\n+            raise ValueError(\n+                f\"variables {var_names} must all have the same dimensions and the same shape\"\n+            )\n+\n+        var0 = next(iter(variables.values()))\n+\n+        if len(variables) != len(var0.dims):\n+            raise ValueError(\n+                f\"the number of variables {len(variables)} doesn't match \"\n+                f\"the number of dimensions {len(var0.dims)}\"\n+            )\n+\n+        opts = dict(options)\n+\n+        tree_adapter_cls: type[T_TreeAdapter] = opts.pop(\"tree_adapter_cls\", None)\n+        if tree_adapter_cls is None:\n+            tree_adapter_cls = ScipyKDTreeAdapter\n+\n+        points = get_points(variables.values())\n+\n+        return cls(\n+            tree_adapter_cls(points, options=opts),\n+            coord_names=tuple(variables),\n+            dims=var0.dims,\n+            shape=var0.shape,\n+        )\n+\n+    def create_variables(\n+        self, variables: Mapping[Any, Variable] | None = None\n+    ) -> dict[Any, Variable]:\n+        if variables is not None:\n+            for var in variables.values():\n+                # maybe re-sync variable dimensions with the index object\n+                # returned by NDPointIndex.rename()\n+                if var.dims != self._dims:\n+                    var.dims = self._dims\n+            return dict(**variables)\n+        else:\n+            return {}\n+\n+    def equals(\n+        self, other: Index, *, exclude: frozenset[Hashable] | None = None\n+    ) -> bool:\n+        if not isinstance(other, NDPointIndex):\n+            return False\n+        if type(self._tree_obj) is not type(other._tree_obj):\n+            return False\n+        return self._tree_obj.equals(other._tree_obj)\n+\n+    def _get_dim_indexers(\n+        self,\n+        indices: np.ndarray,\n+        label_dims: tuple[Hashable, ...],\n+        label_shape: tuple[int, ...],\n+    ) -> dict[Hashable, Variable]:\n+        \"\"\"Returns dimension indexers based on the query results (indices) and\n+        the original label dimensions and shape.\n+\n+        1. Unravel the flat indices returned from the query\n+        2. Reshape the unraveled indices according to indexers shapes\n+        3. Wrap the indices in xarray.Variable objects.\n+\n+        \"\"\"\n+        dim_indexers = {}\n+\n+        u_indices = list(np.unravel_index(indices.ravel(), self._shape))\n+\n+        for dim, ind in zip(self._dims, u_indices, strict=False):\n+            dim_indexers[dim] = Variable(label_dims, ind.reshape(label_shape))\n+\n+        return dim_indexers\n+\n+    def sel(\n+        self, labels: dict[Any, Any], method=None, tolerance=None\n+    ) -> IndexSelResult:\n+        if method != \"nearest\":\n+            raise ValueError(\n+                \"NDPointIndex only supports selection with method='nearest'\"\n+            )\n+\n+        missing_labels = set(self._coord_names) - set(labels)\n+        if missing_labels:\n+            missing_labels_str = \",\".join([f\"{name}\" for name in missing_labels])\n+            raise ValueError(f\"missing labels for coordinate(s): {missing_labels_str}.\")\n+\n+        # maybe convert labels into xarray DataArray objects\n+        xr_labels: dict[Any, DataArray] = {}\n+\n+        for name, lbl in labels.items():\n+            if isinstance(lbl, DataArray):\n+                xr_labels[name] = lbl\n+            elif isinstance(lbl, Variable):\n+                xr_labels[name] = DataArray(lbl)\n+            elif is_scalar(lbl):\n+                xr_labels[name] = DataArray(lbl, dims=())\n+            elif np.asarray(lbl).ndim == len(self._dims):\n+                xr_labels[name] = DataArray(lbl, dims=self._dims)\n+            else:\n+                raise ValueError(\n+                    \"invalid label value. NDPointIndex only supports advanced (point-wise) indexing \"\n+                    \"with the following label value kinds:\\n\"\n+                    \"- xarray.DataArray or xarray.Variable objects\\n\"\n+                    \"- scalar values\\n\"\n+                    \"- unlabelled array-like objects with the same number of dimensions \"\n+                    f\"than the {self._coord_names} coordinate variables ({len(self._dims)})\"\n+                )\n+\n+        # broadcast xarray labels against one another and determine labels shape and dimensions\n+        broadcasted = broadcast(*xr_labels.values())\n+        label_dims = broadcasted[0].dims\n+        label_shape = broadcasted[0].shape\n+        xr_labels = dict(zip(xr_labels, broadcasted, strict=True))\n+\n+        # get and return dimension indexers\n+        points = get_points(xr_labels[name] for name in self._coord_names)\n+        _, indices = self._tree_obj.query(points)\n+\n+        dim_indexers = self._get_dim_indexers(indices, label_dims, label_shape)\n+\n+        return IndexSelResult(dim_indexers=dim_indexers)\n+\n+    def rename(\n+        self,\n+        name_dict: Mapping[Any, Hashable],\n+        dims_dict: Mapping[Any, Hashable],\n+    ) -> Self:\n+        if not set(self._coord_names) & set(name_dict) and not set(self._dims) & set(\n+            dims_dict\n+        ):\n+            return self\n+\n+        new_coord_names = tuple(name_dict.get(n, n) for n in self._coord_names)\n+        new_dims = tuple(dims_dict.get(d, d) for d in self._dims)\n+\n+        return type(self)(\n+            self._tree_obj,\n+            coord_names=new_coord_names,\n+            dims=new_dims,\n+            shape=self._shape,\n+        )\n+\n+    def _repr_inline_(self, max_width: int) -> str:\n+        tree_obj_type = self._tree_obj.__class__.__name__\n+        return f\"{self.__class__.__name__} ({tree_obj_type})\"\n\ndiff --git a/xarray/plot/facetgrid.py b/xarray/plot/facetgrid.py\nindex e64348c..c5303e9 100644\n--- a/xarray/plot/facetgrid.py\n+++ b/xarray/plot/facetgrid.py\n@@ -549,7 +549,7 @@ class FacetGrid(Generic[T_DataArrayOrSet]):\n         )\n \n         if add_legend:\n-            use_legend_elements = not func.__name__ == \"hist\"\n+            use_legend_elements = func.__name__ != \"hist\"\n             if use_legend_elements:\n                 self.add_legend(\n                     use_legend_elements=use_legend_elements,\n\ndiff --git a/xarray/plot/utils.py b/xarray/plot/utils.py\nindex fc4ca15..a716135 100644\n--- a/xarray/plot/utils.py\n+++ b/xarray/plot/utils.py\n@@ -419,9 +419,10 @@ def _infer_xy_labels(\n         _assert_valid_xy(darray, x, \"x\")\n         _assert_valid_xy(darray, y, \"y\")\n \n-        if darray._indexes.get(x, 1) is darray._indexes.get(y, 2):\n-            if isinstance(darray._indexes[x], PandasMultiIndex):\n-                raise ValueError(\"x and y cannot be levels of the same MultiIndex\")\n+        if darray._indexes.get(x, 1) is darray._indexes.get(y, 2) and isinstance(\n+            darray._indexes[x], PandasMultiIndex\n+        ):\n+            raise ValueError(\"x and y cannot be levels of the same MultiIndex\")\n \n     return x, y\n \n@@ -1142,7 +1143,7 @@ def legend_elements(\n         # Labels are not numerical so modifying label_values is not\n         # possible, instead filter the array with nicely distributed\n         # indexes:\n-        if type(num) == int:  # noqa: E721\n+        if type(num) is int:\n             loc = mpl.ticker.LinearLocator(num)\n         else:\n             raise ValueError(\"`num` only supports integers for non-numeric labels.\")\n\ndiff --git a/xarray/structure/merge.py b/xarray/structure/merge.py\nindex 4031862..5c99807 100644\n--- a/xarray/structure/merge.py\n+++ b/xarray/structure/merge.py\n@@ -300,7 +300,7 @@ def merge_collected(\n                 variables = [variable for variable, _ in elements_list]\n                 try:\n                     merged_vars[name] = unique_variable(\n-                        name, variables, compat, equals.get(name, None)\n+                        name, variables, compat, equals.get(name)\n                     )\n                 except MergeError:\n                     if compat != \"minimal\":\n\ndiff --git a/xarray/util/print_versions.py b/xarray/util/print_versions.py\nindex 8f3be73..0be9713 100644\n--- a/xarray/util/print_versions.py\n+++ b/xarray/util/print_versions.py\n@@ -20,7 +20,7 @@ def get_sys_info():\n     if os.path.isdir(\".git\") and os.path.isdir(\"xarray\"):\n         try:\n             pipe = subprocess.Popen(\n-                'git log --format=\"%H\" -n 1'.split(\" \"),\n+                (\"git\", \"log\", '--format=\"%H\"', \"-n\", \"1\"),\n                 stdout=subprocess.PIPE,\n                 stderr=subprocess.PIPE,\n             )\n",
+  "structured_diff": {
+    "asv_bench/benchmarks/repr.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -57,3 +57,31 @@",
+          "snippet": " class ReprMultiIndex:\n \n     def time_repr_html(self):\n         self.da._repr_html_()\n+\n+\n+class ReprPandasRangeIndex:\n+    # display a memory-saving pandas.RangeIndex shouldn't trigger memory\n+    # expensive conversion into a numpy array\n+    def setup(self):\n+        index = xr.indexes.PandasIndex(pd.RangeIndex(1_000_000), \"x\")\n+        self.ds = xr.Dataset(coords=xr.Coordinates.from_xindex(index))\n+\n+    def time_repr(self):\n+        repr(self.ds.x)\n+\n+    def time_repr_html(self):\n+        self.ds.x._repr_html_()\n+\n+\n+class ReprXarrayRangeIndex:\n+    # display an Xarray RangeIndex shouldn't trigger memory expensive conversion\n+    # of its lazy coordinate into a numpy array\n+    def setup(self):\n+        index = xr.indexes.RangeIndex.arange(1_000_000, dim=\"x\")\n+        self.ds = xr.Dataset(coords=xr.Coordinates.from_xindex(index))\n+\n+    def time_repr(self):\n+        repr(self.ds.x)\n+\n+    def time_repr_html(self):\n+        self.ds.x._repr_html_()\n",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "asv_bench/benchmarks/repr.py::ReprPandasRangeIndex"
+            },
+            {
+              "kind": "method",
+              "node": "asv_bench/benchmarks/repr.py::ReprPandasRangeIndex::setup"
+            },
+            {
+              "kind": "method",
+              "node": "asv_bench/benchmarks/repr.py::ReprPandasRangeIndex::time_repr"
+            },
+            {
+              "kind": "method",
+              "node": "asv_bench/benchmarks/repr.py::ReprPandasRangeIndex::time_repr_html"
+            },
+            {
+              "kind": "class",
+              "node": "asv_bench/benchmarks/repr.py::ReprXarrayRangeIndex"
+            },
+            {
+              "kind": "method",
+              "node": "asv_bench/benchmarks/repr.py::ReprXarrayRangeIndex::setup"
+            },
+            {
+              "kind": "method",
+              "node": "asv_bench/benchmarks/repr.py::ReprXarrayRangeIndex::time_repr"
+            },
+            {
+              "kind": "method",
+              "node": "asv_bench/benchmarks/repr.py::ReprXarrayRangeIndex::time_repr_html"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/backends/api.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -36,6 +36,7 @@",
+          "snippet": " from xarray.backends.common import (\n from xarray.backends.locks import _get_scheduler\n from xarray.coders import CFDatetimeCoder, CFTimedeltaCoder\n from xarray.core import indexing\n+from xarray.core.coordinates import Coordinates\n from xarray.core.dataarray import DataArray\n from xarray.core.dataset import Dataset\n from xarray.core.datatree import DataTree",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/backends/api.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -379,6 +380,15 @@",
+          "snippet": " def _chunk_ds(\n     return backend_ds._replace(variables)\n \n \n+def _maybe_create_default_indexes(ds):\n+    to_index = {\n+        name: coord.variable\n+        for name, coord in ds.coords.items()\n+        if coord.dims == (name,) and name not in ds.xindexes\n+    }\n+    return ds.assign_coords(Coordinates(to_index))\n+\n+\n def _dataset_from_backend_dataset(\n     backend_ds,\n     filename_or_obj,",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/api.py::_maybe_create_default_indexes"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -389,6 +399,7 @@",
+          "snippet": " def _dataset_from_backend_dataset(\n     inline_array,\n     chunked_array_type,\n     from_array_kwargs,\n+    create_default_indexes,\n     **extra_tokens,\n ):\n     if not isinstance(chunks, int | dict) and chunks not in {None, \"auto\"}:",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/api.py::_dataset_from_backend_dataset"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -397,11 +408,15 @@",
+          "snippet": " def _dataset_from_backend_dataset(\n         )\n \n     _protect_dataset_variables_inplace(backend_ds, cache)\n-    if chunks is None:\n-        ds = backend_ds\n+\n+    if create_default_indexes:\n+        ds = _maybe_create_default_indexes(backend_ds)\n     else:\n+        ds = backend_ds\n+\n+    if chunks is not None:\n         ds = _chunk_ds(\n-            backend_ds,\n+            ds,\n             filename_or_obj,\n             engine,\n             chunks,",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/api.py::_dataset_from_backend_dataset"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -434,6 +449,7 @@",
+          "snippet": " def _datatree_from_backend_datatree(\n     inline_array,\n     chunked_array_type,\n     from_array_kwargs,\n+    create_default_indexes,\n     **extra_tokens,\n ):\n     if not isinstance(chunks, int | dict) and chunks not in {None, \"auto\"}:",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/api.py::_datatree_from_backend_datatree"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -442,9 +458,11 @@",
+          "snippet": " def _datatree_from_backend_datatree(\n         )\n \n     _protect_datatree_variables_inplace(backend_tree, cache)\n-    if chunks is None:\n-        tree = backend_tree\n+    if create_default_indexes:\n+        tree = backend_tree.map_over_datasets(_maybe_create_default_indexes)\n     else:\n+        tree = backend_tree\n+    if chunks is not None:\n         tree = DataTree.from_dict(\n             {\n                 path: _chunk_ds(",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/api.py::_datatree_from_backend_datatree"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -459,11 +477,12 @@",
+          "snippet": " def _datatree_from_backend_datatree(\n                     node=path,\n                     **extra_tokens,\n                 )\n-                for path, [node] in group_subtrees(backend_tree)\n+                for path, [node] in group_subtrees(tree)\n             },\n-            name=backend_tree.name,\n+            name=tree.name,\n         )\n \n+    if create_default_indexes or chunks is not None:\n         for path, [node] in group_subtrees(backend_tree):\n             tree[path].set_close(node._close)\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/api.py::_datatree_from_backend_datatree"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -497,6 +516,7 @@",
+          "snippet": " def open_dataset(\n     concat_characters: bool | Mapping[str, bool] | None = None,\n     decode_coords: Literal[\"coordinates\", \"all\"] | bool | None = None,\n     drop_variables: str | Iterable[str] | None = None,\n+    create_default_indexes: bool = True,\n     inline_array: bool = False,\n     chunked_array_type: str | None = None,\n     from_array_kwargs: dict[str, Any] | None = None,",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/api.py::open_dataset"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -610,6 +630,13 @@",
+          "snippet": " def open_dataset(\n         A variable or list of variables to exclude from being parsed from the\n         dataset. This may be useful to drop variables with problems or\n         inconsistent values.\n+    create_default_indexes : bool, default: True\n+        If True, create pandas indexes for :term:`dimension coordinates <dimension coordinate>`,\n+        which loads the coordinate data into memory. Set it to False if you want to avoid loading\n+        data into memory.\n+\n+        Note that backends can still choose to create other indexes. If you want to control that,\n+        please refer to the backend's documentation.\n     inline_array: bool, default: False\n         How to include the array in the dask task graph.\n         By default(``inline_array=False``) the array is included in a task by",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/api.py::open_dataset"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -702,6 +729,7 @@",
+          "snippet": " def open_dataset(\n         chunked_array_type,\n         from_array_kwargs,\n         drop_variables=drop_variables,\n+        create_default_indexes=create_default_indexes,\n         **decoders,\n         **kwargs,\n     )",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/api.py::open_dataset"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -725,6 +753,7 @@",
+          "snippet": " def open_dataarray(\n     concat_characters: bool | None = None,\n     decode_coords: Literal[\"coordinates\", \"all\"] | bool | None = None,\n     drop_variables: str | Iterable[str] | None = None,\n+    create_default_indexes: bool = True,\n     inline_array: bool = False,\n     chunked_array_type: str | None = None,\n     from_array_kwargs: dict[str, Any] | None = None,",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/api.py::open_dataarray"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -833,6 +862,13 @@",
+          "snippet": " def open_dataarray(\n         A variable or list of variables to exclude from being parsed from the\n         dataset. This may be useful to drop variables with problems or\n         inconsistent values.\n+    create_default_indexes : bool, default: True\n+        If True, create pandas indexes for :term:`dimension coordinates <dimension coordinate>`,\n+        which loads the coordinate data into memory. Set it to False if you want to avoid loading\n+        data into memory.\n+\n+        Note that backends can still choose to create other indexes. If you want to control that,\n+        please refer to the backend's documentation.\n     inline_array: bool, default: False\n         How to include the array in the dask task graph.\n         By default(``inline_array=False``) the array is included in a task by",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/api.py::open_dataarray"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -890,6 +926,7 @@",
+          "snippet": " def open_dataarray(\n         chunks=chunks,\n         cache=cache,\n         drop_variables=drop_variables,\n+        create_default_indexes=create_default_indexes,\n         inline_array=inline_array,\n         chunked_array_type=chunked_array_type,\n         from_array_kwargs=from_array_kwargs,",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/api.py::open_dataarray"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -946,6 +983,7 @@",
+          "snippet": " def open_datatree(\n     concat_characters: bool | Mapping[str, bool] | None = None,\n     decode_coords: Literal[\"coordinates\", \"all\"] | bool | None = None,\n     drop_variables: str | Iterable[str] | None = None,\n+    create_default_indexes: bool = True,\n     inline_array: bool = False,\n     chunked_array_type: str | None = None,\n     from_array_kwargs: dict[str, Any] | None = None,",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/api.py::open_datatree"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1055,6 +1093,13 @@",
+          "snippet": " def open_datatree(\n         A variable or list of variables to exclude from being parsed from the\n         dataset. This may be useful to drop variables with problems or\n         inconsistent values.\n+    create_default_indexes : bool, default: True\n+        If True, create pandas indexes for :term:`dimension coordinates <dimension coordinate>`,\n+        which loads the coordinate data into memory. Set it to False if you want to avoid loading\n+        data into memory.\n+\n+        Note that backends can still choose to create other indexes. If you want to control that,\n+        please refer to the backend's documentation.\n     inline_array: bool, default: False\n         How to include the array in the dask task graph.\n         By default(``inline_array=False``) the array is included in a task by",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/api.py::open_datatree"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1148,6 +1193,7 @@",
+          "snippet": " def open_datatree(\n         chunked_array_type,\n         from_array_kwargs,\n         drop_variables=drop_variables,\n+        create_default_indexes=create_default_indexes,\n         **decoders,\n         **kwargs,\n     )",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/api.py::open_datatree"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1175,6 +1221,7 @@",
+          "snippet": " def open_groups(\n     concat_characters: bool | Mapping[str, bool] | None = None,\n     decode_coords: Literal[\"coordinates\", \"all\"] | bool | None = None,\n     drop_variables: str | Iterable[str] | None = None,\n+    create_default_indexes: bool = True,\n     inline_array: bool = False,\n     chunked_array_type: str | None = None,\n     from_array_kwargs: dict[str, Any] | None = None,",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/api.py::open_groups"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1286,6 +1333,13 @@",
+          "snippet": " def open_groups(\n         A variable or list of variables to exclude from being parsed from the\n         dataset. This may be useful to drop variables with problems or\n         inconsistent values.\n+    create_default_indexes : bool, default: True\n+        If True, create pandas indexes for :term:`dimension coordinates <dimension coordinate>`,\n+        which loads the coordinate data into memory. Set it to False if you want to avoid loading\n+        data into memory.\n+\n+        Note that backends can still choose to create other indexes. If you want to control that,\n+        please refer to the backend's documentation.\n     inline_array: bool, default: False\n         How to include the array in the dask task graph.\n         By default(``inline_array=False``) the array is included in a task by",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/api.py::open_groups"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1381,6 +1435,7 @@",
+          "snippet": " def open_groups(\n             chunked_array_type,\n             from_array_kwargs,\n             drop_variables=drop_variables,\n+            create_default_indexes=create_default_indexes,\n             **decoders,\n             **kwargs,\n         )\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/api.py::open_groups"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/backends/common.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -560,11 +560,10 @@",
+          "snippet": " def _infer_dtype(array, name=None):\n \n     native_dtypes = set(np.vectorize(type, otypes=[object])(array.ravel()))\n     if len(native_dtypes) > 1 and native_dtypes != {bytes, str}:\n+        native_dtype_names = \", \".join(x.__name__ for x in native_dtypes)\n         raise ValueError(\n-            \"unable to infer dtype on variable {!r}; object array \"\n-            \"contains mixed native types: {}\".format(\n-                name, \", \".join(x.__name__ for x in native_dtypes)\n-            )\n+            f\"unable to infer dtype on variable {name!r}; object array \"\n+            f\"contains mixed native types: {native_dtype_names}\"\n         )\n \n     element = array[(0,) * array.ndim]\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/common.py::_infer_dtype"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/backends/store.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -9,6 +9,7 @@",
+          "snippet": " from xarray.backends.common import (\n     AbstractDataStore,\n     BackendEntrypoint,\n )\n+from xarray.core.coordinates import Coordinates\n from xarray.core.dataset import Dataset\n \n if TYPE_CHECKING:",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/backends/store.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -36,6 +37,7 @@",
+          "snippet": " class StoreBackendEntrypoint(BackendEntrypoint):\n         concat_characters=True,\n         decode_coords=True,\n         drop_variables: str | Iterable[str] | None = None,\n+        set_indexes: bool = True,\n         use_cftime=None,\n         decode_timedelta=None,\n     ) -> Dataset:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/store.py::StoreBackendEntrypoint::open_dataset"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -56,8 +58,19 @@",
+          "snippet": " class StoreBackendEntrypoint(BackendEntrypoint):\n             decode_timedelta=decode_timedelta,\n         )\n \n-        ds = Dataset(vars, attrs=attrs)\n-        ds = ds.set_coords(coord_names.intersection(vars))\n+        # split data and coordinate variables (promote dimension coordinates)\n+        data_vars = {}\n+        coord_vars = {}\n+        for name, var in vars.items():\n+            if name in coord_names or var.dims == (name,):\n+                coord_vars[name] = var\n+            else:\n+                data_vars[name] = var\n+\n+        # explicit Coordinates object with no index passed\n+        coords = Coordinates(coord_vars, indexes={})\n+\n+        ds = Dataset(data_vars, coords=coords, attrs=attrs)\n         ds.set_close(filename_or_obj.close)\n         ds.encoding = encoding\n \n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/store.py::StoreBackendEntrypoint::open_dataset"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/backends/zarr.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1347,6 +1347,7 @@",
+          "snippet": " def open_zarr(\n     use_zarr_fill_value_as_mask=None,\n     chunked_array_type: str | None = None,\n     from_array_kwargs: dict[str, Any] | None = None,\n+    create_default_indexes=True,\n     **kwargs,\n ):\n     \"\"\"Load and decode a dataset from a Zarr store.",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/zarr.py::open_zarr"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1457,6 +1458,13 @@",
+          "snippet": " def open_zarr(\n         chunked arrays, via whichever chunk manager is specified through the ``chunked_array_type`` kwarg.\n         Defaults to ``{'manager': 'dask'}``, meaning additional kwargs will be passed eventually to\n         :py:func:`dask.array.from_array`. Experimental API that should not be relied upon.\n+    create_default_indexes : bool, default: True\n+        If True, create pandas indexes for :term:`dimension coordinates <dimension coordinate>`,\n+        which loads the coordinate data into memory. Set it to False if you want to avoid loading\n+        data into memory.\n+\n+        Note that backends can still choose to create other indexes. If you want to control that,\n+        please refer to the backend's documentation.\n \n     Returns\n     -------",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/zarr.py::open_zarr"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1513,6 +1521,7 @@",
+          "snippet": " def open_zarr(\n         engine=\"zarr\",\n         chunks=chunks,\n         drop_variables=drop_variables,\n+        create_default_indexes=create_default_indexes,\n         chunked_array_type=chunked_array_type,\n         from_array_kwargs=from_array_kwargs,\n         backend_kwargs=backend_kwargs,\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/zarr.py::open_zarr"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/coding/variables.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -164,10 +164,8 @@",
+          "snippet": " def _check_fill_values(attrs, name, dtype):\n     Issue SerializationWarning if appropriate.\n     \"\"\"\n     raw_fill_dict = {}\n-    [\n+    for attr in (\"missing_value\", \"_FillValue\"):\n         pop_to(attrs, raw_fill_dict, attr, name=name)\n-        for attr in (\"missing_value\", \"_FillValue\")\n-    ]\n     encoded_fill_values = set()\n     for k in list(raw_fill_dict):\n         v = raw_fill_dict[k]",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/coding/variables.py::_check_fill_values"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -376,11 +374,9 @@",
+          "snippet": " class CFMaskCoder(VariableCoder):\n \n         dims, data, attrs, encoding = unpack_for_decoding(variable)\n \n-        # Even if _Unsigned is use, retain on-disk _FillValue\n-        [\n+        # Even if _Unsigned is used, retain on-disk _FillValue\n+        for attr, value in raw_fill_dict.items():\n             safe_setitem(encoding, attr, value, name=name)\n-            for attr, value in raw_fill_dict.items()\n-        ]\n \n         if \"_Unsigned\" in attrs:\n             unsigned = pop_to(attrs, encoding, \"_Unsigned\")\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/coding/variables.py::CFMaskCoder::decode"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/computation/apply_ufunc.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -141,8 +141,13 @@",
+          "snippet": " class _UFuncSignature:\n         return f\"{type(self).__name__}({list(self.input_core_dims)!r}, {list(self.output_core_dims)!r})\"\n \n     def __str__(self):\n-        lhs = \",\".join(\"({})\".format(\",\".join(dims)) for dims in self.input_core_dims)\n-        rhs = \",\".join(\"({})\".format(\",\".join(dims)) for dims in self.output_core_dims)\n+        comma_separated = \",\".join\n+        lhs = comma_separated(\n+            f\"({comma_separated(dims)})\" for dims in self.input_core_dims\n+        )\n+        rhs = comma_separated(\n+            f\"({comma_separated(dims)})\" for dims in self.output_core_dims\n+        )\n         return f\"{lhs}->{rhs}\"\n \n     def to_gufunc_string(self, exclude_dims=frozenset()):\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/computation/apply_ufunc.py::_UFuncSignature::__str__"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/computation/rolling.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -132,7 +132,7 @@",
+          "snippet": " class Rolling(Generic[T_Xarray]):\n         \"\"\"provide a nice str repr of our rolling object\"\"\"\n \n         attrs = \",\".join(\n-            \"{k}->{v}{c}\".format(k=k, v=w, c=\"(center)\" if c else \"\")\n+            f\"{k}->{w}{'(center)' if c else ''}\"\n             for k, w, c in zip(self.dim, self.window, self.center, strict=True)\n         )\n         return f\"{self.__class__.__name__} [{attrs}]\"\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/computation/rolling.py::Rolling::__repr__"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/accessor_str.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -662,10 +662,11 @@",
+          "snippet": " class StringAccessor(Generic[T_DataArray]):\n         \"\"\"\n         args = tuple(self._stringify(x) for x in args)\n         kwargs = {key: self._stringify(val) for key, val in kwargs.items()}\n-        func = lambda x, *args, **kwargs: self._obj.dtype.type.format(\n-            x, *args, **kwargs\n+        return self._apply(\n+            func=self._obj.dtype.type.format,\n+            func_args=args,\n+            func_kwargs={\"kwargs\": kwargs},\n         )\n-        return self._apply(func=func, func_args=args, func_kwargs={\"kwargs\": kwargs})\n \n     def capitalize(self) -> T_DataArray:\n         \"\"\"\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/accessor_str.py::StringAccessor::format"
+            },
+            {
+              "kind": "class",
+              "node": "xarray/core/accessor_str.py::StringAccessor"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/coordinate_transform.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -9,8 +9,9 @@",
+          "snippet": " import numpy as np\n class CoordinateTransform:\n     \"\"\"Abstract coordinate transform with dimension & coordinate names.\n \n-    EXPERIMENTAL (not ready for public use yet).\n-\n+    .. caution::\n+        This API is experimental and subject to change. Please report any bugs or surprising\n+        behaviour you encounter.\n     \"\"\"\n \n     coord_names: tuple[Hashable, ...]",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "xarray/core/coordinate_transform.py::CoordinateTransform"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -80,7 +81,7 @@",
+          "snippet": " class CoordinateTransform:\n         Parameters\n         ----------\n         other : CoordinateTransform\n-            The other Index object to compare with this object.\n+            The other CoordinateTransform object to compare with this object.\n         exclude : frozenset of hashable, optional\n             Dimensions excluded from checking. It is None by default, (i.e.,\n             when this method is not called in the context of alignment). For a\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/coordinate_transform.py::CoordinateTransform::equals"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/dataarray.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -6915,7 +6915,7 @@",
+          "snippet": " class DataArray(\n         :ref:`groupby`\n             Users guide explanation of how to group and bin data.\n \n-        :doc:`xarray-tutorial:intermediate/01-high-level-computation-patterns`\n+        :doc:`xarray-tutorial:intermediate/computation/01-high-level-computation-patterns`\n             Tutorial on :py:func:`~xarray.DataArray.Groupby` for windowed computation\n \n         :doc:`xarray-tutorial:fundamentals/03.2_groupby_with_xarray`\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/dataarray.py::DataArray::groupby"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/dataset.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -4940,6 +4940,20 @@",
+          "snippet": " class Dataset(\n         if isinstance(index, PandasMultiIndex):\n             coord_names = [index.dim] + list(coord_names)\n \n+        # Check for extra variables that don't match the coordinate names\n+        extra_vars = set(new_coord_vars) - set(coord_names)\n+        if extra_vars:\n+            extra_vars_str = \", \".join(f\"'{name}'\" for name in extra_vars)\n+            coord_names_str = \", \".join(f\"'{name}'\" for name in coord_names)\n+            raise ValueError(\n+                f\"The index created extra variables {extra_vars_str} that are not \"\n+                f\"in the list of coordinates {coord_names_str}. \"\n+                f\"Use a factory method pattern instead:\\n\"\n+                f\"  index = {index_cls.__name__}.from_variables(ds, {list(coord_names)!r})\\n\"\n+                f\"  coords = xr.Coordinates.from_xindex(index)\\n\"\n+                f\"  ds = ds.assign_coords(coords)\"\n+            )\n+\n         variables: dict[Hashable, Variable]\n         indexes: dict[Hashable, Index]\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/dataset.py::Dataset::set_xindex"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -9941,7 +9955,7 @@",
+          "snippet": " class Dataset(\n         :ref:`groupby`\n             Users guide explanation of how to group and bin data.\n \n-        :doc:`xarray-tutorial:intermediate/01-high-level-computation-patterns`\n+        :doc:`xarray-tutorial:intermediate/computation/01-high-level-computation-patterns`\n             Tutorial on :py:func:`~xarray.Dataset.Groupby` for windowed computation.\n \n         :doc:`xarray-tutorial:fundamentals/03.2_groupby_with_xarray`\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/dataset.py::Dataset::groupby"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/formatting.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -20,7 +20,11 @@",
+          "snippet": " from pandas.errors import OutOfBoundsDatetime\n from xarray.core.datatree_render import RenderDataTree\n from xarray.core.duck_array_ops import array_all, array_any, array_equiv, astype, ravel\n from xarray.core.extension_array import PandasExtensionArray\n-from xarray.core.indexing import MemoryCachedArray\n+from xarray.core.indexing import (\n+    BasicIndexer,\n+    ExplicitlyIndexed,\n+    MemoryCachedArray,\n+)\n from xarray.core.options import OPTIONS, _get_boolean_with_default\n from xarray.core.treenode import group_subtrees\n from xarray.core.utils import is_duck_array",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/core/formatting.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -87,6 +91,8 @@",
+          "snippet": " def first_n_items(array, n_desired):\n \n     if n_desired < array.size:\n         indexer = _get_indexer_at_least_n_items(array.shape, n_desired, from_end=False)\n+        if isinstance(array, ExplicitlyIndexed):\n+            indexer = BasicIndexer(indexer)\n         array = array[indexer]\n \n     # We pass variable objects in to handle indexing",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/formatting.py::first_n_items"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -111,6 +117,8 @@",
+          "snippet": " def last_n_items(array, n_desired):\n \n     if n_desired < array.size:\n         indexer = _get_indexer_at_least_n_items(array.shape, n_desired, from_end=True)\n+        if isinstance(array, ExplicitlyIndexed):\n+            indexer = BasicIndexer(indexer)\n         array = array[indexer]\n \n     # We pass variable objects in to handle indexing",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/formatting.py::last_n_items"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -340,17 +348,17 @@",
+          "snippet": " def summarize_variable(\n         first_col = pretty_print(first_col, col_width)\n \n     if variable.dims:\n-        dims_str = \"({}) \".format(\", \".join(map(str, variable.dims)))\n+        dims_str = \", \".join(map(str, variable.dims))\n+        dims_str = f\"({dims_str}) \"\n     else:\n         dims_str = \"\"\n \n-    nbytes_str = f\" {render_human_readable_nbytes(variable.nbytes)}\"\n-    front_str = f\"{first_col}{dims_str}{variable.dtype}{nbytes_str} \"\n+    front_str = f\"{first_col}{dims_str}{variable.dtype} {render_human_readable_nbytes(variable.nbytes)} \"\n \n     values_width = max_width - len(front_str)\n     values_str = inline_variable_array_repr(variable, values_width)\n \n-    return front_str + values_str\n+    return f\"{front_str}{values_str}\"\n \n \n def summarize_attr(key, value, col_width=None):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/formatting.py::summarize_variable"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -659,6 +667,7 @@",
+          "snippet": " def short_array_repr(array):\n def short_data_repr(array):\n     \"\"\"Format \"data\" for DataArray and Variable.\"\"\"\n     internal_data = getattr(array, \"variable\", array)._data\n+\n     if isinstance(array, np.ndarray):\n         return short_array_repr(array)\n     elif is_duck_array(internal_data):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/formatting.py::short_data_repr"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -989,9 +998,10 @@",
+          "snippet": " def diff_array_repr(a, b, compat):\n         ):\n             summary.append(coords_diff)\n \n-    if compat == \"identical\":\n-        if attrs_diff := diff_attrs_repr(a.attrs, b.attrs, compat):\n-            summary.append(attrs_diff)\n+    if compat == \"identical\" and (\n+        attrs_diff := diff_attrs_repr(a.attrs, b.attrs, compat)\n+    ):\n+        summary.append(attrs_diff)\n \n     return \"\\n\".join(summary)\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/formatting.py::diff_array_repr"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1029,9 +1039,10 @@",
+          "snippet": " def diff_dataset_repr(a, b, compat):\n     ):\n         summary.append(data_diff)\n \n-    if compat == \"identical\":\n-        if attrs_diff := diff_attrs_repr(a.attrs, b.attrs, compat):\n-            summary.append(attrs_diff)\n+    if compat == \"identical\" and (\n+        attrs_diff := diff_attrs_repr(a.attrs, b.attrs, compat)\n+    ):\n+        summary.append(attrs_diff)\n \n     return \"\\n\".join(summary)\n \n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/formatting.py::diff_dataset_repr"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/indexes.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -768,10 +768,12 @@",
+          "snippet": " class PandasIndex(Index):\n \n         if not indexes:\n             coord_dtype = None\n-        elif len(set(idx.coord_dtype for idx in indexes)) == 1:\n-            coord_dtype = indexes[0].coord_dtype\n         else:\n-            coord_dtype = np.result_type(*[idx.coord_dtype for idx in indexes])\n+            indexes_coord_dtypes = {idx.coord_dtype for idx in indexes}\n+            if len(indexes_coord_dtypes) == 1:\n+                coord_dtype = next(iter(indexes_coord_dtypes))\n+            else:\n+                coord_dtype = np.result_type(*indexes_coord_dtypes)\n \n         return cls(new_pd_index, dim=dim, coord_dtype=coord_dtype)\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/indexes.py::PandasIndex::concat"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1247,7 +1249,7 @@",
+          "snippet": " class PandasMultiIndex(PandasIndex):\n                 level = name\n                 dtype = self.level_coords_dtype[name]  # type: ignore[index]  # TODO: are Hashables ok?\n \n-            var = variables.get(name, None)\n+            var = variables.get(name)\n             if var is not None:\n                 attrs = var.attrs\n                 encoding = var.encoding",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/indexes.py::PandasMultiIndex::create_variables"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1453,14 +1455,15 @@",
+          "snippet": " class PandasMultiIndex(PandasIndex):\n class CoordinateTransformIndex(Index):\n     \"\"\"Helper class for creating Xarray indexes based on coordinate transforms.\n \n-    EXPERIMENTAL (not ready for public use yet).\n-\n     - wraps a :py:class:`CoordinateTransform` instance\n     - takes care of creating the index (lazy) coordinates\n     - supports point-wise label-based selection\n     - supports exact alignment only, by comparing indexes based on their transform\n       (not on their explicit coordinate labels)\n \n+    .. caution::\n+        This API is experimental and subject to change. Please report any bugs or surprising\n+        behaviour you encounter.\n     \"\"\"\n \n     transform: CoordinateTransform\n",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "xarray/core/indexes.py::CoordinateTransformIndex"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/indexing.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -9,7 +9,6 @@",
+          "snippet": " from collections.abc import Callable, Hashable, Iterable, Mapping\n from contextlib import suppress\n from dataclasses import dataclass, field\n from datetime import timedelta\n-from html import escape\n from typing import TYPE_CHECKING, Any, cast, overload\n \n import numpy as np",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/core/indexing.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -20,7 +19,6 @@",
+          "snippet": " from packaging.version import Version\n from xarray.core import duck_array_ops\n from xarray.core.coordinate_transform import CoordinateTransform\n from xarray.core.nputils import NumpyVIndexAdapter\n-from xarray.core.options import OPTIONS\n from xarray.core.types import T_Xarray\n from xarray.core.utils import (\n     NDArrayMixin,",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/core/indexing.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1775,10 +1773,25 @@",
+          "snippet": " class PandasIndexingAdapter(ExplicitlyIndexedNDArrayMixin):\n         else:\n             self._dtype = np.dtype(cast(DTypeLike, dtype))\n \n+    @property\n+    def _in_memory(self) -> bool:\n+        # prevent costly conversion of a memory-saving pd.RangeIndex into a\n+        # large numpy array.\n+        return not isinstance(self.array, pd.RangeIndex)\n+\n     @property\n     def dtype(self) -> np.dtype | pd.api.extensions.ExtensionDtype:  # type: ignore[override]\n         return self._dtype\n \n+    def _get_numpy_dtype(self, dtype: np.typing.DTypeLike | None = None) -> np.dtype:\n+        if dtype is None:\n+            if is_valid_numpy_dtype(self.dtype):\n+                return cast(np.dtype, self.dtype)\n+            else:\n+                return get_valid_numpy_dtype(self.array)\n+        else:\n+            return np.dtype(dtype)\n+\n     def __array__(\n         self,\n         dtype: np.typing.DTypeLike | None = None,",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "xarray/core/indexing.py::PandasIndexingAdapter"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::PandasIndexingAdapter::_in_memory"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::PandasIndexingAdapter::_get_numpy_dtype"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1786,11 +1799,9 @@",
+          "snippet": " class PandasIndexingAdapter(ExplicitlyIndexedNDArrayMixin):\n         *,\n         copy: bool | None = None,\n     ) -> np.ndarray:\n-        if dtype is None and is_valid_numpy_dtype(self.dtype):\n-            dtype = cast(np.dtype, self.dtype)\n-        else:\n-            dtype = get_valid_numpy_dtype(self.array)\n+        dtype = self._get_numpy_dtype(dtype)\n         array = self.array\n+\n         if isinstance(array, pd.PeriodIndex):\n             with suppress(AttributeError):\n                 # this might not be public API",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::PandasIndexingAdapter::__array__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1834,98 +1845,61 @@",
+          "snippet": " class PandasIndexingAdapter(ExplicitlyIndexedNDArrayMixin):\n             # numpy fails to convert pd.Timestamp to np.datetime64[ns]\n             item = np.asarray(item.to_datetime64())\n         elif self.dtype != object:\n-            dtype = self.dtype\n-            if pd.api.types.is_extension_array_dtype(dtype):\n-                dtype = get_valid_numpy_dtype(self.array)\n-            item = np.asarray(item, dtype=cast(np.dtype, dtype))\n+            dtype = self._get_numpy_dtype()\n+            item = np.asarray(item, dtype=dtype)\n \n         # as for numpy.ndarray indexing, we always want the result to be\n         # a NumPy array.\n         return to_0d_array(item)\n \n-    def _prepare_key(self, key: Any | tuple[Any, ...]) -> tuple[Any, ...]:\n-        if isinstance(key, tuple) and len(key) == 1:\n+    def _index_get(\n+        self, indexer: ExplicitIndexer, func_name: str\n+    ) -> PandasIndexingAdapter | np.ndarray:\n+        key = indexer.tuple\n+\n+        if len(key) == 1:\n             # unpack key so it can index a pandas.Index object (pandas.Index\n             # objects don't like tuples)\n             (key,) = key\n \n-        return key\n+        # if multidimensional key, convert the index to numpy array and index the latter\n+        if getattr(key, \"ndim\", 0) > 1:\n+            indexable = NumpyIndexingAdapter(np.asarray(self))\n+            return getattr(indexable, func_name)(indexer)\n+\n+        # otherwise index the pandas index then re-wrap or convert the result\n+        result = self.array[key]\n \n-    def _handle_result(\n-        self, result: Any\n-    ) -> (\n-        PandasIndexingAdapter\n-        | NumpyIndexingAdapter\n-        | np.ndarray\n-        | np.datetime64\n-        | np.timedelta64\n-    ):\n         if isinstance(result, pd.Index):\n             return type(self)(result, dtype=self.dtype)\n         else:\n             return self._convert_scalar(result)\n \n-    def _oindex_get(\n-        self, indexer: OuterIndexer\n-    ) -> (\n-        PandasIndexingAdapter\n-        | NumpyIndexingAdapter\n-        | np.ndarray\n-        | np.datetime64\n-        | np.timedelta64\n-    ):\n-        key = self._prepare_key(indexer.tuple)\n-\n-        if getattr(key, \"ndim\", 0) > 1:  # Return np-array if multidimensional\n-            indexable = NumpyIndexingAdapter(np.asarray(self))\n-            return indexable.oindex[indexer]\n-\n-        result = self.array[key]\n-\n-        return self._handle_result(result)\n+    def _oindex_get(self, indexer: OuterIndexer) -> PandasIndexingAdapter | np.ndarray:\n+        return self._index_get(indexer, \"_oindex_get\")\n \n     def _vindex_get(\n         self, indexer: VectorizedIndexer\n-    ) -> (\n-        PandasIndexingAdapter\n-        | NumpyIndexingAdapter\n-        | np.ndarray\n-        | np.datetime64\n-        | np.timedelta64\n-    ):\n+    ) -> PandasIndexingAdapter | np.ndarray:\n         _assert_not_chunked_indexer(indexer.tuple)\n-        key = self._prepare_key(indexer.tuple)\n-\n-        if getattr(key, \"ndim\", 0) > 1:  # Return np-array if multidimensional\n-            indexable = NumpyIndexingAdapter(np.asarray(self))\n-            return indexable.vindex[indexer]\n-\n-        result = self.array[key]\n-\n-        return self._handle_result(result)\n+        return self._index_get(indexer, \"_vindex_get\")\n \n     def __getitem__(\n         self, indexer: ExplicitIndexer\n-    ) -> (\n-        PandasIndexingAdapter\n-        | NumpyIndexingAdapter\n-        | np.ndarray\n-        | np.datetime64\n-        | np.timedelta64\n-    ):\n-        key = self._prepare_key(indexer.tuple)\n-\n-        if getattr(key, \"ndim\", 0) > 1:  # Return np-array if multidimensional\n-            indexable = NumpyIndexingAdapter(np.asarray(self))\n-            return indexable[indexer]\n-\n-        result = self.array[key]\n-\n-        return self._handle_result(result)\n+    ) -> PandasIndexingAdapter | np.ndarray:\n+        return self._index_get(indexer, \"__getitem__\")\n \n     def transpose(self, order) -> pd.Index:\n         return self.array  # self.array should be always one-dimensional\n \n+    def _repr_inline_(self, max_width: int) -> str:\n+        # we want to display values in the inline repr for lazy coordinates too\n+        # (pd.RangeIndex and pd.MultiIndex). `format_array_flat` prevents loading\n+        # the whole array in memory.\n+        from xarray.core.formatting import format_array_flat\n+\n+        return format_array_flat(self, max_width)\n+\n     def __repr__(self) -> str:\n         return f\"{type(self).__name__}(array={self.array!r}, dtype={self.dtype!r})\"\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::PandasIndexingAdapter::_convert_scalar"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::PandasIndexingAdapter::_index_get"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::PandasIndexingAdapter::_oindex_get"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::PandasIndexingAdapter::_vindex_get"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::PandasIndexingAdapter::__getitem__"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::PandasIndexingAdapter::_repr_inline_"
+            },
+            {
+              "kind": "class",
+              "node": "xarray/core/indexing.py::PandasIndexingAdapter"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1944,7 +1918,9 @@",
+          "snippet": " class PandasIndexingAdapter(ExplicitlyIndexedNDArrayMixin):\n     def nbytes(self) -> int:\n         if pd.api.types.is_extension_array_dtype(self.dtype):\n             return self.array.nbytes\n-        return cast(np.dtype, self.dtype).itemsize * len(self.array)\n+\n+        dtype = self._get_numpy_dtype()\n+        return dtype.itemsize * len(self.array)\n \n \n class PandasMultiIndexingAdapter(PandasIndexingAdapter):",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::PandasIndexingAdapter::nbytes"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1977,8 +1953,8 @@",
+          "snippet": " class PandasMultiIndexingAdapter(PandasIndexingAdapter):\n         *,\n         copy: bool | None = None,\n     ) -> np.ndarray:\n-        if dtype is None:\n-            dtype = cast(np.dtype, self.dtype)\n+        dtype = self._get_numpy_dtype(dtype)\n+\n         if self.level is not None:\n             return np.asarray(\n                 self.array.get_level_values(self.level).values, dtype=dtype",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::PandasMultiIndexingAdapter::__array__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1986,47 +1962,28 @@",
+          "snippet": " class PandasMultiIndexingAdapter(PandasIndexingAdapter):\n         else:\n             return super().__array__(dtype, copy=copy)\n \n-    def _convert_scalar(self, item):\n+    @property\n+    def _in_memory(self) -> bool:\n+        # The pd.MultiIndex's data is fully in memory, but it has a different\n+        # layout than the level and dimension coordinate arrays. Marking this\n+        # adapter class as a \"lazy\" array will prevent costly conversion when,\n+        # e.g., formatting the Xarray reprs.\n+        return False\n+\n+    def _convert_scalar(self, item: Any):\n         if isinstance(item, tuple) and self.level is not None:\n             idx = tuple(self.array.names).index(self.level)\n             item = item[idx]\n         return super()._convert_scalar(item)\n \n-    def _oindex_get(\n-        self, indexer: OuterIndexer\n-    ) -> (\n-        PandasIndexingAdapter\n-        | NumpyIndexingAdapter\n-        | np.ndarray\n-        | np.datetime64\n-        | np.timedelta64\n-    ):\n-        result = super()._oindex_get(indexer)\n-        if isinstance(result, type(self)):\n-            result.level = self.level\n-        return result\n-\n-    def _vindex_get(\n-        self, indexer: VectorizedIndexer\n-    ) -> (\n-        PandasIndexingAdapter\n-        | NumpyIndexingAdapter\n-        | np.ndarray\n-        | np.datetime64\n-        | np.timedelta64\n-    ):\n-        result = super()._vindex_get(indexer)\n+    def _index_get(\n+        self, indexer: ExplicitIndexer, func_name: str\n+    ) -> PandasIndexingAdapter | np.ndarray:\n+        result = super()._index_get(indexer, func_name)\n         if isinstance(result, type(self)):\n             result.level = self.level\n         return result\n \n-    def __getitem__(self, indexer: ExplicitIndexer):\n-        result = super().__getitem__(indexer)\n-        if isinstance(result, type(self)):\n-            result.level = self.level\n-\n-        return result\n-\n     def __repr__(self) -> str:\n         if self.level is None:\n             return super().__repr__()",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "xarray/core/indexing.py::PandasMultiIndexingAdapter"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::PandasMultiIndexingAdapter::_in_memory"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::PandasMultiIndexingAdapter::_convert_scalar"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::PandasMultiIndexingAdapter::_index_get"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::PandasMultiIndexingAdapter::__repr__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2036,31 +1993,11 @@",
+          "snippet": " class PandasMultiIndexingAdapter(PandasIndexingAdapter):\n             )\n             return f\"{type(self).__name__}{props}\"\n \n-    def _get_array_subset(self) -> np.ndarray:\n-        # used to speed-up the repr for big multi-indexes\n-        threshold = max(100, OPTIONS[\"display_values_threshold\"] + 2)\n-        if self.size > threshold:\n-            pos = threshold // 2\n-            indices = np.concatenate([np.arange(0, pos), np.arange(-pos, 0)])\n-            subset = self[OuterIndexer((indices,))]\n-        else:\n-            subset = self\n-\n-        return np.asarray(subset)\n-\n     def _repr_inline_(self, max_width: int) -> str:\n-        from xarray.core.formatting import format_array_flat\n-\n         if self.level is None:\n             return \"MultiIndex\"\n         else:\n-            return format_array_flat(self._get_array_subset(), max_width)\n-\n-    def _repr_html_(self) -> str:\n-        from xarray.core.formatting import short_array_repr\n-\n-        array_repr = short_array_repr(self._get_array_subset())\n-        return f\"<pre>{escape(array_repr)}</pre>\"\n+            return super()._repr_inline_(max_width=max_width)\n \n     def copy(self, deep: bool = True) -> Self:\n         # see PandasIndexingAdapter.copy",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::PandasMultiIndexingAdapter::_repr_inline_"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2097,6 +2034,10 @@",
+          "snippet": " class CoordinateTransformIndexingAdapter(ExplicitlyIndexedNDArrayMixin):\n     def shape(self) -> tuple[int, ...]:\n         return tuple(self._transform.dim_size.values())\n \n+    @property\n+    def _in_memory(self) -> bool:\n+        return False\n+\n     def get_duck_array(self) -> np.ndarray:\n         all_coords = self._transform.generate_coords(dims=self._dims)\n         return np.asarray(all_coords[self._coord_name])",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "xarray/core/indexing.py::CoordinateTransformIndexingAdapter"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::CoordinateTransformIndexingAdapter::_in_memory"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2157,23 +2098,9 @@",
+          "snippet": " class CoordinateTransformIndexingAdapter(ExplicitlyIndexedNDArrayMixin):\n     def __repr__(self: Any) -> str:\n         return f\"{type(self).__name__}(transform={self._transform!r})\"\n \n-    def _get_array_subset(self) -> np.ndarray:\n-        threshold = max(100, OPTIONS[\"display_values_threshold\"] + 2)\n-        if self.size > threshold:\n-            pos = threshold // 2\n-            flat_indices = np.concatenate(\n-                [np.arange(0, pos), np.arange(self.size - pos, self.size)]\n-            )\n-            subset = self.vindex[\n-                VectorizedIndexer(np.unravel_index(flat_indices, self.shape))\n-            ]\n-        else:\n-            subset = self\n-\n-        return np.asarray(subset)\n-\n     def _repr_inline_(self, max_width: int) -> str:\n-        \"\"\"Good to see some labels even for a lazy coordinate.\"\"\"\n+        # we want to display values in the inline repr for this lazy coordinate\n+        # `format_array_flat` prevents loading the whole array in memory.\n         from xarray.core.formatting import format_array_flat\n \n-        return format_array_flat(self._get_array_subset(), max_width)\n+        return format_array_flat(self, max_width)\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/indexing.py::CoordinateTransformIndexingAdapter::_repr_inline_"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/resample_cftime.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -84,22 +84,16 @@",
+          "snippet": " class CFTimeGrouper:\n         self.freq = to_offset(freq)\n         self.origin = origin\n \n-        if isinstance(self.freq, MonthEnd | QuarterEnd | YearEnd):\n-            if closed is None:\n-                self.closed = \"right\"\n-            else:\n-                self.closed = closed\n-            if label is None:\n-                self.label = \"right\"\n-            else:\n-                self.label = label\n-        # The backward resample sets ``closed`` to ``'right'`` by default\n-        # since the last value should be considered as the edge point for\n-        # the last bin. When origin in \"end\" or \"end_day\", the value for a\n-        # specific ``cftime.datetime`` index stands for the resample result\n-        # from the current ``cftime.datetime`` minus ``freq`` to the current\n-        # ``cftime.datetime`` with a right close.\n-        elif self.origin in [\"end\", \"end_day\"]:\n+        if isinstance(self.freq, MonthEnd | QuarterEnd | YearEnd) or self.origin in [\n+            \"end\",\n+            \"end_day\",\n+        ]:\n+            # The backward resample sets ``closed`` to ``'right'`` by default\n+            # since the last value should be considered as the edge point for\n+            # the last bin. When origin in \"end\" or \"end_day\", the value for a\n+            # specific ``cftime.datetime`` index stands for the resample result\n+            # from the current ``cftime.datetime`` minus ``freq`` to the current\n+            # ``cftime.datetime`` with a right close.\n             if closed is None:\n                 self.closed = \"right\"\n             else:\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/resample_cftime.py::CFTimeGrouper::__init__"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/treenode.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -752,7 +752,7 @@",
+          "snippet": " class NamedNode(TreeNode, Generic[Tree]):\n             )\n \n         this_path = NodePath(self.path)\n-        if other.path in list(parent.path for parent in (self, *self.parents)):\n+        if any(other.path == parent.path for parent in (self, *self.parents)):\n             return str(this_path.relative_to(other.path))\n         else:\n             common_ancestor = self.find_common_ancestor(other)\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/treenode.py::NamedNode::relative_to"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/variable.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -23,6 +23,7 @@",
+          "snippet": " from xarray.core.common import AbstractArray\n from xarray.core.extension_array import PandasExtensionArray\n from xarray.core.indexing import (\n     BasicIndexer,\n+    CoordinateTransformIndexingAdapter,\n     OuterIndexer,\n     PandasIndexingAdapter,\n     VectorizedIndexer,",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/core/variable.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -403,10 +404,15 @@",
+          "snippet": " class Variable(NamedArray, AbstractArray, VariableArithmetic):\n             return cls_(dims_, data, attrs_)\n \n     @property\n-    def _in_memory(self):\n+    def _in_memory(self) -> bool:\n+        if isinstance(\n+            self._data, PandasIndexingAdapter | CoordinateTransformIndexingAdapter\n+        ):\n+            return self._data._in_memory\n+\n         return isinstance(\n             self._data,\n-            np.ndarray | np.number | PandasIndexingAdapter | PandasExtensionArray,\n+            np.ndarray | np.number | PandasExtensionArray,\n         ) or (\n             isinstance(self._data, indexing.MemoryCachedArray)\n             and isinstance(self._data.array, indexing.NumpyIndexingAdapter)\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/variable.py::Variable::_in_memory"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/groupers.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -617,10 +617,10 @@",
+          "snippet": " def season_to_month_tuple(seasons: Sequence[str]) -> tuple[tuple[int, ...], ...]\n     ((12, 1, 2, 3), (9, 10, 11, 12))\n     \"\"\"\n     initials = \"JFMAMJJASOND\"\n-    starts = dict(\n-        (\"\".join(s), i + 1)\n+    starts = {\n+        \"\".join(s): i + 1\n         for s, i in zip(sliding_window(2, initials + \"J\"), range(12), strict=True)\n-    )\n+    }\n     result: list[tuple[int, ...]] = []\n     for i, season in enumerate(seasons):\n         if len(season) == 1:",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/groupers.py::season_to_month_tuple"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -701,25 +701,23 @@",
+          "snippet": " def find_independent_seasons(seasons: Sequence[str]) -> Sequence[SeasonsGroup]:\n     grouped = defaultdict(list)\n     codes = defaultdict(list)\n     seen: set[tuple[int, ...]] = set()\n-    idx = 0\n     # This is quadratic, but the number of seasons is at most 12\n     for i, current in enumerate(season_inds):\n         # Start with a group\n         if current not in seen:\n-            grouped[idx].append(current)\n-            codes[idx].append(i)\n+            grouped[i].append(current)\n+            codes[i].append(i)\n             seen.add(current)\n \n         # Loop through remaining groups, and look for overlaps\n         for j, second in enumerate(season_inds[i:]):\n-            if not (set(chain(*grouped[idx])) & set(second)) and second not in seen:\n-                grouped[idx].append(second)\n-                codes[idx].append(j + i)\n+            if not (set(chain(*grouped[i])) & set(second)) and second not in seen:\n+                grouped[i].append(second)\n+                codes[i].append(j + i)\n                 seen.add(second)\n         if len(seen) == len(seasons):\n             break\n-        # found all non-overlapping groups for this row, increment and start over\n-        idx += 1\n+        # found all non-overlapping groups for this row start over\n \n     grouped_ints = tuple(tuple(idx) for idx in grouped.values() if idx)\n     return [\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/groupers.py::find_independent_seasons"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/indexes/__init__.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -10,13 +10,16 @@",
+          "snippet": " from xarray.core.indexes import (\n     PandasIndex,\n     PandasMultiIndex,\n )\n+from xarray.indexes.nd_point_index import NDPointIndex, TreeAdapter\n from xarray.indexes.range_index import RangeIndex\n \n __all__ = [\n     \"CoordinateTransform\",\n     \"CoordinateTransformIndex\",\n     \"Index\",\n+    \"NDPointIndex\",\n     \"PandasIndex\",\n     \"PandasMultiIndex\",\n     \"RangeIndex\",\n+    \"TreeAdapter\",\n ]\n",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "xarray/indexes/__init__.py::__all__"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/indexes/nd_point_index.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -0,0 +1,398 @@",
+          "snippet": "+from __future__ import annotations\n+\n+import abc\n+from collections.abc import Hashable, Iterable, Mapping\n+from typing import TYPE_CHECKING, Any, Generic, TypeVar\n+\n+import numpy as np\n+\n+from xarray.core.dataarray import DataArray\n+from xarray.core.indexes import Index\n+from xarray.core.indexing import IndexSelResult\n+from xarray.core.utils import is_scalar\n+from xarray.core.variable import Variable\n+from xarray.structure.alignment import broadcast\n+\n+if TYPE_CHECKING:\n+    from scipy.spatial import KDTree\n+\n+    from xarray.core.types import Self\n+\n+\n+class TreeAdapter(abc.ABC):\n+    \"\"\"Lightweight adapter abstract class for plugging in 3rd-party structures\n+    like :py:class:`scipy.spatial.KDTree` or :py:class:`sklearn.neighbors.KDTree`\n+    into :py:class:`~xarray.indexes.NDPointIndex`.\n+\n+    \"\"\"\n+\n+    @abc.abstractmethod\n+    def __init__(self, points: np.ndarray, *, options: Mapping[str, Any]):\n+        \"\"\"\n+        Parameters\n+        ----------\n+        points : ndarray of shape (n_points, n_coordinates)\n+            Two-dimensional array of points/samples (rows) and their\n+            corresponding coordinate labels (columns) to index.\n+        \"\"\"\n+        ...\n+\n+    @abc.abstractmethod\n+    def query(self, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:\n+        \"\"\"Query points.\n+\n+        Parameters\n+        ----------\n+        points: ndarray of shape (n_points, n_coordinates)\n+            Two-dimensional array of points/samples (rows) and their\n+            corresponding coordinate labels (columns) to query.\n+\n+        Returns\n+        -------\n+        distances : ndarray of shape (n_points)\n+            Distances to the nearest neighbors.\n+        indices : ndarray of shape (n_points)\n+            Indices of the nearest neighbors in the array of the indexed\n+            points.\n+        \"\"\"\n+        ...\n+\n+    def equals(self, other: Self) -> bool:\n+        \"\"\"Check equality with another TreeAdapter of the same kind.\n+\n+        Parameters\n+        ----------\n+        other :\n+            The other TreeAdapter object to compare with this object.\n+\n+        \"\"\"\n+        raise NotImplementedError\n+\n+\n+class ScipyKDTreeAdapter(TreeAdapter):\n+    \"\"\":py:class:`scipy.spatial.KDTree` adapter for :py:class:`~xarray.indexes.NDPointIndex`.\"\"\"\n+\n+    _kdtree: KDTree\n+\n+    def __init__(self, points: np.ndarray, options: Mapping[str, Any]):\n+        from scipy.spatial import KDTree\n+\n+        self._kdtree = KDTree(points, **options)\n+\n+    def query(self, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:\n+        return self._kdtree.query(points)\n+\n+    def equals(self, other: Self) -> bool:\n+        return np.array_equal(self._kdtree.data, other._kdtree.data)\n+\n+\n+def get_points(coords: Iterable[Variable | Any]) -> np.ndarray:\n+    \"\"\"Re-arrange data from a sequence of xarray coordinate variables or\n+    labels into a 2-d array of shape (n_points, n_coordinates).\n+\n+    \"\"\"\n+    data = [c.values if isinstance(c, Variable | DataArray) else c for c in coords]\n+    return np.stack([np.ravel(d) for d in data]).T\n+\n+\n+T_TreeAdapter = TypeVar(\"T_TreeAdapter\", bound=TreeAdapter)\n+\n+\n+class NDPointIndex(Index, Generic[T_TreeAdapter]):\n+    \"\"\"Xarray index for irregular, n-dimensional data.\n+\n+    This index may be associated with a set of coordinate variables representing\n+    the arbitrary location of data points in an n-dimensional space. All\n+    coordinates must have the same shape and dimensions. The number of\n+    associated coordinate variables must correspond to the number of dimensions\n+    of the space.\n+\n+    This index supports label-based selection (nearest neighbor lookup). It also\n+    has limited support for alignment.\n+\n+    By default, this index relies on :py:class:`scipy.spatial.KDTree` for fast\n+    lookup.\n+\n+    Do not use :py:meth:`~xarray.indexes.NDPointIndex.__init__` directly. Instead\n+    use :py:meth:`xarray.Dataset.set_xindex` or\n+    :py:meth:`xarray.DataArray.set_xindex` to create and set the index from\n+    existing coordinates (see the example below).\n+\n+    Examples\n+    --------\n+    An example using a dataset with 2-dimensional coordinates.\n+\n+    >>> xx = [[1.0, 2.0], [3.0, 0.0]]\n+    >>> yy = [[11.0, 21.0], [29.0, 9.0]]\n+    >>> ds = xr.Dataset(coords={\"xx\": ((\"y\", \"x\"), xx), \"yy\": ((\"y\", \"x\"), yy)})\n+    >>> ds\n+    <xarray.Dataset> Size: 64B\n+    Dimensions:  (y: 2, x: 2)\n+    Coordinates:\n+        xx       (y, x) float64 32B 1.0 2.0 3.0 0.0\n+        yy       (y, x) float64 32B 11.0 21.0 29.0 9.0\n+    Dimensions without coordinates: y, x\n+    Data variables:\n+        *empty*\n+\n+    Creation of a NDPointIndex from the \"xx\" and \"yy\" coordinate variables:\n+\n+    >>> ds = ds.set_xindex((\"xx\", \"yy\"), xr.indexes.NDPointIndex)\n+    >>> ds\n+    <xarray.Dataset> Size: 64B\n+    Dimensions:  (y: 2, x: 2)\n+    Coordinates:\n+      * xx       (y, x) float64 32B 1.0 2.0 3.0 0.0\n+      * yy       (y, x) float64 32B 11.0 21.0 29.0 9.0\n+    Dimensions without coordinates: y, x\n+    Data variables:\n+        *empty*\n+    Indexes:\n+      ┌ xx       NDPointIndex (ScipyKDTreeAdapter)\n+      └ yy\n+\n+    Point-wise (nearest-neighbor) data selection using Xarray's advanced\n+    indexing, i.e., using arbitrary dimension(s) for the Variable objects passed\n+    as labels:\n+\n+    >>> ds.sel(\n+    ...     xx=xr.Variable(\"points\", [1.9, 0.1]),\n+    ...     yy=xr.Variable(\"points\", [13.0, 8.0]),\n+    ...     method=\"nearest\",\n+    ... )\n+    <xarray.Dataset> Size: 32B\n+    Dimensions:  (points: 2)\n+    Coordinates:\n+        xx       (points) float64 16B 1.0 0.0\n+        yy       (points) float64 16B 11.0 9.0\n+    Dimensions without coordinates: points\n+    Data variables:\n+        *empty*\n+\n+    Data selection with scalar labels:\n+\n+    >>> ds.sel(xx=1.9, yy=13.0, method=\"nearest\")\n+    <xarray.Dataset> Size: 16B\n+    Dimensions:  ()\n+    Coordinates:\n+        xx       float64 8B 1.0\n+        yy       float64 8B 11.0\n+    Data variables:\n+        *empty*\n+\n+    Data selection with broadcasting the input labels:\n+\n+    >>> ds.sel(xx=1.9, yy=xr.Variable(\"points\", [13.0, 8.0]), method=\"nearest\")\n+    <xarray.Dataset> Size: 32B\n+    Dimensions:  (points: 2)\n+    Coordinates:\n+        xx       (points) float64 16B 1.0 0.0\n+        yy       (points) float64 16B 11.0 9.0\n+    Dimensions without coordinates: points\n+    Data variables:\n+        *empty*\n+\n+    >>> da = xr.DataArray(\n+    ...     [[45.1, 53.3], [65.4, 78.2]],\n+    ...     coords={\"u\": [1.9, 0.1], \"v\": [13.0, 8.0]},\n+    ...     dims=(\"u\", \"v\"),\n+    ... )\n+    >>> ds.sel(xx=da.u, yy=da.v, method=\"nearest\")\n+    <xarray.Dataset> Size: 64B\n+    Dimensions:  (u: 2, v: 2)\n+    Coordinates:\n+        xx       (u, v) float64 32B 1.0 0.0 1.0 0.0\n+        yy       (u, v) float64 32B 11.0 9.0 11.0 9.0\n+    Dimensions without coordinates: u, v\n+    Data variables:\n+        *empty*\n+\n+    Data selection with array-like labels (implicit dimensions):\n+\n+    >>> ds.sel(xx=[[1.9], [0.1]], yy=[[13.0], [8.0]], method=\"nearest\")\n+    <xarray.Dataset> Size: 32B\n+    Dimensions:  (y: 2, x: 1)\n+    Coordinates:\n+        xx       (y, x) float64 16B 1.0 0.0\n+        yy       (y, x) float64 16B 11.0 9.0\n+    Dimensions without coordinates: y, x\n+    Data variables:\n+        *empty*\n+\n+    \"\"\"\n+\n+    _tree_obj: T_TreeAdapter\n+    _coord_names: tuple[Hashable, ...]\n+    _dims: tuple[Hashable, ...]\n+    _shape: tuple[int, ...]\n+\n+    def __init__(\n+        self,\n+        tree_obj: T_TreeAdapter,\n+        *,\n+        coord_names: tuple[Hashable, ...],\n+        dims: tuple[Hashable, ...],\n+        shape: tuple[int, ...],\n+    ):\n+        # this constructor is \"private\"\n+        assert isinstance(tree_obj, TreeAdapter)\n+        self._tree_obj = tree_obj\n+\n+        assert len(coord_names) == len(dims) == len(shape)\n+        self._coord_names = coord_names\n+        self._dims = dims\n+        self._shape = shape\n+\n+    @classmethod\n+    def from_variables(\n+        cls,\n+        variables: Mapping[Any, Variable],\n+        *,\n+        options: Mapping[str, Any],\n+    ) -> Self:\n+        if len({var.dims for var in variables.values()}) > 1:\n+            var_names = \",\".join(vn for vn in variables)\n+            raise ValueError(\n+                f\"variables {var_names} must all have the same dimensions and the same shape\"\n+            )\n+\n+        var0 = next(iter(variables.values()))\n+\n+        if len(variables) != len(var0.dims):\n+            raise ValueError(\n+                f\"the number of variables {len(variables)} doesn't match \"\n+                f\"the number of dimensions {len(var0.dims)}\"\n+            )\n+\n+        opts = dict(options)\n+\n+        tree_adapter_cls: type[T_TreeAdapter] = opts.pop(\"tree_adapter_cls\", None)\n+        if tree_adapter_cls is None:\n+            tree_adapter_cls = ScipyKDTreeAdapter\n+\n+        points = get_points(variables.values())\n+\n+        return cls(\n+            tree_adapter_cls(points, options=opts),\n+            coord_names=tuple(variables),\n+            dims=var0.dims,\n+            shape=var0.shape,\n+        )\n+\n+    def create_variables(\n+        self, variables: Mapping[Any, Variable] | None = None\n+    ) -> dict[Any, Variable]:\n+        if variables is not None:\n+            for var in variables.values():\n+                # maybe re-sync variable dimensions with the index object\n+                # returned by NDPointIndex.rename()\n+                if var.dims != self._dims:\n+                    var.dims = self._dims\n+            return dict(**variables)\n+        else:\n+            return {}\n+\n+    def equals(\n+        self, other: Index, *, exclude: frozenset[Hashable] | None = None\n+    ) -> bool:\n+        if not isinstance(other, NDPointIndex):\n+            return False\n+        if type(self._tree_obj) is not type(other._tree_obj):\n+            return False\n+        return self._tree_obj.equals(other._tree_obj)\n+\n+    def _get_dim_indexers(\n+        self,\n+        indices: np.ndarray,\n+        label_dims: tuple[Hashable, ...],\n+        label_shape: tuple[int, ...],\n+    ) -> dict[Hashable, Variable]:\n+        \"\"\"Returns dimension indexers based on the query results (indices) and\n+        the original label dimensions and shape.\n+\n+        1. Unravel the flat indices returned from the query\n+        2. Reshape the unraveled indices according to indexers shapes\n+        3. Wrap the indices in xarray.Variable objects.\n+\n+        \"\"\"\n+        dim_indexers = {}\n+\n+        u_indices = list(np.unravel_index(indices.ravel(), self._shape))\n+\n+        for dim, ind in zip(self._dims, u_indices, strict=False):\n+            dim_indexers[dim] = Variable(label_dims, ind.reshape(label_shape))\n+\n+        return dim_indexers\n+\n+    def sel(\n+        self, labels: dict[Any, Any], method=None, tolerance=None\n+    ) -> IndexSelResult:\n+        if method != \"nearest\":\n+            raise ValueError(\n+                \"NDPointIndex only supports selection with method='nearest'\"\n+            )\n+\n+        missing_labels = set(self._coord_names) - set(labels)\n+        if missing_labels:\n+            missing_labels_str = \",\".join([f\"{name}\" for name in missing_labels])\n+            raise ValueError(f\"missing labels for coordinate(s): {missing_labels_str}.\")\n+\n+        # maybe convert labels into xarray DataArray objects\n+        xr_labels: dict[Any, DataArray] = {}\n+\n+        for name, lbl in labels.items():\n+            if isinstance(lbl, DataArray):\n+                xr_labels[name] = lbl\n+            elif isinstance(lbl, Variable):\n+                xr_labels[name] = DataArray(lbl)\n+            elif is_scalar(lbl):\n+                xr_labels[name] = DataArray(lbl, dims=())\n+            elif np.asarray(lbl).ndim == len(self._dims):\n+                xr_labels[name] = DataArray(lbl, dims=self._dims)\n+            else:\n+                raise ValueError(\n+                    \"invalid label value. NDPointIndex only supports advanced (point-wise) indexing \"\n+                    \"with the following label value kinds:\\n\"\n+                    \"- xarray.DataArray or xarray.Variable objects\\n\"\n+                    \"- scalar values\\n\"\n+                    \"- unlabelled array-like objects with the same number of dimensions \"\n+                    f\"than the {self._coord_names} coordinate variables ({len(self._dims)})\"\n+                )\n+\n+        # broadcast xarray labels against one another and determine labels shape and dimensions\n+        broadcasted = broadcast(*xr_labels.values())\n+        label_dims = broadcasted[0].dims\n+        label_shape = broadcasted[0].shape\n+        xr_labels = dict(zip(xr_labels, broadcasted, strict=True))\n+\n+        # get and return dimension indexers\n+        points = get_points(xr_labels[name] for name in self._coord_names)\n+        _, indices = self._tree_obj.query(points)\n+\n+        dim_indexers = self._get_dim_indexers(indices, label_dims, label_shape)\n+\n+        return IndexSelResult(dim_indexers=dim_indexers)\n+\n+    def rename(\n+        self,\n+        name_dict: Mapping[Any, Hashable],\n+        dims_dict: Mapping[Any, Hashable],\n+    ) -> Self:\n+        if not set(self._coord_names) & set(name_dict) and not set(self._dims) & set(\n+            dims_dict\n+        ):\n+            return self\n+\n+        new_coord_names = tuple(name_dict.get(n, n) for n in self._coord_names)\n+        new_dims = tuple(dims_dict.get(d, d) for d in self._dims)\n+\n+        return type(self)(\n+            self._tree_obj,\n+            coord_names=new_coord_names,\n+            dims=new_dims,\n+            shape=self._shape,\n+        )\n+\n+    def _repr_inline_(self, max_width: int) -> str:\n+        tree_obj_type = self._tree_obj.__class__.__name__\n+        return f\"{self.__class__.__name__} ({tree_obj_type})\"\n",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "xarray/indexes/nd_point_index.py::TreeAdapter"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/indexes/nd_point_index.py::TreeAdapter::__init__"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/indexes/nd_point_index.py::TreeAdapter::query"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/indexes/nd_point_index.py::TreeAdapter::equals"
+            },
+            {
+              "kind": "class",
+              "node": "xarray/indexes/nd_point_index.py::ScipyKDTreeAdapter"
+            },
+            {
+              "kind": "attribute",
+              "node": "xarray/indexes/nd_point_index.py::ScipyKDTreeAdapter::_kdtree"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/indexes/nd_point_index.py::ScipyKDTreeAdapter::__init__"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/indexes/nd_point_index.py::ScipyKDTreeAdapter::query"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/indexes/nd_point_index.py::ScipyKDTreeAdapter::equals"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/indexes/nd_point_index.py::get_points"
+            },
+            {
+              "kind": "variable",
+              "node": "xarray/indexes/nd_point_index.py::T_TreeAdapter"
+            },
+            {
+              "kind": "class",
+              "node": "xarray/indexes/nd_point_index.py::NDPointIndex"
+            },
+            {
+              "kind": "attribute",
+              "node": "xarray/indexes/nd_point_index.py::NDPointIndex::_tree_obj"
+            },
+            {
+              "kind": "attribute",
+              "node": "xarray/indexes/nd_point_index.py::NDPointIndex::_coord_names"
+            },
+            {
+              "kind": "attribute",
+              "node": "xarray/indexes/nd_point_index.py::NDPointIndex::_dims"
+            },
+            {
+              "kind": "attribute",
+              "node": "xarray/indexes/nd_point_index.py::NDPointIndex::_shape"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/indexes/nd_point_index.py::NDPointIndex::__init__"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/indexes/nd_point_index.py::NDPointIndex::from_variables"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/indexes/nd_point_index.py::NDPointIndex::create_variables"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/indexes/nd_point_index.py::NDPointIndex::equals"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/indexes/nd_point_index.py::NDPointIndex::_get_dim_indexers"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/indexes/nd_point_index.py::NDPointIndex::sel"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/indexes/nd_point_index.py::NDPointIndex::rename"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/indexes/nd_point_index.py::NDPointIndex::_repr_inline_"
+            }
+          ]
+        }
+      ],
+      "messages": [
+        "new file mode 100644"
+      ]
+    },
+    "xarray/plot/facetgrid.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -549,7 +549,7 @@",
+          "snippet": " class FacetGrid(Generic[T_DataArrayOrSet]):\n         )\n \n         if add_legend:\n-            use_legend_elements = not func.__name__ == \"hist\"\n+            use_legend_elements = func.__name__ != \"hist\"\n             if use_legend_elements:\n                 self.add_legend(\n                     use_legend_elements=use_legend_elements,\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/plot/facetgrid.py::FacetGrid::map_plot1d"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/plot/utils.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -419,9 +419,10 @@",
+          "snippet": " def _infer_xy_labels(\n         _assert_valid_xy(darray, x, \"x\")\n         _assert_valid_xy(darray, y, \"y\")\n \n-        if darray._indexes.get(x, 1) is darray._indexes.get(y, 2):\n-            if isinstance(darray._indexes[x], PandasMultiIndex):\n-                raise ValueError(\"x and y cannot be levels of the same MultiIndex\")\n+        if darray._indexes.get(x, 1) is darray._indexes.get(y, 2) and isinstance(\n+            darray._indexes[x], PandasMultiIndex\n+        ):\n+            raise ValueError(\"x and y cannot be levels of the same MultiIndex\")\n \n     return x, y\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/plot/utils.py::_infer_xy_labels"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1142,7 +1143,7 @@",
+          "snippet": " def legend_elements(\n         # Labels are not numerical so modifying label_values is not\n         # possible, instead filter the array with nicely distributed\n         # indexes:\n-        if type(num) == int:  # noqa: E721\n+        if type(num) is int:\n             loc = mpl.ticker.LinearLocator(num)\n         else:\n             raise ValueError(\"`num` only supports integers for non-numeric labels.\")\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/plot/utils.py::legend_elements"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/structure/merge.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -300,7 +300,7 @@",
+          "snippet": " def merge_collected(\n                 variables = [variable for variable, _ in elements_list]\n                 try:\n                     merged_vars[name] = unique_variable(\n-                        name, variables, compat, equals.get(name, None)\n+                        name, variables, compat, equals.get(name)\n                     )\n                 except MergeError:\n                     if compat != \"minimal\":\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/structure/merge.py::merge_collected"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/util/print_versions.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -20,7 +20,7 @@",
+          "snippet": " def get_sys_info():\n     if os.path.isdir(\".git\") and os.path.isdir(\"xarray\"):\n         try:\n             pipe = subprocess.Popen(\n-                'git log --format=\"%H\" -n 1'.split(\" \"),\n+                (\"git\", \"log\", '--format=\"%H\"', \"-n\", \"1\"),\n                 stdout=subprocess.PIPE,\n                 stderr=subprocess.PIPE,\n             )",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/util/print_versions.py::get_sys_info"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

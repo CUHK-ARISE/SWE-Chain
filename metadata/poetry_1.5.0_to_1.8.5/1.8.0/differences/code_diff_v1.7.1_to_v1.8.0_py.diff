@@ -1,0 +1,4182 @@
+diff --git a/src/poetry/config/config.py b/src/poetry/config/config.py
+index cbd89eb..1919aa1 100644
+--- a/src/poetry/config/config.py
++++ b/src/poetry/config/config.py
+@@ -133,9 +133,15 @@ class Config:
+             "max-workers": None,
+             "no-binary": None,
+         },
++        "solver": {
++            "lazy-wheel": True,
++        },
+         "warnings": {
+             "export": True,
+         },
++        "keyring": {
++            "enabled": True,
++        },
+     }
+ 
+     def __init__(
+@@ -269,6 +275,11 @@ class Config:
+ 
+             value = value[key]
+ 
++        if self._use_environment and isinstance(value, dict):
++            # this is a configuration table, it is likely that we missed env vars
++            # in order to capture them recurse, eg: virtualenvs.options
++            return {k: self.get(f"{setting_name}.{k}") for k in value}
++
+         return self.process(value)
+ 
+     def process(self, value: Any) -> Any:
+@@ -293,12 +304,16 @@ class Config:
+             "virtualenvs.create",
+             "virtualenvs.in-project",
+             "virtualenvs.options.always-copy",
++            "virtualenvs.options.no-pip",
++            "virtualenvs.options.no-setuptools",
+             "virtualenvs.options.system-site-packages",
+             "virtualenvs.options.prefer-active-python",
+             "experimental.system-git-client",
+             "installer.modern-installation",
+             "installer.parallel",
++            "solver.lazy-wheel",
+             "warnings.export",
++            "keyring.enabled",
+         }:
+             return boolean_normalizer
+ 
+
+diff --git a/src/poetry/console/commands/about.py b/src/poetry/console/commands/about.py
+index 9b117ae..cf2548d 100644
+--- a/src/poetry/console/commands/about.py
++++ b/src/poetry/console/commands/about.py
+@@ -21,7 +21,8 @@ class AboutCommand(Command):
+         # that.
+         version: Callable[[str], str] = metadata.version
+ 
+-        self.line(f"""\
++        self.line(
++            f"""\
+ <info>Poetry - Package Management for Python
+ 
+ Version: {version('poetry')}
+@@ -30,6 +31,7 @@ Poetry-Core Version: {version('poetry-core')}</info>
+ <comment>Poetry is a dependency manager tracking local dependencies of your projects\
+  and libraries.
+ See <fg=blue>https://github.com/python-poetry/poetry</> for more information.</comment>\
+-""")
++"""
++        )
+ 
+         return 0
+
+diff --git a/src/poetry/console/commands/add.py b/src/poetry/console/commands/add.py
+index 37277c9..fc13f6f 100644
+--- a/src/poetry/console/commands/add.py
++++ b/src/poetry/console/commands/add.py
+@@ -298,5 +298,5 @@ The add command adds required packages to your <comment>pyproject.toml</> and in
+             " be skipped:\n"
+         )
+         for name in existing_packages:
+-            self.line(f"  • <c1>{name}</c1>")
++            self.line(f"  - <c1>{name}</c1>")
+         self.line(self._hint_update_packages)
+
+diff --git a/src/poetry/console/commands/build.py b/src/poetry/console/commands/build.py
+index 5339a86..07ca017 100644
+--- a/src/poetry/console/commands/build.py
++++ b/src/poetry/console/commands/build.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++from pathlib import Path
++
+ from cleo.helpers import option
+ 
+ from poetry.console.commands.env_command import EnvCommand
+@@ -11,7 +13,14 @@ class BuildCommand(EnvCommand):
+     description = "Builds a package, as a tarball and a wheel by default."
+ 
+     options = [
+-        option("format", "f", "Limit the format to either sdist or wheel.", flag=False)
++        option("format", "f", "Limit the format to either sdist or wheel.", flag=False),
++        option(
++            "output",
++            "o",
++            "Set output directory for build artifacts. Default is `dist`.",
++            default="dist",
++            flag=False,
++        ),
+     ]
+ 
+     loggers = [
+@@ -20,17 +29,40 @@ class BuildCommand(EnvCommand):
+         "poetry.core.masonry.builders.wheel",
+     ]
+ 
++    def _build(
++        self,
++        fmt: str,
++        executable: str | Path | None = None,
++        *,
++        target_dir: Path | None = None,
++    ) -> None:
++        from poetry.masonry.builders import BUILD_FORMATS
++
++        if fmt in BUILD_FORMATS:
++            builders = [BUILD_FORMATS[fmt]]
++        elif fmt == "all":
++            builders = list(BUILD_FORMATS.values())
++        else:
++            raise ValueError(f"Invalid format: {fmt}")
++
++        for builder in builders:
++            builder(self.poetry, executable=executable).build(target_dir)
++
+     def handle(self) -> int:
+-        from poetry.core.masonry.builder import Builder
++        if not self.poetry.is_package_mode:
++            self.line_error("Building a package is not possible in non-package mode.")
++            return 1
+ 
+         with build_environment(poetry=self.poetry, env=self.env, io=self.io) as env:
+             fmt = self.option("format") or "all"
++            dist_dir = Path(self.option("output"))
+             package = self.poetry.package
+             self.line(
+                 f"Building <c1>{package.pretty_name}</c1> (<c2>{package.version}</c2>)"
+             )
+ 
+-            builder = Builder(self.poetry)
+-            builder.build(fmt, executable=env.python)
++            if not dist_dir.is_absolute():
++                dist_dir = self.poetry.pyproject_path.parent / dist_dir
++            self._build(fmt, executable=env.python, target_dir=dist_dir)
+ 
+         return 0
+
+diff --git a/src/poetry/console/commands/check.py b/src/poetry/console/commands/check.py
+index 570a7f4..6f53685 100644
+--- a/src/poetry/console/commands/check.py
++++ b/src/poetry/console/commands/check.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ from typing import TYPE_CHECKING
++from typing import Any
+ 
+ from cleo.helpers import option
+ 
+@@ -88,9 +89,41 @@ class CheckCommand(Command):
+                 errors.append(f"Declared README file does not exist: {name}")
+         return errors
+ 
++    def _validate_dependencies_source(self, config: dict[str, Any]) -> list[str]:
++        """Check dependencies's source are valid"""
++        sources = {k["name"] for k in config.get("source", [])}
++
++        dependency_declarations: list[
++            dict[str, str | dict[str, str] | list[dict[str, str]]]
++        ] = []
++        # scan dependencies and group dependencies settings in pyproject.toml
++        if "dependencies" in config:
++            dependency_declarations.append(config["dependencies"])
++
++        for group in config.get("group", {}).values():
++            if "dependencies" in group:
++                dependency_declarations.append(group["dependencies"])
++
++        all_referenced_sources: set[str] = set()
++
++        for dependency_declaration in dependency_declarations:
++            for declaration in dependency_declaration.values():
++                if isinstance(declaration, list):
++                    for item in declaration:
++                        if "source" in item:
++                            all_referenced_sources.add(item["source"])
++                elif isinstance(declaration, dict) and "source" in declaration:
++                    all_referenced_sources.add(declaration["source"])
++
++        return [
++            f'Invalid source "{source}" referenced in dependencies.'
++            for source in sorted(all_referenced_sources - sources)
++        ]
++
+     def handle(self) -> int:
++        from poetry.core.pyproject.toml import PyProjectTOML
++
+         from poetry.factory import Factory
+-        from poetry.pyproject.toml import PyProjectTOML
+ 
+         # Load poetry config and display errors, if any
+         poetry_file = self.poetry.file.path
+@@ -108,13 +141,15 @@ class CheckCommand(Command):
+             errors = self._validate_readme(config["readme"], poetry_file)
+             check_result["errors"].extend(errors)
+ 
++        check_result["errors"] += self._validate_dependencies_source(config)
++
+         # Verify that lock file is consistent
+         if self.option("lock") and not self.poetry.locker.is_locked():
+             check_result["errors"] += ["poetry.lock was not found."]
+         if self.poetry.locker.is_locked() and not self.poetry.locker.is_fresh():
+             check_result["errors"] += [
+-                "poetry.lock is not consistent with pyproject.toml. Run `poetry"
+-                " lock [--no-update]` to fix it."
++                "pyproject.toml changed significantly since poetry.lock was last generated. "
++                "Run `poetry lock [--no-update]` to fix the lock file."
+             ]
+ 
+         if not check_result["errors"] and not check_result["warnings"]:
+
+diff --git a/src/poetry/console/commands/config.py b/src/poetry/console/commands/config.py
+index 3b460fb..3d0162e 100644
+--- a/src/poetry/console/commands/config.py
++++ b/src/poetry/console/commands/config.py
+@@ -68,16 +68,18 @@ To remove a repository (repo is a short alias for repositories):
+             ),
+             "virtualenvs.path": (str, lambda val: str(Path(val))),
+             "virtualenvs.prefer-active-python": (boolean_validator, boolean_normalizer),
++            "virtualenvs.prompt": (str, str),
+             "experimental.system-git-client": (boolean_validator, boolean_normalizer),
+             "installer.modern-installation": (boolean_validator, boolean_normalizer),
+             "installer.parallel": (boolean_validator, boolean_normalizer),
+             "installer.max-workers": (lambda val: int(val) > 0, int_normalizer),
+-            "virtualenvs.prompt": (str, lambda val: str(val)),
+             "installer.no-binary": (
+                 PackageFilterPolicy.validator,
+                 PackageFilterPolicy.normalize,
+             ),
++            "solver.lazy-wheel": (boolean_validator, boolean_normalizer),
+             "warnings.export": (boolean_validator, boolean_normalizer),
++            "keyring.enabled": (boolean_validator, boolean_normalizer),
+         }
+ 
+         return unique_config_values
+
+diff --git a/src/poetry/console/commands/env/info.py b/src/poetry/console/commands/env/info.py
+index 2de77f7..cb8152a 100644
+--- a/src/poetry/console/commands/env/info.py
++++ b/src/poetry/console/commands/env/info.py
+@@ -71,17 +71,17 @@ class EnvInfoCommand(Command):
+ 
+         self.line("")
+ 
+-        system_env = env.parent_env
+-        python = ".".join(str(v) for v in system_env.version_info[:3])
+-        self.line("<b>System</b>")
++        base_env = env.parent_env
++        python = ".".join(str(v) for v in base_env.version_info[:3])
++        self.line("<b>Base</b>")
+         self.line(
+             "\n".join(
+                 [
+                     f"<info>Platform</info>:   <comment>{env.platform}</>",
+                     f"<info>OS</info>:         <comment>{env.os}</>",
+                     f"<info>Python</info>:     <comment>{python}</>",
+-                    f"<info>Path</info>:       <comment>{system_env.path}</>",
+-                    f"<info>Executable</info>: <comment>{system_env.python}</>",
++                    f"<info>Path</info>:       <comment>{base_env.path}</>",
++                    f"<info>Executable</info>: <comment>{base_env.python}</>",
+                 ]
+             )
+         )
+
+diff --git a/src/poetry/console/commands/env/remove.py b/src/poetry/console/commands/env/remove.py
+index d23fafe..4325f04 100644
+--- a/src/poetry/console/commands/env/remove.py
++++ b/src/poetry/console/commands/env/remove.py
+@@ -45,5 +45,10 @@ class EnvRemoveCommand(Command):
+             for venv in manager.list():
+                 manager.remove_venv(venv.path)
+                 self.line(f"Deleted virtualenv: <comment>{venv.path}</comment>")
++            # Since we remove all the virtualenvs, we can also remove the entry
++            # in the envs file. (Strictly speaking, we should do this explicitly,
++            # in case it points to a virtualenv that had been removed manually before.)
++            if manager.envs_file.exists():
++                manager.envs_file.remove_section(manager.base_env_name)
+ 
+         return 0
+
+diff --git a/src/poetry/console/commands/init.py b/src/poetry/console/commands/init.py
+index 658b7a4..fe708c9 100644
+--- a/src/poetry/console/commands/init.py
++++ b/src/poetry/console/commands/init.py
+@@ -456,10 +456,12 @@ You can specify a package in the following forms:
+ 
+         return requires
+ 
+-    def _validate_author(self, author: str, default: str) -> str | None:
++    @staticmethod
++    def _validate_author(author: str, default: str) -> str | None:
+         from poetry.core.packages.package import AUTHOR_REGEX
++        from poetry.core.utils.helpers import combine_unicode
+ 
+-        author = author or default
++        author = combine_unicode(author or default)
+ 
+         if author in ["n", "no"]:
+             return None
+
+diff --git a/src/poetry/console/commands/install.py b/src/poetry/console/commands/install.py
+index 8e716ca..8186719 100644
+--- a/src/poetry/console/commands/install.py
++++ b/src/poetry/console/commands/install.py
+@@ -77,6 +77,9 @@ dependencies and not including the current project, run the command with the
+ <info>--no-root</info> option like below:
+ 
+ <info> poetry install --no-root</info>
++
++If you want to use Poetry only for dependency management but not for packaging,
++you can set the "package-mode" to false in your pyproject.toml file.
+ """
+ 
+     _loggers = ["poetry.repositories.pypi_repository", "poetry.inspection.info"]
+@@ -152,7 +155,7 @@ dependencies and not including the current project, run the command with the
+         if return_code != 0:
+             return return_code
+ 
+-        if self.option("no-root"):
++        if self.option("no-root") or not self.poetry.is_package_mode:
+             return 0
+ 
+         log_install = (
+@@ -184,9 +187,13 @@ dependencies and not including the current project, run the command with the
+             # No need for an editable install in this case.
+             self.line("")
+             self.line_error(
+-                f"The current project could not be installed: <error>{e}</error>\n"
++                f"Warning: The current project could not be installed: {e}\n"
+                 "If you do not want to install the current project"
+-                " use <c1>--no-root</c1>",
++                " use <c1>--no-root</c1>.\n"
++                "If you want to use Poetry only for dependency management"
++                " but not for packaging, you can set the operating mode to "
++                '"non-package" in your pyproject.toml file.\n'
++                "In a future version of Poetry this warning will become an error!",
+                 style="warning",
+             )
+             return 0
+
+diff --git a/src/poetry/console/commands/lock.py b/src/poetry/console/commands/lock.py
+index b32c05d..fd8eda7 100644
+--- a/src/poetry/console/commands/lock.py
++++ b/src/poetry/console/commands/lock.py
+@@ -44,8 +44,8 @@ file.
+                 return 0
+             self.line_error(
+                 "<error>"
+-                "Error: poetry.lock is not consistent with pyproject.toml. "
+-                "Run `poetry lock [--no-update]` to fix it."
++                "Error: pyproject.toml changed significantly since poetry.lock was last generated. "
++                "Run `poetry lock [--no-update]` to fix the lock file."
+                 "</error>"
+             )
+             return 1
+
+diff --git a/src/poetry/console/commands/publish.py b/src/poetry/console/commands/publish.py
+index a53df82..2671c7a 100644
+--- a/src/poetry/console/commands/publish.py
++++ b/src/poetry/console/commands/publish.py
+@@ -26,6 +26,13 @@ class PublishCommand(Command):
+             "Client certificate to access the repository.",
+             flag=False,
+         ),
++        option(
++            "dist-dir",
++            None,
++            "Dist directory where built artifact are stored. Default is `dist`.",
++            default="dist",
++            flag=False,
++        ),
+         option("build", None, "Build the package before publishing."),
+         option("dry-run", None, "Perform all actions except upload the package."),
+         option(
+@@ -49,7 +56,13 @@ the config command.
+     def handle(self) -> int:
+         from poetry.publishing.publisher import Publisher
+ 
+-        publisher = Publisher(self.poetry, self.io)
++        if not self.poetry.is_package_mode:
++            self.line_error("Publishing a package is not possible in non-package mode.")
++            return 1
++
++        dist_dir = self.option("dist-dir")
++
++        publisher = Publisher(self.poetry, self.io, Path(dist_dir))
+ 
+         # Building package first, if told
+         if self.option("build"):
+@@ -61,7 +74,7 @@ the config command.
+ 
+                 return 1
+ 
+-            self.call("build")
++            self.call("build", args=f"--output {dist_dir}")
+ 
+         files = publisher.files
+         if not files:
+
+diff --git a/src/poetry/console/commands/self/show/plugins.py b/src/poetry/console/commands/self/show/plugins.py
+index 15c9854..9f8299a 100644
+--- a/src/poetry/console/commands/self/show/plugins.py
++++ b/src/poetry/console/commands/self/show/plugins.py
+@@ -88,7 +88,7 @@ commands respectively.
+             package = info.package
+             description = " " + package.description if package.description else ""
+             self.line("")
+-            self.line(f"  • <c1>{name}</c1> (<c2>{package.version}</c2>){description}")
++            self.line(f"  - <c1>{name}</c1> (<c2>{package.version}</c2>){description}")
+             provide_line = "     "
+ 
+             if info.plugins:
+
+diff --git a/src/poetry/console/commands/show.py b/src/poetry/console/commands/show.py
+index 8b22e08..1208ca4 100644
+--- a/src/poetry/console/commands/show.py
++++ b/src/poetry/console/commands/show.py
+@@ -48,8 +48,9 @@ class ShowCommand(GroupCommand, EnvCommand):
+         option(
+             "why",
+             None,
+-            "When showing the full list, or a <info>--tree</info> for a single"
+-            " package, also display why it's included.",
++            "When showing the full list, or a <info>--tree</info> for a single package,"
++            " display whether they are a direct dependency or required by other"
++            " packages",
+         ),
+         option("latest", "l", "Show the latest version."),
+         option(
+
+diff --git a/src/poetry/console/commands/source/add.py b/src/poetry/console/commands/source/add.py
+index 5e1526f..6d1ab58 100644
+--- a/src/poetry/console/commands/source/add.py
++++ b/src/poetry/console/commands/source/add.py
+@@ -107,12 +107,20 @@ class SourceAddCommand(Command):
+             priority = Priority[priority_str.upper()]
+ 
+         if priority is Priority.SECONDARY:
+-            allowed_prios = (p for p in Priority if p is not Priority.SECONDARY)
++            allowed_prios = (
++                p for p in Priority if p not in {Priority.DEFAULT, Priority.SECONDARY}
++            )
+             self.line_error(
+                 "<warning>Warning: Priority 'secondary' is deprecated. Consider"
+                 " changing the priority to one of the non-deprecated values:"
+                 f" {', '.join(repr(p.name.lower()) for p in allowed_prios)}.</warning>"
+             )
++        if priority is Priority.DEFAULT:
++            self.line_error(
++                "<warning>Warning: Priority 'default' is deprecated. You can achieve"
++                " the same effect by changing the priority to 'primary' and putting"
++                " the source first.</warning>"
++            )
+ 
+         sources = AoT([])
+         new_source = Source(name=name, url=url, priority=priority)
+
+diff --git a/src/poetry/console/commands/update.py b/src/poetry/console/commands/update.py
+index 57b1730..59c17ca 100644
+--- a/src/poetry/console/commands/update.py
++++ b/src/poetry/console/commands/update.py
+@@ -23,6 +23,12 @@ class UpdateCommand(InstallerCommand):
+             "Do not update the development dependencies."
+             " (<warning>Deprecated</warning>)",
+         ),
++        option(
++            "sync",
++            None,
++            "Synchronize the environment with the locked packages and the specified"
++            " groups.",
++        ),
+         option(
+             "dry-run",
+             None,
+@@ -41,6 +47,7 @@ class UpdateCommand(InstallerCommand):
+ 
+         self.installer.only_groups(self.activated_groups)
+         self.installer.dry_run(self.option("dry-run"))
++        self.installer.requires_synchronization(self.option("sync"))
+         self.installer.execute_operations(not self.option("lock"))
+ 
+         # Force update
+
+diff --git a/src/poetry/console/commands/version.py b/src/poetry/console/commands/version.py
+index 0af2a00..7e8d118 100644
+--- a/src/poetry/console/commands/version.py
++++ b/src/poetry/console/commands/version.py
+@@ -86,7 +86,7 @@ patch, minor, major, prepatch, preminor, premajor, prerelease.
+                 self.line(self.poetry.package.pretty_version)
+             else:
+                 self.line(
+-                    f"<comment>{self.poetry.package.name}</>"
++                    f"<comment>{self.poetry.package.pretty_name}</>"
+                     f" <info>{self.poetry.package.pretty_version}</>"
+                 )
+ 
+
+diff --git a/src/poetry/console/logging/io_formatter.py b/src/poetry/console/logging/io_formatter.py
+index 274e29e..0131501 100644
+--- a/src/poetry/console/logging/io_formatter.py
++++ b/src/poetry/console/logging/io_formatter.py
+@@ -1,7 +1,10 @@
+ from __future__ import annotations
+ 
+ import logging
++import sys
++import textwrap
+ 
++from pathlib import Path
+ from typing import TYPE_CHECKING
+ 
+ from poetry.console.logging.filters import POETRY_FILTER
+@@ -32,8 +35,37 @@ class IOFormatter(logging.Formatter):
+ 
+             record.msg = msg
+ 
++        formatted = super().format(record)
++
+         if not POETRY_FILTER.filter(record):
+-            # prefix third-party packages with name for easier debugging
+-            record.msg = f"[{record.name}] {record.msg}"
++            # prefix all lines from third-party packages for easier debugging
++            formatted = textwrap.indent(
++                formatted, f"[{_log_prefix(record)}] ", lambda line: True
++            )
++
++        return formatted
++
++
++def _log_prefix(record: LogRecord) -> str:
++    prefix = _path_to_package(Path(record.pathname)) or record.module
++    if record.name != "root":
++        prefix = ":".join([prefix, record.name])
++    return prefix
++
+ 
+-        return super().format(record)
++def _path_to_package(path: Path) -> str | None:
++    """Return main package name from the LogRecord.pathname."""
++    prefix: Path | None = None
++    # Find the most specific prefix in sys.path.
++    # We have to search the entire sys.path because a subsequent path might be
++    # a sub path of the first match and thereby a better match.
++    for syspath in sys.path:
++        if (
++            prefix and prefix in (p := Path(syspath)).parents and p in path.parents
++        ) or (not prefix and (p := Path(syspath)) in path.parents):
++            prefix = p
++    if not prefix:
++        # this is unexpected, but let's play it safe
++        return None
++    path = path.relative_to(prefix)
++    return path.parts[0]  # main package name
+
+diff --git a/src/poetry/factory.py b/src/poetry/factory.py
+index 15bd004..16400ed 100644
+--- a/src/poetry/factory.py
++++ b/src/poetry/factory.py
+@@ -159,6 +159,14 @@ class Factory(BaseFactory):
+                     f" {', '.join(repr(p.name.lower()) for p in allowed_prios)}."
+                 )
+                 io.write_error_line(f"<warning>Warning: {warning}</warning>")
++            elif priority is Priority.DEFAULT:
++                warning = (
++                    "Found deprecated priority 'default' for source"
++                    f" '{source.get('name')}' in pyproject.toml. You can achieve"
++                    " the same effect by changing the priority to 'primary' and putting"
++                    " the source first."
++                )
++                io.write_error_line(f"<warning>Warning: {warning}</warning>")
+ 
+             if io.is_debug():
+                 message = f"Adding repository {repository.name} ({repository.url})"
+@@ -175,32 +183,15 @@ class Factory(BaseFactory):
+ 
+         # Only add PyPI if no default repository is configured
+         if not explicit_pypi:
+-            if pool.has_default():
++            if pool.has_default() or pool.has_primary_repositories():
+                 if io.is_debug():
+                     io.write_line("Deactivating the PyPI repository")
+             else:
+                 from poetry.repositories.pypi_repository import PyPiRepository
+ 
+-                if pool.has_primary_repositories():
+-                    io.write_error_line(
+-                        "<warning>"
+-                        "Warning: In a future version of Poetry, PyPI will be disabled"
+-                        " automatically if at least one custom primary source is"
+-                        " configured. In order to avoid"
+-                        " a breaking change and make your pyproject.toml forward"
+-                        " compatible, add PyPI explicitly via 'poetry source add pypi'."
+-                        " By the way, this has the advantage that you can set the"
+-                        " priority of PyPI as with any other source."
+-                        "</warning>"
+-                    )
+-
+-                if pool.has_primary_repositories():
+-                    pypi_priority = Priority.SECONDARY
+-                else:
+-                    pypi_priority = Priority.DEFAULT
+-
+                 pool.add_repository(
+-                    PyPiRepository(disable_cache=disable_cache), priority=pypi_priority
++                    PyPiRepository(disable_cache=disable_cache),
++                    priority=Priority.PRIMARY,
+                 )
+ 
+         if not pool.repositories:
+@@ -370,9 +361,10 @@ class Factory(BaseFactory):
+ 
+         dependencies = {canonicalize_name(d) for d in dependencies}
+ 
+-        if canonicalize_name(config["name"]) in dependencies:
++        project_name = config.get("name")
++        if project_name is not None and canonicalize_name(project_name) in dependencies:
+             results["errors"].append(
+-                f"Project name ({config['name']}) is same as one of its dependencies"
++                f"Project name ({project_name}) is same as one of its dependencies"
+             )
+ 
+         return results
+
+diff --git a/src/poetry/inspection/info.py b/src/poetry/inspection/info.py
+index 545eed2..1c432e2 100644
+--- a/src/poetry/inspection/info.py
++++ b/src/poetry/inspection/info.py
+@@ -9,18 +9,20 @@ import os
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+ from typing import Any
++from typing import Mapping
++from typing import Sequence
+ 
+ import pkginfo
+ 
+ from poetry.core.factory import Factory
+ from poetry.core.packages.dependency import Dependency
+ from poetry.core.packages.package import Package
++from poetry.core.pyproject.toml import PyProjectTOML
+ from poetry.core.utils.helpers import parse_requires
+ from poetry.core.utils.helpers import temporary_directory
+ from poetry.core.version.markers import InvalidMarker
+ from poetry.core.version.requirements import InvalidRequirement
+ 
+-from poetry.pyproject.toml import PyProjectTOML
+ from poetry.utils.env import EnvCommandError
+ from poetry.utils.env import ephemeral_environment
+ from poetry.utils.helpers import extractall
+@@ -30,6 +32,8 @@ from poetry.utils.setup_reader import SetupReader
+ if TYPE_CHECKING:
+     from collections.abc import Iterator
+ 
++    from packaging.metadata import RawMetadata
++    from packaging.utils import NormalizedName
+     from poetry.core.packages.project_package import ProjectPackage
+ 
+ 
+@@ -44,10 +48,8 @@ source = '{source}'
+ dest = '{dest}'
+ 
+ with build.env.DefaultIsolatedEnv() as env:
+-    builder = build.ProjectBuilder(
+-        source_dir=source,
+-        python_executable=env.python_executable,
+-        runner=pyproject_hooks.quiet_subprocess_runner,
++    builder = build.ProjectBuilder.from_isolated_env(
++        env, source, runner=pyproject_hooks.quiet_subprocess_runner
+     )
+     env.install(builder.build_system_requires)
+     env.install(builder.get_requires_for_build('wheel'))
+@@ -72,7 +74,7 @@ class PackageInfo:
+         summary: str | None = None,
+         requires_dist: list[str] | None = None,
+         requires_python: str | None = None,
+-        files: list[dict[str, str]] | None = None,
++        files: Sequence[Mapping[str, str]] | None = None,
+         yanked: str | bool = False,
+         cache_version: str | None = None,
+     ) -> None:
+@@ -188,6 +190,7 @@ class PackageInfo:
+ 
+         seen_requirements = set()
+ 
++        package_extras: dict[NormalizedName, list[Dependency]] = {}
+         for req in self.requires_dist or []:
+             try:
+                 # Attempt to parse the PEP-508 requirement string
+@@ -215,12 +218,12 @@ class PackageInfo:
+             if dependency.in_extras:
+                 # this dependency is required by an extra package
+                 for extra in dependency.in_extras:
+-                    if extra not in package.extras:
++                    if extra not in package_extras:
+                         # this is the first time we encounter this extra for this
+                         # package
+-                        package.extras[extra] = []
++                        package_extras[extra] = []
+ 
+-                    package.extras[extra].append(dependency)
++                    package_extras[extra].append(dependency)
+ 
+             req = dependency.to_pep_508(with_extras=True)
+ 
+@@ -228,6 +231,8 @@ class PackageInfo:
+                 package.add_dependency(dependency)
+                 seen_requirements.add(req)
+ 
++        package.extras = package_extras
++
+         return package
+ 
+     @classmethod
+@@ -247,8 +252,8 @@ class PackageInfo:
+         else:
+             requires = Path(dist.filename) / "requires.txt"
+             if requires.exists():
+-                with requires.open(encoding="utf-8") as f:
+-                    requirements = parse_requires(f.read())
++                text = requires.read_text(encoding="utf-8")
++                requirements = parse_requires(text)
+ 
+         info = cls(
+             name=dist.name,
+@@ -274,16 +279,13 @@ class PackageInfo:
+         """
+         info = None
+ 
+-        try:
+-            info = cls._from_distribution(pkginfo.SDist(str(path)))
+-        except ValueError:
+-            # Unable to determine dependencies
+-            # We pass and go deeper
+-            pass
+-        else:
+-            if info.requires_dist is not None:
+-                # we successfully retrieved dependencies from sdist metadata
+-                return info
++        with contextlib.suppress(ValueError):
++            sdist = pkginfo.SDist(str(path))
++            info = cls._from_distribution(sdist)
++
++        if info is not None and info.requires_dist is not None:
++            # we successfully retrieved dependencies from sdist metadata
++            return info
+ 
+         # Still not dependencies found
+         # So, we unpack and introspect
+@@ -313,6 +315,8 @@ class PackageInfo:
+ 
+             # now this is an unpacked directory we know how to deal with
+             new_info = cls.from_directory(path=sdist_dir)
++            new_info._source_type = "file"
++            new_info._source_url = path.resolve().as_posix()
+ 
+         if not info:
+             return new_info
+@@ -395,7 +399,22 @@ class PackageInfo:
+             yield Path(d)
+ 
+     @classmethod
+-    def from_metadata(cls, path: Path) -> PackageInfo | None:
++    def from_metadata(cls, metadata: RawMetadata) -> PackageInfo:
++        """
++        Create package information from core metadata.
++
++        :param metadata: raw metadata
++        """
++        return cls(
++            name=metadata.get("name"),
++            version=metadata.get("version"),
++            summary=metadata.get("summary"),
++            requires_dist=metadata.get("requires_dist"),
++            requires_python=metadata.get("requires_python"),
++        )
++
++    @classmethod
++    def from_metadata_directory(cls, path: Path) -> PackageInfo | None:
+         """
+         Helper method to parse package information from an unpacked metadata directory.
+ 
+@@ -477,7 +496,7 @@ class PackageInfo:
+         if project_package:
+             info = cls.from_package(project_package)
+         else:
+-            info = cls.from_metadata(path)
++            info = cls.from_metadata_directory(path)
+ 
+             if not info or info.requires_dist is None:
+                 try:
+@@ -518,7 +537,8 @@ class PackageInfo:
+         :param path: Path to wheel.
+         """
+         try:
+-            return cls._from_distribution(pkginfo.Wheel(str(path)))
++            wheel = pkginfo.Wheel(str(path))
++            return cls._from_distribution(wheel)
+         except ValueError:
+             return PackageInfo()
+ 
+@@ -529,14 +549,12 @@ class PackageInfo:
+ 
+         :param path: Path to bdist.
+         """
+-        if isinstance(path, (pkginfo.BDist, pkginfo.Wheel)):
+-            cls._from_distribution(dist=path)
+-
+         if path.suffix == ".whl":
+             return cls.from_wheel(path=path)
+ 
+         try:
+-            return cls._from_distribution(pkginfo.BDist(str(path)))
++            bdist = pkginfo.BDist(str(path))
++            return cls._from_distribution(bdist)
+         except ValueError as e:
+             raise PackageInfoError(path, e)
+ 
+@@ -587,7 +605,7 @@ def get_pep517_metadata(path: Path) -> PackageInfo:
+                 *PEP517_META_BUILD_DEPS,
+             )
+             venv.run_python_script(pep517_meta_build_script)
+-            info = PackageInfo.from_metadata(dest_dir)
++            info = PackageInfo.from_metadata_directory(dest_dir)
+         except EnvCommandError as e:
+             # something went wrong while attempting pep517 metadata build
+             # fallback to egg_info if setup.py available
+@@ -604,7 +622,7 @@ def get_pep517_metadata(path: Path) -> PackageInfo:
+             os.chdir(path)
+             try:
+                 venv.run("python", "setup.py", "egg_info")
+-                info = PackageInfo.from_metadata(path)
++                info = PackageInfo.from_metadata_directory(path)
+             except EnvCommandError as fbe:
+                 raise PackageInfoError(
+                     path, e, "Fallback egg_info generation failed.", fbe
+
+diff --git a/src/poetry/inspection/lazy_wheel.py b/src/poetry/inspection/lazy_wheel.py
+new file mode 100644
+index 0000000..885ea71
+--- /dev/null
++++ b/src/poetry/inspection/lazy_wheel.py
+@@ -0,0 +1,694 @@
++"""Lazy ZIP over HTTP"""
++
++from __future__ import annotations
++
++import io
++import logging
++import re
++
++from bisect import bisect_left
++from bisect import bisect_right
++from contextlib import contextmanager
++from tempfile import NamedTemporaryFile
++from typing import TYPE_CHECKING
++from typing import Any
++from typing import BinaryIO
++from typing import ClassVar
++from typing import TypeVar
++from typing import cast
++from urllib.parse import urlparse
++from zipfile import BadZipFile
++from zipfile import ZipFile
++
++from packaging.metadata import parse_email
++from requests.models import CONTENT_CHUNK_SIZE
++from requests.models import HTTPError
++from requests.models import Response
++from requests.status_codes import codes
++
++
++if TYPE_CHECKING:
++    from collections.abc import Iterable
++    from collections.abc import Iterator
++    from types import TracebackType
++
++    from packaging.metadata import RawMetadata
++    from requests import Session
++
++    from poetry.utils.authenticator import Authenticator
++
++
++logger = logging.getLogger(__name__)
++
++
++class HTTPRangeRequestUnsupported(Exception):
++    """Raised when the remote server appears unable to support byte ranges."""
++
++
++class UnsupportedWheel(Exception):
++    """Unsupported wheel."""
++
++
++class InvalidWheel(Exception):
++    """Invalid (e.g. corrupt) wheel."""
++
++    def __init__(self, location: str, name: str) -> None:
++        self.location = location
++        self.name = name
++
++    def __str__(self) -> str:
++        return f"Wheel {self.name} located at {self.location} is invalid."
++
++
++def metadata_from_wheel_url(
++    name: str, url: str, session: Session | Authenticator
++) -> RawMetadata:
++    """Fetch metadata from the given wheel URL.
++
++    This uses HTTP range requests to only fetch the portion of the wheel
++    containing metadata, just enough for the object to be constructed.
++
++    :raises HTTPRangeRequestUnsupported: if range requests are unsupported for ``url``.
++    :raises InvalidWheel: if the zip file contents could not be parsed.
++    """
++    try:
++        # After context manager exit, wheel.name will point to a deleted file path.
++        # Add `delete_backing_file=False` to disable this for debugging.
++        with LazyWheelOverHTTP(url, session) as lazy_file:
++            metadata_bytes = lazy_file.read_metadata(name)
++
++        metadata, _ = parse_email(metadata_bytes)
++        return metadata
++
++    except (BadZipFile, UnsupportedWheel):
++        # We assume that these errors have occurred because the wheel contents
++        # themselves are invalid, not because we've messed up our bookkeeping
++        # and produced an invalid file.
++        raise InvalidWheel(url, name)
++
++
++class MergeIntervals:
++    """Stateful bookkeeping to merge interval graphs."""
++
++    def __init__(self, *, left: Iterable[int] = (), right: Iterable[int] = ()) -> None:
++        self._left = list(left)
++        self._right = list(right)
++
++    def __repr__(self) -> str:
++        return (
++            f"{type(self).__name__}"
++            f"(left={tuple(self._left)}, right={tuple(self._right)})"
++        )
++
++    def _merge(
++        self, start: int, end: int, left: int, right: int
++    ) -> Iterator[tuple[int, int]]:
++        """Return an iterator of intervals to be fetched.
++
++        Args:
++            start: Start of needed interval
++            end: End of needed interval
++            left: Index of first overlapping downloaded data
++            right: Index after last overlapping downloaded data
++        """
++        lslice, rslice = self._left[left:right], self._right[left:right]
++        i = start = min([start] + lslice[:1])
++        end = max([end] + rslice[-1:])
++        for j, k in zip(lslice, rslice):
++            if j > i:
++                yield i, j - 1
++            i = k + 1
++        if i <= end:
++            yield i, end
++        self._left[left:right], self._right[left:right] = [start], [end]
++
++    def minimal_intervals_covering(
++        self, start: int, end: int
++    ) -> Iterator[tuple[int, int]]:
++        """Provide the intervals needed to cover from ``start <= x <= end``.
++
++        This method mutates internal state so that later calls only return intervals not
++        covered by prior calls. The first call to this method will always return exactly
++        one interval, which was exactly the one requested. Later requests for
++        intervals overlapping that first requested interval will yield only the ranges
++        not previously covered (which may be empty, e.g. if the same interval is
++        requested twice).
++
++        This may be used e.g. to download substrings of remote files on demand.
++        """
++        left = bisect_left(self._right, start)
++        right = bisect_right(self._left, end)
++        yield from self._merge(start, end, left, right)
++
++
++T = TypeVar("T", bound="ReadOnlyIOWrapper")
++
++
++class ReadOnlyIOWrapper(BinaryIO):
++    """Implement read-side ``BinaryIO`` methods wrapping an inner ``BinaryIO``.
++
++    This wrapper is useful because Python currently does not distinguish read-only
++    streams at the type level.
++    """
++
++    def __init__(self, inner: BinaryIO) -> None:
++        self._file = inner
++
++    def __enter__(self: T) -> T:
++        self._file.__enter__()
++        return self
++
++    def __exit__(
++        self,
++        exc_type: type[BaseException] | None,
++        exc_value: BaseException | None,
++        traceback: TracebackType | None,
++    ) -> None:
++        self._file.__exit__(exc_type, exc_value, traceback)
++
++    def __iter__(self) -> Iterator[bytes]:
++        raise NotImplementedError
++
++    def __next__(self) -> bytes:
++        raise NotImplementedError
++
++    @property
++    def mode(self) -> str:
++        """Opening mode, which is always rb."""
++        return "rb"
++
++    @property
++    def name(self) -> str:
++        """Path to the underlying file."""
++        return self._file.name
++
++    def seekable(self) -> bool:
++        """Return whether random access is supported, which is True."""
++        return True
++
++    def close(self) -> None:
++        """Close the file."""
++        self._file.close()
++
++    @property
++    def closed(self) -> bool:
++        """Whether the file is closed."""
++        return self._file.closed
++
++    def fileno(self) -> int:
++        return self._file.fileno()
++
++    def flush(self) -> None:
++        self._file.flush()
++
++    def isatty(self) -> bool:
++        return False
++
++    def readable(self) -> bool:
++        """Return whether the file is readable, which is True."""
++        return True
++
++    def read(self, size: int = -1) -> bytes:
++        """Read up to size bytes from the object and return them.
++
++        As a convenience, if size is unspecified or -1,
++        all bytes until EOF are returned.  Fewer than
++        size bytes may be returned if EOF is reached.
++        """
++        return self._file.read(size)
++
++    def readline(self, limit: int = -1) -> bytes:
++        # Explicit impl needed to satisfy mypy.
++        raise NotImplementedError
++
++    def readlines(self, hint: int = -1) -> list[bytes]:
++        raise NotImplementedError
++
++    def seek(self, offset: int, whence: int = 0) -> int:
++        """Change stream position and return the new absolute position.
++
++        Seek to offset relative position indicated by whence:
++        * 0: Start of stream (the default).  pos should be >= 0;
++        * 1: Current position - pos may be negative;
++        * 2: End of stream - pos usually negative.
++        """
++        return self._file.seek(offset, whence)
++
++    def tell(self) -> int:
++        """Return the current position."""
++        return self._file.tell()
++
++    def truncate(self, size: int | None = None) -> int:
++        """Resize the stream to the given size in bytes.
++
++        If size is unspecified resize to the current position.
++        The current stream position isn't changed.
++
++        Return the new file size.
++        """
++        return self._file.truncate(size)
++
++    def writable(self) -> bool:
++        """Return False."""
++        return False
++
++    def write(self, s: Any) -> int:
++        raise NotImplementedError
++
++    def writelines(self, lines: Iterable[Any]) -> None:
++        raise NotImplementedError
++
++
++U = TypeVar("U", bound="LazyFileOverHTTP")
++
++
++class LazyFileOverHTTP(ReadOnlyIOWrapper):
++    """File-like object representing a fixed-length file over HTTP.
++
++    This uses HTTP range requests to lazily fetch the file's content into a temporary
++    file. If such requests are not supported by the server, raises
++    ``HTTPRangeRequestUnsupported`` in the ``__enter__`` method."""
++
++    def __init__(
++        self,
++        url: str,
++        session: Session | Authenticator,
++        delete_backing_file: bool = True,
++    ) -> None:
++        super().__init__(cast(BinaryIO, NamedTemporaryFile(delete=delete_backing_file)))
++
++        self._merge_intervals: MergeIntervals | None = None
++        self._length: int | None = None
++
++        self._request_count = 0
++        self._session = session
++        self._url = url
++
++    def __enter__(self: U) -> U:
++        super().__enter__()
++        self._setup_content()
++        return self
++
++    def __exit__(
++        self,
++        exc_type: type[BaseException] | None,
++        exc_value: BaseException | None,
++        traceback: TracebackType | None,
++    ) -> None:
++        self._reset_content()
++        super().__exit__(exc_type, exc_value, traceback)
++
++    def read(self, size: int = -1) -> bytes:
++        """Read up to size bytes from the object and return them.
++
++        As a convenience, if size is unspecified or -1,
++        all bytes until EOF are returned.  Fewer than
++        size bytes may be returned if EOF is reached.
++
++        :raises ValueError: if ``__enter__`` was not called beforehand.
++        """
++        if self._length is None:
++            raise ValueError(".__enter__() must be called to set up content length")
++        cur = self.tell()
++        logger.debug("read size %d at %d from lazy file %s", size, cur, self.name)
++        if size < 0:
++            assert cur <= self._length
++            download_size = self._length - cur
++        elif size == 0:
++            return b""
++        else:
++            download_size = size
++        stop = min(cur + download_size, self._length)
++        self._ensure_downloaded(cur, stop)
++        return super().read(download_size)
++
++    @classmethod
++    def _uncached_headers(cls) -> dict[str, str]:
++        """HTTP headers to bypass any HTTP caching.
++
++        The requests we perform in this file are intentionally small, and any caching
++        should be done at a higher level.
++
++        Further, caching partial requests might cause issues:
++        https://github.com/pypa/pip/pull/8716
++        """
++        # "no-cache" is the correct value for "up to date every time", so this will also
++        # ensure we get the most recent value from the server:
++        # https://developer.mozilla.org/en-US/docs/Web/HTTP/Caching#provide_up-to-date_content_every_time
++        return {"Accept-Encoding": "identity", "Cache-Control": "no-cache"}
++
++    def _setup_content(self) -> None:
++        """Initialize the internal length field and other bookkeeping.
++
++        Ensure ``self._merge_intervals`` is initialized.
++
++        After parsing the remote file length with ``self._fetch_content_length()``,
++        this method will truncate the underlying file from parent abstract class
++        ``ReadOnlyIOWrapper`` to that size in order to support seek operations against
++        ``io.SEEK_END`` in ``self.read()``.
++
++        Called in ``__enter__``, and should make recursive invocations into a no-op.
++        Subclasses may override this method."""
++        if self._merge_intervals is None:
++            self._merge_intervals = MergeIntervals()
++
++        if self._length is None:
++            logger.debug("begin fetching content length")
++            self._length = self._fetch_content_length()
++            logger.debug("done fetching content length (is: %d)", self._length)
++            # Enable us to seek and write anywhere in the backing file up to this
++            # known length.
++            self.truncate(self._length)
++        else:
++            logger.debug("content length already fetched (is: %d)", self._length)
++
++    def _reset_content(self) -> None:
++        """Unset the internal length field and merge intervals.
++
++        Called in ``__exit__``, and should make recursive invocations into a no-op.
++        Subclasses may override this method."""
++        if self._merge_intervals is not None:
++            logger.debug(
++                "unsetting merge intervals (were: %s)", repr(self._merge_intervals)
++            )
++            self._merge_intervals = None
++
++        if self._length is not None:
++            logger.debug("unsetting content length (was: %d)", self._length)
++            self._length = None
++
++    def _content_length_from_head(self) -> int:
++        """Performs a HEAD request to extract the Content-Length.
++
++        :raises HTTPRangeRequestUnsupported: if the response fails to indicate support
++                                             for "bytes" ranges."""
++        self._request_count += 1
++        head = self._session.head(self._url, headers=self._uncached_headers())
++        head.raise_for_status()
++        assert head.status_code == codes.ok
++        accepted_range = head.headers.get("Accept-Ranges", None)
++        if accepted_range != "bytes":
++            raise HTTPRangeRequestUnsupported(
++                f"server does not support byte ranges: header was '{accepted_range}'"
++            )
++        return int(head.headers["Content-Length"])
++
++    def _fetch_content_length(self) -> int:
++        """Get the remote file's length."""
++        # NB: This is currently dead code, as _fetch_content_length() is overridden
++        #     again in LazyWheelOverHTTP.
++        return self._content_length_from_head()
++
++    def _stream_response(self, start: int, end: int) -> Response:
++        """Return streaming HTTP response to a range request from start to end."""
++        headers = self._uncached_headers()
++        headers["Range"] = f"bytes={start}-{end}"
++        logger.debug("streamed bytes request: %s", headers["Range"])
++        self._request_count += 1
++        response = self._session.get(self._url, headers=headers, stream=True)
++        response.raise_for_status()
++        assert int(response.headers["Content-Length"]) == (end - start + 1)
++        return response
++
++    def _fetch_content_range(self, start: int, end: int) -> Iterator[bytes]:
++        """Perform a series of HTTP range requests to cover the specified byte range.
++
++        NB: For compatibility with HTTP range requests, the range provided to this
++        method must *include* the byte indexed at argument ``end`` (so e.g. ``0-1`` is 2
++        bytes long, and the range can never be empty).
++        """
++        yield from self._stream_response(start, end).iter_content(CONTENT_CHUNK_SIZE)
++
++    @contextmanager
++    def _stay(self) -> Iterator[None]:
++        """Return a context manager keeping the position.
++
++        At the end of the block, seek back to original position.
++        """
++        pos = self.tell()
++        try:
++            yield
++        finally:
++            self.seek(pos)
++
++    def _ensure_downloaded(self, start: int, end: int) -> None:
++        """Ensures bytes start to end (inclusive) have been downloaded and written to
++        the backing file.
++
++        :raises ValueError: if ``__enter__`` was not called beforehand.
++        """
++        if self._merge_intervals is None:
++            raise ValueError(".__enter__() must be called to set up merge intervals")
++        # Reducing by 1 to get an inclusive end range.
++        end -= 1
++        with self._stay():
++            for (
++                range_start,
++                range_end,
++            ) in self._merge_intervals.minimal_intervals_covering(start, end):
++                self.seek(start)
++                for chunk in self._fetch_content_range(range_start, range_end):
++                    self._file.write(chunk)
++
++
++class LazyWheelOverHTTP(LazyFileOverHTTP):
++    """File-like object mapped to a ZIP file over HTTP.
++
++    This uses HTTP range requests to lazily fetch the file's content, which should be
++    provided as the first argument to a ``ZipFile``.
++    """
++
++    # Cache this on the type to avoid trying and failing our initial lazy wheel request
++    # multiple times in the same invocation against an index without this support.
++    _domains_without_negative_range: ClassVar[set[str]] = set()
++
++    _metadata_regex = re.compile(r"^[^/]*\.dist-info/METADATA$")
++
++    def read_metadata(self, name: str) -> bytes:
++        """Download and read the METADATA file from the remote wheel."""
++        with ZipFile(self) as zf:
++            # prefetch metadata to reduce the number of range requests
++            filename = self._prefetch_metadata(name)
++            return zf.read(filename)
++
++    @classmethod
++    def _initial_chunk_length(cls) -> int:
++        """Return the size of the chunk (in bytes) to download from the end of the file.
++
++        This method is called in ``self._fetch_content_length()``. As noted in that
++        method's docstring, this should be set high enough to cover the central
++        directory sizes of the *average* wheels you expect to see, in order to avoid
++        further requests before being able to process the zip file's contents at all.
++        If we choose a small number, we need one more range request for larger wheels.
++        If we choose a big number, we download unnecessary data from smaller wheels.
++        If the chunk size from this method is larger than the size of an entire wheel,
++        that may raise an HTTP error, but this is gracefully handled in
++        ``self._fetch_content_length()`` with a small performance penalty.
++        """
++        return 10_000
++
++    def _fetch_content_length(self) -> int:
++        """Get the total remote file length, but also download a chunk from the end.
++
++        This method is called within ``__enter__``. In an attempt to reduce
++        the total number of requests needed to populate this lazy file's contents, this
++        method will also attempt to fetch a chunk of the file's actual content. This
++        chunk will be ``self._initial_chunk_length()`` bytes in size, or just the remote
++        file's length if that's smaller, and the chunk will come from the *end* of
++        the file.
++
++        This method will first attempt to download with a negative byte range request,
++        i.e. a GET with the headers ``Range: bytes=-N`` for ``N`` equal to
++        ``self._initial_chunk_length()``. If negative offsets are unsupported, it will
++        instead fall back to making a HEAD request first to extract the length, followed
++        by a GET request with the double-ended range header ``Range: bytes=X-Y`` to
++        extract the final ``N`` bytes from the remote resource.
++        """
++        initial_chunk_size = self._initial_chunk_length()
++        ret_length, tail = self._extract_content_length(initial_chunk_size)
++
++        # Need to explicitly truncate here in order to perform the write and seek
++        # operations below when we write the chunk of file contents to disk.
++        self.truncate(ret_length)
++
++        if tail is None:
++            # If we could not download any file contents yet (e.g. if negative byte
++            # ranges were not supported, or the requested range was larger than the file
++            # size), then download all of this at once, hopefully pulling in the entire
++            # central directory.
++            initial_start = max(0, ret_length - initial_chunk_size)
++            self._ensure_downloaded(initial_start, ret_length)
++        else:
++            # If we *could* download some file contents, then write them to the end of
++            # the file and set up our bisect boundaries by hand.
++            with self._stay():
++                response_length = int(tail.headers["Content-Length"])
++                assert response_length == min(initial_chunk_size, ret_length)
++                self.seek(-response_length, io.SEEK_END)
++                # Default initial chunk size is currently 1MB, but streaming content
++                # here allows it to be set arbitrarily large.
++                for chunk in tail.iter_content(CONTENT_CHUNK_SIZE):
++                    self._file.write(chunk)
++
++                # We now need to update our bookkeeping to cover the interval we just
++                # wrote to file so we know not to do it in later read()s.
++                init_chunk_start = ret_length - response_length
++                # MergeIntervals uses inclusive boundaries i.e. start <= x <= end.
++                init_chunk_end = ret_length - 1
++                assert self._merge_intervals is not None
++                assert ((init_chunk_start, init_chunk_end),) == tuple(
++                    # NB: We expect LazyRemoteResource to reset `self._merge_intervals`
++                    # just before it calls the current method, so our assertion here
++                    # checks that indeed no prior overlapping intervals have
++                    # been covered.
++                    self._merge_intervals.minimal_intervals_covering(
++                        init_chunk_start, init_chunk_end
++                    )
++                )
++        return ret_length
++
++    @staticmethod
++    def _parse_full_length_from_content_range(arg: str) -> int:
++        """Parse the file's full underlying length from the Content-Range header.
++
++        This supports both * and numeric ranges, from success or error responses:
++        https://www.rfc-editor.org/rfc/rfc9110#field.content-range.
++        """
++        m = re.match(r"bytes [^/]+/([0-9]+)", arg)
++        if m is None:
++            raise HTTPRangeRequestUnsupported(f"could not parse Content-Range: '{arg}'")
++        return int(m.group(1))
++
++    def _try_initial_chunk_request(
++        self, initial_chunk_size: int
++    ) -> tuple[int, Response]:
++        """Attempt to fetch a chunk from the end of the file with a negative offset."""
++        headers = self._uncached_headers()
++        # Perform a negative range index, which is not supported by some servers.
++        headers["Range"] = f"bytes=-{initial_chunk_size}"
++        logger.debug("initial bytes request: %s", headers["Range"])
++
++        self._request_count += 1
++        tail = self._session.get(self._url, headers=headers, stream=True)
++        tail.raise_for_status()
++
++        code = tail.status_code
++        if code != codes.partial_content:
++            # According to
++            # https://developer.mozilla.org/en-US/docs/Web/HTTP/Range_requests,
++            # a 200 OK implies that range requests are not supported,
++            # regardless of the requested size.
++            # However, some servers that support negative range requests also return a
++            # 200 OK if the requested range from the end was larger than the file size.
++            if code == codes.ok:
++                accept_ranges = tail.headers.get("Accept-Ranges", None)
++                content_length = int(tail.headers["Content-Length"])
++                if accept_ranges == "bytes" and content_length <= initial_chunk_size:
++                    return content_length, tail
++
++            raise HTTPRangeRequestUnsupported(
++                f"did not receive partial content: got code {code}"
++            )
++
++        file_length = self._parse_full_length_from_content_range(
++            tail.headers["Content-Range"]
++        )
++        return (file_length, tail)
++
++    def _extract_content_length(
++        self, initial_chunk_size: int
++    ) -> tuple[int, Response | None]:
++        """Get the Content-Length of the remote file, and possibly a chunk of it."""
++        domain = urlparse(self._url).netloc
++        if domain in self._domains_without_negative_range:
++            return (self._content_length_from_head(), None)
++
++        tail: Response | None
++        try:
++            # Initial range request for just the end of the file.
++            file_length, tail = self._try_initial_chunk_request(initial_chunk_size)
++        except HTTPError as e:
++            resp = e.response
++            code = resp.status_code if resp is not None else None
++            # Our initial request using a negative byte range was not supported.
++            if code in [codes.not_implemented, codes.method_not_allowed]:
++                # pypi notably does not support negative byte ranges: see
++                # https://github.com/pypi/warehouse/issues/12823.
++                logger.debug(
++                    "Negative byte range not supported for domain '%s': "
++                    "using HEAD request before lazy wheel from now on",
++                    domain,
++                )
++                # Avoid trying a negative byte range request against this domain for the
++                # rest of the resolve.
++                self._domains_without_negative_range.add(domain)
++                # Apply a HEAD request to get the real size, and nothing else for now.
++                return (self._content_length_from_head(), None)
++            # This indicates that the requested range from the end was larger than the
++            # actual file size: https://www.rfc-editor.org/rfc/rfc9110#status.416.
++            if code == codes.requested_range_not_satisfiable:
++                # In this case, we don't have any file content yet, but we do know the
++                # size the file will be, so we can return that and exit here.
++                assert resp is not None
++                file_length = self._parse_full_length_from_content_range(
++                    resp.headers["Content-Range"]
++                )
++                return (file_length, None)
++            # If we get some other error, then we expect that non-range requests will
++            # also fail, so we error out here and let the user figure it out.
++            raise
++
++        # Some servers that do not support negative offsets,
++        # handle a negative offset like "-10" as "0-10".
++        if int(
++            tail.headers["Content-Length"]
++        ) == initial_chunk_size + 1 and tail.headers["Content-Range"].startswith(
++            f"bytes 0-{initial_chunk_size}"
++        ):
++            tail = None
++            self._domains_without_negative_range.add(domain)
++        return file_length, tail
++
++    def _prefetch_metadata(self, name: str) -> str:
++        """Locate the *.dist-info/METADATA entry from a temporary ``ZipFile`` wrapper,
++        and download it.
++
++        This method assumes that the *.dist-info directory (containing e.g. METADATA) is
++        contained in a single contiguous section of the zip file in order to ensure it
++        can be downloaded in a single ranged GET request."""
++        logger.debug("begin prefetching METADATA for %s", name)
++
++        start: int | None = None
++        end: int | None = None
++
++        # This may perform further requests if __init__() did not pull in the entire
++        # central directory at the end of the file (although _initial_chunk_length()
++        # should be set large enough to avoid this).
++        zf = ZipFile(self)
++
++        filename = ""
++        for info in zf.infolist():
++            if start is None:
++                if self._metadata_regex.search(info.filename):
++                    filename = info.filename
++                    start = info.header_offset
++                    continue
++            else:
++                # The last .dist-info/ entry may be before the end of the file if the
++                # wheel's entries are sorted lexicographically (which is unusual).
++                if not self._metadata_regex.search(info.filename):
++                    end = info.header_offset
++                    break
++        if start is None:
++            raise UnsupportedWheel(
++                f"no {self._metadata_regex!r} found for {name} in {self.name}"
++            )
++        # If it is the last entry of the zip, then give us everything
++        # until the start of the central directory.
++        if end is None:
++            end = zf.start_dir
++        logger.debug(f"fetch {filename}")
++        self._ensure_downloaded(start, end)
++        logger.debug("done prefetching METADATA for %s", name)
++
++        return filename
+
+diff --git a/src/poetry/installation/chooser.py b/src/poetry/installation/chooser.py
+index cb05dff..e60f03c 100644
+--- a/src/poetry/installation/chooser.py
++++ b/src/poetry/installation/chooser.py
+@@ -9,6 +9,7 @@ from typing import Any
+ from poetry.config.config import Config
+ from poetry.config.config import PackageFilterPolicy
+ from poetry.repositories.http_repository import HTTPRepository
++from poetry.utils.helpers import get_highest_priority_hash_type
+ from poetry.utils.wheel import Wheel
+ 
+ 
+@@ -88,38 +89,43 @@ class Chooser:
+             repository = self._pool.repository("pypi")
+         links = repository.find_links_for_package(package)
+ 
+-        hashes = {f["hash"] for f in package.files}
+-        if not hashes:
++        locked_hashes = {f["hash"] for f in package.files}
++        if not locked_hashes:
+             return links
+ 
+         selected_links = []
++        skipped = []
++        locked_hash_names = {h.split(":")[0] for h in locked_hashes}
+         for link in links:
+-            if not link.hash:
++            if not link.hashes:
+                 selected_links.append(link)
+                 continue
+ 
+-            assert link.hash_name is not None
+-            h = link.hash_name + ":" + link.hash
+-            if (
+-                h not in hashes
+-                and link.hash_name not in ("sha256", "sha384", "sha512")
+-                and isinstance(repository, HTTPRepository)
++            link_hash: str | None = None
++            if (candidates := locked_hash_names.intersection(link.hashes.keys())) and (
++                hash_name := get_highest_priority_hash_type(candidates, link.filename)
+             ):
+-                h = repository.calculate_sha256(link) or h
+-            if h not in hashes:
++                link_hash = f"{hash_name}:{link.hashes[hash_name]}"
++
++            elif isinstance(repository, HTTPRepository):
++                link_hash = repository.calculate_sha256(link)
++
++            if link_hash not in locked_hashes:
++                skipped.append((link.filename, link_hash))
+                 logger.debug(
+                     "Skipping %s as %s checksum does not match expected value",
+                     link.filename,
+-                    link.hash_name,
++                    link_hash,
+                 )
+                 continue
+ 
+             selected_links.append(link)
+ 
+         if links and not selected_links:
++            links_str = ", ".join(f"{link}({h})" for link, h in skipped)
+             raise RuntimeError(
+-                f"Retrieved digest for link {link.filename}({h}) not in poetry.lock"
+-                f" metadata {hashes}"
++                f"Retrieved digests for links {links_str} not in poetry.lock"
++                f" metadata {locked_hashes}"
+             )
+ 
+         return selected_links
+@@ -186,10 +192,10 @@ class Chooser:
+         )
+ 
+     def _is_link_hash_allowed_for_package(self, link: Link, package: Package) -> bool:
+-        if not link.hash:
++        if not link.hashes:
+             return True
+ 
+-        assert link.hash_name is not None
+-        h = link.hash_name + ":" + link.hash
++        link_hashes = {f"{name}:{h}" for name, h in link.hashes.items()}
++        locked_hashes = {f["hash"] for f in package.files}
+ 
+-        return h in {f["hash"] for f in package.files}
++        return bool(link_hashes & locked_hashes)
+
+diff --git a/src/poetry/installation/executor.py b/src/poetry/installation/executor.py
+index 0d4ca05..84af089 100644
+--- a/src/poetry/installation/executor.py
++++ b/src/poetry/installation/executor.py
+@@ -31,6 +31,7 @@ from poetry.utils.authenticator import Authenticator
+ from poetry.utils.env import EnvCommandError
+ from poetry.utils.helpers import Downloader
+ from poetry.utils.helpers import get_file_hash
++from poetry.utils.helpers import get_highest_priority_hash_type
+ from poetry.utils.helpers import pluralize
+ from poetry.utils.helpers import remove_directory
+ from poetry.utils.pip import pip_install
+@@ -67,6 +68,17 @@ class Executor:
+         self._use_modern_installation = config.get(
+             "installer.modern-installation", True
+         )
++        if not self._use_modern_installation:
++            self._io.write_line(
++                "<warning>Warning: Setting `installer.modern-installation` to `false` "
++                "is deprecated.</>"
++            )
++            self._io.write_line(
++                "<warning>The pip-based installer will be removed in a future release.</>"
++            )
++            self._io.write_line(
++                "<warning>See https://github.com/python-poetry/poetry/issues/8987.</>"
++            )
+ 
+         if parallel is None:
+             parallel = config.get("installer.parallel", True)
+@@ -248,18 +260,18 @@ class Executor:
+                     with self._lock:
+                         self._sections[id(operation)] = self._io.section()
+                         self._sections[id(operation)].write_line(
+-                            f"  <fg=blue;options=bold>•</> {op_message}:"
++                            f"  <fg=blue;options=bold>-</> {op_message}:"
+                             " <fg=blue>Pending...</>"
+                         )
+             else:
+                 if self._should_write_operation(operation):
+                     if not operation.skipped:
+                         self._io.write_line(
+-                            f"  <fg=blue;options=bold>•</> {op_message}"
++                            f"  <fg=blue;options=bold>-</> {op_message}"
+                         )
+                     else:
+                         self._io.write_line(
+-                            f"  <fg=default;options=bold,dark>•</> {op_message}: "
++                            f"  <fg=default;options=bold,dark>-</> {op_message}: "
+                             "<fg=default;options=bold,dark>Skipped</> "
+                             "<fg=default;options=dark>for the following reason:</> "
+                             f"<fg=default;options=bold,dark>{operation.skip_reason}</>"
+@@ -287,7 +299,7 @@ class Executor:
+                     io = self._io
+                 else:
+                     message = (
+-                        "  <error>•</error>"
++                        "  <error>-</error>"
+                         f" {self.get_operation_message(operation, error=True)}:"
+                         " <error>Failed</error>"
+                     )
+@@ -343,7 +355,7 @@ class Executor:
+         except KeyboardInterrupt:
+             try:
+                 message = (
+-                    "  <warning>•</warning>"
++                    "  <warning>-</warning>"
+                     f" {self.get_operation_message(operation, warning=True)}:"
+                     " <warning>Cancelled</warning>"
+                 )
+@@ -363,7 +375,7 @@ class Executor:
+             if self.supports_fancy_output():
+                 self._write(
+                     operation,
+-                    f"  <fg=default;options=bold,dark>•</> {operation_message}: "
++                    f"  <fg=default;options=bold,dark>-</> {operation_message}: "
+                     "<fg=default;options=bold,dark>Skipped</> "
+                     "<fg=default;options=dark>for the following reason:</> "
+                     f"<fg=default;options=bold,dark>{operation.skip_reason}</>",
+@@ -382,7 +394,7 @@ class Executor:
+             return result
+ 
+         operation_message = self.get_operation_message(operation, done=True)
+-        message = f"  <fg=green;options=bold>•</> {operation_message}"
++        message = f"  <fg=green;options=bold>-</> {operation_message}"
+         self._write(operation, message)
+ 
+         self._increment_operations_count(operation, True)
+@@ -516,7 +528,7 @@ class Executor:
+ 
+     def _execute_uninstall(self, operation: Uninstall) -> int:
+         op_msg = self.get_operation_message(operation)
+-        message = f"  <fg=blue;options=bold>•</> {op_msg}: <info>Removing...</info>"
++        message = f"  <fg=blue;options=bold>-</> {op_msg}: <info>Removing...</info>"
+         self._write(operation, message)
+ 
+         return self._remove(operation.package)
+@@ -543,7 +555,7 @@ class Executor:
+ 
+         operation_message = self.get_operation_message(operation)
+         message = (
+-            f"  <fg=blue;options=bold>•</> {operation_message}:"
++            f"  <fg=blue;options=bold>-</> {operation_message}:"
+             " <info>Installing...</info>"
+         )
+         self._write(operation, message)
+@@ -591,7 +603,7 @@ class Executor:
+         operation_message = self.get_operation_message(operation)
+ 
+         message = (
+-            f"  <fg=blue;options=bold>•</> {operation_message}:"
++            f"  <fg=blue;options=bold>-</> {operation_message}:"
+             " <info>Preparing...</info>"
+         )
+         self._write(operation, message)
+@@ -630,7 +642,7 @@ class Executor:
+         operation_message = self.get_operation_message(operation)
+ 
+         message = (
+-            f"  <fg=blue;options=bold>•</> {operation_message}: <info>Cloning...</info>"
++            f"  <fg=blue;options=bold>-</> {operation_message}: <info>Cloning...</info>"
+         )
+         self._write(operation, message)
+ 
+@@ -673,7 +685,7 @@ class Executor:
+         operation_message = self.get_operation_message(operation)
+ 
+         message = (
+-            f"  <fg=blue;options=bold>•</> {operation_message}:"
++            f"  <fg=blue;options=bold>-</> {operation_message}:"
+             " <info>Building...</info>"
+         )
+         self._write(operation, message)
+@@ -695,15 +707,6 @@ class Executor:
+                 package_poetry = Factory().create_poetry(pyproject.file.path.parent)
+ 
+         if package_poetry is not None:
+-            # Even if there is a build system specified
+-            # some versions of pip (< 19.0.0) don't understand it
+-            # so we need to check the version of pip to know
+-            # if we can rely on the build system
+-            legacy_pip = (
+-                self._env.pip_version
+-                < self._env.pip_version.__class__.from_parts(19, 0, 0)
+-            )
+-
+             builder: Builder
+             if package.develop and not package_poetry.package.build_script:
+                 from poetry.masonry.builders.editable import EditableBuilder
+@@ -715,13 +718,10 @@ class Executor:
+                 builder.build()
+ 
+                 return 0
+-            elif legacy_pip or package_poetry.package.build_script:
++
++            if package_poetry.package.build_script:
+                 from poetry.core.masonry.builders.sdist import SdistBuilder
+ 
+-                # We need to rely on creating a temporary setup.py
+-                # file since the version of pip does not support
+-                # build-systems
+-                # We also need it for non-PEP-517 packages
+                 builder = SdistBuilder(package_poetry)
+                 with builder.setup_py():
+                     return self.pip_install(req, upgrade=True, editable=package.develop)
+@@ -773,7 +773,7 @@ class Executor:
+ 
+         if archive.suffix != ".whl":
+             message = (
+-                f"  <fg=blue;options=bold>•</> {self.get_operation_message(operation)}:"
++                f"  <fg=blue;options=bold>-</> {self.get_operation_message(operation)}:"
+                 " <info>Preparing...</info>"
+             )
+             self._write(operation, message)
+@@ -792,8 +792,17 @@ class Executor:
+ 
+     @staticmethod
+     def _validate_archive_hash(archive: Path, package: Package) -> str:
+-        archive_hash: str = "sha256:" + get_file_hash(archive)
+         known_hashes = {f["hash"] for f in package.files if f["file"] == archive.name}
++        hash_types = {t.split(":")[0] for t in known_hashes}
++        hash_type = get_highest_priority_hash_type(hash_types, archive.name)
++
++        if hash_type is None:
++            raise RuntimeError(
++                f"No usable hash type(s) for {package} from archive"
++                f" {archive.name} found (known hashes: {known_hashes!s})"
++            )
++
++        archive_hash = f"{hash_type}:{get_file_hash(archive, hash_type)}"
+ 
+         if archive_hash not in known_hashes:
+             raise RuntimeError(
+@@ -814,7 +823,7 @@ class Executor:
+ 
+         operation_message = self.get_operation_message(operation)
+         message = (
+-            f"  <fg=blue;options=bold>•</> {operation_message}: <info>Downloading...</>"
++            f"  <fg=blue;options=bold>-</> {operation_message}: <info>Downloading...</>"
+         )
+         progress = None
+         if self.supports_fancy_output():
+@@ -857,17 +866,18 @@ class Executor:
+         package = operation.package
+ 
+         if not package.source_url or package.source_type == "legacy":
+-            # Since we are installing from our own distribution cache
+-            # pip will write a `direct_url.json` file pointing to the cache
+-            # distribution.
+-            # That's not what we want, so we remove the direct_url.json file,
+-            # if it exists.
+-            for (
+-                direct_url_json
+-            ) in self._env.site_packages.find_distribution_direct_url_json_files(
+-                distribution_name=package.name, writable_only=True
+-            ):
+-                direct_url_json.unlink(missing_ok=True)
++            if not self._use_modern_installation:
++                # Since we are installing from our own distribution cache pip will write
++                # a `direct_url.json` file pointing to the cache distribution.
++                #
++                # That's not what we want, so we remove the direct_url.json file, if it
++                # exists.
++                for (
++                    direct_url_json
++                ) in self._env.site_packages.find_distribution_direct_url_json_files(
++                    distribution_name=package.name, writable_only=True
++                ):
++                    direct_url_json.unlink(missing_ok=True)
+             return
+ 
+         url_reference: dict[str, Any] | None = None
+
+diff --git a/src/poetry/installation/installer.py b/src/poetry/installation/installer.py
+index c30dd1b..7bc9f23 100644
+--- a/src/poetry/installation/installer.py
++++ b/src/poetry/installation/installer.py
+@@ -245,12 +245,9 @@ class Installer:
+             locked_repository = self._locker.locked_repository()
+ 
+             if not self._locker.is_fresh():
+-                self._io.write_error_line(
+-                    "<warning>"
+-                    "Warning: poetry.lock is not consistent with pyproject.toml. "
+-                    "You may be getting improper dependencies. "
+-                    "Run `poetry lock [--no-update]` to fix it."
+-                    "</warning>"
++                raise ValueError(
++                    "pyproject.toml changed significantly since poetry.lock was last generated. "
++                    "Run `poetry lock [--no-update]` to fix the lock file."
+                 )
+ 
+             locker_extras = {
+@@ -267,7 +264,7 @@ class Installer:
+             ops = self._get_operations_from_lock(locked_repository)
+ 
+         lockfile_repo = LockfileRepository()
+-        self._populate_lockfile_repo(lockfile_repo, ops)
++        uninstalls = self._populate_lockfile_repo(lockfile_repo, ops)
+ 
+         if not self.executor.enabled:
+             # If we are only in lock mode, no need to go any further
+@@ -324,6 +321,8 @@ class Installer:
+                 for op in transaction.calculate_operations(with_uninstalls=True)
+                 if op.job_type == "uninstall"
+             ] + ops
++        else:
++            ops = uninstalls + ops
+ 
+         # We need to filter operations so that packages
+         # not compatible with the current system,
+@@ -335,7 +334,7 @@ class Installer:
+             dep = op.package.to_dependency()
+             if dep.is_file() or dep.is_directory():
+                 dep = cast("PathDependency", dep)
+-                dep.validate(raise_error=True)
++                dep.validate(raise_error=not op.skipped)
+ 
+         # Execute operations
+         status = self._execute(ops)
+@@ -359,18 +358,19 @@ class Installer:
+ 
+     def _populate_lockfile_repo(
+         self, repo: LockfileRepository, ops: Iterable[Operation]
+-    ) -> None:
++    ) -> list[Uninstall]:
++        uninstalls = []
+         for op in ops:
+             if isinstance(op, Uninstall):
++                uninstalls.append(op)
+                 continue
+-            elif isinstance(op, Update):
+-                package = op.target_package
+-            else:
+-                package = op.package
+ 
++            package = op.target_package if isinstance(op, Update) else op.package
+             if not repo.has_package(package):
+                 repo.add_package(package)
+ 
++        return uninstalls
++
+     def _get_operations_from_lock(
+         self, locked_repository: Repository
+     ) -> list[Operation]:
+
+diff --git a/src/poetry/installation/operations/operation.py b/src/poetry/installation/operations/operation.py
+index 816618a..c54ccb4 100644
+--- a/src/poetry/installation/operations/operation.py
++++ b/src/poetry/installation/operations/operation.py
+@@ -11,7 +11,7 @@ T = TypeVar("T", bound="Operation")
+ 
+ 
+ class Operation:
+-    def __init__(self, reason: str | None = None, priority: int | float = 0) -> None:
++    def __init__(self, reason: str | None = None, priority: float = 0) -> None:
+         self._reason = reason
+ 
+         self._skipped = False
+@@ -35,7 +35,7 @@ class Operation:
+         return self._skip_reason
+ 
+     @property
+-    def priority(self) -> float | int:
++    def priority(self) -> float:
+         return self._priority
+ 
+     @property
+
+diff --git a/src/poetry/installation/operations/uninstall.py b/src/poetry/installation/operations/uninstall.py
+index 9b4a498..0bcb870 100644
+--- a/src/poetry/installation/operations/uninstall.py
++++ b/src/poetry/installation/operations/uninstall.py
+@@ -14,7 +14,7 @@ class Uninstall(Operation):
+         self,
+         package: Package,
+         reason: str | None = None,
+-        priority: float | int = float("inf"),
++        priority: float = float("inf"),
+     ) -> None:
+         super().__init__(reason, priority=priority)
+ 
+
+diff --git a/src/poetry/masonry/builders/__init__.py b/src/poetry/masonry/builders/__init__.py
+index 6166242..4fdd87d 100644
+--- a/src/poetry/masonry/builders/__init__.py
++++ b/src/poetry/masonry/builders/__init__.py
+@@ -1,6 +1,16 @@
+ from __future__ import annotations
+ 
++from poetry.core.masonry.builders.sdist import SdistBuilder
++from poetry.core.masonry.builders.wheel import WheelBuilder
++
+ from poetry.masonry.builders.editable import EditableBuilder
+ 
+ 
+-__all__ = ["EditableBuilder"]
++__all__ = ["BUILD_FORMATS", "EditableBuilder"]
++
++
++# might be extended by plugins
++BUILD_FORMATS = {
++    "sdist": SdistBuilder,
++    "wheel": WheelBuilder,
++}
+
+diff --git a/src/poetry/masonry/builders/editable.py b/src/poetry/masonry/builders/editable.py
+index e0f5dc5..a2bb9a5 100644
+--- a/src/poetry/masonry/builders/editable.py
++++ b/src/poetry/masonry/builders/editable.py
+@@ -61,8 +61,7 @@ class EditableBuilder(Builder):
+                     "  - <warning>Falling back on using a <b>setup.py</b></warning>"
+                 )
+                 self._setup_build()
+-                path: Path = self._path
+-                return path
++                return self._path
+ 
+             self._run_build_script(self._package.build_script)
+ 
+@@ -79,8 +78,7 @@ class EditableBuilder(Builder):
+         added_files += self._add_scripts()
+         self._add_dist_info(added_files)
+ 
+-        path = self._path
+-        return path
++        return self._path
+ 
+     def _run_build_script(self, build_script: str) -> None:
+         with build_environment(poetry=self._poetry, env=self._env, io=self._io) as env:
+@@ -158,8 +156,27 @@ class EditableBuilder(Builder):
+ 
+         scripts = entry_points.get("console_scripts", [])
+         for script in scripts:
+-            name, script = script.split(" = ")
+-            module, callable_ = script.split(":")
++            name, script_with_extras = script.split(" = ")
++            script_without_extras = script_with_extras.split("[")[0]
++            try:
++                module, callable_ = script_without_extras.split(":")
++            except ValueError as exc:
++                msg = (
++                    f"Bad script ({name}): script needs to specify a function within a"
++                    " module like: module(.submodule):function\nInstead got:"
++                    f" {script_with_extras}"
++                )
++                if "not enough values" in str(exc):
++                    msg += (
++                        "\nHint: If the script depends on module-level code, try"
++                        " wrapping it in a main() function and modifying your script"
++                        f' like:\n{name} = "{script_with_extras}:main"'
++                    )
++                elif "too many values" in str(exc):
++                    msg += '\nToo many ":" found!'
++
++                raise ValueError(msg)
++
+             callable_holder = callable_.split(".", 1)[0]
+ 
+             script_file = scripts_path.joinpath(name)
+
+diff --git a/src/poetry/mixology/incompatibility.py b/src/poetry/mixology/incompatibility.py
+index 26bf72e..9a2cc96 100644
+--- a/src/poetry/mixology/incompatibility.py
++++ b/src/poetry/mixology/incompatibility.py
+@@ -43,10 +43,7 @@ class Incompatibility:
+             # Coalesce multiple terms about the same package if possible.
+             by_name: dict[str, dict[str, Term]] = {}
+             for term in terms:
+-                if term.dependency.complete_name not in by_name:
+-                    by_name[term.dependency.complete_name] = {}
+-
+-                by_ref = by_name[term.dependency.complete_name]
++                by_ref = by_name.setdefault(term.dependency.complete_name, {})
+                 ref = term.dependency.complete_name
+ 
+                 if ref in by_ref:
+@@ -432,7 +429,8 @@ class Incompatibility:
+ 
+         if term.dependency.source_type:
+             return str(term.dependency)
+-        return f"{term.dependency.pretty_name} ({term.dependency.pretty_constraint})"
++        pretty_name = term.dependency.complete_pretty_name
++        return f"{pretty_name} ({term.dependency.pretty_constraint})"
+ 
+     def _single_term_where(self, callable: Callable[[Term], bool]) -> Term | None:
+         found = None
+
+diff --git a/src/poetry/mixology/version_solver.py b/src/poetry/mixology/version_solver.py
+index 55e76a5..5bb02d9 100644
+--- a/src/poetry/mixology/version_solver.py
++++ b/src/poetry/mixology/version_solver.py
+@@ -19,6 +19,7 @@ from poetry.mixology.partial_solution import PartialSolution
+ from poetry.mixology.result import SolverResult
+ from poetry.mixology.set_relation import SetRelation
+ from poetry.mixology.term import Term
++from poetry.packages import PackageCollection
+ 
+ 
+ if TYPE_CHECKING:
+@@ -99,18 +100,28 @@ class DependencyCache:
+         decision_level: int,
+     ) -> list[DependencyPackage]:
+         key = (
+-            dependency.complete_name,
++            dependency.name,
+             dependency.source_type,
+             dependency.source_url,
+             dependency.source_reference,
+             dependency.source_subdirectory,
+         )
+ 
+-        packages = self._search_for_cached(dependency, key)
++        # We could always use dependency.without_features() here,
++        # but for performance reasons we only do it if necessary.
++        packages = self._search_for_cached(
++            dependency.without_features() if dependency.features else dependency, key
++        )
+         if not self._cache[key] or self._cache[key][-1] is not packages:
+             self._cache[key].append(packages)
+             self._cached_dependencies_by_level[decision_level].append(key)
+ 
++        if dependency.features and packages:
++            # Use the cached dependency so that a possible explicit source is set.
++            return PackageCollection(
++                packages[0].dependency.with_features(dependency.features), packages
++            )
++
+         return packages
+ 
+     def clear_level(self, level: int) -> None:
+
+diff --git a/src/poetry/packages/locker.py b/src/poetry/packages/locker.py
+index 822e0a5..ab4b53f 100644
+--- a/src/poetry/packages/locker.py
++++ b/src/poetry/packages/locker.py
+@@ -31,6 +31,7 @@ from poetry.utils._compat import tomllib
+ 
+ 
+ if TYPE_CHECKING:
++    from packaging.utils import NormalizedName
+     from poetry.core.packages.directory_dependency import DirectoryDependency
+     from poetry.core.packages.file_dependency import FileDependency
+     from poetry.core.packages.url_dependency import URLDependency
+@@ -167,11 +168,13 @@ class Locker:
+                     package.files = files
+ 
+             package.python_versions = info["python-versions"]
++
++            package_extras: dict[NormalizedName, list[Dependency]] = {}
+             extras = info.get("extras", {})
+             if extras:
+                 for name, deps in extras.items():
+                     name = canonicalize_name(name)
+-                    package.extras[name] = []
++                    package_extras[name] = []
+ 
+                     for dep in deps:
+                         try:
+@@ -187,7 +190,9 @@ class Locker:
+                             dependency = Dependency(
+                                 dep_name, constraint, extras=extras.split(",")
+                             )
+-                        package.extras[name].append(dependency)
++                        package_extras[name].append(dependency)
++
++            package.extras = package_extras
+ 
+             if "marker" in info:
+                 package.marker = parse_marker(info["marker"])
+@@ -379,8 +384,7 @@ class Locker:
+             package.requires,
+             key=lambda d: d.name,
+         ):
+-            if dependency.pretty_name not in dependencies:
+-                dependencies[dependency.pretty_name] = []
++            dependencies.setdefault(dependency.pretty_name, [])
+ 
+             constraint = inline_table()
+ 
+
+diff --git a/src/poetry/publishing/publisher.py b/src/poetry/publishing/publisher.py
+index a533525..a009e7a 100644
+--- a/src/poetry/publishing/publisher.py
++++ b/src/poetry/publishing/publisher.py
+@@ -23,11 +23,11 @@ class Publisher:
+     Registers and publishes packages to remote repositories.
+     """
+ 
+-    def __init__(self, poetry: Poetry, io: IO) -> None:
++    def __init__(self, poetry: Poetry, io: IO, dist_dir: Path | None = None) -> None:
+         self._poetry = poetry
+         self._package = poetry.package
+         self._io = io
+-        self._uploader = Uploader(poetry, io)
++        self._uploader = Uploader(poetry, io, dist_dir)
+         self._authenticator = Authenticator(poetry.config, self._io)
+ 
+     @property
+
+diff --git a/src/poetry/publishing/uploader.py b/src/poetry/publishing/uploader.py
+index ab415db..03f7e32 100644
+--- a/src/poetry/publishing/uploader.py
++++ b/src/poetry/publishing/uploader.py
+@@ -49,10 +49,11 @@ class UploadError(Exception):
+ 
+ 
+ class Uploader:
+-    def __init__(self, poetry: Poetry, io: IO) -> None:
++    def __init__(self, poetry: Poetry, io: IO, dist_dir: Path | None = None) -> None:
+         self._poetry = poetry
+         self._package = poetry.package
+         self._io = io
++        self._dist_dir = dist_dir or self.default_dist_dir
+         self._username: str | None = None
+         self._password: str | None = None
+ 
+@@ -61,9 +62,20 @@ class Uploader:
+         agent: str = user_agent("poetry", __version__)
+         return agent
+ 
++    @property
++    def default_dist_dir(self) -> Path:
++        return self._poetry.file.path.parent / "dist"
++
++    @property
++    def dist_dir(self) -> Path:
++        if not self._dist_dir.is_absolute():
++            return self._poetry.file.path.parent / self._dist_dir
++
++        return self._dist_dir
++
+     @property
+     def files(self) -> list[Path]:
+-        dist = self._poetry.file.path.parent / "dist"
++        dist = self.dist_dir
+         version = self._package.version.to_string()
+         escaped_name = distribution_name(self._package.name)
+ 
+@@ -277,7 +289,7 @@ class Uploader:
+         """
+         Register a package to a repository.
+         """
+-        dist = self._poetry.file.path.parent / "dist"
++        dist = self.dist_dir
+         escaped_name = distribution_name(self._package.name)
+         file = dist / f"{escaped_name}-{self._package.version.to_string()}.tar.gz"
+ 
+
+diff --git a/src/poetry/puzzle/exceptions.py b/src/poetry/puzzle/exceptions.py
+index 58087c4..6bb7c00 100644
+--- a/src/poetry/puzzle/exceptions.py
++++ b/src/poetry/puzzle/exceptions.py
+@@ -5,9 +5,9 @@ from typing import TYPE_CHECKING
+ 
+ if TYPE_CHECKING:
+     from poetry.core.packages.dependency import Dependency
++    from poetry.core.packages.package import Package
+ 
+     from poetry.mixology.failure import SolveFailure
+-    from poetry.packages import DependencyPackage
+ 
+ 
+ class SolverProblemError(Exception):
+@@ -22,11 +22,9 @@ class SolverProblemError(Exception):
+ 
+ 
+ class OverrideNeeded(Exception):
+-    def __init__(
+-        self, *overrides: dict[DependencyPackage, dict[str, Dependency]]
+-    ) -> None:
++    def __init__(self, *overrides: dict[Package, dict[str, Dependency]]) -> None:
+         self._overrides = overrides
+ 
+     @property
+-    def overrides(self) -> tuple[dict[DependencyPackage, dict[str, Dependency]], ...]:
++    def overrides(self) -> tuple[dict[Package, dict[str, Dependency]], ...]:
+         return self._overrides
+
+diff --git a/src/poetry/puzzle/provider.py b/src/poetry/puzzle/provider.py
+index 09fbe86..754795b 100644
+--- a/src/poetry/puzzle/provider.py
++++ b/src/poetry/puzzle/provider.py
+@@ -125,7 +125,7 @@ class Provider:
+         self._env: Env | None = None
+         self._python_constraint = package.python_constraint
+         self._is_debugging: bool = self._io.is_debug() or self._io.is_very_verbose()
+-        self._overrides: dict[DependencyPackage, dict[str, Dependency]] = {}
++        self._overrides: dict[Package, dict[str, Dependency]] = {}
+         self._deferred_cache: dict[Dependency, Package] = {}
+         self._load_deferred = True
+         self._source_root: Path | None = None
+@@ -134,6 +134,7 @@ class Provider:
+         self._locked: dict[NormalizedName, list[DependencyPackage]] = defaultdict(list)
+         self._use_latest: Collection[NormalizedName] = []
+ 
++        self._explicit_sources: dict[str, str] = {}
+         for package in locked or []:
+             self._locked[package.name].append(
+                 DependencyPackage(package.to_dependency(), package)
+@@ -155,9 +156,7 @@ class Provider:
+     def is_debugging(self) -> bool:
+         return self._is_debugging
+ 
+-    def set_overrides(
+-        self, overrides: dict[DependencyPackage, dict[str, Dependency]]
+-    ) -> None:
++    def set_overrides(self, overrides: dict[Package, dict[str, Dependency]]) -> None:
+         self._overrides = overrides
+ 
+     def load_deferred(self, load_deferred: bool) -> None:
+@@ -385,7 +384,7 @@ class Provider:
+         return package
+ 
+     def _get_dependencies_with_overrides(
+-        self, dependencies: list[Dependency], package: DependencyPackage
++        self, dependencies: list[Dependency], package: Package
+     ) -> list[Dependency]:
+         overrides = self._overrides.get(package, {})
+         _dependencies = []
+@@ -460,9 +459,7 @@ class Provider:
+             and self._python_constraint.allows_any(dep.python_constraint)
+             and (not self._env or dep.marker.validate(self._env.marker_env))
+         ]
+-        dependencies = self._get_dependencies_with_overrides(
+-            _dependencies, dependency_package
+-        )
++        dependencies = self._get_dependencies_with_overrides(_dependencies, package)
+ 
+         return [
+             Incompatibility(
+@@ -570,9 +567,7 @@ class Provider:
+                         continue
+                     self.search_for_direct_origin_dependency(dep)
+ 
+-        dependencies = self._get_dependencies_with_overrides(
+-            _dependencies, dependency_package
+-        )
++        dependencies = self._get_dependencies_with_overrides(_dependencies, package)
+ 
+         # Searching for duplicate dependencies
+         #
+@@ -649,11 +644,9 @@ class Provider:
+             for dep in deps:
+                 if not overrides_marker_intersection.intersect(dep.marker).is_empty():
+                     current_overrides = self._overrides.copy()
+-                    package_overrides = current_overrides.get(
+-                        dependency_package, {}
+-                    ).copy()
++                    package_overrides = current_overrides.get(package, {}).copy()
+                     package_overrides.update({dep.name: dep})
+-                    current_overrides.update({dependency_package: package_overrides})
++                    current_overrides.update({package: package_overrides})
+                     overrides.append(current_overrides)
+ 
+             if overrides:
+@@ -692,6 +685,16 @@ class Provider:
+         for dep in clean_dependencies:
+             package.add_dependency(dep)
+ 
++        if self._locked and package.is_root():
++            # At this point all duplicates have been eliminated via overrides
++            # so that explicit sources are unambiguous.
++            # Clear _explicit_sources because it might be filled
++            # from a previous override.
++            self._explicit_sources.clear()
++            for dep in clean_dependencies:
++                if dep.source_name:
++                    self._explicit_sources[dep.name] = dep.source_name
++
+         return dependency_package
+ 
+     def get_locked(self, dependency: Dependency) -> DependencyPackage | None:
+@@ -702,6 +705,8 @@ class Provider:
+         for dependency_package in locked:
+             package = dependency_package.package
+             if package.satisfies(dependency):
++                if explicit_source := self._explicit_sources.get(dependency.name):
++                    dependency.source_name = explicit_source
+                 return DependencyPackage(dependency, package)
+         return None
+ 
+
+diff --git a/src/poetry/puzzle/solver.py b/src/poetry/puzzle/solver.py
+index 3e0b2d4..af10764 100644
+--- a/src/poetry/puzzle/solver.py
++++ b/src/poetry/puzzle/solver.py
+@@ -27,7 +27,6 @@ if TYPE_CHECKING:
+     from poetry.core.packages.package import Package
+     from poetry.core.packages.project_package import ProjectPackage
+ 
+-    from poetry.packages import DependencyPackage
+     from poetry.puzzle.transaction import Transaction
+     from poetry.repositories import RepositoryPool
+     from poetry.utils.env import Env
+@@ -51,7 +50,7 @@ class Solver:
+         self._provider = Provider(
+             self._package, self._pool, self._io, installed=installed, locked=locked
+         )
+-        self._overrides: list[dict[DependencyPackage, dict[str, Dependency]]] = []
++        self._overrides: list[dict[Package, dict[str, Dependency]]] = []
+ 
+     @property
+     def provider(self) -> Provider:
+@@ -119,7 +118,7 @@ class Solver:
+ 
+     def _solve_in_compatibility_mode(
+         self,
+-        overrides: tuple[dict[DependencyPackage, dict[str, Dependency]], ...],
++        overrides: tuple[dict[Package, dict[str, Dependency]], ...],
+     ) -> tuple[list[Package], list[int]]:
+         packages = []
+         depths = []
+
+diff --git a/src/poetry/repositories/http_repository.py b/src/poetry/repositories/http_repository.py
+index 826703a..788f7ce 100644
+--- a/src/poetry/repositories/http_repository.py
++++ b/src/poetry/repositories/http_repository.py
+@@ -3,7 +3,6 @@ from __future__ import annotations
+ import functools
+ import hashlib
+ 
+-from collections import defaultdict
+ from contextlib import contextmanager
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+@@ -13,27 +12,32 @@ from typing import Iterator
+ import requests
+ import requests.adapters
+ 
++from packaging.metadata import parse_email
+ from poetry.core.constraints.version import parse_constraint
+ from poetry.core.packages.dependency import Dependency
+-from poetry.core.packages.utils.link import Link
+ from poetry.core.utils.helpers import temporary_directory
+ from poetry.core.version.markers import parse_marker
+ 
++from poetry.config.config import Config
++from poetry.inspection.info import PackageInfo
++from poetry.inspection.lazy_wheel import HTTPRangeRequestUnsupported
++from poetry.inspection.lazy_wheel import metadata_from_wheel_url
+ from poetry.repositories.cached_repository import CachedRepository
+ from poetry.repositories.exceptions import PackageNotFound
+ from poetry.repositories.exceptions import RepositoryError
+ from poetry.repositories.link_sources.html import HTMLPage
+ from poetry.utils.authenticator import Authenticator
+ from poetry.utils.constants import REQUESTS_TIMEOUT
++from poetry.utils.helpers import HTTPRangeRequestSupported
+ from poetry.utils.helpers import download_file
++from poetry.utils.helpers import get_highest_priority_hash_type
+ from poetry.utils.patterns import wheel_file_re
+ 
+ 
+ if TYPE_CHECKING:
+     from packaging.utils import NormalizedName
++    from poetry.core.packages.utils.link import Link
+ 
+-    from poetry.config.config import Config
+-    from poetry.inspection.info import PackageInfo
+     from poetry.repositories.link_sources.base import LinkSource
+     from poetry.utils.authenticator import RepositoryCertificateConfig
+ 
+@@ -49,6 +53,8 @@ class HTTPRepository(CachedRepository):
+     ) -> None:
+         super().__init__(name, disable_cache, config)
+         self._url = url
++        if config is None:
++            config = Config.create()
+         self._authenticator = Authenticator(
+             config=config,
+             cache_id=name,
+@@ -58,6 +64,16 @@ class HTTPRepository(CachedRepository):
+         self._authenticator.add_repository(name, url)
+         self.get_page = functools.lru_cache(maxsize=None)(self._get_page)
+ 
++        self._lazy_wheel = config.get("solver.lazy-wheel", True)
++        # We are tracking if a domain supports range requests or not to avoid
++        # unnecessary requests.
++        # ATTENTION: A domain might support range requests only for some files, so the
++        # meaning is as follows:
++        # - Domain not in dict: We don't know anything.
++        # - True: The domain supports range requests for at least some files.
++        # - False: The domain does not support range requests for the files we tried.
++        self._supports_range_requests: dict[str, bool] = {}
++
+     @property
+     def session(self) -> Authenticator:
+         return self._authenticator
+@@ -74,32 +90,124 @@ class HTTPRepository(CachedRepository):
+     def authenticated_url(self) -> str:
+         return self._authenticator.authenticated_url(url=self.url)
+ 
+-    def _download(self, url: str, dest: Path) -> None:
+-        return download_file(url, dest, session=self.session)
++    def _download(
++        self, url: str, dest: Path, *, raise_accepts_ranges: bool = False
++    ) -> None:
++        return download_file(
++            url, dest, session=self.session, raise_accepts_ranges=raise_accepts_ranges
++        )
+ 
+     @contextmanager
+-    def _cached_or_downloaded_file(self, link: Link) -> Iterator[Path]:
++    def _cached_or_downloaded_file(
++        self, link: Link, *, raise_accepts_ranges: bool = False
++    ) -> Iterator[Path]:
+         self._log(f"Downloading: {link.url}", level="debug")
+         with temporary_directory() as temp_dir:
+             filepath = Path(temp_dir) / link.filename
+-            self._download(link.url, filepath)
++            self._download(
++                link.url, filepath, raise_accepts_ranges=raise_accepts_ranges
++            )
+             yield filepath
+ 
+-    def _get_info_from_wheel(self, url: str) -> PackageInfo:
++    def _get_info_from_wheel(self, link: Link) -> PackageInfo:
+         from poetry.inspection.info import PackageInfo
+ 
+-        with self._cached_or_downloaded_file(Link(url)) as filepath:
+-            return PackageInfo.from_wheel(filepath)
++        netloc = link.netloc
++
++        # If "lazy-wheel" is enabled and the domain supports range requests
++        # or we don't know yet, we try range requests.
++        raise_accepts_ranges = self._lazy_wheel
++        if self._lazy_wheel and self._supports_range_requests.get(netloc, True):
++            try:
++                package_info = PackageInfo.from_metadata(
++                    metadata_from_wheel_url(link.filename, link.url, self.session)
++                )
++            except HTTPRangeRequestUnsupported:
++                # Do not set to False if we already know that the domain supports
++                # range requests for some URLs!
++                raise_accepts_ranges = False
++                self._supports_range_requests.setdefault(netloc, False)
++            else:
++                self._supports_range_requests[netloc] = True
++                return package_info
++
++        try:
++            with self._cached_or_downloaded_file(
++                link, raise_accepts_ranges=raise_accepts_ranges
++            ) as filepath:
++                return PackageInfo.from_wheel(filepath)
++        except HTTPRangeRequestSupported:
++            # The domain did not support range requests for the first URL(s) we tried,
++            # but supports it for some URLs (especially the current URL),
++            # so we abort the download, update _supports_range_requests to try
++            # range requests for all files and use it for the current URL.
++            self._log(
++                f"Abort downloading {link.url} because server supports range requests",
++                level="debug",
++            )
++            self._supports_range_requests[netloc] = True
++            return self._get_info_from_wheel(link)
+ 
+-    def _get_info_from_sdist(self, url: str) -> PackageInfo:
++    def _get_info_from_sdist(self, link: Link) -> PackageInfo:
+         from poetry.inspection.info import PackageInfo
+ 
+-        with self._cached_or_downloaded_file(Link(url)) as filepath:
++        with self._cached_or_downloaded_file(link) as filepath:
+             return PackageInfo.from_sdist(filepath)
+ 
+-    def _get_info_from_urls(self, urls: dict[str, list[str]]) -> PackageInfo:
++    def _get_info_from_metadata(self, link: Link) -> PackageInfo | None:
++        if link.has_metadata:
++            try:
++                assert link.metadata_url is not None
++                response = self.session.get(link.metadata_url)
++                if link.metadata_hashes and (
++                    hash_name := get_highest_priority_hash_type(
++                        set(link.metadata_hashes.keys()), f"{link.filename}.metadata"
++                    )
++                ):
++                    metadata_hash = getattr(hashlib, hash_name)(
++                        response.text.encode()
++                    ).hexdigest()
++                    if metadata_hash != link.metadata_hashes[hash_name]:
++                        self._log(
++                            f"Metadata file hash ({metadata_hash}) does not match"
++                            f" expected hash ({link.metadata_hashes[hash_name]})."
++                            f" Metadata file for {link.filename} will be ignored.",
++                            level="warning",
++                        )
++                        return None
++
++                metadata, _ = parse_email(response.content)
++                return PackageInfo.from_metadata(metadata)
++
++            except requests.HTTPError:
++                self._log(
++                    f"Failed to retrieve metadata at {link.metadata_url}",
++                    level="warning",
++                )
++
++        return None
++
++    def _get_info_from_links(
++        self,
++        links: list[Link],
++        *,
++        ignore_yanked: bool = True,
++    ) -> PackageInfo:
++        # Sort links by distribution type
++        wheels: list[Link] = []
++        sdists: list[Link] = []
++        for link in links:
++            if link.yanked and ignore_yanked:
++                # drop yanked files unless the entire release is yanked
++                continue
++            if link.is_wheel:
++                wheels.append(link)
++            elif link.filename.endswith(
++                (".tar.gz", ".zip", ".bz2", ".xz", ".Z", ".tar")
++            ):
++                sdists.append(link)
++
+         # Prefer to read data from wheels: this is faster and more reliable
+-        wheels = urls.get("bdist_wheel")
+         if wheels:
+             # We ought just to be able to look at any of the available wheels to read
+             # metadata, they all should give the same answer.
+@@ -115,8 +223,7 @@ class HTTPRepository(CachedRepository):
+             universal_python3_wheel = None
+             platform_specific_wheels = []
+             for wheel in wheels:
+-                link = Link(wheel)
+-                m = wheel_file_re.match(link.filename)
++                m = wheel_file_re.match(wheel.filename)
+                 if not m:
+                     continue
+ 
+@@ -136,13 +243,19 @@ class HTTPRepository(CachedRepository):
+                     platform_specific_wheels.append(wheel)
+ 
+             if universal_wheel is not None:
+-                return self._get_info_from_wheel(universal_wheel)
++                return self._get_info_from_metadata(
++                    universal_wheel
++                ) or self._get_info_from_wheel(universal_wheel)
+ 
+             info = None
+             if universal_python2_wheel and universal_python3_wheel:
+-                info = self._get_info_from_wheel(universal_python2_wheel)
++                info = self._get_info_from_metadata(
++                    universal_python2_wheel
++                ) or self._get_info_from_wheel(universal_python2_wheel)
+ 
+-                py3_info = self._get_info_from_wheel(universal_python3_wheel)
++                py3_info = self._get_info_from_metadata(
++                    universal_python3_wheel
++                ) or self._get_info_from_wheel(universal_python3_wheel)
+ 
+                 if info.requires_python or py3_info.requires_python:
+                     info.requires_python = str(
+@@ -192,16 +305,24 @@ class HTTPRepository(CachedRepository):
+ 
+             # Prefer non platform specific wheels
+             if universal_python3_wheel:
+-                return self._get_info_from_wheel(universal_python3_wheel)
++                return self._get_info_from_metadata(
++                    universal_python3_wheel
++                ) or self._get_info_from_wheel(universal_python3_wheel)
+ 
+             if universal_python2_wheel:
+-                return self._get_info_from_wheel(universal_python2_wheel)
++                return self._get_info_from_metadata(
++                    universal_python2_wheel
++                ) or self._get_info_from_wheel(universal_python2_wheel)
+ 
+             if platform_specific_wheels:
+                 first_wheel = platform_specific_wheels[0]
+-                return self._get_info_from_wheel(first_wheel)
++                return self._get_info_from_metadata(
++                    first_wheel
++                ) or self._get_info_from_wheel(first_wheel)
+ 
+-        return self._get_info_from_sdist(urls["sdist"][0])
++        return self._get_info_from_metadata(sdists[0]) or self._get_info_from_sdist(
++            sdists[0]
++        )
+ 
+     def _links_to_data(self, links: list[Link], data: PackageInfo) -> dict[str, Any]:
+         if not links:
+@@ -209,33 +330,34 @@ class HTTPRepository(CachedRepository):
+                 f'No valid distribution links found for package: "{data.name}" version:'
+                 f' "{data.version}"'
+             )
+-        urls = defaultdict(list)
++
+         files: list[dict[str, Any]] = []
+         for link in links:
+             if link.yanked and not data.yanked:
+                 # drop yanked files unless the entire release is yanked
+                 continue
+-            if link.is_wheel:
+-                urls["bdist_wheel"].append(link.url)
+-            elif link.filename.endswith(
+-                (".tar.gz", ".zip", ".bz2", ".xz", ".Z", ".tar")
+-            ):
+-                urls["sdist"].append(link.url)
+-
+-            file_hash = f"{link.hash_name}:{link.hash}" if link.hash else None
+ 
+-            if not link.hash or (
+-                link.hash_name is not None
+-                and link.hash_name not in ("sha256", "sha384", "sha512")
+-                and hasattr(hashlib, link.hash_name)
++            file_hash: str | None
++            for hash_name in ("sha512", "sha384", "sha256"):
++                if hash_name in link.hashes:
++                    file_hash = f"{hash_name}:{link.hashes[hash_name]}"
++                    break
++            else:
++                file_hash = self.calculate_sha256(link)
++
++            if file_hash is None and (
++                hash_type := get_highest_priority_hash_type(
++                    set(link.hashes.keys()), link.filename
++                )
+             ):
+-                file_hash = self.calculate_sha256(link) or file_hash
++                file_hash = f"{hash_type}:{link.hashes[hash_type]}"
+ 
+             files.append({"file": link.filename, "hash": file_hash})
+ 
+         data.files = files
+ 
+-        info = self._get_info_from_urls(urls)
++        # drop yanked files unless the entire release is yanked
++        info = self._get_info_from_links(links, ignore_yanked=not data.yanked)
+ 
+         data.summary = info.summary
+         data.requires_dist = info.requires_dist
+@@ -245,7 +367,10 @@ class HTTPRepository(CachedRepository):
+ 
+     def calculate_sha256(self, link: Link) -> str | None:
+         with self._cached_or_downloaded_file(link) as filepath:
+-            known_hash = getattr(hashlib, link.hash_name)() if link.hash_name else None
++            hash_name = get_highest_priority_hash_type(
++                set(link.hashes.keys()), link.filename
++            )
++            known_hash = getattr(hashlib, hash_name)() if hash_name else None
+             required_hash = hashlib.sha256()
+ 
+             chunksize = 4096
+@@ -258,7 +383,11 @@ class HTTPRepository(CachedRepository):
+                         known_hash.update(chunk)
+                     required_hash.update(chunk)
+ 
+-            if not known_hash or known_hash.hexdigest() == link.hash:
++            if (
++                not hash_name
++                or not known_hash
++                or known_hash.hexdigest() == link.hashes[hash_name]
++            ):
+                 return f"{required_hash.name}:{required_hash.hexdigest()}"
+         return None
+ 
+
+diff --git a/src/poetry/repositories/link_sources/html.py b/src/poetry/repositories/link_sources/html.py
+index 74663cd..7dfbd19 100644
+--- a/src/poetry/repositories/link_sources/html.py
++++ b/src/poetry/repositories/link_sources/html.py
+@@ -42,7 +42,21 @@ class HTMLPage(LinkSource):
+                     yanked = unescape(yanked_value)
+                 else:
+                     yanked = "data-yanked" in anchor
+-                link = Link(url, requires_python=pyrequire, yanked=yanked)
++
++                # see https://peps.python.org/pep-0714/#clients
++                # and https://peps.python.org/pep-0658/#specification
++                metadata: str | bool
++                for metadata_key in ("data-core-metadata", "data-dist-info-metadata"):
++                    metadata_value = anchor.get(metadata_key)
++                    if metadata_value:
++                        metadata = unescape(metadata_value)
++                    else:
++                        metadata = metadata_key in anchor
++                    if metadata:
++                        break
++                link = Link(
++                    url, requires_python=pyrequire, yanked=yanked, metadata=metadata
++                )
+ 
+                 if link.ext not in self.SUPPORTED_FORMATS:
+                     continue
+
+diff --git a/src/poetry/repositories/link_sources/json.py b/src/poetry/repositories/link_sources/json.py
+index 12b9c43..f33a679 100644
+--- a/src/poetry/repositories/link_sources/json.py
++++ b/src/poetry/repositories/link_sources/json.py
+@@ -28,7 +28,22 @@ class SimpleJsonPage(LinkSource):
+             url = file["url"]
+             requires_python = file.get("requires-python")
+             yanked = file.get("yanked", False)
+-            link = Link(url, requires_python=requires_python, yanked=yanked)
++
++            # see https://peps.python.org/pep-0714/#clients
++            # and https://peps.python.org/pep-0691/#project-detail
++            metadata: dict[str, str] | bool = False
++            for metadata_key in ("core-metadata", "dist-info-metadata"):
++                if metadata_key in file:
++                    metadata_value = file[metadata_key]
++                    if metadata_value and isinstance(metadata_value, dict):
++                        metadata = metadata_value
++                    else:
++                        metadata = bool(metadata_value)
++                    break
++
++            link = Link(
++                url, requires_python=requires_python, yanked=yanked, metadata=metadata
++            )
+ 
+             if link.ext not in self.SUPPORTED_FORMATS:
+                 continue
+
+diff --git a/src/poetry/repositories/pypi_repository.py b/src/poetry/repositories/pypi_repository.py
+index 66f6fb6..43d6c51 100644
+--- a/src/poetry/repositories/pypi_repository.py
++++ b/src/poetry/repositories/pypi_repository.py
+@@ -2,7 +2,6 @@ from __future__ import annotations
+ 
+ import logging
+ 
+-from collections import defaultdict
+ from typing import TYPE_CHECKING
+ from typing import Any
+ 
+@@ -143,7 +142,6 @@ class PyPiRepository(HTTPRepository):
+             summary=info["summary"],
+             requires_dist=info["requires_dist"],
+             requires_python=info["requires_python"],
+-            files=info.get("files", []),
+             yanked=self._get_yanked(info),
+             cache_version=str(self.CACHE_VERSION),
+         )
+@@ -153,35 +151,30 @@ class PyPiRepository(HTTPRepository):
+         except KeyError:
+             version_info = []
+ 
++        files = info.get("files", [])
+         for file_info in version_info:
+             if file_info["packagetype"] in SUPPORTED_PACKAGE_TYPES:
+-                data.files.append(
++                files.append(
+                     {
+                         "file": file_info["filename"],
+                         "hash": "sha256:" + file_info["digests"]["sha256"],
+                     }
+                 )
++        data.files = files
+ 
+         if self._fallback and data.requires_dist is None:
+-            self._log("No dependencies found, downloading archives", level="debug")
++            self._log(
++                "No dependencies found, downloading metadata and/or archives",
++                level="debug",
++            )
+             # No dependencies set (along with other information)
+             # This might be due to actually no dependencies
+-            # or badly set metadata when uploading
++            # or badly set metadata when uploading.
+             # So, we need to make sure there is actually no
+-            # dependencies by introspecting packages
+-            urls = defaultdict(list)
+-            for url in json_data["urls"]:
+-                # Only get sdist and wheels if they exist
+-                dist_type = url["packagetype"]
+-                if dist_type not in SUPPORTED_PACKAGE_TYPES:
+-                    continue
+-
+-                urls[dist_type].append(url["url"])
+-
+-            if not urls:
+-                return data.asdict()
+-
+-            info = self._get_info_from_urls(urls)
++            # dependencies by introspecting packages.
++            page = self.get_page(name)
++            links = list(page.links_for_version(name, version))
++            info = self._get_info_from_links(links)
+ 
+             data.requires_dist = info.requires_dist
+ 
+
+diff --git a/src/poetry/utils/authenticator.py b/src/poetry/utils/authenticator.py
+index 2628e5b..47a03a7 100644
+--- a/src/poetry/utils/authenticator.py
++++ b/src/poetry/utils/authenticator.py
+@@ -90,17 +90,15 @@ class AuthenticatorRepositoryConfig:
+             **(password_manager.get_http_auth(self.name) or {})
+         )
+ 
+-        if credential.password is None:
++        if credential.password is not None:
++            return credential
++
++        if password_manager.use_keyring:
+             # fallback to url and netloc based keyring entries
+-            credential = password_manager.keyring.get_credential(
++            credential = password_manager.get_credential(
+                 self.url, self.netloc, username=credential.username
+             )
+ 
+-            if credential.password is not None:
+-                return HTTPAuthCredential(
+-                    username=credential.username, password=credential.password
+-                )
+-
+         return credential
+ 
+ 
+@@ -124,11 +122,9 @@ class Authenticator:
+         self._password_manager = PasswordManager(self._config)
+         self._cache_control = (
+             FileCache(
+-                str(
+-                    self._config.repository_cache_directory
+-                    / (cache_id or "_default_cache")
+-                    / "_http"
+-                ),
++                self._config.repository_cache_directory
++                / (cache_id or "_default_cache")
++                / "_http"
+             )
+             if not disable_cache
+             else None
+@@ -270,6 +266,10 @@ class Authenticator:
+     def get(self, url: str, **kwargs: Any) -> requests.Response:
+         return self.request("get", url, **kwargs)
+ 
++    def head(self, url: str, **kwargs: Any) -> requests.Response:
++        kwargs.setdefault("allow_redirects", False)
++        return self.request("head", url, **kwargs)
++
+     def post(self, url: str, **kwargs: Any) -> requests.Response:
+         return self.request("post", url, **kwargs)
+ 
+@@ -301,7 +301,7 @@ class Authenticator:
+         if credential.password is None:
+             parsed_url = urllib.parse.urlsplit(url)
+             netloc = parsed_url.netloc
+-            credential = self._password_manager.keyring.get_credential(
++            credential = self._password_manager.get_credential(
+                 url, netloc, username=credential.username
+             )
+ 
+
+diff --git a/src/poetry/utils/cache.py b/src/poetry/utils/cache.py
+index 99955e4..913fdb5 100644
+--- a/src/poetry/utils/cache.py
++++ b/src/poetry/utils/cache.py
+@@ -18,6 +18,7 @@ from typing import overload
+ 
+ from poetry.utils._compat import decode
+ from poetry.utils._compat import encode
++from poetry.utils.helpers import get_highest_priority_hash_type
+ from poetry.utils.wheel import InvalidWheelName
+ from poetry.utils.wheel import Wheel
+ 
+@@ -197,8 +198,10 @@ class ArtifactCache:
+     def get_cache_directory_for_link(self, link: Link) -> Path:
+         key_parts = {"url": link.url_without_fragment}
+ 
+-        if link.hash_name is not None and link.hash is not None:
+-            key_parts[link.hash_name] = link.hash
++        if hash_name := get_highest_priority_hash_type(
++            set(link.hashes.keys()), link.filename
++        ):
++            key_parts[hash_name] = link.hashes[hash_name]
+ 
+         if link.subdirectory_fragment:
+             key_parts["subdirectory"] = link.subdirectory_fragment
+
+diff --git a/src/poetry/utils/dependency_specification.py b/src/poetry/utils/dependency_specification.py
+index 554994f..fc21fe5 100644
+--- a/src/poetry/utils/dependency_specification.py
++++ b/src/poetry/utils/dependency_specification.py
+@@ -92,8 +92,8 @@ class RequirementsParser:
+         )
+ 
+         if specification:
+-            if extras and "extras" not in specification:
+-                specification["extras"] = extras
++            if extras:
++                specification.setdefault("extras", extras)
+             return specification
+ 
+         raise ValueError(f"Invalid dependency specification: {requirement}")
+
+diff --git a/src/poetry/utils/env/__init__.py b/src/poetry/utils/env/__init__.py
+index ed22bb3..e99abda 100644
+--- a/src/poetry/utils/env/__init__.py
++++ b/src/poetry/utils/env/__init__.py
+@@ -67,25 +67,18 @@ def build_environment(
+     """
+     if not env or poetry.package.build_script:
+         with ephemeral_environment(executable=env.python if env else None) as venv:
+-            overwrite = (
+-                io is not None and io.output.is_decorated() and not io.is_debug()
+-            )
+-
+             if io:
+-                if not overwrite:
+-                    io.write_error_line("")
+-
+                 requires = [
+                     f"<c1>{requirement}</c1>"
+                     for requirement in poetry.pyproject.build_system.requires
+                 ]
+ 
+-                io.overwrite_error(
++                io.write_error_line(
+                     "<b>Preparing</b> build environment with build-system requirements"
+                     f" {', '.join(requires)}"
+                 )
+ 
+-            venv.run_pip(
++            output = venv.run_pip(
+                 "install",
+                 "--disable-pip-version-check",
+                 "--ignore-installed",
+@@ -93,9 +86,8 @@ def build_environment(
+                 *poetry.pyproject.build_system.requires,
+             )
+ 
+-            if overwrite:
+-                assert io is not None
+-                io.write_error_line("")
++            if io and io.is_debug() and output:
++                io.write_error(output)
+ 
+             yield venv
+     else:
+
+diff --git a/src/poetry/utils/env/base_env.py b/src/poetry/utils/env/base_env.py
+index 0880502..5f4d558 100644
+--- a/src/poetry/utils/env/base_env.py
++++ b/src/poetry/utils/env/base_env.py
+@@ -21,7 +21,6 @@ from poetry.utils.helpers import get_real_windows_path
+ 
+ if TYPE_CHECKING:
+     from packaging.tags import Tag
+-    from poetry.core.constraints.version import Version
+     from poetry.core.version.markers import BaseMarker
+     from virtualenv.seed.wheels.util import Wheel
+ 
+@@ -54,7 +53,6 @@ class Env:
+         self._base = base or path
+ 
+         self._marker_env: dict[str, Any] | None = None
+-        self._pip_version: Version | None = None
+         self._site_packages: SitePackages | None = None
+         self._paths: dict[str, str] | None = None
+         self._supported_tags: list[Tag] | None = None
+@@ -170,13 +168,6 @@ class Env:
+     def os(self) -> str:
+         return os.name
+ 
+-    @property
+-    def pip_version(self) -> Version:
+-        if self._pip_version is None:
+-            self._pip_version = self.get_pip_version()
+-
+-        return self._pip_version
+-
+     @property
+     def site_packages(self) -> SitePackages:
+         if self._site_packages is None:
+@@ -288,9 +279,6 @@ class Env:
+     def get_supported_tags(self) -> list[Tag]:
+         raise NotImplementedError()
+ 
+-    def get_pip_version(self) -> Version:
+-        raise NotImplementedError()
+-
+     def get_paths(self) -> dict[str, str]:
+         raise NotImplementedError()
+ 
+
+diff --git a/src/poetry/utils/env/env_manager.py b/src/poetry/utils/env/env_manager.py
+index e7b0cc7..12eaac5 100644
+--- a/src/poetry/utils/env/env_manager.py
++++ b/src/poetry/utils/env/env_manager.py
+@@ -9,6 +9,7 @@ import shutil
+ import subprocess
+ import sys
+ 
++from functools import cached_property
+ from pathlib import Path
+ from subprocess import CalledProcessError
+ from typing import TYPE_CHECKING
+@@ -45,6 +46,44 @@ if TYPE_CHECKING:
+     from poetry.utils.env.base_env import Env
+ 
+ 
++class EnvsFile(TOMLFile):
++    """
++    This file contains one section per project with the project's base env name
++    as section name. Each section contains the minor and patch version of the
++    python executable used to create the currently active virtualenv.
++
++    Example:
++
++    [poetry-QRErDmmj]
++    minor = "3.9"
++    patch = "3.9.13"
++
++    [poetry-core-m5r7DkRA]
++    minor = "3.11"
++    patch = "3.11.6"
++    """
++
++    def remove_section(self, name: str, minor: str | None = None) -> str | None:
++        """
++        Remove a section from the envs file.
++
++        If "minor" is given, the section is only removed if its minor value
++        matches "minor".
++
++        Returns the "minor" value of the removed section.
++        """
++        envs = self.read()
++        current_env = envs.get(name)
++        if current_env is not None and (not minor or current_env["minor"] == minor):
++            del envs[name]
++            self.write(envs)
++            minor = current_env["minor"]
++            assert isinstance(minor, str)
++            return minor
++
++        return None
++
++
+ class EnvManager:
+     """
+     Environments manager
+@@ -121,11 +160,19 @@ class EnvManager:
+         venv: Path = self._poetry.file.path.parent / ".venv"
+         return venv
+ 
++    @cached_property
++    def envs_file(self) -> EnvsFile:
++        return EnvsFile(self._poetry.config.virtualenvs_path / self.ENVS_FILE)
++
++    @cached_property
++    def base_env_name(self) -> str:
++        return self.generate_env_name(
++            self._poetry.package.name,
++            str(self._poetry.file.path.parent),
++        )
++
+     def activate(self, python: str) -> Env:
+         venv_path = self._poetry.config.virtualenvs_path
+-        cwd = self._poetry.file.path.parent
+-
+-        envs_file = TOMLFile(venv_path / self.ENVS_FILE)
+ 
+         try:
+             python_version = Version.parse(python)
+@@ -170,10 +217,9 @@ class EnvManager:
+             return self.get(reload=True)
+ 
+         envs = tomlkit.document()
+-        base_env_name = self.generate_env_name(self._poetry.package.name, str(cwd))
+-        if envs_file.exists():
+-            envs = envs_file.read()
+-            current_env = envs.get(base_env_name)
++        if self.envs_file.exists():
++            envs = self.envs_file.read()
++            current_env = envs.get(self.base_env_name)
+             if current_env is not None:
+                 current_minor = current_env["minor"]
+                 current_patch = current_env["patch"]
+@@ -182,7 +228,7 @@ class EnvManager:
+                     # We need to recreate
+                     create = True
+ 
+-        name = f"{base_env_name}-py{minor}"
++        name = f"{self.base_env_name}-py{minor}"
+         venv = venv_path / name
+ 
+         # Create if needed
+@@ -202,29 +248,21 @@ class EnvManager:
+             self.create_venv(executable=python_path, force=create)
+ 
+         # Activate
+-        envs[base_env_name] = {"minor": minor, "patch": patch}
+-        envs_file.write(envs)
++        envs[self.base_env_name] = {"minor": minor, "patch": patch}
++        self.envs_file.write(envs)
+ 
+         return self.get(reload=True)
+ 
+     def deactivate(self) -> None:
+         venv_path = self._poetry.config.virtualenvs_path
+-        name = self.generate_env_name(
+-            self._poetry.package.name, str(self._poetry.file.path.parent)
+-        )
+ 
+-        envs_file = TOMLFile(venv_path / self.ENVS_FILE)
+-        if envs_file.exists():
+-            envs = envs_file.read()
+-            env = envs.get(name)
+-            if env is not None:
+-                venv = venv_path / f"{name}-py{env['minor']}"
+-                self._io.write_error_line(
+-                    f"Deactivating virtualenv: <comment>{venv}</comment>"
+-                )
+-                del envs[name]
+-
+-                envs_file.write(envs)
++        if self.envs_file.exists() and (
++            minor := self.envs_file.remove_section(self.base_env_name)
++        ):
++            venv = venv_path / f"{self.base_env_name}-py{minor}"
++            self._io.write_error_line(
++                f"Deactivating virtualenv: <comment>{venv}</comment>"
++            )
+ 
+     def get(self, reload: bool = False) -> Env:
+         if self._env is not None and not reload:
+@@ -237,15 +275,10 @@ class EnvManager:
+             precision=2, prefer_active_python=prefer_active_python, io=self._io
+         ).to_string()
+ 
+-        venv_path = self._poetry.config.virtualenvs_path
+-
+-        cwd = self._poetry.file.path.parent
+-        envs_file = TOMLFile(venv_path / self.ENVS_FILE)
+         env = None
+-        base_env_name = self.generate_env_name(self._poetry.package.name, str(cwd))
+-        if envs_file.exists():
+-            envs = envs_file.read()
+-            env = envs.get(base_env_name)
++        if self.envs_file.exists():
++            envs = self.envs_file.read()
++            env = envs.get(self.base_env_name)
+             if env:
+                 python_minor = env["minor"]
+ 
+@@ -272,7 +305,7 @@ class EnvManager:
+ 
+             venv_path = self._poetry.config.virtualenvs_path
+ 
+-            name = f"{base_env_name}-py{python_minor.strip()}"
++            name = f"{self.base_env_name}-py{python_minor.strip()}"
+ 
+             venv = venv_path / name
+ 
+@@ -313,12 +346,6 @@ class EnvManager:
+         return env.startswith(base_env_name)
+ 
+     def remove(self, python: str) -> Env:
+-        venv_path = self._poetry.config.virtualenvs_path
+-
+-        cwd = self._poetry.file.path.parent
+-        envs_file = TOMLFile(venv_path / self.ENVS_FILE)
+-        base_env_name = self.generate_env_name(self._poetry.package.name, str(cwd))
+-
+         python_path = Path(python)
+         if python_path.is_file():
+             # Validate env name if provided env is a full path to python
+@@ -327,34 +354,21 @@ class EnvManager:
+                     [python, "-c", GET_ENV_PATH_ONELINER], text=True
+                 ).strip("\n")
+                 env_name = Path(env_dir).name
+-                if not self.check_env_is_for_current_project(env_name, base_env_name):
++                if not self.check_env_is_for_current_project(
++                    env_name, self.base_env_name
++                ):
+                     raise IncorrectEnvError(env_name)
+             except CalledProcessError as e:
+                 raise EnvCommandError(e)
+ 
+-        if self.check_env_is_for_current_project(python, base_env_name):
++        if self.check_env_is_for_current_project(python, self.base_env_name):
+             venvs = self.list()
+             for venv in venvs:
+                 if venv.path.name == python:
+                     # Exact virtualenv name
+-                    if not envs_file.exists():
+-                        self.remove_venv(venv.path)
+-
+-                        return venv
+-
+-                    venv_minor = ".".join(str(v) for v in venv.version_info[:2])
+-                    base_env_name = self.generate_env_name(cwd.name, str(cwd))
+-                    envs = envs_file.read()
+-
+-                    current_env = envs.get(base_env_name)
+-                    if not current_env:
+-                        self.remove_venv(venv.path)
+-
+-                        return venv
+-
+-                    if current_env["minor"] == venv_minor:
+-                        del envs[base_env_name]
+-                        envs_file.write(envs)
++                    if self.envs_file.exists():
++                        venv_minor = ".".join(str(v) for v in venv.version_info[:2])
++                        self.envs_file.remove_section(self.base_env_name, venv_minor)
+ 
+                     self.remove_venv(venv.path)
+ 
+@@ -389,21 +403,14 @@ class EnvManager:
+         python_version = Version.parse(python_version_string.strip())
+         minor = f"{python_version.major}.{python_version.minor}"
+ 
+-        name = f"{base_env_name}-py{minor}"
++        name = f"{self.base_env_name}-py{minor}"
+         venv_path = venv_path / name
+ 
+         if not venv_path.exists():
+             raise ValueError(f'<warning>Environment "{name}" does not exist.</warning>')
+ 
+-        if envs_file.exists():
+-            envs = envs_file.read()
+-            current_env = envs.get(base_env_name)
+-            if current_env is not None:
+-                current_minor = current_env["minor"]
+-
+-                if current_minor == minor:
+-                    del envs[base_env_name]
+-                    envs_file.write(envs)
++        if self.envs_file.exists():
++            self.envs_file.remove_section(self.base_env_name, minor)
+ 
+         self.remove_venv(venv_path)
+ 
+@@ -668,7 +675,7 @@ class EnvManager:
+ 
+         args.append(str(path))
+ 
+-        cli_result = virtualenv.cli_run(args)
++        cli_result = virtualenv.cli_run(args, setup_logging=False)
+ 
+         # Exclude the venv folder from from macOS Time Machine backups
+         # TODO: Add backup-ignore markers for other platforms too
+@@ -721,17 +728,7 @@ class EnvManager:
+         prefix, base_prefix = Path(sys.prefix), Path(cls.get_base_prefix())
+         env: Env = SystemEnv(prefix)
+         if not naive:
+-            if prefix.joinpath("poetry_env").exists():
+-                env = GenericEnv(base_prefix, child_env=env)
+-            else:
+-                from poetry.locations import data_dir
+-
+-                try:
+-                    prefix.relative_to(data_dir())
+-                except ValueError:
+-                    pass
+-                else:
+-                    env = GenericEnv(base_prefix, child_env=env)
++            env = GenericEnv(base_prefix, child_env=env)
+ 
+         return env
+ 
+
+diff --git a/src/poetry/utils/env/mock_env.py b/src/poetry/utils/env/mock_env.py
+index 225b88f..59fb37b 100644
+--- a/src/poetry/utils/env/mock_env.py
++++ b/src/poetry/utils/env/mock_env.py
+@@ -3,8 +3,6 @@ from __future__ import annotations
+ from typing import TYPE_CHECKING
+ from typing import Any
+ 
+-from poetry.core.constraints.version import Version
+-
+ from poetry.utils.env.null_env import NullEnv
+ 
+ 
+@@ -22,7 +20,6 @@ class MockEnv(NullEnv):
+         platform_machine: str = "amd64",
+         os_name: str = "posix",
+         is_venv: bool = False,
+-        pip_version: str = "19.1",
+         sys_path: list[str] | None = None,
+         marker_env: dict[str, Any] | None = None,
+         supported_tags: list[Tag] | None = None,
+@@ -36,7 +33,6 @@ class MockEnv(NullEnv):
+         self._platform_machine = platform_machine
+         self._os_name = os_name
+         self._is_venv = is_venv
+-        self._pip_version: Version = Version.parse(pip_version)
+         self._sys_path = sys_path
+         self._mock_marker_env = marker_env
+         self._supported_tags = supported_tags
+@@ -53,10 +49,6 @@ class MockEnv(NullEnv):
+     def os(self) -> str:
+         return self._os_name
+ 
+-    @property
+-    def pip_version(self) -> Version:
+-        return self._pip_version
+-
+     @property
+     def sys_path(self) -> list[str]:
+         if self._sys_path is None:
+
+diff --git a/src/poetry/utils/env/site_packages.py b/src/poetry/utils/env/site_packages.py
+index f91caf2..a637f5a 100644
+--- a/src/poetry/utils/env/site_packages.py
++++ b/src/poetry/utils/env/site_packages.py
+@@ -121,7 +121,9 @@ class SitePackages:
+             files = [] if distribution.files is None else distribution.files
+             for file in files:
+                 if file.name.endswith(suffix):
+-                    yield Path(distribution.locate_file(file))
++                    path = distribution.locate_file(file)
++                    assert isinstance(path, Path)
++                    yield path
+ 
+     def find_distribution_files_with_name(
+         self, distribution_name: str, name: str, writable_only: bool = False
+@@ -132,7 +134,9 @@ class SitePackages:
+             files = [] if distribution.files is None else distribution.files
+             for file in files:
+                 if file.name == name:
+-                    yield Path(distribution.locate_file(file))
++                    path = distribution.locate_file(file)
++                    assert isinstance(path, Path)
++                    yield path
+ 
+     def find_distribution_direct_url_json_files(
+         self, distribution_name: str, writable_only: bool = False
+@@ -151,7 +155,8 @@ class SitePackages:
+         ):
+             files = [] if distribution.files is None else distribution.files
+             for file in files:
+-                path = Path(distribution.locate_file(file))
++                path = distribution.locate_file(file)
++                assert isinstance(path, Path)
+                 path.unlink(missing_ok=True)
+ 
+             distribution_path: Path = distribution._path  # type: ignore[attr-defined]
+
+diff --git a/src/poetry/utils/env/system_env.py b/src/poetry/utils/env/system_env.py
+index e088e68..8ddef7b 100644
+--- a/src/poetry/utils/env/system_env.py
++++ b/src/poetry/utils/env/system_env.py
+@@ -13,7 +13,6 @@ from packaging.tags import Tag
+ from packaging.tags import interpreter_name
+ from packaging.tags import interpreter_version
+ from packaging.tags import sys_tags
+-from poetry.core.constraints.version import Version
+ 
+ from poetry.utils.env.base_env import Env
+ 
+@@ -81,11 +80,6 @@ class SystemEnv(Env):
+             "interpreter_version": interpreter_version(),
+         }
+ 
+-    def get_pip_version(self) -> Version:
+-        from pip import __version__
+-
+-        return Version.parse(__version__)
+-
+     def is_venv(self) -> bool:
+         return self._path != self._base
+ 
+
+diff --git a/src/poetry/utils/env/virtual_env.py b/src/poetry/utils/env/virtual_env.py
+index 8a57342..d91330c 100644
+--- a/src/poetry/utils/env/virtual_env.py
++++ b/src/poetry/utils/env/virtual_env.py
+@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING
+ from typing import Any
+ 
+ from packaging.tags import Tag
+-from poetry.core.constraints.version import Version
+ 
+ from poetry.utils.env.base_env import Env
+ from poetry.utils.env.script_strings import GET_BASE_PREFIX
+@@ -72,16 +71,6 @@ class VirtualEnv(Env):
+         env: dict[str, Any] = json.loads(output)
+         return env
+ 
+-    def get_pip_version(self) -> Version:
+-        output = self.run_pip("--version")
+-        output = output.strip()
+-
+-        m = re.match("pip (.+?)(?: from .+)?$", output)
+-        if not m:
+-            return Version.parse("0.0")
+-
+-        return Version.parse(m.group(1))
+-
+     def get_paths(self) -> dict[str, str]:
+         output = self.run_python_script(GET_PATHS)
+         paths: dict[str, str] = json.loads(output)
+
+diff --git a/src/poetry/utils/helpers.py b/src/poetry/utils/helpers.py
+index 5c312a6..fbc29e5 100644
+--- a/src/poetry/utils/helpers.py
++++ b/src/poetry/utils/helpers.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import hashlib
+ import io
++import logging
+ import os
+ import shutil
+ import stat
+@@ -36,6 +37,29 @@ if TYPE_CHECKING:
+ 
+     from poetry.utils.authenticator import Authenticator
+ 
++logger = logging.getLogger(__name__)
++prioritised_hash_types: tuple[str, ...] = tuple(
++    t
++    for t in [
++        "sha3_512",
++        "sha3_384",
++        "sha3_256",
++        "sha3_224",
++        "sha512",
++        "sha384",
++        "sha256",
++        "sha224",
++        "shake_256",
++        "shake_128",
++        "blake2s",
++        "blake2b",
++    ]
++    if t in hashlib.algorithms_available
++)
++non_prioritised_available_hash_types: frozenset[str] = frozenset(
++    set(hashlib.algorithms_available).difference(prioritised_hash_types)
++)
++
+ 
+ @contextmanager
+ def directory(path: Path) -> Iterator[Path]:
+@@ -98,16 +122,25 @@ def merge_dicts(d1: dict[str, Any], d2: dict[str, Any]) -> None:
+             d1[k] = d2[k]
+ 
+ 
++class HTTPRangeRequestSupported(Exception):
++    """Raised when server unexpectedly supports byte ranges."""
++
++
+ def download_file(
+     url: str,
+     dest: Path,
++    *,
+     session: Authenticator | Session | None = None,
+     chunk_size: int = 1024,
++    raise_accepts_ranges: bool = False,
+ ) -> None:
+     from poetry.puzzle.provider import Indicator
+ 
+     downloader = Downloader(url, dest, session)
+ 
++    if raise_accepts_ranges and downloader.accepts_ranges:
++        raise HTTPRangeRequestSupported(f"URL {url} supports range requests.")
++
+     set_indicator = False
+     with Indicator.context() as update_context:
+         update_context(f"Downloading {url}")
+@@ -139,10 +172,17 @@ class Downloader:
+         self._dest = dest
+ 
+         get = requests.get if not session else session.get
++        headers = {"Accept-Encoding": "Identity"}
+ 
+-        self._response = get(url, stream=True, timeout=REQUESTS_TIMEOUT)
++        self._response = get(
++            url, stream=True, headers=headers, timeout=REQUESTS_TIMEOUT
++        )
+         self._response.raise_for_status()
+ 
++    @cached_property
++    def accepts_ranges(self) -> bool:
++        return self._response.headers.get("Accept-Ranges") == "bytes"
++
+     @cached_property
+     def total_size(self) -> int:
+         total_size = 0
+@@ -292,6 +332,28 @@ def get_file_hash(path: Path, hash_name: str = "sha256") -> str:
+     return h.hexdigest()
+ 
+ 
++def get_highest_priority_hash_type(
++    hash_types: set[str], archive_name: str
++) -> str | None:
++    if not hash_types:
++        return None
++
++    for prioritised_hash_type in prioritised_hash_types:
++        if prioritised_hash_type in hash_types:
++            return prioritised_hash_type
++
++    logger.debug(
++        f"There are no known hash types for {archive_name} that are prioritised (known"
++        f" hash types: {hash_types!s})"
++    )
++
++    for available_hash_type in non_prioritised_available_hash_types:
++        if available_hash_type in hash_types:
++            return available_hash_type
++
++    return None
++
++
+ def extractall(source: Path, dest: Path, zip: bool) -> None:
+     """Extract all members from either a zip or tar archive."""
+     if zip:
+
+diff --git a/src/poetry/utils/password_manager.py b/src/poetry/utils/password_manager.py
+index 166386f..f4ab123 100644
+--- a/src/poetry/utils/password_manager.py
++++ b/src/poetry/utils/password_manager.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import dataclasses
++import functools
+ import logging
+ 
+ from contextlib import suppress
+@@ -8,6 +9,8 @@ from typing import TYPE_CHECKING
+ 
+ 
+ if TYPE_CHECKING:
++    from keyring.backend import KeyringBackend
++
+     from poetry.config.config import Config
+ 
+ logger = logging.getLogger(__name__)
+@@ -30,21 +33,10 @@ class HTTPAuthCredential:
+ class PoetryKeyring:
+     def __init__(self, namespace: str) -> None:
+         self._namespace = namespace
+-        self._is_available = True
+-
+-        self._check()
+-
+-    def is_available(self) -> bool:
+-        return self._is_available
+ 
+     def get_credential(
+         self, *names: str, username: str | None = None
+     ) -> HTTPAuthCredential:
+-        default = HTTPAuthCredential(username=username, password=None)
+-
+-        if not self.is_available():
+-            return default
+-
+         import keyring
+ 
+         from keyring.errors import KeyringError
+@@ -64,12 +56,9 @@ class PoetryKeyring:
+                     username=credential.username, password=credential.password
+                 )
+ 
+-        return default
++        return HTTPAuthCredential(username=username, password=None)
+ 
+     def get_password(self, name: str, username: str) -> str | None:
+-        if not self.is_available():
+-            return None
+-
+         import keyring
+         import keyring.errors
+ 
+@@ -83,9 +72,6 @@ class PoetryKeyring:
+             )
+ 
+     def set_password(self, name: str, username: str, password: str) -> None:
+-        if not self.is_available():
+-            return
+-
+         import keyring
+         import keyring.errors
+ 
+@@ -99,9 +85,6 @@ class PoetryKeyring:
+             )
+ 
+     def delete_password(self, name: str, username: str) -> None:
+-        if not self.is_available():
+-            return
+-
+         import keyring.errors
+ 
+         name = self.get_entry_name(name)
+@@ -116,69 +99,75 @@ class PoetryKeyring:
+     def get_entry_name(self, name: str) -> str:
+         return f"{self._namespace}-{name}"
+ 
+-    def _check(self) -> None:
++    @classmethod
++    def is_available(cls) -> bool:
++        logger.debug("Checking if keyring is available")
+         try:
+             import keyring
++            import keyring.backend
+         except ImportError as e:
+             logger.debug("An error occurred while importing keyring: %s", e)
+-            self._is_available = False
++            return False
+ 
+-            return
++        def backend_name(backend: KeyringBackend) -> str:
++            name: str = backend.name
++            return name.split(" ")[0]
+ 
+-        backend = keyring.get_keyring()
+-        name = backend.name.split(" ")[0]
+-        if name in ("fail", "null"):
+-            logger.debug("No suitable keyring backend found")
+-            self._is_available = False
+-        elif "plaintext" in backend.name.lower():
+-            logger.debug("Only a plaintext keyring backend is available. Not using it.")
+-            self._is_available = False
+-        elif name == "chainer":
+-            try:
+-                import keyring.backend
++        def backend_is_valid(backend: KeyringBackend) -> bool:
++            name = backend_name(backend)
++            if name in ("chainer", "fail", "null"):
++                logger.debug(f"Backend {backend.name!r} is not suitable")
++                return False
++            elif "plaintext" in backend.name.lower():
++                logger.debug(f"Not using plaintext keyring backend {backend.name!r}")
++                return False
+ 
+-                backends = keyring.backend.get_all_keyring()
++            return True
+ 
+-                self._is_available = any(
+-                    b.name.split(" ")[0] not in ["chainer", "fail", "null"]
+-                    and "plaintext" not in b.name.lower()
+-                    for b in backends
+-                )
+-            except ImportError:
+-                self._is_available = False
++        backend = keyring.get_keyring()
++        if backend_name(backend) == "chainer":
++            backends = keyring.backend.get_all_keyring()
++            valid_backend = next((b for b in backends if backend_is_valid(b)), None)
++        else:
++            valid_backend = backend if backend_is_valid(backend) else None
+ 
+-        if not self._is_available:
+-            logger.debug("No suitable keyring backends were found")
++        if valid_backend is None:
++            logger.debug("No valid keyring backend was found")
++            return False
++        else:
++            logger.debug(f"Using keyring backend {backend.name!r}")
++            return True
+ 
+ 
+ class PasswordManager:
+     def __init__(self, config: Config) -> None:
+         self._config = config
+-        self._keyring: PoetryKeyring | None = None
+ 
+-    @property
+-    def keyring(self) -> PoetryKeyring:
+-        if self._keyring is None:
+-            self._keyring = PoetryKeyring("poetry-repository")
++    @functools.cached_property
++    def use_keyring(self) -> bool:
++        return self._config.get("keyring.enabled") and PoetryKeyring.is_available()
+ 
+-            if not self._keyring.is_available():
+-                logger.debug(
+-                    "<warning>Keyring is not available, credentials will be stored and "
+-                    "retrieved from configuration files as plaintext.</>"
+-                )
++    @functools.cached_property
++    def keyring(self) -> PoetryKeyring:
++        if not self.use_keyring:
++            raise PoetryKeyringError(
++                "Access to keyring was requested, but it is not available"
++            )
+ 
+-        return self._keyring
++        return PoetryKeyring("poetry-repository")
+ 
+     @staticmethod
+     def warn_plaintext_credentials_stored() -> None:
+         logger.warning("Using a plaintext file to store credentials")
+ 
+-    def set_pypi_token(self, name: str, token: str) -> None:
+-        if not self.keyring.is_available():
++    def set_pypi_token(self, repo_name: str, token: str) -> None:
++        if not self.use_keyring:
+             self.warn_plaintext_credentials_stored()
+-            self._config.auth_config_source.add_property(f"pypi-token.{name}", token)
++            self._config.auth_config_source.add_property(
++                f"pypi-token.{repo_name}", token
++            )
+         else:
+-            self.keyring.set_password(name, "__token__", token)
++            self.keyring.set_password(repo_name, "__token__", token)
+ 
+     def get_pypi_token(self, repo_name: str) -> str | None:
+         """Get PyPi token.
+@@ -194,41 +183,49 @@ class PasswordManager:
+         if token:
+             return token
+ 
+-        return self.keyring.get_password(repo_name, "__token__")
++        if self.use_keyring:
++            return self.keyring.get_password(repo_name, "__token__")
++        else:
++            return None
+ 
+-    def delete_pypi_token(self, name: str) -> None:
+-        if not self.keyring.is_available():
+-            return self._config.auth_config_source.remove_property(f"pypi-token.{name}")
++    def delete_pypi_token(self, repo_name: str) -> None:
++        if not self.use_keyring:
++            return self._config.auth_config_source.remove_property(
++                f"pypi-token.{repo_name}"
++            )
+ 
+-        self.keyring.delete_password(name, "__token__")
++        self.keyring.delete_password(repo_name, "__token__")
+ 
+-    def get_http_auth(self, name: str) -> dict[str, str | None] | None:
+-        username = self._config.get(f"http-basic.{name}.username")
+-        password = self._config.get(f"http-basic.{name}.password")
++    def get_http_auth(self, repo_name: str) -> dict[str, str | None] | None:
++        username = self._config.get(f"http-basic.{repo_name}.username")
++        password = self._config.get(f"http-basic.{repo_name}.password")
+         if not username and not password:
+             return None
+ 
+         if not password:
+-            password = self.keyring.get_password(name, username)
++            if self.use_keyring:
++                password = self.keyring.get_password(repo_name, username)
++            else:
++                return None
+ 
+         return {
+             "username": username,
+             "password": password,
+         }
+ 
+-    def set_http_password(self, name: str, username: str, password: str) -> None:
++    def set_http_password(self, repo_name: str, username: str, password: str) -> None:
+         auth = {"username": username}
+ 
+-        if not self.keyring.is_available():
++        if not self.use_keyring:
+             self.warn_plaintext_credentials_stored()
+             auth["password"] = password
+         else:
+-            self.keyring.set_password(name, username, password)
++            self.keyring.set_password(repo_name, username, password)
+ 
+-        self._config.auth_config_source.add_property(f"http-basic.{name}", auth)
++        self._config.auth_config_source.add_property(f"http-basic.{repo_name}", auth)
+ 
+-    def delete_http_password(self, name: str) -> None:
+-        auth = self.get_http_auth(name)
++    def delete_http_password(self, repo_name: str) -> None:
++        auth = self.get_http_auth(repo_name)
+         if not auth:
+             return
+ 
+@@ -237,6 +234,14 @@ class PasswordManager:
+             return
+ 
+         with suppress(PoetryKeyringError):
+-            self.keyring.delete_password(name, username)
++            self.keyring.delete_password(repo_name, username)
++
++        self._config.auth_config_source.remove_property(f"http-basic.{repo_name}")
+ 
+-        self._config.auth_config_source.remove_property(f"http-basic.{name}")
++    def get_credential(
++        self, *names: str, username: str | None = None
++    ) -> HTTPAuthCredential:
++        if self.use_keyring:
++            return self.keyring.get_credential(*names, username=username)
++        else:
++            return HTTPAuthCredential(username=username, password=None)
+
+diff --git a/src/poetry/utils/setup_reader.py b/src/poetry/utils/setup_reader.py
+index ffc10a1..3c233cd 100644
+--- a/src/poetry/utils/setup_reader.py
++++ b/src/poetry/utils/setup_reader.py
+@@ -14,6 +14,10 @@ if TYPE_CHECKING:
+     from pathlib import Path
+ 
+ 
++class SetupReaderError(Exception):
++    pass
++
++
+ class SetupReader:
+     """
+     Class that reads a setup.py file without executing it.
+@@ -192,113 +196,95 @@ class SetupReader:
+         return None
+ 
+     def _find_install_requires(self, call: ast.Call, body: list[ast.stmt]) -> list[str]:
+-        install_requires: list[str] = []
+         value = self._find_in_call(call, "install_requires")
+         if value is None:
+             # Trying to find in kwargs
+             kwargs = self._find_call_kwargs(call)
+ 
+             if kwargs is None or not isinstance(kwargs, ast.Name):
+-                return install_requires
++                return []
+ 
+             variable = self._find_variable_in_body(body, kwargs.id)
+-            if not isinstance(variable, (ast.Dict, ast.Call)):
+-                return install_requires
+-
+-            if isinstance(variable, ast.Call):
+-                if not isinstance(variable.func, ast.Name):
+-                    return install_requires
+ 
+-                if variable.func.id != "dict":
+-                    return install_requires
++            if isinstance(variable, ast.Dict):
++                value = self._find_in_dict(variable, "install_requires")
+ 
++            elif (
++                isinstance(variable, ast.Call)
++                and isinstance(variable.func, ast.Name)
++                and variable.func.id == "dict"
++            ):
+                 value = self._find_in_call(variable, "install_requires")
++
+             else:
+-                value = self._find_in_dict(variable, "install_requires")
++                raise SetupReaderError(f"Cannot handle variable {variable}")
+ 
+         if value is None:
+-            return install_requires
++            return []
+ 
+-        if isinstance(value, ast.List):
+-            for el in value.elts:
+-                if isinstance(el, ast.Constant) and isinstance(el.value, str):
+-                    install_requires.append(el.value)
+-        elif isinstance(value, ast.Name):
+-            variable = self._find_variable_in_body(body, value.id)
++        if isinstance(value, ast.Name):
++            value = self._find_variable_in_body(body, value.id)
+ 
+-            if variable is not None and isinstance(variable, ast.List):
+-                for el in variable.elts:
+-                    if isinstance(el, ast.Constant) and isinstance(el.value, str):
+-                        install_requires.append(el.value)
++        if isinstance(value, ast.Constant) and value.value is None:
++            return []
+ 
+-        return install_requires
++        if isinstance(value, ast.List):
++            return string_list_values(value)
++
++        raise SetupReaderError(f"Cannot handle value of type {type(value)}")
+ 
+     def _find_extras_require(
+         self, call: ast.Call, body: list[ast.stmt]
+     ) -> dict[str, list[str]]:
+-        extras_require: dict[str, list[str]] = {}
+         value = self._find_in_call(call, "extras_require")
+         if value is None:
+             # Trying to find in kwargs
+             kwargs = self._find_call_kwargs(call)
+ 
+             if kwargs is None or not isinstance(kwargs, ast.Name):
+-                return extras_require
++                return {}
+ 
+             variable = self._find_variable_in_body(body, kwargs.id)
+-            if not isinstance(variable, (ast.Dict, ast.Call)):
+-                return extras_require
+-
+-            if isinstance(variable, ast.Call):
+-                if not isinstance(variable.func, ast.Name):
+-                    return extras_require
+-
+-                if variable.func.id != "dict":
+-                    return extras_require
++            if isinstance(variable, ast.Dict):
++                value = self._find_in_dict(variable, "extras_require")
+ 
++            elif (
++                isinstance(variable, ast.Call)
++                and isinstance(variable.func, ast.Name)
++                and variable.func.id == "dict"
++            ):
+                 value = self._find_in_call(variable, "extras_require")
++
+             else:
+-                value = self._find_in_dict(variable, "extras_require")
++                raise SetupReaderError(f"Cannot handle variable {variable}")
+ 
+         if value is None:
+-            return extras_require
++            return {}
++
++        if isinstance(value, ast.Name):
++            value = self._find_variable_in_body(body, value.id)
++
++        if isinstance(value, ast.Constant) and value.value is None:
++            return {}
+ 
+         if isinstance(value, ast.Dict):
++            extras_require: dict[str, list[str]] = {}
+             val: ast.expr | None
+             for key, val in zip(value.keys, value.values):
+                 if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+-                    continue
++                    raise SetupReaderError(f"Cannot handle key {key}")
+ 
+                 if isinstance(val, ast.Name):
+                     val = self._find_variable_in_body(body, val.id)
+ 
+-                if isinstance(val, ast.List):
+-                    extras_require[key.value] = [
+-                        e.value
+-                        for e in val.elts
+-                        if isinstance(e, ast.Constant) and isinstance(e.value, str)
+-                    ]
+-        elif isinstance(value, ast.Name):
+-            variable = self._find_variable_in_body(body, value.id)
+-
+-            if variable is None or not isinstance(variable, ast.Dict):
+-                return extras_require
+-
+-            for key, val in zip(variable.keys, variable.values):
+-                if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+-                    continue
++                if not isinstance(val, ast.List):
++                    raise SetupReaderError(f"Cannot handle value of type {type(val)}")
+ 
+-                if isinstance(val, ast.Name):
+-                    val = self._find_variable_in_body(body, val.id)
++                extras_require[key.value] = string_list_values(val)
+ 
+-                if isinstance(val, ast.List):
+-                    extras_require[key.value] = [
+-                        e.value
+-                        for e in val.elts
+-                        if isinstance(e, ast.Constant) and isinstance(e.value, str)
+-                    ]
++            return extras_require
+ 
+-        return extras_require
++        raise SetupReaderError(f"Cannot handle value of type {type(value)}")
+ 
+     def _find_single_string(
+         self, call: ast.Call, body: list[ast.stmt], name: str
+@@ -383,3 +369,15 @@ class SetupReader:
+                 return val
+ 
+         return None
++
++
++def string_list_values(value: ast.List) -> list[str]:
++    strings = []
++    for element in value.elts:
++        if isinstance(element, ast.Constant) and isinstance(element.value, str):
++            strings.append(element.value)
++
++        else:
++            raise SetupReaderError("Found non-string element in list")
++
++    return strings
+
+diff --git a/src/poetry/utils/shell.py b/src/poetry/utils/shell.py
+index f8c413a..8f72096 100644
+--- a/src/poetry/utils/shell.py
++++ b/src/poetry/utils/shell.py
+@@ -70,7 +70,13 @@ class Shell:
+ 
+     def activate(self, env: VirtualEnv) -> int | None:
+         activate_script = self._get_activate_script()
+-        bin_dir = "Scripts" if WINDOWS else "bin"
++        if WINDOWS:
++            bin_path = env.path / "Scripts"
++            # Python innstalled via msys2 on Windows might produce a POSIX-like venv
++            # See https://github.com/python-poetry/poetry/issues/8638
++            bin_dir = "Scripts" if bin_path.exists() else "bin"
++        else:
++            bin_dir = "bin"
+         activate_path = env.path / bin_dir / activate_script
+ 
+         # mypy requires using sys.platform instead of WINDOWS constant
+@@ -100,7 +106,12 @@ class Shell:
+         cmd = f"{self._get_source_command()} {shlex.quote(str(activate_path))}"
+ 
+         with env.temp_environ():
+-            args = ["-e", cmd] if self._name == "nu" else ["-i"]
++            if self._name == "nu":
++                args = ["-e", cmd]
++            elif self._name == "fish":
++                args = ["-i", "--init-command", cmd]
++            else:
++                args = ["-i"]
+ 
+             c = pexpect.spawn(
+                 self._path, args, dimensions=(terminal.lines, terminal.columns)
+@@ -111,17 +122,15 @@ class Shell:
+ 
+         if self._name == "zsh":
+             # Under ZSH the source command should be invoked in zsh's bash emulator
+-            c.sendline(f"emulate bash -c '. {shlex.quote(str(activate_path))}'")
++            quoted_activate_path = shlex.quote(str(activate_path))
++            c.sendline(f"emulate bash -c {shlex.quote(f'. {quoted_activate_path}')}")
+         elif self._name == "xonsh":
+             c.sendline(f"vox activate {shlex.quote(str(env.path))}")
+-        elif self._name == "nu":
+-            # If this is nu, we don't want to send the activation command to the
++        elif self._name in ["nu", "fish"]:
++            # If this is nu or fish, we don't want to send the activation command to the
+             # command line since we already ran it via the shell's invocation.
+             pass
+         else:
+-            if self._name in ["fish"]:
+-                # Under fish, "\r" should be sent explicitly
+-                cmd += "\r"
+             c.sendline(cmd)
+ 
+         def resize(sig: Any, data: Any) -> None:
+
+diff --git a/src/poetry/vcs/git/system.py b/src/poetry/vcs/git/system.py
+index ae4f9a0..3661051 100644
+--- a/src/poetry/vcs/git/system.py
++++ b/src/poetry/vcs/git/system.py
+@@ -15,18 +15,18 @@ if TYPE_CHECKING:
+ 
+ class SystemGit:
+     @classmethod
+-    def clone(cls, repository: str, dest: Path) -> str:
++    def clone(cls, repository: str, dest: Path) -> None:
+         cls._check_parameter(repository)
+ 
+-        return cls.run("clone", "--recurse-submodules", "--", repository, str(dest))
++        cls.run("clone", "--recurse-submodules", "--", repository, str(dest))
+ 
+     @classmethod
+-    def checkout(cls, rev: str, target: Path | None = None) -> str:
++    def checkout(cls, rev: str, target: Path | None = None) -> None:
+         cls._check_parameter(rev)
+-        return cls.run("checkout", rev, folder=target)
++        cls.run("checkout", rev, folder=target)
+ 
+     @staticmethod
+-    def run(*args: Any, **kwargs: Any) -> str:
++    def run(*args: Any, **kwargs: Any) -> None:
+         folder = kwargs.pop("folder", None)
+         if folder:
+             args = (
+@@ -40,12 +40,13 @@ class SystemGit:
+         git_command = find_git_command()
+         env = os.environ.copy()
+         env["GIT_TERMINAL_PROMPT"] = "0"
+-        return subprocess.check_output(
++        subprocess.check_call(
+             git_command + list(args),
+-            stderr=subprocess.STDOUT,
++            stderr=subprocess.DEVNULL,
++            stdout=subprocess.DEVNULL,
+             env=env,
+             text=True,
+-        ).strip()
++        )
+ 
+     @staticmethod
+     def _check_parameter(parameter: str) -> None:

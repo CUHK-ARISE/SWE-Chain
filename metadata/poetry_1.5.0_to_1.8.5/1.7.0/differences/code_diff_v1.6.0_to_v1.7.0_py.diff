@@ -1,0 +1,2186 @@
+diff --git a/src/poetry/config/config.py b/src/poetry/config/config.py
+index 6d76586..cbd89eb 100644
+--- a/src/poetry/config/config.py
++++ b/src/poetry/config/config.py
+@@ -133,6 +133,9 @@ class Config:
+             "max-workers": None,
+             "no-binary": None,
+         },
++        "warnings": {
++            "export": True,
++        },
+     }
+ 
+     def __init__(
+@@ -223,6 +226,22 @@ class Config:
+             path = Path(self.get("cache-dir")) / "virtualenvs"
+         return Path(path).expanduser()
+ 
++    @property
++    def installer_max_workers(self) -> int:
++        # This should be directly handled by ThreadPoolExecutor
++        # however, on some systems the number of CPUs cannot be determined
++        # (it raises a NotImplementedError), so, in this case, we assume
++        # that the system only has one CPU.
++        try:
++            default_max_workers = (os.cpu_count() or 1) + 4
++        except NotImplementedError:
++            default_max_workers = 5
++
++        desired_max_workers = self.get("installer.max-workers")
++        if desired_max_workers is None:
++            return default_max_workers
++        return min(default_max_workers, int(desired_max_workers))
++
+     def get(self, setting_name: str, default: Any = None) -> Any:
+         """
+         Retrieve a setting value.
+@@ -279,6 +298,7 @@ class Config:
+             "experimental.system-git-client",
+             "installer.modern-installation",
+             "installer.parallel",
++            "warnings.export",
+         }:
+             return boolean_normalizer
+ 
+
+diff --git a/src/poetry/console/application.py b/src/poetry/console/application.py
+index 8d325ef..3286c73 100644
+--- a/src/poetry/console/application.py
++++ b/src/poetry/console/application.py
+@@ -354,6 +354,12 @@ class Application(BaseApplication):
+             manager.load_plugins()
+             manager.activate(self)
+ 
++            # We have to override the command from poetry-plugin-export
++            # with the wrapper.
++            if self.command_loader.has("export"):
++                del self.command_loader._factories["export"]
++            self.command_loader._factories["export"] = load_command("export")
++
+         self._plugins_loaded = True
+ 
+     @property
+@@ -391,7 +397,7 @@ class Application(BaseApplication):
+             SolutionProviderRepository,
+         )
+ 
+-        from poetry.mixology.solutions.providers.python_requirement_solution_provider import (  # noqa: E501
++        from poetry.mixology.solutions.providers.python_requirement_solution_provider import (
+             PythonRequirementSolutionProvider,
+         )
+ 
+
+diff --git a/src/poetry/console/commands/config.py b/src/poetry/console/commands/config.py
+index eed7cad..3b460fb 100644
+--- a/src/poetry/console/commands/config.py
++++ b/src/poetry/console/commands/config.py
+@@ -77,6 +77,7 @@ To remove a repository (repo is a short alias for repositories):
+                 PackageFilterPolicy.validator,
+                 PackageFilterPolicy.normalize,
+             ),
++            "warnings.export": (boolean_validator, boolean_normalizer),
+         }
+ 
+         return unique_config_values
+@@ -122,6 +123,9 @@ To remove a repository (repo is a short alias for repositories):
+ 
+         # show the value if no value is provided
+         if not self.argument("value") and not self.option("unset"):
++            if setting_key.split(".")[0] in self.LIST_PROHIBITED_SETTINGS:
++                raise ValueError(f"Expected a value for {setting_key} setting.")
++
+             m = re.match(r"^repos?(?:itories)?(?:\.(.+))?", self.argument("key"))
+             value: str | dict[str, Any]
+             if m:
+
+diff --git a/src/poetry/console/commands/export.py b/src/poetry/console/commands/export.py
+new file mode 100644
+index 0000000..cf18e27
+--- /dev/null
++++ b/src/poetry/console/commands/export.py
+@@ -0,0 +1,21 @@
++from __future__ import annotations
++
++from poetry_plugin_export.command import (  # type: ignore[import-untyped]
++    ExportCommand as BaseExportCommand,
++)
++
++
++class ExportCommand(BaseExportCommand):  # type: ignore[misc]
++    def handle(self) -> int:
++        if self.poetry.config.get("warnings.export"):
++            self.line_error(
++                "Warning: poetry-plugin-export will not be installed by default in a"
++                " future version of Poetry.\n"
++                "In order to avoid a breaking change and make your automation"
++                " forward-compatible, please install poetry-plugin-export explicitly."
++                " See https://python-poetry.org/docs/plugins/#using-plugins for details"
++                " on how to install a plugin.\n"
++                "To disable this warning run 'poetry config warnings.export false'.",
++                style="warning",
++            )
++        return super().handle()  # type: ignore[no-any-return]
+
+diff --git a/src/poetry/console/commands/init.py b/src/poetry/console/commands/init.py
+index d7dc3bb..cf59517 100644
+--- a/src/poetry/console/commands/init.py
++++ b/src/poetry/console/commands/init.py
+@@ -489,6 +489,7 @@ You can specify a package in the following forms:
+ 
+         if self._pool is None:
+             self._pool = RepositoryPool()
+-            self._pool.add_repository(PyPiRepository())
++            pool_size = self.poetry.config.installer_max_workers
++            self._pool.add_repository(PyPiRepository(pool_size=pool_size))
+ 
+         return self._pool
+
+diff --git a/src/poetry/console/commands/install.py b/src/poetry/console/commands/install.py
+index cc6e22e..8e716ca 100644
+--- a/src/poetry/console/commands/install.py
++++ b/src/poetry/console/commands/install.py
+@@ -155,14 +155,6 @@ dependencies and not including the current project, run the command with the
+         if self.option("no-root"):
+             return 0
+ 
+-        try:
+-            builder = EditableBuilder(self.poetry, self.env, self.io)
+-        except ModuleOrPackageNotFound:
+-            # This is likely due to the fact that the project is an application
+-            # not following the structure expected by Poetry
+-            # If this is a true error it will be picked up later by build anyway.
+-            return 0
+-
+         log_install = (
+             "<b>Installing</> the current project:"
+             f" <c1>{self.poetry.package.pretty_name}</c1>"
+@@ -178,7 +170,26 @@ dependencies and not including the current project, run the command with the
+             self.line("")
+             return 0
+ 
+-        builder.build()
++        # Prior to https://github.com/python-poetry/poetry-core/pull/629
++        # the existence of a module/package was checked when creating the
++        # EditableBuilder. Afterwards, the existence is checked after
++        # executing the build script (if there is one),
++        # i.e. during EditableBuilder.build().
++        try:
++            builder = EditableBuilder(self.poetry, self.env, self.io)
++            builder.build()
++        except (ModuleOrPackageNotFound, FileNotFoundError) as e:
++            # This is likely due to the fact that the project is an application
++            # not following the structure expected by Poetry.
++            # No need for an editable install in this case.
++            self.line("")
++            self.line_error(
++                f"The current project could not be installed: <error>{e}</error>\n"
++                "If you do not want to install the current project"
++                " use <c1>--no-root</c1>",
++                style="warning",
++            )
++            return 0
+ 
+         if overwrite:
+             self.overwrite(log_install.format(tag="success"))
+
+diff --git a/src/poetry/console/commands/version.py b/src/poetry/console/commands/version.py
+index b6953c9..0af2a00 100644
+--- a/src/poetry/console/commands/version.py
++++ b/src/poetry/console/commands/version.py
+@@ -27,7 +27,7 @@ class VersionCommand(Command):
+             "version",
+             "The version number or the rule to update the version.",
+             optional=True,
+-        )
++        ),
+     ]
+     options = [
+         option("short", "s", "Output the version number only"),
+@@ -36,6 +36,7 @@ class VersionCommand(Command):
+             None,
+             "Do not update pyproject.toml file",
+         ),
++        option("next-phase", None, "Increment the phase of the current version"),
+     ]
+ 
+     help = """\
+@@ -62,7 +63,7 @@ patch, minor, major, prepatch, preminor, premajor, prerelease.
+ 
+         if version:
+             version = self.increment_version(
+-                self.poetry.package.pretty_version, version
++                self.poetry.package.pretty_version, version, self.option("next-phase")
+             )
+ 
+             if self.option("short"):
+@@ -91,7 +92,9 @@ patch, minor, major, prepatch, preminor, premajor, prerelease.
+ 
+         return 0
+ 
+-    def increment_version(self, version: str, rule: str) -> Version:
++    def increment_version(
++        self, version: str, rule: str, next_phase: bool = False
++    ) -> Version:
+         from poetry.core.constraints.version import Version
+ 
+         try:
+@@ -115,7 +118,8 @@ patch, minor, major, prepatch, preminor, premajor, prerelease.
+             if parsed.is_unstable():
+                 pre = parsed.pre
+                 assert pre is not None
+-                new = Version(parsed.epoch, parsed.release, pre.next())
++                pre = pre.next_phase() if next_phase else pre.next()
++                new = Version(parsed.epoch, parsed.release, pre)
+             else:
+                 new = parsed.next_patch().first_prerelease()
+         else:
+
+diff --git a/src/poetry/factory.py b/src/poetry/factory.py
+index 828ce26..15bd004 100644
+--- a/src/poetry/factory.py
++++ b/src/poetry/factory.py
+@@ -224,12 +224,14 @@ class Factory(BaseFactory):
+         except KeyError:
+             raise InvalidSourceError("Missing [name] in source.")
+ 
++        pool_size = config.installer_max_workers
++
+         if name.lower() == "pypi":
+             if "url" in source:
+                 raise InvalidSourceError(
+                     "The PyPI repository cannot be configured with a custom url."
+                 )
+-            return PyPiRepository(disable_cache=disable_cache)
++            return PyPiRepository(disable_cache=disable_cache, pool_size=pool_size)
+ 
+         try:
+             url = source["url"]
+@@ -246,6 +248,7 @@ class Factory(BaseFactory):
+             url,
+             config=config,
+             disable_cache=disable_cache,
++            pool_size=pool_size,
+         )
+ 
+     @classmethod
+
+diff --git a/src/poetry/inspection/info.py b/src/poetry/inspection/info.py
+index d1461d4..545eed2 100644
+--- a/src/poetry/inspection/info.py
++++ b/src/poetry/inspection/info.py
+@@ -5,8 +5,6 @@ import functools
+ import glob
+ import logging
+ import os
+-import tarfile
+-import zipfile
+ 
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+@@ -25,13 +23,12 @@ from poetry.core.version.requirements import InvalidRequirement
+ from poetry.pyproject.toml import PyProjectTOML
+ from poetry.utils.env import EnvCommandError
+ from poetry.utils.env import ephemeral_environment
++from poetry.utils.helpers import extractall
+ from poetry.utils.setup_reader import SetupReader
+ 
+ 
+ if TYPE_CHECKING:
+-    from collections.abc import Callable
+     from collections.abc import Iterator
+-    from contextlib import AbstractContextManager
+ 
+     from poetry.core.packages.project_package import ProjectPackage
+ 
+@@ -46,11 +43,10 @@ import pyproject_hooks
+ source = '{source}'
+ dest = '{dest}'
+ 
+-with build.env.IsolatedEnvBuilder() as env:
++with build.env.DefaultIsolatedEnv() as env:
+     builder = build.ProjectBuilder(
+-        srcdir=source,
+-        scripts_dir=env.scripts_dir,
+-        python_executable=env.executable,
++        source_dir=source,
++        python_executable=env.python_executable,
+         runner=pyproject_hooks.quiet_subprocess_runner,
+     )
+     env.install(builder.build_system_requires)
+@@ -58,7 +54,7 @@ with build.env.IsolatedEnvBuilder() as env:
+     builder.metadata_path(dest)
+ """
+ 
+-PEP517_META_BUILD_DEPS = ["build==0.10.0", "pyproject_hooks==1.0.0"]
++PEP517_META_BUILD_DEPS = ["build==1.0.3", "pyproject_hooks==1.0.0"]
+ 
+ 
+ class PackageInfoError(ValueError):
+@@ -292,26 +288,18 @@ class PackageInfo:
+         # Still not dependencies found
+         # So, we unpack and introspect
+         suffix = path.suffix
++        zip = suffix == ".zip"
+ 
+-        context: Callable[
+-            [str], AbstractContextManager[zipfile.ZipFile | tarfile.TarFile]
+-        ]
+-        if suffix == ".zip":
+-            context = zipfile.ZipFile
+-        else:
+-            if suffix == ".bz2":
+-                suffixes = path.suffixes
+-                if len(suffixes) > 1 and suffixes[-2] == ".tar":
+-                    suffix = ".tar.bz2"
+-            else:
+-                suffix = ".tar.gz"
+-
+-            context = tarfile.open
++        if suffix == ".bz2":
++            suffixes = path.suffixes
++            if len(suffixes) > 1 and suffixes[-2] == ".tar":
++                suffix = ".tar.bz2"
++        elif not zip:
++            suffix = ".tar.gz"
+ 
+         with temporary_directory() as tmp_str:
+             tmp = Path(tmp_str)
+-            with context(path.as_posix()) as archive:
+-                archive.extractall(tmp.as_posix())
++            extractall(source=path, dest=tmp, zip=zip)
+ 
+             # a little bit of guess work to determine the directory we care about
+             elements = list(tmp.glob("*"))
+@@ -580,7 +568,7 @@ def get_pep517_metadata(path: Path) -> PackageInfo:
+             return info
+ 
+     with ephemeral_environment(
+-        flags={"no-pip": False, "no-setuptools": False, "no-wheel": False}
++        flags={"no-pip": False, "setuptools": "bundle", "wheel": "bundle"}
+     ) as venv:
+         # TODO: cache PEP 517 build environment corresponding to each project venv
+         dest_dir = venv.path.parent / "dist"
+@@ -598,11 +586,7 @@ def get_pep517_metadata(path: Path) -> PackageInfo:
+                 "--no-input",
+                 *PEP517_META_BUILD_DEPS,
+             )
+-            venv.run(
+-                "python",
+-                "-",
+-                input_=pep517_meta_build_script,
+-            )
++            venv.run_python_script(pep517_meta_build_script)
+             info = PackageInfo.from_metadata(dest_dir)
+         except EnvCommandError as e:
+             # something went wrong while attempting pep517 metadata build
+
+diff --git a/src/poetry/installation/chef.py b/src/poetry/installation/chef.py
+index da8679d..d801fb6 100644
+--- a/src/poetry/installation/chef.py
++++ b/src/poetry/installation/chef.py
+@@ -1,8 +1,7 @@
+ from __future__ import annotations
+ 
+-import tarfile
++import os
+ import tempfile
+-import zipfile
+ 
+ from contextlib import redirect_stdout
+ from io import StringIO
+@@ -13,28 +12,42 @@ from build import BuildBackendException
+ from build import ProjectBuilder
+ from build.env import IsolatedEnv as BaseIsolatedEnv
+ from poetry.core.utils.helpers import temporary_directory
+-from pyproject_hooks import quiet_subprocess_runner  # type: ignore[import]
++from pyproject_hooks import quiet_subprocess_runner  # type: ignore[import-untyped]
+ 
+ from poetry.utils._compat import decode
+ from poetry.utils.env import ephemeral_environment
++from poetry.utils.helpers import extractall
+ 
+ 
+ if TYPE_CHECKING:
+-    from collections.abc import Callable
+     from collections.abc import Collection
+-    from contextlib import AbstractContextManager
+ 
+     from poetry.repositories import RepositoryPool
+     from poetry.utils.cache import ArtifactCache
+     from poetry.utils.env import Env
+ 
+ 
+-class ChefError(Exception):
+-    ...
++class ChefError(Exception): ...
+ 
+ 
+-class ChefBuildError(ChefError):
+-    ...
++class ChefBuildError(ChefError): ...
++
++
++class ChefInstallError(ChefError):
++    def __init__(self, requirements: Collection[str], output: str, error: str) -> None:
++        message = "\n\n".join(
++            (
++                f"Failed to install {', '.join(requirements)}.",
++                f"Output:\n{output}",
++                f"Error:\n{error}",
++            )
++        )
++        super().__init__(message)
++        self._requirements = requirements
++
++    @property
++    def requirements(self) -> Collection[str]:
++        return self._requirements
+ 
+ 
+ class IsolatedEnv(BaseIsolatedEnv):
+@@ -43,15 +56,22 @@ class IsolatedEnv(BaseIsolatedEnv):
+         self._pool = pool
+ 
+     @property
+-    def executable(self) -> str:
++    def python_executable(self) -> str:
+         return str(self._env.python)
+ 
+-    @property
+-    def scripts_dir(self) -> str:
+-        return str(self._env._bin_dir)
++    def make_extra_environ(self) -> dict[str, str]:
++        path = os.environ.get("PATH")
++        scripts_dir = str(self._env._bin_dir)
++        return {
++            "PATH": (
++                os.pathsep.join([scripts_dir, path])
++                if path is not None
++                else scripts_dir
++            )
++        }
+ 
+     def install(self, requirements: Collection[str]) -> None:
+-        from cleo.io.null_io import NullIO
++        from cleo.io.buffered_io import BufferedIO
+         from poetry.core.packages.dependency import Dependency
+         from poetry.core.packages.project_package import ProjectPackage
+ 
+@@ -67,8 +87,9 @@ class IsolatedEnv(BaseIsolatedEnv):
+             dependency = Dependency.create_from_pep_508(requirement)
+             package.add_dependency(dependency)
+ 
++        io = BufferedIO()
+         installer = Installer(
+-            NullIO(),
++            io,
+             self._env,
+             package,
+             Locker(self._env.path.joinpath("poetry.lock"), {}),
+@@ -77,7 +98,8 @@ class IsolatedEnv(BaseIsolatedEnv):
+             InstalledRepository.load(self._env),
+         )
+         installer.update(True)
+-        installer.run()
++        if installer.run() != 0:
++            raise ChefInstallError(requirements, io.fetch_output(), io.fetch_error())
+ 
+ 
+ class Chef:
+@@ -109,8 +131,7 @@ class Chef:
+             env = IsolatedEnv(venv, self._pool)
+             builder = ProjectBuilder(
+                 directory,
+-                python_executable=env.executable,
+-                scripts_dir=env.scripts_dir,
++                python_executable=env.python_executable,
+                 runner=quiet_subprocess_runner,
+             )
+             env.install(builder.build_system_requires)
+@@ -132,14 +153,12 @@ class Chef:
+                     )
+             except BuildBackendException as e:
+                 message_parts = [str(e)]
+-                if isinstance(e.exception, CalledProcessError) and (
+-                    e.exception.stdout is not None or e.exception.stderr is not None
+-                ):
+-                    message_parts.append(
+-                        decode(e.exception.stderr)
+-                        if e.exception.stderr is not None
+-                        else decode(e.exception.stdout)
+-                    )
++                if isinstance(e.exception, CalledProcessError):
++                    text = e.exception.stderr or e.exception.stdout
++                    if text is not None:
++                        message_parts.append(decode(text))
++                else:
++                    message_parts.append(str(e.exception))
+ 
+                 error = ChefBuildError("\n\n".join(message_parts))
+ 
+@@ -152,19 +171,11 @@ class Chef:
+         from poetry.core.packages.utils.link import Link
+ 
+         suffix = archive.suffix
+-        context: Callable[
+-            [str], AbstractContextManager[zipfile.ZipFile | tarfile.TarFile]
+-        ]
+-        if suffix == ".zip":  # noqa: SIM108
+-            context = zipfile.ZipFile
+-        else:
+-            context = tarfile.open
++        zip = suffix == ".zip"
+ 
+         with temporary_directory() as tmp_dir:
+-            with context(archive.as_posix()) as archive_archive:
+-                archive_archive.extractall(tmp_dir)
+-
+             archive_dir = Path(tmp_dir)
++            extractall(source=archive, dest=archive_dir, zip=zip)
+ 
+             elements = list(archive_dir.glob("*"))
+ 
+
+diff --git a/src/poetry/installation/executor.py b/src/poetry/installation/executor.py
+index 4103da2..0d4ca05 100644
+--- a/src/poetry/installation/executor.py
++++ b/src/poetry/installation/executor.py
+@@ -2,9 +2,9 @@ from __future__ import annotations
+ 
+ import contextlib
+ import csv
++import functools
+ import itertools
+ import json
+-import os
+ import threading
+ 
+ from concurrent.futures import ThreadPoolExecutor
+@@ -16,10 +16,10 @@ from typing import Any
+ 
+ from cleo.io.null_io import NullIO
+ from poetry.core.packages.utils.link import Link
+-from requests.utils import atomic_open
+ 
+ from poetry.installation.chef import Chef
+ from poetry.installation.chef import ChefBuildError
++from poetry.installation.chef import ChefInstallError
+ from poetry.installation.chooser import Chooser
+ from poetry.installation.operations import Install
+ from poetry.installation.operations import Uninstall
+@@ -28,8 +28,8 @@ from poetry.installation.wheel_installer import WheelInstaller
+ from poetry.puzzle.exceptions import SolverProblemError
+ from poetry.utils._compat import decode
+ from poetry.utils.authenticator import Authenticator
+-from poetry.utils.cache import ArtifactCache
+ from poetry.utils.env import EnvCommandError
++from poetry.utils.helpers import Downloader
+ from poetry.utils.helpers import get_file_hash
+ from poetry.utils.helpers import pluralize
+ from poetry.utils.helpers import remove_directory
+@@ -72,13 +72,11 @@ class Executor:
+             parallel = config.get("installer.parallel", True)
+ 
+         if parallel:
+-            self._max_workers = self._get_max_workers(
+-                desired_max_workers=config.get("installer.max-workers")
+-            )
++            self._max_workers = config.installer_max_workers
+         else:
+             self._max_workers = 1
+ 
+-        self._artifact_cache = ArtifactCache(cache_dir=config.artifacts_cache_directory)
++        self._artifact_cache = pool.artifact_cache
+         self._authenticator = Authenticator(
+             config, self._io, disable_cache=disable_cache, pool_size=self._max_workers
+         )
+@@ -222,21 +220,6 @@ class Executor:
+ 
+         return 1 if self._shutdown else 0
+ 
+-    @staticmethod
+-    def _get_max_workers(desired_max_workers: int | None = None) -> int:
+-        # This should be directly handled by ThreadPoolExecutor
+-        # however, on some systems the number of CPUs cannot be determined
+-        # (it raises a NotImplementedError), so, in this case, we assume
+-        # that the system only has one CPU.
+-        try:
+-            default_max_workers = (os.cpu_count() or 1) + 4
+-        except NotImplementedError:
+-            default_max_workers = 5
+-
+-        if desired_max_workers is None:
+-            return default_max_workers
+-        return min(default_max_workers, desired_max_workers)
+-
+     def _write(self, operation: Operation, line: str) -> None:
+         if not self.supports_fancy_output() or not self._should_write_operation(
+             operation
+@@ -314,9 +297,9 @@ class Executor:
+                 with self._lock:
+                     trace = ExceptionTrace(e)
+                     trace.render(io)
++                    pkg = operation.package
+                     if isinstance(e, ChefBuildError):
+-                        pkg = operation.package
+-                        pip_command = "pip wheel --use-pep517"
++                        pip_command = "pip wheel --no-cache-dir --use-pep517"
+                         if pkg.develop:
+                             requirement = pkg.source_url
+                             pip_command += " --editable"
+@@ -324,8 +307,7 @@ class Executor:
+                             requirement = (
+                                 pkg.to_dependency().to_pep_508().split(";")[0].strip()
+                             )
+-                        io.write_line("")
+-                        io.write_line(
++                        message = (
+                             "<info>"
+                             "Note: This error originates from the build backend,"
+                             " and is likely not a problem with poetry"
+@@ -334,19 +316,30 @@ class Executor:
+                             f" running '{pip_command} \"{requirement}\"'."
+                             "</info>"
+                         )
++                    elif isinstance(e, ChefInstallError):
++                        message = (
++                            "<error>"
++                            "Cannot install build-system.requires"
++                            f" for {pkg.pretty_name}."
++                            "</error>"
++                        )
+                     elif isinstance(e, SolverProblemError):
+-                        pkg = operation.package
+-                        io.write_line("")
+-                        io.write_line(
++                        message = (
+                             "<error>"
+                             "Cannot resolve build-system.requires"
+                             f" for {pkg.pretty_name}."
+                             "</error>"
+                         )
++                    else:
++                        message = f"<error>Cannot install {pkg.pretty_name}.</error>"
++
++                    io.write_line("")
++                    io.write_line(message)
+                     io.write_line("")
+             finally:
+                 with self._lock:
+                     self._shutdown = True
++
+         except KeyboardInterrupt:
+             try:
+                 message = (
+@@ -755,23 +748,11 @@ class Executor:
+     def _download_link(self, operation: Install | Update, link: Link) -> Path:
+         package = operation.package
+ 
+-        output_dir = self._artifact_cache.get_cache_directory_for_link(link)
+-        # Try to get cached original package for the link provided
++        # Get original package for the link provided
++        download_func = functools.partial(self._download_archive, operation)
+         original_archive = self._artifact_cache.get_cached_archive_for_link(
+-            link, strict=True
++            link, strict=True, download_func=download_func
+         )
+-        if original_archive is None:
+-            # No cached original distributions was found, so we download and prepare it
+-            try:
+-                original_archive = self._download_archive(operation, link)
+-            except BaseException:
+-                cache_directory = self._artifact_cache.get_cache_directory_for_link(
+-                    link
+-                )
+-                cached_file = cache_directory.joinpath(link.filename)
+-                cached_file.unlink(missing_ok=True)
+-
+-                raise
+ 
+         # Get potential higher prioritized cached archive, otherwise it will fall back
+         # to the original archive.
+@@ -797,7 +778,7 @@ class Executor:
+             )
+             self._write(operation, message)
+ 
+-            archive = self._chef.prepare(archive, output_dir=output_dir)
++            archive = self._chef.prepare(archive, output_dir=original_archive.parent)
+ 
+         # Use the original archive to provide the correct hash.
+         self._populate_hashes_dict(original_archive, package)
+@@ -822,11 +803,15 @@ class Executor:
+ 
+         return archive_hash
+ 
+-    def _download_archive(self, operation: Install | Update, link: Link) -> Path:
+-        response = self._authenticator.request(
+-            "get", link.url, stream=True, io=self._sections.get(id(operation), self._io)
+-        )
+-        wheel_size = response.headers.get("content-length")
++    def _download_archive(
++        self,
++        operation: Install | Update,
++        url: str,
++        dest: Path,
++    ) -> None:
++        downloader = Downloader(url, dest, self._authenticator)
++        wheel_size = downloader.total_size
++
+         operation_message = self.get_operation_message(operation)
+         message = (
+             f"  <fg=blue;options=bold>•</> {operation_message}: <info>Downloading...</>"
+@@ -848,30 +833,15 @@ class Executor:
+                 self._sections[id(operation)].clear()
+                 progress.start()
+ 
+-        done = 0
+-        archive = (
+-            self._artifact_cache.get_cache_directory_for_link(link) / link.filename
+-        )
+-        archive.parent.mkdir(parents=True, exist_ok=True)
+-        with atomic_open(archive) as f:
+-            for chunk in response.iter_content(chunk_size=4096):
+-                if not chunk:
+-                    break
+-
+-                done += len(chunk)
+-
+-                if progress:
+-                    with self._lock:
+-                        progress.set_progress(done)
+-
+-                f.write(chunk)
++        for fetched_size in downloader.download_with_progress(chunk_size=4096):
++            if progress:
++                with self._lock:
++                    progress.set_progress(fetched_size)
+ 
+         if progress:
+             with self._lock:
+                 progress.finish()
+ 
+-        return archive
+-
+     def _should_write_operation(self, operation: Operation) -> bool:
+         return (
+             not operation.skipped or self._dry_run or self._verbose or not self._enabled
+
+diff --git a/src/poetry/installation/wheel_installer.py b/src/poetry/installation/wheel_installer.py
+index d25811f..27a867f 100644
+--- a/src/poetry/installation/wheel_installer.py
++++ b/src/poetry/installation/wheel_installer.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import logging
+ import platform
+ import sys
+ 
+@@ -15,7 +16,10 @@ from poetry.__version__ import __version__
+ from poetry.utils._compat import WINDOWS
+ 
+ 
++logger = logging.getLogger(__name__)
++
+ if TYPE_CHECKING:
++    from collections.abc import Collection
+     from typing import BinaryIO
+ 
+     from installer.records import RecordEntry
+@@ -42,9 +46,9 @@ class WheelDestination(SchemeDictionaryDestination):
+ 
+         target_path = Path(self.scheme_dict[scheme]) / path
+         if target_path.exists():
+-            # Contrary to the base library we don't raise an error
+-            # here since it can break namespace packages (like Poetry's)
+-            pass
++            # Contrary to the base library we don't raise an error here since it can
++            # break pkgutil-style and pkg_resource-style namespace packages.
++            logger.warning(f"Installing {target_path} over existing file")
+ 
+         parent_folder = target_path.parent
+         if not parent_folder.exists():
+@@ -60,18 +64,6 @@ class WheelDestination(SchemeDictionaryDestination):
+ 
+         return RecordEntry(path, Hash(self.hash_algorithm, hash_), size)
+ 
+-    def for_source(self, source: WheelFile) -> WheelDestination:
+-        scheme_dict = self.scheme_dict.copy()
+-
+-        scheme_dict["headers"] = str(Path(scheme_dict["headers"]) / source.distribution)
+-
+-        return self.__class__(
+-            scheme_dict,
+-            interpreter=self.interpreter,
+-            script_kind=self.script_kind,
+-            bytecode_optimization_levels=self.bytecode_optimization_levels,
+-        )
+-
+ 
+ class WheelInstaller:
+     def __init__(self, env: Env) -> None:
+@@ -85,18 +77,13 @@ class WheelInstaller:
+                 script_kind = "win-arm64" if sys.maxsize > 2**32 else "win-arm"
+             else:
+                 script_kind = "win-amd64" if sys.maxsize > 2**32 else "win-ia32"
++        self._script_kind = script_kind
+ 
+-        schemes = self._env.paths
+-        schemes["headers"] = schemes["include"]
+-
+-        self._destination = WheelDestination(
+-            schemes, interpreter=str(self._env.python), script_kind=script_kind
+-        )
+-
++        self._bytecode_optimization_levels: Collection[int] = ()
+         self.invalid_wheels: dict[Path, list[str]] = {}
+ 
+     def enable_bytecode_compilation(self, enable: bool = True) -> None:
+-        self._destination.bytecode_optimization_levels = (-1,) if enable else ()
++        self._bytecode_optimization_levels = (-1,) if enable else ()
+ 
+     def install(self, wheel: Path) -> None:
+         with WheelFile.open(wheel) as source:
+@@ -107,9 +94,21 @@ class WheelInstaller:
+                 source.validate_record(validate_contents=False)
+             except _WheelFileValidationError as e:
+                 self.invalid_wheels[wheel] = e.issues
++
++            scheme_dict = self._env.paths.copy()
++            scheme_dict["headers"] = str(
++                Path(scheme_dict["include"]) / source.distribution
++            )
++            destination = WheelDestination(
++                scheme_dict,
++                interpreter=str(self._env.python),
++                script_kind=self._script_kind,
++                bytecode_optimization_levels=self._bytecode_optimization_levels,
++            )
++
+             install(
+                 source=source,
+-                destination=self._destination.for_source(source),
++                destination=destination,
+                 # Additional metadata that is generated by the installation tool.
+                 additional_metadata={
+                     "INSTALLER": f"Poetry {__version__}".encode(),
+
+diff --git a/src/poetry/json/__init__.py b/src/poetry/json/__init__.py
+index 06ee010..de4f178 100644
+--- a/src/poetry/json/__init__.py
++++ b/src/poetry/json/__init__.py
+@@ -5,8 +5,9 @@ import json
+ from pathlib import Path
+ from typing import Any
+ 
+-import jsonschema
++import fastjsonschema
+ 
++from fastjsonschema.exceptions import JsonSchemaException
+ from poetry.core.json import SCHEMA_DIR as CORE_SCHEMA_DIR
+ 
+ 
+@@ -21,18 +22,13 @@ def validate_object(obj: dict[str, Any]) -> list[str]:
+     schema_file = Path(SCHEMA_DIR, "poetry.json")
+     schema = json.loads(schema_file.read_text(encoding="utf-8"))
+ 
+-    validator = jsonschema.Draft7Validator(schema)
+-    validation_errors = sorted(validator.iter_errors(obj), key=lambda e: e.path)
++    validate = fastjsonschema.compile(schema)
+ 
+     errors = []
+-
+-    for error in validation_errors:
+-        message = error.message
+-        if error.path:
+-            path = ".".join(str(x) for x in error.absolute_path)
+-            message = f"[{path}] {message}"
+-
+-        errors.append(message)
++    try:
++        validate(obj)
++    except JsonSchemaException as e:
++        errors = [e.message]
+ 
+     core_schema = json.loads(
+         (CORE_SCHEMA_DIR / "poetry-schema.json").read_text(encoding="utf-8")
+
+diff --git a/src/poetry/mixology/failure.py b/src/poetry/mixology/failure.py
+index da14d15..8c7cebb 100644
+--- a/src/poetry/mixology/failure.py
++++ b/src/poetry/mixology/failure.py
+@@ -41,7 +41,7 @@ class _Writer:
+             if isinstance(incompatibility.cause, PythonCause):
+                 if not required_python_version_notification:
+                     buffer.append(
+-                        "The current project's Python requirement"
++                        "The current project's supported Python range"
+                         f" ({incompatibility.cause.root_python_version}) is not"
+                         " compatible with some of the required packages Python"
+                         " requirement:"
+
+diff --git a/src/poetry/mixology/solutions/providers/python_requirement_solution_provider.py b/src/poetry/mixology/solutions/providers/python_requirement_solution_provider.py
+index b7d6e83..040e325 100644
+--- a/src/poetry/mixology/solutions/providers/python_requirement_solution_provider.py
++++ b/src/poetry/mixology/solutions/providers/python_requirement_solution_provider.py
+@@ -19,7 +19,7 @@ class PythonRequirementSolutionProvider(HasSolutionsForException):
+             return False
+ 
+         m = re.match(
+-            "^The current project's Python requirement (.+) is not compatible "
++            "^The current project's supported Python range (.+) is not compatible "
+             "with some of the required packages Python requirement",
+             str(exception),
+         )
+
+diff --git a/src/poetry/mixology/solutions/solutions/python_requirement_solution.py b/src/poetry/mixology/solutions/solutions/python_requirement_solution.py
+index b625e12..9856ca3 100644
+--- a/src/poetry/mixology/solutions/solutions/python_requirement_solution.py
++++ b/src/poetry/mixology/solutions/solutions/python_requirement_solution.py
+@@ -58,6 +58,6 @@ class PythonRequirementSolution(Solution):
+     @property
+     def documentation_links(self) -> list[str]:
+         return [
+-            "https://python-poetry.org/docs/dependency-specification/#python-restricted-dependencies",  # noqa: E501
+-            "https://python-poetry.org/docs/dependency-specification/#using-environment-markers",  # noqa: E501
++            "https://python-poetry.org/docs/dependency-specification/#python-restricted-dependencies",
++            "https://python-poetry.org/docs/dependency-specification/#using-environment-markers",
+         ]
+
+diff --git a/src/poetry/mixology/version_solver.py b/src/poetry/mixology/version_solver.py
+index 5c613a7..55e76a5 100644
+--- a/src/poetry/mixology/version_solver.py
++++ b/src/poetry/mixology/version_solver.py
+@@ -394,7 +394,7 @@ class VersionSolver:
+             # details.
+             #
+             # .. _algorithm documentation:
+-            # https://github.com/dart-lang/pub/tree/master/doc/solver.md#conflict-resolution  # noqa: E501
++            # https://github.com/dart-lang/pub/tree/master/doc/solver.md#conflict-resolution
+             if difference is not None:
+                 inverse = difference.inverse
+                 if inverse.dependency != most_recent_satisfier.dependency:
+
+diff --git a/src/poetry/packages/direct_origin.py b/src/poetry/packages/direct_origin.py
+index f8e6095..9451e38 100644
+--- a/src/poetry/packages/direct_origin.py
++++ b/src/poetry/packages/direct_origin.py
+@@ -76,14 +76,9 @@ class DirectOrigin:
+ 
+     def get_package_from_url(self, url: str) -> Package:
+         link = Link(url)
+-        artifact = self._artifact_cache.get_cached_archive_for_link(link, strict=True)
+-
+-        if not artifact:
+-            artifact = (
+-                self._artifact_cache.get_cache_directory_for_link(link) / link.filename
+-            )
+-            artifact.parent.mkdir(parents=True, exist_ok=True)
+-            download_file(url, artifact)
++        artifact = self._artifact_cache.get_cached_archive_for_link(
++            link, strict=True, download_func=download_file
++        )
+ 
+         package = self.get_package_from_file(artifact)
+         package.files = [
+
+diff --git a/src/poetry/packages/locker.py b/src/poetry/packages/locker.py
+index 2031194..822e0a5 100644
+--- a/src/poetry/packages/locker.py
++++ b/src/poetry/packages/locker.py
+@@ -323,6 +323,14 @@ class Locker:
+             except tomllib.TOMLDecodeError as e:
+                 raise RuntimeError(f"Unable to read the lock file ({e}).")
+ 
++        # if the lockfile doesn't contain a metadata section at all,
++        # it probably needs to be rebuilt completely
++        if "metadata" not in lock_data:
++            raise RuntimeError(
++                "The lock file does not have a metadata entry.\n"
++                "Regenerate the lock file with the `poetry lock` command."
++            )
++
+         metadata = lock_data["metadata"]
+         lock_version = Version.parse(metadata.get("lock-version", "1.0"))
+         current_version = Version.parse(self._VERSION)
+
+diff --git a/src/poetry/publishing/uploader.py b/src/poetry/publishing/uploader.py
+index e4d5088..ab415db 100644
+--- a/src/poetry/publishing/uploader.py
++++ b/src/poetry/publishing/uploader.py
+@@ -31,17 +31,20 @@ if TYPE_CHECKING:
+ class UploadError(Exception):
+     def __init__(self, error: ConnectionError | HTTPError | str) -> None:
+         if isinstance(error, HTTPError):
+-            message = (
+-                f"HTTP Error {error.response.status_code}: {error.response.reason} |"
+-                f" {error.response.content!r}"
+-            )
++            if error.response is None:
++                message = "HTTP Error connecting to the repository"
++            else:
++                message = (
++                    f"HTTP Error {error.response.status_code}: "
++                    f"{error.response.reason} | {error.response.content!r}"
++                )
+         elif isinstance(error, ConnectionError):
+             message = (
+                 "Connection Error: We were unable to connect to the repository, "
+                 "ensure the url is correct and can be reached."
+             )
+         else:
+-            message = str(error)
++            message = error
+         super().__init__(message)
+ 
+ 
+@@ -74,7 +77,7 @@ class Uploader:
+         self._password = password
+ 
+     def make_session(self) -> requests.Session:
+-        session = requests.session()
++        session = requests.Session()
+         auth = self.get_auth()
+         if auth is not None:
+             session.auth = auth
+@@ -103,10 +106,8 @@ class Uploader:
+         if client_cert:
+             session.cert = str(client_cert)
+ 
+-        try:
++        with session:
+             self._upload(session, url, dry_run, skip_existing)
+-        finally:
+-            session.close()
+ 
+     def post_data(self, file: Path) -> dict[str, Any]:
+         meta = Metadata.from_package(self._package)
+@@ -321,7 +322,7 @@ class Uploader:
+         raise ValueError("Unknown distribution format " + "".join(exts))
+ 
+     def _is_file_exists_error(self, response: requests.Response) -> bool:
+-        # based on https://github.com/pypa/twine/blob/a6dd69c79f7b5abfb79022092a5d3776a499e31b/twine/commands/upload.py#L32  # noqa: E501
++        # based on https://github.com/pypa/twine/blob/a6dd69c79f7b5abfb79022092a5d3776a499e31b/twine/commands/upload.py#L32
+         status = response.status_code
+         reason = response.reason.lower()
+         text = response.text.lower()
+
+diff --git a/src/poetry/puzzle/provider.py b/src/poetry/puzzle/provider.py
+index a7ef7a0..09fbe86 100644
+--- a/src/poetry/puzzle/provider.py
++++ b/src/poetry/puzzle/provider.py
+@@ -606,10 +606,11 @@ class Provider:
+ 
+             # For dependency resolution, markers of duplicate dependencies must be
+             # mutually exclusive.
+-            deps = self._resolve_overlapping_markers(package, deps)
++            active_extras = None if package.is_root() else dependency.extras
++            deps = self._resolve_overlapping_markers(package, deps, active_extras)
+ 
+             if len(deps) == 1:
+-                self.debug(f"<debug>Merging requirements for {deps[0]!s}</debug>")
++                self.debug(f"<debug>Merging requirements for {dep_name}</debug>")
+                 dependencies.append(deps[0])
+                 continue
+ 
+@@ -682,7 +683,6 @@ class Provider:
+                 if python_constraint_intersection.is_empty():
+                     # This dependency is not needed under current python constraint.
+                     continue
+-                dep.transitive_python_versions = str(python_constraint_intersection)
+ 
+             clean_dependencies.append(dep)
+ 
+@@ -839,11 +839,14 @@ class Provider:
+ 
+         return merged_dependencies
+ 
+-    def _is_relevant_marker(self, marker: BaseMarker) -> bool:
++    def _is_relevant_marker(
++        self, marker: BaseMarker, active_extras: Collection[NormalizedName] | None
++    ) -> bool:
+         """
+         A marker is relevant if
+         - it is not empty
+         - allowed by the project's python constraint
++        - allowed by active extras of the dependency (not relevant for root package)
+         - allowed by the environment (only during installation)
+         """
+         return (
+@@ -851,11 +854,15 @@ class Provider:
+             and self._python_constraint.allows_any(
+                 get_python_constraint_from_marker(marker)
+             )
++            and (active_extras is None or marker.validate({"extra": active_extras}))
+             and (not self._env or marker.validate(self._env.marker_env))
+         )
+ 
+     def _resolve_overlapping_markers(
+-        self, package: Package, dependencies: list[Dependency]
++        self,
++        package: Package,
++        dependencies: list[Dependency],
++        active_extras: Collection[NormalizedName] | None,
+     ) -> list[Dependency]:
+         """
+         Convert duplicate dependencies with potentially overlapping markers
+@@ -888,7 +895,7 @@ class Provider:
+             used_marker_intersection: BaseMarker = AnyMarker()
+             for m in markers:
+                 used_marker_intersection = used_marker_intersection.intersect(m)
+-            if not self._is_relevant_marker(used_marker_intersection):
++            if not self._is_relevant_marker(used_marker_intersection, active_extras):
+                 continue
+ 
+             # intersection of constraints
+
+diff --git a/src/poetry/puzzle/transaction.py b/src/poetry/puzzle/transaction.py
+index 6650934..7a5f8bc 100644
+--- a/src/poetry/puzzle/transaction.py
++++ b/src/poetry/puzzle/transaction.py
+@@ -98,14 +98,9 @@ class Transaction:
+                 result_package_names = {
+                     result_package.name for result_package, _ in self._result_packages
+                 }
+-                # We preserve pip/setuptools/wheel when not managed by poetry, this is
+-                # done to avoid externally managed virtual environments causing
+-                # unnecessary removals.
+-                preserved_package_names = {
+-                    "pip",
+-                    "setuptools",
+-                    "wheel",
+-                } - result_package_names
++                # We preserve pip when not managed by poetry, this is done to avoid
++                # externally managed virtual environments causing unnecessary removals.
++                preserved_package_names = {"pip"} - result_package_names
+ 
+                 for installed_package in self._installed_packages:
+                     if installed_package.name in uninstalls:
+
+diff --git a/src/poetry/repositories/abstract_repository.py b/src/poetry/repositories/abstract_repository.py
+index dbbc6a9..a40b970 100644
+--- a/src/poetry/repositories/abstract_repository.py
++++ b/src/poetry/repositories/abstract_repository.py
+@@ -20,12 +20,10 @@ class AbstractRepository(ABC):
+         return self._name
+ 
+     @abstractmethod
+-    def find_packages(self, dependency: Dependency) -> list[Package]:
+-        ...
++    def find_packages(self, dependency: Dependency) -> list[Package]: ...
+ 
+     @abstractmethod
+-    def search(self, query: str) -> list[Package]:
+-        ...
++    def search(self, query: str) -> list[Package]: ...
+ 
+     @abstractmethod
+     def package(
+@@ -33,5 +31,4 @@ class AbstractRepository(ABC):
+         name: str,
+         version: Version,
+         extras: list[str] | None = None,
+-    ) -> Package:
+-        ...
++    ) -> Package: ...
+
+diff --git a/src/poetry/repositories/cached_repository.py b/src/poetry/repositories/cached_repository.py
+index a04fb4d..1a24477 100644
+--- a/src/poetry/repositories/cached_repository.py
++++ b/src/poetry/repositories/cached_repository.py
+@@ -35,8 +35,7 @@ class CachedRepository(Repository, ABC):
+     @abstractmethod
+     def _get_release_info(
+         self, name: NormalizedName, version: Version
+-    ) -> dict[str, Any]:
+-        ...
++    ) -> dict[str, Any]: ...
+ 
+     def get_release_info(self, name: NormalizedName, version: Version) -> PackageInfo:
+         """
+
+diff --git a/src/poetry/repositories/http_repository.py b/src/poetry/repositories/http_repository.py
+index ebf8b1a..826703a 100644
+--- a/src/poetry/repositories/http_repository.py
++++ b/src/poetry/repositories/http_repository.py
+@@ -11,6 +11,7 @@ from typing import Any
+ from typing import Iterator
+ 
+ import requests
++import requests.adapters
+ 
+ from poetry.core.constraints.version import parse_constraint
+ from poetry.core.packages.dependency import Dependency
+@@ -44,6 +45,7 @@ class HTTPRepository(CachedRepository):
+         url: str,
+         config: Config | None = None,
+         disable_cache: bool = False,
++        pool_size: int = requests.adapters.DEFAULT_POOLSIZE,
+     ) -> None:
+         super().__init__(name, disable_cache, config)
+         self._url = url
+@@ -51,6 +53,7 @@ class HTTPRepository(CachedRepository):
+             config=config,
+             cache_id=name,
+             disable_cache=disable_cache,
++            pool_size=pool_size,
+         )
+         self._authenticator.add_repository(name, url)
+         self.get_page = functools.lru_cache(maxsize=None)(self._get_page)
+
+diff --git a/src/poetry/repositories/legacy_repository.py b/src/poetry/repositories/legacy_repository.py
+index 2c23a9e..a6557ee 100644
+--- a/src/poetry/repositories/legacy_repository.py
++++ b/src/poetry/repositories/legacy_repository.py
+@@ -3,6 +3,8 @@ from __future__ import annotations
+ from typing import TYPE_CHECKING
+ from typing import Any
+ 
++import requests.adapters
++
+ from poetry.core.packages.package import Package
+ 
+ from poetry.inspection.info import PackageInfo
+@@ -27,11 +29,12 @@ class LegacyRepository(HTTPRepository):
+         url: str,
+         config: Config | None = None,
+         disable_cache: bool = False,
++        pool_size: int = requests.adapters.DEFAULT_POOLSIZE,
+     ) -> None:
+         if name == "pypi":
+             raise ValueError("The name [pypi] is reserved for repositories")
+ 
+-        super().__init__(name, url.rstrip("/"), config, disable_cache)
++        super().__init__(name, url.rstrip("/"), config, disable_cache, pool_size)
+ 
+     @property
+     def packages(self) -> list[Package]:
+
+diff --git a/src/poetry/repositories/pypi_repository.py b/src/poetry/repositories/pypi_repository.py
+index cf63e3c..66f6fb6 100644
+--- a/src/poetry/repositories/pypi_repository.py
++++ b/src/poetry/repositories/pypi_repository.py
+@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
+ from typing import Any
+ 
+ import requests
++import requests.adapters
+ 
+ from cachecontrol.controller import logger as cache_control_logger
+ from poetry.core.packages.package import Package
+@@ -38,9 +39,13 @@ class PyPiRepository(HTTPRepository):
+         url: str = "https://pypi.org/",
+         disable_cache: bool = False,
+         fallback: bool = True,
++        pool_size: int = requests.adapters.DEFAULT_POOLSIZE,
+     ) -> None:
+         super().__init__(
+-            "PyPI", url.rstrip("/") + "/simple/", disable_cache=disable_cache
++            "PyPI",
++            url.rstrip("/") + "/simple/",
++            disable_cache=disable_cache,
++            pool_size=pool_size,
+         )
+ 
+         self._base_url = url
+@@ -49,7 +54,7 @@ class PyPiRepository(HTTPRepository):
+     def search(self, query: str) -> list[Package]:
+         results = []
+ 
+-        response = requests.session().get(
++        response = requests.get(
+             self._base_url + "search", params={"q": query}, timeout=REQUESTS_TIMEOUT
+         )
+         parser = SearchResultParser()
+
+diff --git a/src/poetry/utils/authenticator.py b/src/poetry/utils/authenticator.py
+index dd432e9..2628e5b 100644
+--- a/src/poetry/utils/authenticator.py
++++ b/src/poetry/utils/authenticator.py
+@@ -13,12 +13,15 @@ from typing import TYPE_CHECKING
+ from typing import Any
+ 
+ import requests
++import requests.adapters
+ import requests.auth
+ import requests.exceptions
+ 
+ from cachecontrol import CacheControlAdapter
+ from cachecontrol.caches import FileCache
++from requests_toolbelt import user_agent
+ 
++from poetry.__version__ import __version__
+ from poetry.config.config import Config
+ from poetry.exceptions import PoetryException
+ from poetry.utils.constants import REQUESTS_TIMEOUT
+@@ -108,16 +111,16 @@ class Authenticator:
+         io: IO | None = None,
+         cache_id: str | None = None,
+         disable_cache: bool = False,
+-        pool_size: int = 10,
++        pool_size: int = requests.adapters.DEFAULT_POOLSIZE,
+     ) -> None:
+         self._config = config or Config.create()
+         self._io = io
+         self._sessions_for_netloc: dict[str, requests.Session] = {}
+         self._credentials: dict[str, HTTPAuthCredential] = {}
+         self._certs: dict[str, RepositoryCertificateConfig] = {}
+-        self._configured_repositories: dict[
+-            str, AuthenticatorRepositoryConfig
+-        ] | None = None
++        self._configured_repositories: (
++            dict[str, AuthenticatorRepositoryConfig] | None
++        ) = None
+         self._password_manager = PasswordManager(self._config)
+         self._cache_control = (
+             FileCache(
+@@ -134,9 +137,11 @@ class Authenticator:
+             self._get_repository_config_for_url
+         )
+         self._pool_size = pool_size
++        self._user_agent = user_agent("poetry", __version__)
+ 
+     def create_session(self) -> requests.Session:
+         session = requests.Session()
++        session.headers["User-Agent"] = self._user_agent
+ 
+         if self._cache_control is None:
+             return session
+
+diff --git a/src/poetry/utils/cache.py b/src/poetry/utils/cache.py
+index 79e6739..99955e4 100644
+--- a/src/poetry/utils/cache.py
++++ b/src/poetry/utils/cache.py
+@@ -5,13 +5,16 @@ import hashlib
+ import json
+ import logging
+ import shutil
++import threading
+ import time
+ 
++from collections import defaultdict
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+ from typing import Any
+ from typing import Generic
+ from typing import TypeVar
++from typing import overload
+ 
+ from poetry.utils._compat import decode
+ from poetry.utils._compat import encode
+@@ -187,6 +190,9 @@ class FileCache(Generic[T]):
+ class ArtifactCache:
+     def __init__(self, *, cache_dir: Path) -> None:
+         self._cache_dir = cache_dir
++        self._archive_locks: defaultdict[Path, threading.Lock] = defaultdict(
++            threading.Lock
++        )
+ 
+     def get_cache_directory_for_link(self, link: Link) -> Path:
+         key_parts = {"url": link.url_without_fragment}
+@@ -218,18 +224,54 @@ class ArtifactCache:
+ 
+         return self._get_directory_from_hash(key_parts)
+ 
++    @overload
++    def get_cached_archive_for_link(
++        self,
++        link: Link,
++        *,
++        strict: bool,
++        env: Env | None = ...,
++        download_func: Callable[[str, Path], None],
++    ) -> Path: ...
++
++    @overload
++    def get_cached_archive_for_link(
++        self,
++        link: Link,
++        *,
++        strict: bool,
++        env: Env | None = ...,
++        download_func: None = ...,
++    ) -> Path | None: ...
++
+     def get_cached_archive_for_link(
+         self,
+         link: Link,
+         *,
+         strict: bool,
+         env: Env | None = None,
++        download_func: Callable[[str, Path], None] | None = None,
+     ) -> Path | None:
+         cache_dir = self.get_cache_directory_for_link(link)
+ 
+-        return self._get_cached_archive(
++        cached_archive = self._get_cached_archive(
+             cache_dir, strict=strict, filename=link.filename, env=env
+         )
++        if cached_archive is None and strict and download_func is not None:
++            cached_archive = cache_dir / link.filename
++            with self._archive_locks[cached_archive]:
++                # Check again if the archive exists (under the lock) to avoid
++                # duplicate downloads because it may have already been downloaded
++                # by another thread in the meantime
++                if not cached_archive.exists():
++                    cache_dir.mkdir(parents=True, exist_ok=True)
++                    try:
++                        download_func(link.url, cached_archive)
++                    except BaseException:
++                        cached_archive.unlink(missing_ok=True)
++                        raise
++
++        return cached_archive
+ 
+     def get_cached_archive_for_git(
+         self, url: str, reference: str, subdirectory: str | None, env: Env
+@@ -246,8 +288,9 @@ class ArtifactCache:
+         filename: str | None = None,
+         env: Env | None = None,
+     ) -> Path | None:
++        # implication "not strict -> env must not be None"
+         assert strict or env is not None
+-        # implication "strict -> filename should not be None"
++        # implication "strict -> filename must not be None"
+         assert not strict or filename is not None
+ 
+         archives = self._get_cached_archives(cache_dir)
+
+diff --git a/src/poetry/utils/env/__init__.py b/src/poetry/utils/env/__init__.py
+index dc5bc36..ed22bb3 100644
+--- a/src/poetry/utils/env/__init__.py
++++ b/src/poetry/utils/env/__init__.py
+@@ -41,7 +41,7 @@ if TYPE_CHECKING:
+ @contextmanager
+ def ephemeral_environment(
+     executable: Path | None = None,
+-    flags: dict[str, bool] | None = None,
++    flags: dict[str, str | bool] | None = None,
+ ) -> Iterator[VirtualEnv]:
+     with temporary_directory() as tmp_dir:
+         # TODO: cache PEP 517 build environment corresponding to each project venv
+
+diff --git a/src/poetry/utils/env/base_env.py b/src/poetry/utils/env/base_env.py
+index 487a0aa..0880502 100644
+--- a/src/poetry/utils/env/base_env.py
++++ b/src/poetry/utils/env/base_env.py
+@@ -219,8 +219,11 @@ class Env:
+ 
+         return self._platlib
+ 
++    def _get_lib_dirs(self) -> list[Path]:
++        return [self.purelib, self.platlib]
++
+     def is_path_relative_to_lib(self, path: Path) -> bool:
+-        for lib_path in [self.purelib, self.platlib]:
++        for lib_path in self._get_lib_dirs():
+             with contextlib.suppress(ValueError):
+                 path.relative_to(lib_path)
+                 return True
+@@ -324,8 +327,8 @@ class Env:
+             "-I",
+             "-W",
+             "ignore",
+-            "-",
+-            input_=content,
++            "-c",
++            content,
+             stderr=subprocess.PIPE,
+             **kwargs,
+         )
+@@ -335,23 +338,11 @@ class Env:
+         Run a command inside the Python environment.
+         """
+         call = kwargs.pop("call", False)
+-        input_ = kwargs.pop("input_", None)
+         env = kwargs.pop("env", dict(os.environ))
+         stderr = kwargs.pop("stderr", subprocess.STDOUT)
+ 
+         try:
+-            if input_:
+-                output: str = subprocess.run(
+-                    cmd,
+-                    stdout=subprocess.PIPE,
+-                    stderr=stderr,
+-                    input=input_,
+-                    check=True,
+-                    env=env,
+-                    text=True,
+-                    **kwargs,
+-                ).stdout
+-            elif call:
++            if call:
+                 assert stderr != subprocess.PIPE
+                 subprocess.check_call(cmd, stderr=stderr, env=env, **kwargs)
+                 output = ""
+@@ -360,7 +351,7 @@ class Env:
+                     cmd, stderr=stderr, env=env, text=True, **kwargs
+                 )
+         except CalledProcessError as e:
+-            raise EnvCommandError(e, input=input_)
++            raise EnvCommandError(e)
+ 
+         return output
+ 
+
+diff --git a/src/poetry/utils/env/env_manager.py b/src/poetry/utils/env/env_manager.py
+index 1fa70af..e7b0cc7 100644
+--- a/src/poetry/utils/env/env_manager.py
++++ b/src/poetry/utils/env/env_manager.py
+@@ -612,35 +612,40 @@ class EnvManager:
+         cls,
+         path: Path,
+         executable: Path | None = None,
+-        flags: dict[str, bool] | None = None,
++        flags: dict[str, str | bool] | None = None,
+         with_pip: bool | None = None,
+         with_wheel: bool | None = None,
+         with_setuptools: bool | None = None,
+         prompt: str | None = None,
+     ) -> virtualenv.run.session.Session:
+-        if WINDOWS:
+-            path = get_real_windows_path(path)
+-            executable = get_real_windows_path(executable) if executable else None
+-
+         flags = flags or {}
+ 
+-        flags["no-pip"] = (
+-            not with_pip if with_pip is not None else flags.pop("no-pip", True)
+-        )
++        if with_pip is not None:
++            flags["no-pip"] = not with_pip
+ 
+-        flags["no-setuptools"] = (
+-            not with_setuptools
+-            if with_setuptools is not None
+-            else flags.pop("no-setuptools", True)
+-        )
++        if with_wheel is not None:
++            wheel_flags: dict[str, str | bool] = (
++                {"wheel": "bundle"} if with_wheel else {"no-wheel": True}
++            )
++            flags.update(wheel_flags)
+ 
+-        # we want wheels to be enabled when pip is required and it has not been
+-        # explicitly disabled
+-        flags["no-wheel"] = (
+-            not with_wheel
+-            if with_wheel is not None
+-            else flags.pop("no-wheel", flags["no-pip"])
+-        )
++        if with_setuptools is not None:
++            setuptools_flags: dict[str, str | bool] = (
++                {"setuptools": "bundle"} if with_setuptools else {"no-setuptools": True}
++            )
++            flags.update(setuptools_flags)
++
++        flags.setdefault("no-pip", True)
++
++        if "setuptools" not in flags and "no-setuptools" not in flags:
++            flags["no-setuptools"] = True
++
++        if "wheel" not in flags and "no-wheel" not in flags:
++            flags["no-wheel"] = True
++
++        if WINDOWS:
++            path = get_real_windows_path(path)
++            executable = get_real_windows_path(executable) if executable else None
+ 
+         executable_str = None if executable is None else executable.resolve().as_posix()
+ 
+@@ -658,6 +663,9 @@ class EnvManager:
+             if value is True:
+                 args.append(f"--{flag}")
+ 
++            elif value is not False:
++                args.append(f"--{flag}={value}")
++
+         args.append(str(path))
+ 
+         cli_result = virtualenv.cli_run(args)
+
+diff --git a/src/poetry/utils/env/exceptions.py b/src/poetry/utils/env/exceptions.py
+index 13c4311..ece3b39 100644
+--- a/src/poetry/utils/env/exceptions.py
++++ b/src/poetry/utils/env/exceptions.py
+@@ -20,7 +20,7 @@ class IncorrectEnvError(EnvError):
+ 
+ 
+ class EnvCommandError(EnvError):
+-    def __init__(self, e: CalledProcessError, input: str | None = None) -> None:
++    def __init__(self, e: CalledProcessError) -> None:
+         self.e = e
+ 
+         message_parts = [
+@@ -30,8 +30,6 @@ class EnvCommandError(EnvError):
+             message_parts.append(f"Output:\n{decode(e.output)}")
+         if e.stderr:
+             message_parts.append(f"Error output:\n{decode(e.stderr)}")
+-        if input:
+-            message_parts.append(f"Input:\n{input}")
+         super().__init__("\n\n".join(message_parts))
+ 
+ 
+
+diff --git a/src/poetry/utils/env/system_env.py b/src/poetry/utils/env/system_env.py
+index 81ec740..e088e68 100644
+--- a/src/poetry/utils/env/system_env.py
++++ b/src/poetry/utils/env/system_env.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import os
+ import platform
++import site
+ import sys
+ import sysconfig
+ 
+@@ -87,3 +88,6 @@ class SystemEnv(Env):
+ 
+     def is_venv(self) -> bool:
+         return self._path != self._base
++
++    def _get_lib_dirs(self) -> list[Path]:
++        return super()._get_lib_dirs() + [Path(d) for d in site.getsitepackages()]
+
+diff --git a/src/poetry/utils/env/virtual_env.py b/src/poetry/utils/env/virtual_env.py
+index 4487683..c8a8115 100644
+--- a/src/poetry/utils/env/virtual_env.py
++++ b/src/poetry/utils/env/virtual_env.py
+@@ -3,9 +3,11 @@ from __future__ import annotations
+ import json
+ import os
+ import re
++import sys
+ 
+ from contextlib import contextmanager
+ from copy import deepcopy
++from functools import cached_property
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+ from typing import Any
+@@ -20,6 +22,7 @@ from poetry.utils.env.script_strings import GET_PATHS
+ from poetry.utils.env.script_strings import GET_PYTHON_VERSION
+ from poetry.utils.env.script_strings import GET_SYS_PATH
+ from poetry.utils.env.script_strings import GET_SYS_TAGS
++from poetry.utils.env.system_env import SystemEnv
+ 
+ 
+ if TYPE_CHECKING:
+@@ -133,3 +136,21 @@ class VirtualEnv(Env):
+ 
+     def _updated_path(self) -> str:
+         return os.pathsep.join([str(self._bin_dir), os.environ.get("PATH", "")])
++
++    @cached_property
++    def includes_system_site_packages(self) -> bool:
++        pyvenv_cfg = self._path / "pyvenv.cfg"
++        return (
++            re.search(
++                r"^\s*include-system-site-packages\s*=\s*true\s*$",
++                pyvenv_cfg.read_text(),
++                re.IGNORECASE | re.MULTILINE,
++            )
++            is not None
++        )
++
++    def is_path_relative_to_lib(self, path: Path) -> bool:
++        return super().is_path_relative_to_lib(path) or (
++            self.includes_system_site_packages
++            and SystemEnv(Path(sys.prefix)).is_path_relative_to_lib(path)
++        )
+
+diff --git a/src/poetry/utils/helpers.py b/src/poetry/utils/helpers.py
+index fb14e81..ad74353 100644
+--- a/src/poetry/utils/helpers.py
++++ b/src/poetry/utils/helpers.py
+@@ -6,13 +6,20 @@ import os
+ import shutil
+ import stat
+ import sys
++import tarfile
+ import tempfile
++import zipfile
+ 
+ from collections.abc import Mapping
+ from contextlib import contextmanager
++from contextlib import suppress
++from functools import cached_property
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+ from typing import Any
++from typing import overload
++
++import requests
+ 
+ from requests.utils import atomic_open
+ 
+@@ -22,6 +29,7 @@ from poetry.utils.constants import REQUESTS_TIMEOUT
+ if TYPE_CHECKING:
+     from collections.abc import Callable
+     from collections.abc import Iterator
++    from types import TracebackType
+ 
+     from poetry.core.packages.package import Package
+     from requests import Session
+@@ -39,7 +47,23 @@ def directory(path: Path) -> Iterator[Path]:
+         os.chdir(cwd)
+ 
+ 
+-def _on_rm_error(func: Callable[[str], None], path: str, exc_info: Exception) -> None:
++# Correct type signature when used as `shutil.rmtree(..., onexc=_on_rm_error)`.
++@overload
++def _on_rm_error(
++    func: Callable[[str], None], path: str, exc_info: Exception
++) -> None: ...
++
++
++# Correct type signature when used as `shutil.rmtree(..., onerror=_on_rm_error)`.
++@overload
++def _on_rm_error(
++    func: Callable[[str], None],
++    path: str,
++    exc_info: tuple[type[BaseException], BaseException, TracebackType],
++) -> None: ...
++
++
++def _on_rm_error(func: Callable[[str], None], path: str, exc_info: Any) -> None:
+     if not os.path.exists(path):
+         return
+ 
+@@ -47,9 +71,7 @@ def _on_rm_error(func: Callable[[str], None], path: str, exc_info: Exception) ->
+     func(path)
+ 
+ 
+-def remove_directory(
+-    path: Path, *args: Any, force: bool = False, **kwargs: Any
+-) -> None:
++def remove_directory(path: Path, force: bool = False) -> None:
+     """
+     Helper function handle safe removal, and optionally forces stubborn file removal.
+     This is particularly useful when dist files are read-only or git writes read-only
+@@ -60,8 +82,12 @@ def remove_directory(
+     if path.is_symlink():
+         return os.unlink(path)
+ 
+-    kwargs["onerror"] = kwargs.pop("onerror", _on_rm_error if force else None)
+-    shutil.rmtree(path, *args, **kwargs)
++    kwargs: dict[str, Any] = {}
++    if force:
++        onexc = "onexc" if sys.version_info >= (3, 12) else "onerror"
++        kwargs[onexc] = _on_rm_error
++
++    shutil.rmtree(path, **kwargs)
+ 
+ 
+ def merge_dicts(d1: dict[str, Any], d2: dict[str, Any]) -> None:
+@@ -78,25 +104,16 @@ def download_file(
+     session: Authenticator | Session | None = None,
+     chunk_size: int = 1024,
+ ) -> None:
+-    import requests
+-
+     from poetry.puzzle.provider import Indicator
+ 
+-    get = requests.get if not session else session.get
+-
+-    response = get(url, stream=True, timeout=REQUESTS_TIMEOUT)
+-    response.raise_for_status()
++    downloader = Downloader(url, dest, session)
+ 
+     set_indicator = False
+     with Indicator.context() as update_context:
+         update_context(f"Downloading {url}")
+ 
+-        if "Content-Length" in response.headers:
+-            try:
+-                total_size = int(response.headers["Content-Length"])
+-            except ValueError:
+-                total_size = 0
+-
++        total_size = downloader.total_size
++        if total_size > 0:
+             fetched_size = 0
+             last_percent = 0
+ 
+@@ -104,17 +121,44 @@ def download_file(
+             # but skip the updating
+             set_indicator = total_size > 1024 * 1024
+ 
+-        with atomic_open(dest) as f:
+-            for chunk in response.iter_content(chunk_size=chunk_size):
++        for fetched_size in downloader.download_with_progress(chunk_size):
++            if set_indicator:
++                percent = (fetched_size * 100) // total_size
++                if percent > last_percent:
++                    last_percent = percent
++                    update_context(f"Downloading {url} {percent:3}%")
++
++
++class Downloader:
++    def __init__(
++        self,
++        url: str,
++        dest: Path,
++        session: Authenticator | Session | None = None,
++    ):
++        self._dest = dest
++
++        get = requests.get if not session else session.get
++
++        self._response = get(url, stream=True, timeout=REQUESTS_TIMEOUT)
++        self._response.raise_for_status()
++
++    @cached_property
++    def total_size(self) -> int:
++        total_size = 0
++        if "Content-Length" in self._response.headers:
++            with suppress(ValueError):
++                total_size = int(self._response.headers["Content-Length"])
++        return total_size
++
++    def download_with_progress(self, chunk_size: int = 1024) -> Iterator[int]:
++        fetched_size = 0
++        with atomic_open(self._dest) as f:
++            for chunk in self._response.iter_content(chunk_size=chunk_size):
+                 if chunk:
+                     f.write(chunk)
+-
+-                    if set_indicator:
+-                        fetched_size += len(chunk)
+-                        percent = (fetched_size * 100) // total_size
+-                        if percent > last_percent:
+-                            last_percent = percent
+-                            update_context(f"Downloading {url} {percent:3}%")
++                    fetched_size += len(chunk)
++                    yield fetched_size
+ 
+ 
+ def get_package_version_display_string(
+@@ -246,3 +290,16 @@ def get_file_hash(path: Path, hash_name: str = "sha256") -> str:
+             h.update(content)
+ 
+     return h.hexdigest()
++
++
++def extractall(source: Path, dest: Path, zip: bool) -> None:
++    """Extract all members from either a zip or tar archive."""
++    if zip:
++        with zipfile.ZipFile(source) as archive:
++            archive.extractall(dest)
++    else:
++        with tarfile.open(source) as archive:
++            if hasattr(tarfile, "data_filter"):
++                archive.extractall(dest, filter="data")
++            else:
++                archive.extractall(dest)
+
+diff --git a/src/poetry/utils/password_manager.py b/src/poetry/utils/password_manager.py
+index 6205560..166386f 100644
+--- a/src/poetry/utils/password_manager.py
++++ b/src/poetry/utils/password_manager.py
+@@ -47,8 +47,18 @@ class PoetryKeyring:
+ 
+         import keyring
+ 
++        from keyring.errors import KeyringError
++        from keyring.errors import KeyringLocked
++
+         for name in names:
+-            credential = keyring.get_credential(name, username)
++            credential = None
++            try:
++                credential = keyring.get_credential(name, username)
++            except KeyringLocked:
++                logger.debug("Keyring %s is locked", name)
++            except (KeyringError, RuntimeError):
++                logger.debug("Accessing keyring %s failed", name, exc_info=True)
++
+             if credential:
+                 return HTTPAuthCredential(
+                     username=credential.username, password=credential.password
+
+diff --git a/src/poetry/utils/setup_reader.py b/src/poetry/utils/setup_reader.py
+index 9217687..ffc10a1 100644
+--- a/src/poetry/utils/setup_reader.py
++++ b/src/poetry/utils/setup_reader.py
+@@ -22,6 +22,7 @@ class SetupReader:
+     DEFAULT: ClassVar[dict[str, Any]] = {
+         "name": None,
+         "version": None,
++        "description": None,
+         "install_requires": [],
+         "extras_require": {},
+         "python_requires": None,
+@@ -62,6 +63,7 @@ class SetupReader:
+         call, body = setup_call
+         result["name"] = self._find_single_string(call, body, "name")
+         result["version"] = self._find_single_string(call, body, "version")
++        result["description"] = self._find_single_string(call, body, "description")
+         result["install_requires"] = self._find_install_requires(call, body)
+         result["extras_require"] = self._find_extras_require(call, body)
+         result["python_requires"] = self._find_single_string(
+@@ -77,12 +79,16 @@ class SetupReader:
+ 
+         name = None
+         version = None
++        description = None
+         if parser.has_option("metadata", "name"):
+             name = parser.get("metadata", "name")
+ 
+         if parser.has_option("metadata", "version"):
+             version = Version.parse(parser.get("metadata", "version")).text
+ 
++        if parser.has_option("metadata", "description"):
++            description = parser.get("metadata", "description")
++
+         install_requires = []
+         extras_require: dict[str, list[str]] = {}
+         python_requires = None
+@@ -112,6 +118,7 @@ class SetupReader:
+         return {
+             "name": name,
+             "version": version,
++            "description": description,
+             "install_requires": install_requires,
+             "extras_require": extras_require,
+             "python_requires": python_requires,
+
+diff --git a/src/poetry/utils/shell.py b/src/poetry/utils/shell.py
+index 290a62c..f8c413a 100644
+--- a/src/poetry/utils/shell.py
++++ b/src/poetry/utils/shell.py
+@@ -97,12 +97,16 @@ class Shell:
+         import shlex
+ 
+         terminal = shutil.get_terminal_size()
++        cmd = f"{self._get_source_command()} {shlex.quote(str(activate_path))}"
++
+         with env.temp_environ():
++            args = ["-e", cmd] if self._name == "nu" else ["-i"]
++
+             c = pexpect.spawn(
+-                self._path, ["-i"], dimensions=(terminal.lines, terminal.columns)
++                self._path, args, dimensions=(terminal.lines, terminal.columns)
+             )
+ 
+-        if self._name in ["zsh", "nu"]:
++        if self._name in ["zsh"]:
+             c.setecho(False)
+ 
+         if self._name == "zsh":
+@@ -110,10 +114,13 @@ class Shell:
+             c.sendline(f"emulate bash -c '. {shlex.quote(str(activate_path))}'")
+         elif self._name == "xonsh":
+             c.sendline(f"vox activate {shlex.quote(str(env.path))}")
++        elif self._name == "nu":
++            # If this is nu, we don't want to send the activation command to the
++            # command line since we already ran it via the shell's invocation.
++            pass
+         else:
+-            cmd = f"{self._get_source_command()} {shlex.quote(str(activate_path))}"
+-            if self._name in ["fish", "nu"]:
+-                # Under fish and nu "\r" should be sent explicitly
++            if self._name in ["fish"]:
++                # Under fish, "\r" should be sent explicitly
+                 cmd += "\r"
+             c.sendline(cmd)
+ 
+
+diff --git a/src/poetry/vcs/git/backend.py b/src/poetry/vcs/git/backend.py
+index fcafc43..484eae4 100644
+--- a/src/poetry/vcs/git/backend.py
++++ b/src/poetry/vcs/git/backend.py
+@@ -8,6 +8,8 @@ from pathlib import Path
+ from subprocess import CalledProcessError
+ from typing import TYPE_CHECKING
+ from urllib.parse import urljoin
++from urllib.parse import urlparse
++from urllib.parse import urlunparse
+ 
+ from dulwich import porcelain
+ from dulwich.client import HTTPUnauthorized
+@@ -15,6 +17,7 @@ from dulwich.client import get_transport_and_path
+ from dulwich.config import ConfigFile
+ from dulwich.config import parse_submodules
+ from dulwich.errors import NotGitRepository
++from dulwich.index import IndexEntry
+ from dulwich.refs import ANNOTATED_TAG_SUFFIX
+ from dulwich.repo import Repo
+ 
+@@ -30,6 +33,9 @@ if TYPE_CHECKING:
+ 
+ logger = logging.getLogger(__name__)
+ 
++# A relative URL by definition starts with ../ or ./
++RELATIVE_SUBMODULE_REGEX = re.compile(r"^\.{1,2}/")
++
+ 
+ def is_revision_sha(revision: str | None) -> bool:
+     return re.match(r"^\b[0-9a-f]{5,40}\b$", revision or "") is not None
+@@ -326,49 +332,64 @@ class Git:
+         Helper method to identify configured submodules and clone them recursively.
+         """
+         repo_root = Path(repo.path)
+-        modules_config = repo_root.joinpath(".gitmodules")
+-
+-        # A relative URL by definition starts with ../ or ./
+-        relative_submodule_regex = re.compile(r"^\.{1,2}/")
+-
+-        if modules_config.exists():
+-            config = ConfigFile.from_path(str(modules_config))
+-
+-            url: bytes
+-            path: bytes
+-            submodules = parse_submodules(config)
+-
+-            for path, url, name in submodules:
+-                path_relative = Path(path.decode("utf-8"))
+-                path_absolute = repo_root.joinpath(path_relative)
+-
+-                url_string = url.decode("utf-8")
+-                if relative_submodule_regex.search(url_string):
+-                    url_string = urljoin(f"{Git.get_remote_url(repo)}/", url_string)
+-
+-                source_root = path_absolute.parent
+-                source_root.mkdir(parents=True, exist_ok=True)
+-
+-                with repo:
+-                    try:
+-                        revision = repo.open_index()[path].sha.decode("utf-8")
+-                    except KeyError:
+-                        logger.debug(
+-                            "Skip submodule %s in %s, path %s not found",
+-                            name,
+-                            repo.path,
+-                            path,
+-                        )
+-                        continue
+-
+-                cls.clone(
+-                    url=url_string,
+-                    source_root=source_root,
+-                    name=path_relative.name,
++        for submodule in cls._get_submodules(repo):
++            path_absolute = repo_root / submodule.path
++            source_root = path_absolute.parent
++            source_root.mkdir(parents=True, exist_ok=True)
++            cls.clone(
++                url=submodule.url,
++                source_root=source_root,
++                name=path_absolute.name,
++                revision=submodule.revision,
++                clean=path_absolute.exists()
++                and not path_absolute.joinpath(".git").is_dir(),
++            )
++
++    @classmethod
++    def _get_submodules(cls, repo: Repo) -> list[SubmoduleInfo]:
++        modules_config = Path(repo.path, ".gitmodules")
++
++        if not modules_config.exists():
++            return []
++
++        config = ConfigFile.from_path(str(modules_config))
++
++        submodules: list[SubmoduleInfo] = []
++        for path, url, name in parse_submodules(config):
++            url_str = url.decode("utf-8")
++            path_str = path.decode("utf-8")
++            name_str = name.decode("utf-8")
++
++            if RELATIVE_SUBMODULE_REGEX.search(url_str):
++                url_str = urlpathjoin(f"{cls.get_remote_url(repo)}/", url_str)
++
++            with repo:
++                index = repo.open_index()
++
++                try:
++                    entry = index[path]
++                except KeyError:
++                    logger.debug(
++                        "Skip submodule %s in %s, path %s not found",
++                        name,
++                        repo.path,
++                        path,
++                    )
++                    continue
++
++                assert isinstance(entry, IndexEntry)
++                revision = entry.sha.decode("utf-8")
++
++            submodules.append(
++                SubmoduleInfo(
++                    path=path_str,
++                    url=url_str,
++                    name=name_str,
+                     revision=revision,
+-                    clean=path_absolute.exists()
+-                    and not path_absolute.joinpath(".git").is_dir(),
+                 )
++            )
++
++        return submodules
+ 
+     @staticmethod
+     def is_using_legacy_client() -> bool:
+@@ -450,3 +471,31 @@ class Git:
+ 
+         # fallback to legacy git client
+         return cls._clone_legacy(url=url, refspec=refspec, target=target)
++
++
++def urlpathjoin(base: str, path: str) -> str:
++    """
++    Allow any URL to be joined with a path
++
++    This works around an issue with urllib.parse.urljoin where it only handles
++    relative URLs for protocols contained in urllib.parse.uses_relative. As it
++    happens common protocols used with git, like ssh or git+ssh are not in that
++    list.
++
++    Thus we need to implement our own version of urljoin that handles all URLs
++    protocols. This is accomplished by using urlparse and urlunparse to split
++    the URL into its components, join the path, and then reassemble the URL.
++
++    See: https://github.com/python-poetry/poetry/issues/6499#issuecomment-1564712609
++    """
++    parsed_base = urlparse(base)
++    new = parsed_base._replace(path=urljoin(parsed_base.path, path))
++    return urlunparse(new)
++
++
++@dataclasses.dataclass
++class SubmoduleInfo:
++    path: str
++    url: str
++    name: str
++    revision: str
+
+diff --git a/src/poetry/vcs/git/system.py b/src/poetry/vcs/git/system.py
+index 935fc73..ae4f9a0 100644
+--- a/src/poetry/vcs/git/system.py
++++ b/src/poetry/vcs/git/system.py
+@@ -22,21 +22,8 @@ class SystemGit:
+ 
+     @classmethod
+     def checkout(cls, rev: str, target: Path | None = None) -> str:
+-        args = []
+-
+-        if target:
+-            args += [
+-                "--git-dir",
+-                (target / ".git").as_posix(),
+-                "--work-tree",
+-                target.as_posix(),
+-            ]
+-
+         cls._check_parameter(rev)
+-
+-        args += ["checkout", rev]
+-
+-        return cls.run(*args)
++        return cls.run("checkout", rev, folder=target)
+ 
+     @staticmethod
+     def run(*args: Any, **kwargs: Any) -> str:

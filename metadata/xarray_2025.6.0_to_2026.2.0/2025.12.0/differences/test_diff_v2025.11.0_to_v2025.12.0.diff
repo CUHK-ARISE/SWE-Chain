@@ -1,0 +1,901 @@
+diff --git a/xarray/tests/__init__.py b/xarray/tests/__init__.py
+index eb3550f..4adbb63 100644
+--- a/xarray/tests/__init__.py
++++ b/xarray/tests/__init__.py
+@@ -31,6 +31,7 @@ from xarray.tests.arrays import (  # noqa: F401
+     DuckArrayWrapper,
+     FirstElementAccessibleArray,
+     InaccessibleArray,
++    IndexableArray,
+     UnexpectedDataAccess,
+ )
+ 
+
+diff --git a/xarray/tests/arrays.py b/xarray/tests/arrays.py
+index d136d4f..c2e4085 100644
+--- a/xarray/tests/arrays.py
++++ b/xarray/tests/arrays.py
+@@ -41,6 +41,16 @@ class FirstElementAccessibleArray(InaccessibleArray):
+         return self.array[tuple_idxr]
+ 
+ 
++class IndexableArray(InaccessibleArray):
++    """An InaccessibleArray subclass that supports indexing."""
++
++    def __getitem__(self, key):
++        return type(self)(self.array[key])
++
++    def transpose(self, axes):
++        return type(self)(self.array.transpose(axes))
++
++
+ class DuckArrayWrapper(utils.NDArrayMixin):
+     """Array-like that prevents casting to array.
+     Modeled after cupy."""
+
+diff --git a/xarray/tests/test_assertions.py b/xarray/tests/test_assertions.py
+index 6e18e47..eb1a949 100644
+--- a/xarray/tests/test_assertions.py
++++ b/xarray/tests/test_assertions.py
+@@ -16,7 +16,7 @@ except ImportError:
+ try:
+     import pint
+ 
+-    unit_registry = pint.UnitRegistry(force_ndarray_like=True)
++    unit_registry: pint.UnitRegistry = pint.UnitRegistry(force_ndarray_like=True)
+ 
+     def quantity(x):
+         return unit_registry.Quantity(x, "m")
+
+diff --git a/xarray/tests/test_backends.py b/xarray/tests/test_backends.py
+index 36a1e35..5aab153 100644
+--- a/xarray/tests/test_backends.py
++++ b/xarray/tests/test_backends.py
+@@ -77,7 +77,6 @@ from xarray.tests import (
+     has_h5netcdf_1_4_0_or_above,
+     has_netCDF4,
+     has_numpy_2,
+-    has_pydap,
+     has_scipy,
+     has_zarr,
+     has_zarr_v3,
+@@ -209,7 +208,7 @@ def _check_compression_codec_available(codec: str | None) -> bool:
+ 
+             # Attempt to create a variable with the compression
+             if codec and codec.startswith("blosc"):
+-                nc.createVariable(  # type: ignore[call-overload]
++                nc.createVariable(  # type: ignore[call-overload, unused-ignore]
+                     varname="test",
+                     datatype="f4",
+                     dimensions=("x",),
+@@ -217,7 +216,7 @@ def _check_compression_codec_available(codec: str | None) -> bool:
+                     blosc_shuffle=1,
+                 )
+             else:
+-                nc.createVariable(  # type: ignore[call-overload]
++                nc.createVariable(  # type: ignore[call-overload, unused-ignore]
+                     varname="test", datatype="f4", dimensions=("x",), compression=codec
+                 )
+ 
+@@ -6560,6 +6559,46 @@ class TestPydapOnline(TestPydap):
+         )
+ 
+ 
++@requires_pydap
++@network
++@pytest.mark.parametrize("protocol", ["dap2", "dap4"])
++def test_batchdap4_downloads(tmpdir, protocol) -> None:
++    """Test that in dap4, all dimensions are downloaded at once"""
++    import pydap
++    from pydap.net import create_session
++
++    _version_ = Version(pydap.__version__)
++    # Create a session with pre-set params in pydap backend, to cache urls
++    cache_name = tmpdir / "debug"
++    session = create_session(use_cache=True, cache_kwargs={"cache_name": cache_name})
++    session.cache.clear()
++    url = "https://test.opendap.org/opendap/hyrax/data/nc/coads_climatology.nc"
++
++    ds = open_dataset(
++        url.replace("https", protocol),
++        session=session,
++        engine="pydap",
++        decode_times=False,
++    )
++
++    if protocol == "dap4":
++        if _version_ > Version("3.5.5"):
++            # total downloads are:
++            # 1 dmr + 1 dap (all dimensions at once)
++            assert len(session.cache.urls()) == 2
++            # now load the rest of the variables
++            ds.load()
++            # each non-dimension array is downloaded with an individual https requests
++            assert len(session.cache.urls()) == 2 + 4
++        else:
++            assert len(session.cache.urls()) == 4
++            ds.load()
++            assert len(session.cache.urls()) == 4 + 4
++    elif protocol == "dap2":
++        # das + dds + 3 dods urls for dimensions alone
++        assert len(session.cache.urls()) == 5
++
++
+ class TestEncodingInvalid:
+     def test_extract_nc4_variable_encoding(self) -> None:
+         var = xr.Variable(("x",), [1, 2, 3], {}, {"foo": "bar"})
+@@ -7254,9 +7293,9 @@ def test_netcdf4_entrypoint(tmp_path: Path) -> None:
+     _check_guess_can_open_and_open(entrypoint, path, engine="netcdf4", expected=ds)
+     _check_guess_can_open_and_open(entrypoint, str(path), engine="netcdf4", expected=ds)
+ 
+-    # Remote URLs without extensions are no longer claimed (stricter detection)
+-    assert not entrypoint.guess_can_open("http://something/remote")
+-    # Remote URLs with netCDF extensions are claimed
++    # Remote URLs without extensions return True (backward compatibility)
++    assert entrypoint.guess_can_open("http://something/remote")
++    # Remote URLs with netCDF extensions are also claimed
+     assert entrypoint.guess_can_open("http://something/remote.nc")
+     assert entrypoint.guess_can_open("something-local.nc")
+     assert entrypoint.guess_can_open("something-local.nc4")
+@@ -7400,15 +7439,22 @@ def test_remote_url_backend_auto_detection() -> None:
+             f"URL {url!r} should select {expected_backend!r} but got {engine!r}"
+         )
+ 
+-    # DAP URLs without extensions - pydap wins if available, netcdf4 otherwise
+-    # When pydap is not installed, netCDF4 should handle these DAP URLs
+-    expected_dap_backend = "pydap" if has_pydap else "netcdf4"
++    # DAP URLs - netcdf4 should handle these (it comes first in backend order)
++    # Both netcdf4 and pydap can open DAP URLs, but netcdf4 has priority
++    expected_dap_backend = "netcdf4"
+     dap_urls = [
++        # Explicit DAP protocol schemes
+         "dap2://opendap.earthdata.nasa.gov/collections/dataset",
+         "dap4://opendap.earthdata.nasa.gov/collections/dataset",
++        "dap://example.com/dataset",
+         "DAP2://example.com/dataset",  # uppercase scheme
+         "DAP4://example.com/dataset",  # uppercase scheme
++        # DAP path indicators
+         "https://example.com/services/DAP2/dataset",  # uppercase in path
++        "http://test.opendap.org/opendap/data/nc/file.nc",  # /opendap/ path
++        "https://coastwatch.pfeg.noaa.gov/erddap/griddap/erdMH1chla8day",  # ERDDAP
++        "http://thredds.ucar.edu/thredds/dodsC/grib/NCEP/GFS/",  # THREDDS dodsC
++        "https://disc2.gesdisc.eosdis.nasa.gov/dods/TRMM_3B42",  # GrADS /dods/
+     ]
+ 
+     for url in dap_urls:
+@@ -7417,20 +7463,16 @@ def test_remote_url_backend_auto_detection() -> None:
+             f"URL {url!r} should select {expected_dap_backend!r} but got {engine!r}"
+         )
+ 
+-    # URLs that should raise ValueError (no backend can open them)
+-    invalid_urls = [
+-        "http://test.opendap.org/opendap/data/nc/coads_climatology.nc.dap",  # .dap suffix
+-        "https://example.com/data.dap",  # .dap suffix
+-        "http://opendap.example.com/data",  # no extension, no DAP indicators
+-        "https://test.opendap.org/dataset",  # no extension, no DAP indicators
++    # URLs with .dap suffix are claimed by netcdf4 (backward compatibility fallback)
++    # Note: .dap suffix is intentionally NOT recognized as a DAP dataset URL
++    fallback_urls = [
++        ("http://test.opendap.org/opendap/data/nc/coads_climatology.nc.dap", "netcdf4"),
++        ("https://example.com/data.dap", "netcdf4"),
+     ]
+ 
+-    for url in invalid_urls:
+-        with pytest.raises(
+-            ValueError,
+-            match=r"did not find a match in any of xarray's currently installed IO backends",
+-        ):
+-            guess_engine(url)
++    for url, expected_backend in fallback_urls:
++        engine = guess_engine(url)
++        assert engine == expected_backend
+ 
+ 
+ @requires_netCDF4
+
+diff --git a/xarray/tests/test_backends_datatree.py b/xarray/tests/test_backends_datatree.py
+index f534752..38ec3ef 100644
+--- a/xarray/tests/test_backends_datatree.py
++++ b/xarray/tests/test_backends_datatree.py
+@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Literal, cast
+ 
+ import numpy as np
+ import pytest
++from packaging.version import Version
+ 
+ import xarray as xr
+ from xarray import DataTree, load_datatree, open_datatree, open_groups
+@@ -569,8 +570,6 @@ class TestH5NetCDFDatatreeIO(NetCDFIOBase):
+ class TestPyDAPDatatreeIO:
+     """Test PyDAP backend for DataTree."""
+ 
+-    pytestmark = pytest.mark.xfail(reason="test.opendap.org reports a 404 error")
+-
+     engine: T_DataTreeNetcdfEngine | None = "pydap"
+     # you can check these by adding a .dmr to urls, and replacing dap4 with http
+     unaligned_datatree_url = (
+@@ -582,7 +581,8 @@ class TestPyDAPDatatreeIO:
+     simplegroup_datatree_url = "dap4://test.opendap.org/opendap/dap4/SimpleGroup.nc4.h5"
+ 
+     def test_open_datatree_unaligned_hierarchy(
+-        self, url=unaligned_datatree_url
++        self,
++        url=unaligned_datatree_url,
+     ) -> None:
+         with pytest.raises(
+             ValueError,
+@@ -615,7 +615,7 @@ class TestPyDAPDatatreeIO:
+         ) as expected:
+             assert_identical(unaligned_dict_of_datasets["/Group1/subgroup1"], expected)
+ 
+-    def test_inherited_coords(self, url=simplegroup_datatree_url) -> None:
++    def test_inherited_coords(self, tmpdir, url=simplegroup_datatree_url) -> None:
+         """Test that `open_datatree` inherits coordinates from root tree.
+ 
+         This particular h5 file is a test file that inherits the time coordinate from the root
+@@ -641,7 +641,19 @@ class TestPyDAPDatatreeIO:
+             │       Temperature  (time, Z, Y, X) float32 ...
+             |       Salinity     (time, Z, Y, X) float32 ...
+         """
+-        tree = open_datatree(url, engine=self.engine)
++        import pydap
++        from pydap.net import create_session
++
++        # Create a session with pre-set retry params in pydap backend, to cache urls
++        cache_name = tmpdir / "debug"
++        session = create_session(
++            use_cache=True, cache_kwargs={"cache_name": cache_name}
++        )
++        session.cache.clear()
++
++        _version_ = Version(pydap.__version__)
++
++        tree = open_datatree(url, engine=self.engine, session=session)
+         assert set(tree.dims) == {"time", "Z", "nv"}
+         assert tree["/SimpleGroup"].coords["time"].dims == ("time",)
+         assert tree["/SimpleGroup"].coords["Z"].dims == ("Z",)
+@@ -652,6 +664,13 @@ class TestPyDAPDatatreeIO:
+                 list(expected.dims) + ["Z", "nv"]
+             )
+ 
++        if _version_ > Version("3.5.5"):
++            # Total downloads are: 1 dmr, + 1 dap url for all dimensions for each group
++            assert len(session.cache.urls()) == 3
++        else:
++            # 1 dmr + 1 dap url per dimension (total there are 4 dimension arrays)
++            assert len(session.cache.urls()) == 5
++
+     def test_open_groups_to_dict(self, url=all_aligned_child_nodes_url) -> None:
+         aligned_dict_of_datasets = open_groups(url, engine=self.engine)
+         aligned_dt = DataTree.from_dict(aligned_dict_of_datasets)
+
+diff --git a/xarray/tests/test_coding_times.py b/xarray/tests/test_coding_times.py
+index 8261681..dc0bcf6 100644
+--- a/xarray/tests/test_coding_times.py
++++ b/xarray/tests/test_coding_times.py
+@@ -1950,6 +1950,15 @@ def test_decode_timedelta_via_dtype(
+     assert decoded.dtype == expected_dtype
+ 
+ 
++@pytest.mark.parametrize("dtype", [np.uint64, np.int64, np.float64])
++def test_decode_timedelta_dtypes(dtype) -> None:
++    encoded = Variable(["time"], np.arange(10), {"units": "seconds"})
++    coder = CFTimedeltaCoder(time_unit="s")
++    decoded = coder.decode(encoded)
++    assert decoded.dtype.kind == "m"
++    assert_equal(coder.encode(decoded), encoded)
++
++
+ def test_lazy_decode_timedelta_unexpected_dtype() -> None:
+     attrs = {"units": "seconds"}
+     encoded = Variable(["time"], [0, 0.5, 1], attrs=attrs)
+
+diff --git a/xarray/tests/test_combine.py b/xarray/tests/test_combine.py
+index c7c2a60..2883187 100644
+--- a/xarray/tests/test_combine.py
++++ b/xarray/tests/test_combine.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import re
+ from itertools import product
+ 
+ import numpy as np
+@@ -8,6 +9,7 @@ import pytest
+ from xarray import (
+     DataArray,
+     Dataset,
++    DataTree,
+     MergeError,
+     combine_by_coords,
+     combine_nested,
+@@ -624,8 +626,8 @@ class TestNestedCombine:
+                 datasets,
+                 concat_dim=["dim1", "dim2"],
+                 data_vars="all",
+-                combine_attrs=combine_attrs,  # type: ignore[arg-type]
+-            )
++                combine_attrs=combine_attrs,
++            )  # type: ignore[call-overload]
+             assert_identical(result, expected)
+ 
+     def test_combine_nested_missing_data_new_dim(self):
+@@ -764,7 +766,21 @@ class TestNestedCombine:
+         with pytest.raises(
+             ValueError, match=r"Can't combine datasets with unnamed arrays."
+         ):
+-            combine_nested(objs, "x")
++            combine_nested(objs, "x")  # type: ignore[arg-type]
++
++    def test_nested_combine_mixed_datatrees_and_datasets(self):
++        objs = [DataTree.from_dict({"foo": 0}), Dataset({"foo": 1})]
++        with pytest.raises(
++            ValueError,
++            match=r"Can't combine a mix of DataTree and non-DataTree objects.",
++        ):
++            combine_nested(objs, concat_dim="x")  # type: ignore[arg-type]
++
++    def test_datatree(self):
++        objs = [DataTree.from_dict({"foo": 0}), DataTree.from_dict({"foo": 1})]
++        expected = DataTree.from_dict({"foo": ("x", [0, 1])})
++        actual = combine_nested(objs, concat_dim="x")
++        assert expected.identical(actual)
+ 
+ 
+ class TestCombineDatasetsbyCoords:
+@@ -1210,6 +1226,16 @@ class TestCombineMixedObjectsbyCoords:
+         expected = merge([named_da1, named_da2], compat="no_conflicts", join="outer")
+         assert_identical(expected, actual)
+ 
++    def test_combine_by_coords_datatree(self):
++        tree = DataTree.from_dict({"/nested/foo": ("x", [10])}, coords={"x": [1]})
++        with pytest.raises(
++            NotImplementedError,
++            match=re.escape(
++                "combine_by_coords() does not yet support DataTree objects."
++            ),
++        ):
++            combine_by_coords([tree])  # type: ignore[list-item]
++
+ 
+ class TestNewDefaults:
+     def test_concat_along_existing_dim(self):
+
+diff --git a/xarray/tests/test_dask.py b/xarray/tests/test_dask.py
+index ccbfc06..2d10399 100644
+--- a/xarray/tests/test_dask.py
++++ b/xarray/tests/test_dask.py
+@@ -312,7 +312,7 @@ class TestVariable(DaskTestCase):
+     def test_tokenize_duck_dask_array(self):
+         import pint
+ 
+-        unit_registry = pint.UnitRegistry()
++        unit_registry: pint.UnitRegistry = pint.UnitRegistry()
+ 
+         q = unit_registry.Quantity(self.data, "meter")
+         variable = xr.Variable(("x", "y"), q)
+@@ -791,7 +791,7 @@ class TestDataArrayAndDataset(DaskTestCase):
+     def test_tokenize_duck_dask_array(self):
+         import pint
+ 
+-        unit_registry = pint.UnitRegistry()
++        unit_registry: pint.UnitRegistry = pint.UnitRegistry()
+ 
+         q = unit_registry.Quantity(self.data, unit_registry.meter)
+         data_array = xr.DataArray(
+
+diff --git a/xarray/tests/test_dataarray.py b/xarray/tests/test_dataarray.py
+index 5eec7b8..7ae3642 100644
+--- a/xarray/tests/test_dataarray.py
++++ b/xarray/tests/test_dataarray.py
+@@ -49,6 +49,7 @@ from xarray.tests import (
+     assert_no_warnings,
+     has_dask,
+     has_dask_ge_2025_1_0,
++    has_pyarrow,
+     raise_if_dask_computes,
+     requires_bottleneck,
+     requires_cupy,
+@@ -57,6 +58,7 @@ from xarray.tests import (
+     requires_iris,
+     requires_numexpr,
+     requires_pint,
++    requires_pyarrow,
+     requires_scipy,
+     requires_sparse,
+     source_ndarray,
+@@ -1702,6 +1704,20 @@ class TestDataArray:
+         assert_identical(actual, expected, check_default_indexes=False)
+         assert "x_bnds" not in actual.dims
+ 
++    def test_assign_coords_uses_base_variable_class(self) -> None:
++        a = DataArray([0, 1, 3], dims=["x"], coords={"x": [0, 1, 2]})
++        a = a.assign_coords(foo=a.x)
++
++        # explicit check
++        assert isinstance(a["x"].variable, IndexVariable)
++        assert not isinstance(a["foo"].variable, IndexVariable)
++
++        # test internal invariant checks when comparing the datasets
++        expected = DataArray(
++            [0, 1, 3], dims=["x"], coords={"x": [0, 1, 2], "foo": ("x", [0, 1, 2])}
++        )
++        assert_identical(a, expected)
++
+     def test_coords_alignment(self) -> None:
+         lhs = DataArray([1, 2, 3], [("x", [0, 1, 2])])
+         rhs = DataArray([2, 3, 4], [("x", [1, 2, 3])])
+@@ -1867,6 +1883,92 @@ class TestDataArray:
+             "Dtype of reindexed DataArray should remain float32"
+         )
+ 
++    @pytest.mark.parametrize(
++        "extension_array",
++        [
++            pytest.param(pd.Categorical(["a", "b", "c"]), id="categorical"),
++        ]
++        + (
++            [
++                pytest.param(
++                    pd.array([1, 2, 3], dtype="int64[pyarrow]"),
++                    id="int64[pyarrow]",
++                )
++            ]
++            if has_pyarrow
++            else []
++        ),
++    )
++    def test_reindex_extension_array(self, extension_array) -> None:
++        srs = pd.Series(index=["e", "f", "g"], data=extension_array)
++        x = srs.to_xarray()
++        y = x.reindex(index=["f", "g", "z"])
++        assert_array_equal(x, extension_array)
++        pd.testing.assert_extension_array_equal(
++            y.data,
++            extension_array._from_sequence(
++                [extension_array[1], extension_array[2], pd.NA],
++                dtype=extension_array.dtype,
++            ),
++        )
++        assert x.dtype == y.dtype == extension_array.dtype
++
++    @pytest.mark.parametrize(
++        "fill_value,extension_array",
++        [
++            pytest.param("a", pd.Categorical([pd.NA, "a", "b"]), id="categorical"),
++        ]
++        + (
++            [
++                pytest.param(
++                    0,
++                    pd.array([pd.NA, 1, 1], dtype="int64[pyarrow]"),
++                    id="int64[pyarrow]",
++                )
++            ]
++            if has_pyarrow
++            else []
++        ),
++    )
++    def test_fillna_extension_array(self, fill_value, extension_array) -> None:
++        srs: pd.Series = pd.Series(index=np.array([1, 2, 3]), data=extension_array)
++        da = srs.to_xarray()
++        filled = da.fillna(fill_value)
++        assert filled.dtype == srs.dtype
++        assert (filled.values == np.array([fill_value, *(srs.values[1:])])).all()
++
++    @requires_pyarrow
++    def test_fillna_extension_array_bad_val(self) -> None:
++        srs: pd.Series = pd.Series(
++            index=np.array([1, 2, 3]),
++            data=pd.array([pd.NA, 1, 1], dtype="int64[pyarrow]"),
++        )
++        da = srs.to_xarray()
++        with pytest.raises(ValueError):
++            da.fillna("a")
++
++    @pytest.mark.parametrize(
++        "extension_array",
++        [
++            pytest.param(pd.Categorical([pd.NA, "a", "b"]), id="categorical"),
++        ]
++        + (
++            [
++                pytest.param(
++                    pd.array([pd.NA, 1, 1], dtype="int64[pyarrow]"), id="int64[pyarrow]"
++                )
++            ]
++            if has_pyarrow
++            else []
++        ),
++    )
++    def test_dropna_extension_array(self, extension_array) -> None:
++        srs: pd.Series = pd.Series(index=np.array([1, 2, 3]), data=extension_array)
++        da = srs.to_xarray()
++        filled = da.dropna("index")
++        assert filled.dtype == srs.dtype
++        assert (filled.values == srs.values[1:]).all()
++
+     def test_rename(self) -> None:
+         da = xr.DataArray(
+             [1, 2, 3], dims="dim", name="name", coords={"coord": ("dim", [5, 6, 7])}
+
+diff --git a/xarray/tests/test_dataset.py b/xarray/tests/test_dataset.py
+index e677430..6dce32a 100644
+--- a/xarray/tests/test_dataset.py
++++ b/xarray/tests/test_dataset.py
+@@ -71,6 +71,7 @@ from xarray.tests import (
+     requires_dask,
+     requires_numexpr,
+     requires_pint,
++    requires_pyarrow,
+     requires_scipy,
+     requires_sparse,
+     source_ndarray,
+@@ -1908,28 +1909,50 @@ class TestDataset:
+         actual = ds.reindex(cat=["foo"])["cat"].values
+         assert (actual == np.array(["foo"])).all()
+ 
+-    @pytest.mark.parametrize("fill_value", [np.nan, pd.NA])
+-    def test_extensionarray_negative_reindex(self, fill_value) -> None:
+-        cat = pd.Categorical(
+-            ["foo", "bar", "baz"],
+-            categories=["foo", "bar", "baz", "qux", "quux", "corge"],
+-        )
++    @pytest.mark.parametrize("fill_value", [np.nan, pd.NA, None])
++    @pytest.mark.parametrize(
++        "extension_array",
++        [
++            pytest.param(
++                pd.Categorical(
++                    ["foo", "bar", "baz"],
++                    categories=["foo", "bar", "baz", "qux"],
++                ),
++                id="categorical",
++            ),
++        ]
++        + (
++            [
++                pytest.param(
++                    pd.array([1, 1, None], dtype="int64[pyarrow]"), id="int64[pyarrow]"
++                )
++            ]
++            if has_pyarrow
++            else []
++        ),
++    )
++    def test_extensionarray_negative_reindex(self, fill_value, extension_array) -> None:
+         ds = xr.Dataset(
+-            {"cat": ("index", cat)},
++            {"arr": ("index", extension_array)},
+             coords={"index": ("index", np.arange(3))},
+         )
++        kwargs = {}
++        if fill_value is not None:
++            kwargs["fill_value"] = fill_value
+         reindexed_cat = cast(
+             pd.api.extensions.ExtensionArray,
+-            (
+-                ds.reindex(index=[-1, 1, 1], fill_value=fill_value)["cat"]
+-                .to_pandas()
+-                .values
+-            ),
++            (ds.reindex(index=[-1, 1, 1], **kwargs)["arr"].to_pandas().values),
++        )
++        assert reindexed_cat.equals(  # type: ignore[attr-defined]
++            pd.array(
++                [pd.NA, extension_array[1], extension_array[1]],
++                dtype=extension_array.dtype,
++            )
+         )
+-        assert reindexed_cat.equals(pd.array([pd.NA, "bar", "bar"], dtype=cat.dtype))  # type: ignore[attr-defined]
+ 
++    @requires_pyarrow
+     def test_extension_array_reindex_same(self) -> None:
+-        series = pd.Series([1, 2, pd.NA, 3], dtype=pd.Int32Dtype())
++        series = pd.Series([1, 2, pd.NA, 3], dtype="int32[pyarrow]")
+         test = xr.Dataset({"test": series})
+         res = test.reindex(dim_0=series.index)
+         align(res, test, join="exact")
+@@ -4311,9 +4334,11 @@ class TestDataset:
+         # coordinate created from variables names should be of string dtype
+         data = np.array(["a", "a", "a", "b"], dtype="<U1")
+         expected_stacked_variable = DataArray(name="variable", data=data, dims="z")
++
++        # coerce from `IndexVariable` to `Variable` before comparing
+         assert_identical(
+-            stacked.coords["variable"].drop_vars(["z", "variable", "y"]),
+-            expected_stacked_variable,
++            stacked["variable"].variable.to_base_variable(),
++            expected_stacked_variable.variable,
+         )
+ 
+     def test_to_stacked_array_transposed(self) -> None:
+@@ -4779,6 +4804,18 @@ class TestDataset:
+         with pytest.raises(ValueError, match=error_regex):
+             actual[var_list] = data
+ 
++    def test_setitem_uses_base_variable_class_even_for_index_variables(self) -> None:
++        ds = Dataset(coords={"x": [1, 2, 3]})
++        ds["y"] = ds["x"]
++
++        # explicit check
++        assert isinstance(ds["x"].variable, IndexVariable)
++        assert not isinstance(ds["y"].variable, IndexVariable)
++
++        # test internal invariant checks when comparing the datasets
++        expected = Dataset(data_vars={"y": ("x", [1, 2, 3])}, coords={"x": [1, 2, 3]})
++        assert_identical(ds, expected)
++
+     def test_assign(self) -> None:
+         ds = Dataset()
+         actual = ds.assign(x=[0, 1, 2], y=2)
+@@ -4868,6 +4905,19 @@ class TestDataset:
+         assert list(result.data_vars) == list(ds.data_vars)
+         assert list(result.coords) == list(ds.coords)
+ 
++    def test_drop_attrs_custom_index(self):
++        class CustomIndex(Index):
++            @classmethod
++            def from_variables(cls, variables, *, options=None):
++                return cls()
++
++        ds = xr.Dataset(coords={"y": ("x", [1, 2])}).set_xindex("y", CustomIndex)
++        # should not raise a TypeError
++        ds.drop_attrs()
++
++        # make sure the index didn't disappear
++        assert "y" in ds.xindexes
++
+     def test_assign_multiindex_level(self) -> None:
+         data = create_test_multiindex()
+         with pytest.raises(ValueError, match=r"cannot drop or update.*corrupt.*index "):
+@@ -5645,6 +5695,55 @@ class TestDataset:
+         with pytest.raises(TypeError, match=r"must specify how or thresh"):
+             ds.dropna("a", how=None)  # type: ignore[arg-type]
+ 
++    @pytest.mark.parametrize(
++        "fill_value,extension_array",
++        [
++            pytest.param("a", pd.Categorical([pd.NA, "a", "b"]), id="category"),
++        ]
++        + (
++            [
++                pytest.param(
++                    0,
++                    pd.array([pd.NA, 1, 1], dtype="int64[pyarrow]"),
++                    id="int64[pyarrow]",
++                )
++            ]
++            if has_pyarrow
++            else []
++        ),
++    )
++    def test_fillna_extension_array(self, fill_value, extension_array) -> None:
++        srs = pd.DataFrame({"data": extension_array}, index=np.array([1, 2, 3]))
++        ds = srs.to_xarray()
++        filled = ds.fillna(fill_value)
++        assert filled["data"].dtype == extension_array.dtype
++        assert (
++            filled["data"].values
++            == np.array([fill_value, *srs["data"].values[1:]], dtype="object")
++        ).all()
++
++    @pytest.mark.parametrize(
++        "extension_array",
++        [
++            pytest.param(pd.Categorical([pd.NA, "a", "b"]), id="category"),
++        ]
++        + (
++            [
++                pytest.param(
++                    pd.array([pd.NA, 1, 1], dtype="int64[pyarrow]"), id="int64[pyarrow]"
++                )
++            ]
++            if has_pyarrow
++            else []
++        ),
++    )
++    def test_dropna_extension_array(self, extension_array) -> None:
++        srs = pd.DataFrame({"data": extension_array}, index=np.array([1, 2, 3]))
++        ds = srs.to_xarray()
++        dropped = ds.dropna("index")
++        assert dropped["data"].dtype == extension_array.dtype
++        assert (dropped["data"].values == srs["data"].values[1:]).all()
++
+     def test_fillna(self) -> None:
+         ds = Dataset({"a": ("x", [np.nan, 1, np.nan, 3])}, {"x": [0, 1, 2, 3]})
+ 
+
+diff --git a/xarray/tests/test_distributed.py b/xarray/tests/test_distributed.py
+index 9a327ea..c802fb6 100644
+--- a/xarray/tests/test_distributed.py
++++ b/xarray/tests/test_distributed.py
+@@ -246,7 +246,7 @@ def zarr(client):  # noqa: F811
+     except AttributeError:
+         yield zarr_lib
+     finally:
+-        # Zarr-Python 3 lazily allocates a IO thread, a thread pool executor, and
++        # Zarr-Python 3 lazily allocates an IO thread, a thread pool executor, and
+         # an IO loop. Here we clean up these resources to avoid leaking threads
+         # In normal operations, this is done as by an atexit handler when Zarr
+         # is shutting down.
+
+diff --git a/xarray/tests/test_duck_array_ops.py b/xarray/tests/test_duck_array_ops.py
+index 83c7c2b..ca03c7e 100644
+--- a/xarray/tests/test_duck_array_ops.py
++++ b/xarray/tests/test_duck_array_ops.py
+@@ -1109,6 +1109,21 @@ def test_extension_array_repr(int1):
+     assert repr(int1) in repr(int_duck_array)
+ 
+ 
++def test_extension_array_result_type_categorical(categorical1, categorical2):
++    res = np.result_type(
++        PandasExtensionArray(categorical1), PandasExtensionArray(categorical2)
++    )
++    assert isinstance(res, pd.CategoricalDtype)
++    assert set(res.categories) == set(categorical1.categories) | set(
++        categorical2.categories
++    )
++    assert not res.ordered
++
++    assert categorical1.dtype == np.result_type(
++        PandasExtensionArray(categorical1), pd.CategoricalDtype.na_value
++    )
++
++
+ def test_extension_array_attr():
+     array = pd.Categorical(["cat2", "cat1", "cat2", "cat3", "cat1"])
+     wrapped = PandasExtensionArray(array)
+
+diff --git a/xarray/tests/test_formatting.py b/xarray/tests/test_formatting.py
+index 7530bd8..5cb6c28 100644
+--- a/xarray/tests/test_formatting.py
++++ b/xarray/tests/test_formatting.py
+@@ -1064,7 +1064,7 @@ def test_array_repr_dtypes():
+     # Unsigned integer could be used as easy replacements
+     # for tests where the data-type does not matter,
+     # but the repr does, including the size
+-    # (size of a int == size of an uint)
++    # (size of an int == size of a uint)
+ 
+     # Signed integer dtypes
+ 
+
+diff --git a/xarray/tests/test_groupby.py b/xarray/tests/test_groupby.py
+index e8f9ea4..e96d8b6 100644
+--- a/xarray/tests/test_groupby.py
++++ b/xarray/tests/test_groupby.py
+@@ -1669,7 +1669,7 @@ class TestDataArrayGroupBy:
+ 
+         if has_flox:
+             # GH9803
+-            # reduce over one dim of a nD grouper
++            # reduce over one dim of an nD grouper
+             array.coords["labels"] = (("ny", "nx"), np.array([["a", "b"], ["b", "a"]]))
+             actual = array.groupby("labels").sum("nx")
+             expected_np = np.array([[[0, 1], [3, 2]], [[5, 10], [20, 15]]])
+
+diff --git a/xarray/tests/test_indexing.py b/xarray/tests/test_indexing.py
+index ffcfd31..6b564c6 100644
+--- a/xarray/tests/test_indexing.py
++++ b/xarray/tests/test_indexing.py
+@@ -275,6 +275,24 @@ class TestIndexers:
+ 
+ 
+ class TestLazyArray:
++    @pytest.mark.parametrize(
++        ["indexer", "size", "expected"],
++        (
++            (4, 5, 4),
++            (-1, 3, 2),
++            (slice(None), 4, slice(0, 4, 1)),
++            (slice(1, -3), 7, slice(1, 4, 1)),
++            (np.array([-1, 3, -2]), 5, np.array([4, 3, 3])),
++        ),
++    )
++    def normalize_indexer(self, indexer, size, expected):
++        actual = indexing.normalize_indexer(indexer, size)
++
++        if isinstance(expected, np.ndarray):
++            np.testing.assert_equal(actual, expected)
++        else:
++            assert actual == expected
++
+     def test_slice_slice(self) -> None:
+         arr = ReturnItem()
+         for size in [100, 99]:
+@@ -321,6 +339,47 @@ class TestLazyArray:
+         expected = np.arange(size)[old_slice][array]
+         assert_array_equal(actual, expected)
+ 
++    @pytest.mark.parametrize(
++        ["old_indexer", "indexer", "size", "expected"],
++        (
++            pytest.param(
++                slice(None), slice(None, 3), 5, slice(0, 3, 1), id="full_slice-slice"
++            ),
++            pytest.param(
++                slice(None), np.arange(2, 4), 5, np.arange(2, 4), id="full_slice-array"
++            ),
++            pytest.param(slice(None), 3, 5, 3, id="full_slice-int"),
++            pytest.param(
++                slice(2, 12, 3), slice(1, 3), 16, slice(5, 11, 3), id="slice_step-slice"
++            ),
++            pytest.param(
++                slice(2, 12, 3),
++                np.array([1, 3]),
++                16,
++                np.array([5, 11]),
++                id="slice_step-array",
++            ),
++            pytest.param(
++                np.arange(5), slice(1, 3), 7, np.arange(1, 3), id="array-slice"
++            ),
++            pytest.param(
++                np.arange(0, 8, 2),
++                np.arange(1, 3),
++                9,
++                np.arange(2, 6, 2),
++                id="array-array",
++            ),
++            pytest.param(np.arange(3), 2, 5, 2, id="array-int"),
++        ),
++    )
++    def test_index_indexer_1d(self, old_indexer, indexer, size, expected):
++        actual = indexing._index_indexer_1d(old_indexer, indexer, size)
++
++        if isinstance(expected, np.ndarray):
++            np.testing.assert_equal(actual, expected)
++        else:
++            assert actual == expected
++
+     def test_lazily_indexed_array(self) -> None:
+         original = np.random.rand(10, 20, 30)
+         x = indexing.NumpyIndexingAdapter(original)
+
+diff --git a/xarray/tests/test_variable.py b/xarray/tests/test_variable.py
+index 187a2f7..22f61d9 100644
+--- a/xarray/tests/test_variable.py
++++ b/xarray/tests/test_variable.py
+@@ -32,6 +32,7 @@ from xarray.core.utils import NDArrayMixin
+ from xarray.core.variable import as_compatible_data, as_variable
+ from xarray.namedarray.pycompat import array_type
+ from xarray.tests import (
++    IndexableArray,
+     assert_allclose,
+     assert_array_equal,
+     assert_equal,
+@@ -1086,7 +1087,7 @@ class TestVariable(VariableSubclassobjects):
+         [
+             (np.datetime64("2000-01-01"), "s"),
+             (
+-                pd.Timestamp("2000-01-01T00"),
++                pd.Timestamp("2000-01-01T00").as_unit("s"),
+                 "s" if has_pandas_3 else "ns",
+             ),
+             (
+@@ -1128,7 +1129,7 @@ class TestVariable(VariableSubclassobjects):
+         assert v.values == "foo".encode("ascii")
+ 
+     def test_0d_datetime(self):
+-        v = Variable([], pd.Timestamp("2000-01-01"))
++        v = Variable([], pd.Timestamp("2000-01-01").as_unit("s"))
+         expected_unit = "s" if has_pandas_3 else "ns"
+         assert v.dtype == np.dtype(f"datetime64[{expected_unit}]")
+         assert v.values == np.datetime64("2000-01-01", expected_unit)  # type: ignore[call-overload]
+@@ -3255,3 +3256,15 @@ def test_timedelta_conversion(values, unit) -> None:
+     dims = ["time"] if isinstance(values, np.ndarray | pd.Index) else []
+     var = Variable(dims, values)
+     assert var.dtype == np.dtype(f"timedelta64[{unit}]")
++
++
++def test_explicitly_indexed_array_preserved() -> None:
++    """Test that methods using ._data preserve ExplicitlyIndexed arrays.
++
++    Regression test for methods that should use ._data instead of .data
++    to avoid loading lazy arrays into memory.
++    """
++    arr = IndexableArray(np.array([1, 2, 3]))
++    var = Variable(["x"], arr)
++    result = var.drop_encoding()
++    assert isinstance(result._data, indexing.ExplicitlyIndexed)

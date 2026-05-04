@@ -1,0 +1,4376 @@
+diff --git a/jinja2/__init__.py b/jinja2/__init__.py
+index b4e1448..57bcdfd 100644
+--- a/jinja2/__init__.py
++++ b/jinja2/__init__.py
+@@ -23,11 +23,11 @@
+         {% endblock %}
+ 
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD, see LICENSE for more details.
+ """
+ __docformat__ = 'restructuredtext en'
+-__version__ = '2.8.1'
++__version__ = '2.9'
+ 
+ # high level interface
+ from jinja2.environment import Environment, Template
+@@ -55,7 +55,7 @@ from jinja2.filters import environmentfilter, contextfilter, \
+      evalcontextfilter
+ from jinja2.utils import Markup, escape, clear_caches, \
+      environmentfunction, evalcontextfunction, contextfunction, \
+-     is_undefined
++     is_undefined, select_autoescape
+ 
+ __all__ = [
+     'Environment', 'Template', 'BaseLoader', 'FileSystemLoader',
+@@ -67,4 +67,16 @@ __all__ = [
+     'ModuleLoader', 'environmentfilter', 'contextfilter', 'Markup', 'escape',
+     'environmentfunction', 'contextfunction', 'clear_caches', 'is_undefined',
+     'evalcontextfilter', 'evalcontextfunction', 'make_logging_undefined',
++    'select_autoescape',
+ ]
++
++
++def _patch_async():
++    from jinja2.utils import have_async_gen
++    if have_async_gen:
++        from jinja2.asyncsupport import patch_all
++        patch_all()
++
++
++_patch_async()
++del _patch_async
+
+diff --git a/jinja2/_compat.py b/jinja2/_compat.py
+index 143962f..61d8530 100644
+--- a/jinja2/_compat.py
++++ b/jinja2/_compat.py
+@@ -45,7 +45,6 @@ if not PY2:
+     implements_iterator = _identity
+     implements_to_string = _identity
+     encode_filename = _identity
+-    get_next = lambda x: x.__next__
+ 
+ else:
+     unichr = unichr
+@@ -77,8 +76,6 @@ else:
+         cls.__str__ = lambda x: x.__unicode__().encode('utf-8')
+         return cls
+ 
+-    get_next = lambda x: x.next
+-
+     def encode_filename(filename):
+         if isinstance(filename, unicode):
+             return filename.encode('utf-8')
+@@ -86,23 +83,14 @@ else:
+ 
+ 
+ def with_metaclass(meta, *bases):
++    """Create a base class with a metaclass."""
+     # This requires a bit of explanation: the basic idea is to make a
+-    # dummy metaclass for one level of class instanciation that replaces
+-    # itself with the actual metaclass.  Because of internal type checks
+-    # we also need to make sure that we downgrade the custom metaclass
+-    # for one level to something closer to type (that's why __call__ and
+-    # __init__ comes back from type etc.).
+-    #
+-    # This has the advantage over six.with_metaclass in that it does not
+-    # introduce dummy classes into the final MRO.
+-    class metaclass(meta):
+-        __call__ = type.__call__
+-        __init__ = type.__init__
++    # dummy metaclass for one level of class instantiation that replaces
++    # itself with the actual metaclass.
++    class metaclass(type):
+         def __new__(cls, name, this_bases, d):
+-            if this_bases is None:
+-                return type.__new__(cls, name, (), d)
+             return meta(name, bases, d)
+-    return metaclass('temporary_class', None, {})
++    return type.__new__(metaclass, 'temporary_class', (), {})
+ 
+ 
+ try:
+
+diff --git a/jinja2/asyncfilters.py b/jinja2/asyncfilters.py
+new file mode 100644
+index 0000000..5c1f46d
+--- /dev/null
++++ b/jinja2/asyncfilters.py
+@@ -0,0 +1,146 @@
++from functools import wraps
++
++from jinja2.asyncsupport import auto_aiter
++from jinja2 import filters
++
++
++async def auto_to_seq(value):
++    seq = []
++    if hasattr(value, '__aiter__'):
++        async for item in value:
++            seq.append(item)
++    else:
++        for item in value:
++            seq.append(item)
++    return seq
++
++
++async def async_select_or_reject(args, kwargs, modfunc, lookup_attr):
++    seq, func = filters.prepare_select_or_reject(
++        args, kwargs, modfunc, lookup_attr)
++    if seq:
++        async for item in auto_aiter(seq):
++            if func(item):
++                yield item
++
++
++def dualfilter(normal_filter, async_filter):
++    wrap_evalctx = False
++    if getattr(normal_filter, 'environmentfilter', False):
++        is_async = lambda args: args[0].is_async
++        wrap_evalctx = False
++    else:
++        if not getattr(normal_filter, 'evalcontextfilter', False) and \
++           not getattr(normal_filter, 'contextfilter', False):
++            wrap_evalctx = True
++        is_async = lambda args: args[0].environment.is_async
++
++    @wraps(normal_filter)
++    def wrapper(*args, **kwargs):
++        b = is_async(args)
++        if wrap_evalctx:
++            args = args[1:]
++        if b:
++            return async_filter(*args, **kwargs)
++        return normal_filter(*args, **kwargs)
++
++    if wrap_evalctx:
++        wrapper.evalcontextfilter = True
++
++    wrapper.asyncfiltervariant = True
++
++    return wrapper
++
++
++def asyncfiltervariant(original):
++    def decorator(f):
++        return dualfilter(original, f)
++    return decorator
++
++
++@asyncfiltervariant(filters.do_first)
++async def do_first(environment, seq):
++    try:
++        return await auto_aiter(seq).__anext__()
++    except StopAsyncIteration:
++        return environment.undefined('No first item, sequence was empty.')
++
++
++@asyncfiltervariant(filters.do_groupby)
++async def do_groupby(environment, value, attribute):
++    expr = filters.make_attrgetter(environment, attribute)
++    return [filters._GroupTuple(key, await auto_to_seq(values))
++            for key, values in filters.groupby(sorted(
++                await auto_to_seq(value), key=expr), expr)]
++
++
++@asyncfiltervariant(filters.do_join)
++async def do_join(eval_ctx, value, d=u'', attribute=None):
++    return filters.do_join(eval_ctx, await auto_to_seq(value), d, attribute)
++
++
++@asyncfiltervariant(filters.do_list)
++async def do_list(value):
++    return await auto_to_seq(value)
++
++
++@asyncfiltervariant(filters.do_reject)
++async def do_reject(*args, **kwargs):
++    return async_select_or_reject(args, kwargs, lambda x: not x, False)
++
++
++@asyncfiltervariant(filters.do_rejectattr)
++async def do_rejectattr(*args, **kwargs):
++    return async_select_or_reject(args, kwargs, lambda x: not x, True)
++
++
++@asyncfiltervariant(filters.do_select)
++async def do_select(*args, **kwargs):
++    return async_select_or_reject(args, kwargs, lambda x: x, False)
++
++
++@asyncfiltervariant(filters.do_selectattr)
++async def do_selectattr(*args, **kwargs):
++    return async_select_or_reject(args, kwargs, lambda x: x, True)
++
++
++@asyncfiltervariant(filters.do_map)
++async def do_map(*args, **kwargs):
++    seq, func = filters.prepare_map(args, kwargs)
++    if seq:
++        async for item in auto_aiter(seq):
++            yield func(item)
++
++
++@asyncfiltervariant(filters.do_sum)
++async def do_sum(environment, iterable, attribute=None, start=0):
++    rv = start
++    if attribute is not None:
++        func = filters.make_attrgetter(environment, attribute)
++    else:
++        func = lambda x: x
++    async for item in auto_aiter(iterable):
++        rv += func(item)
++    return rv
++
++
++@asyncfiltervariant(filters.do_slice)
++async def do_slice(value, slices, fill_with=None):
++    return filters.do_slice(await auto_to_seq(value), slices, fill_with)
++
++
++ASYNC_FILTERS = {
++    'first':        do_first,
++    'groupby':      do_groupby,
++    'join':         do_join,
++    'list':         do_list,
++    # we intentionally do not support do_last because that would be
++    # ridiculous
++    'reject':       do_reject,
++    'rejectattr':   do_rejectattr,
++    'map':          do_map,
++    'select':       do_select,
++    'selectattr':   do_selectattr,
++    'sum':          do_sum,
++    'slice':        do_slice,
++}
+
+diff --git a/jinja2/asyncsupport.py b/jinja2/asyncsupport.py
+new file mode 100644
+index 0000000..33a1a07
+--- /dev/null
++++ b/jinja2/asyncsupport.py
+@@ -0,0 +1,237 @@
++# -*- coding: utf-8 -*-
++"""
++    jinja2.asyncsupport
++    ~~~~~~~~~~~~~~~~~~~
++
++    Has all the code for async support which is implemented as a patch
++    for supported Python versions.
++
++    :copyright: (c) 2017 by the Jinja Team.
++    :license: BSD, see LICENSE for more details.
++"""
++import sys
++import asyncio
++import inspect
++from functools import update_wrapper
++
++from jinja2.utils import concat, internalcode, concat, Markup
++from jinja2.environment import TemplateModule
++from jinja2.runtime import LoopContextBase, _last_iteration
++
++
++async def concat_async(async_gen):
++    rv = []
++    async def collect():
++        async for event in async_gen:
++            rv.append(event)
++    await collect()
++    return concat(rv)
++
++
++async def generate_async(self, *args, **kwargs):
++    vars = dict(*args, **kwargs)
++    try:
++        async for event in self.root_render_func(self.new_context(vars)):
++            yield event
++    except Exception:
++        exc_info = sys.exc_info()
++    else:
++        return
++    yield self.environment.handle_exception(exc_info, True)
++
++
++def wrap_generate_func(original_generate):
++    def _convert_generator(self, loop, args, kwargs):
++        async_gen = self.generate_async(*args, **kwargs)
++        try:
++            while 1:
++                yield loop.run_until_complete(async_gen.__anext__())
++        except StopAsyncIteration:
++            pass
++    def generate(self, *args, **kwargs):
++        if not self.environment.is_async:
++            return original_generate(self, *args, **kwargs)
++        return _convert_generator(self, asyncio.get_event_loop(), args, kwargs)
++    return update_wrapper(generate, original_generate)
++
++
++async def render_async(self, *args, **kwargs):
++    if not self.environment.is_async:
++        raise RuntimeError('The environment was not created with async mode '
++                           'enabled.')
++
++    vars = dict(*args, **kwargs)
++    ctx = self.new_context(vars)
++
++    try:
++        return await concat_async(self.root_render_func(ctx))
++    except Exception:
++        exc_info = sys.exc_info()
++    return self.environment.handle_exception(exc_info, True)
++
++
++def wrap_render_func(original_render):
++    def render(self, *args, **kwargs):
++        if not self.environment.is_async:
++            return original_render(self, *args, **kwargs)
++        loop = asyncio.get_event_loop()
++        return loop.run_until_complete(self.render_async(*args, **kwargs))
++    return update_wrapper(render, original_render)
++
++
++def wrap_block_reference_call(original_call):
++    @internalcode
++    async def async_call(self):
++        rv = await concat_async(self._stack[self._depth](self._context))
++        if self._context.eval_ctx.autoescape:
++            rv = Markup(rv)
++        return rv
++
++    @internalcode
++    def __call__(self):
++        if not self._context.environment.is_async:
++            return original_call(self)
++        return async_call(self)
++
++    return update_wrapper(__call__, original_call)
++
++
++@internalcode
++async def get_default_module_async(self):
++    if self._module is not None:
++        return self._module
++    self._module = rv = await self.make_module_async()
++    return rv
++
++
++def wrap_default_module(original_default_module):
++    @internalcode
++    def _get_default_module(self):
++        if self.environment.is_async:
++            raise RuntimeError('Template module attribute is unavailable '
++                               'in async mode')
++        return original_default_module(self)
++    return _get_default_module
++
++
++async def make_module_async(self, vars=None, shared=False, locals=None):
++    context = self.new_context(vars, shared, locals)
++    body_stream = []
++    async for item in self.root_render_func(context):
++        body_stream.append(item)
++    return TemplateModule(self, context, body_stream)
++
++
++def patch_template():
++    from jinja2 import Template
++    Template.generate = wrap_generate_func(Template.generate)
++    Template.generate_async = update_wrapper(
++        generate_async, Template.generate_async)
++    Template.render_async = update_wrapper(
++        render_async, Template.render_async)
++    Template.render = wrap_render_func(Template.render)
++    Template._get_default_module = wrap_default_module(
++        Template._get_default_module)
++    Template._get_default_module_async = get_default_module_async
++    Template.make_module_async = update_wrapper(
++        make_module_async, Template.make_module_async)
++
++
++def patch_runtime():
++    from jinja2.runtime import BlockReference
++    BlockReference.__call__ = wrap_block_reference_call(
++        BlockReference.__call__)
++
++
++def patch_filters():
++    from jinja2.filters import FILTERS
++    from jinja2.asyncfilters import ASYNC_FILTERS
++    FILTERS.update(ASYNC_FILTERS)
++
++
++def patch_all():
++    patch_template()
++    patch_runtime()
++    patch_filters()
++
++
++async def auto_await(value):
++    if inspect.isawaitable(value):
++        return await value
++    return value
++
++
++async def auto_aiter(iterable):
++    if hasattr(iterable, '__aiter__'):
++        async for item in iterable:
++            yield item
++        return
++    for item in iterable:
++        yield item
++
++
++class AsyncLoopContext(LoopContextBase):
++
++    def __init__(self, async_iterator, after, length, recurse=None,
++                 depth0=0):
++        LoopContextBase.__init__(self, recurse, depth0)
++        self._async_iterator = async_iterator
++        self._after = after
++        self._length = length
++
++    @property
++    def length(self):
++        if self._length is None:
++            raise TypeError('Loop length for some iterators cannot be '
++                            'lazily calculated in async mode')
++        return self._length
++
++    def __aiter__(self):
++        return AsyncLoopContextIterator(self)
++
++
++class AsyncLoopContextIterator(object):
++    __slots__ = ('context',)
++
++    def __init__(self, context):
++        self.context = context
++
++    def __aiter__(self):
++        return self
++
++    async def __anext__(self):
++        ctx = self.context
++        ctx.index0 += 1
++        if ctx._after is _last_iteration:
++            raise StopAsyncIteration()
++        next_elem = ctx._after
++        try:
++            ctx._after = await ctx._async_iterator.__anext__()
++        except StopAsyncIteration:
++            ctx._after = _last_iteration
++        return next_elem, ctx
++
++
++async def make_async_loop_context(iterable, recurse=None, depth0=0):
++    # Length is more complicated and less efficient in async mode.  The
++    # reason for this is that we cannot know if length will be used
++    # upfront but because length is a property we cannot lazily execute it
++    # later.  This means that we need to buffer it up and measure :(
++    #
++    # We however only do this for actual iterators, not for async
++    # iterators as blocking here does not seem like the best idea in the
++    # world.
++    try:
++        length = len(iterable)
++    except (TypeError, AttributeError):
++        if not hasattr(iterable, '__aiter__'):
++            iterable = tuple(iterable)
++            length = len(iterable)
++        else:
++            length = None
++    async_iterator = auto_aiter(iterable)
++    try:
++        after = await async_iterator.__anext__()
++    except StopAsyncIteration:
++        after = _last_iteration
++    return AsyncLoopContext(async_iterator, after, length, recurse, depth0)
+
+diff --git a/jinja2/bccache.py b/jinja2/bccache.py
+index f5bd314..e58633e 100644
+--- a/jinja2/bccache.py
++++ b/jinja2/bccache.py
+@@ -11,7 +11,7 @@
+     Situations where this is useful are often forking web applications that
+     are initialized on the first request.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD.
+ """
+ from os import path, listdir
+
+diff --git a/jinja2/compiler.py b/jinja2/compiler.py
+index fad007b..0e15d01 100644
+--- a/jinja2/compiler.py
++++ b/jinja2/compiler.py
+@@ -5,19 +5,23 @@
+ 
+     Compiles nodes into python code.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD, see LICENSE for more details.
+ """
+ from itertools import chain
+ from copy import deepcopy
+ from keyword import iskeyword as is_python_keyword
++from functools import update_wrapper
+ from jinja2 import nodes
+ from jinja2.nodes import EvalContext
+ from jinja2.visitor import NodeVisitor
++from jinja2.optimizer import Optimizer
+ from jinja2.exceptions import TemplateAssertionError
+ from jinja2.utils import Markup, concat, escape
+ from jinja2._compat import range_type, text_type, string_types, \
+      iteritems, NativeStringIO, imap
++from jinja2.idtracking import Symbols, VAR_LOAD_PARAMETER, \
++     VAR_LOAD_RESOLVE, VAR_LOAD_ALIAS, VAR_LOAD_UNDEFINED
+ 
+ 
+ operators = {
+@@ -38,27 +42,43 @@ if hasattr(dict, 'iteritems'):
+ else:
+     dict_item_iter = 'items'
+ 
++code_features = ['division']
+ 
+-# does if 0: dummy(x) get us x into the scope?
+-def unoptimize_before_dead_code():
+-    x = 42
+-    def f():
+-        if 0: dummy(x)
+-    return f
++# does this python version support generator stops? (PEP 0479)
++try:
++    exec('from __future__ import generator_stop')
++    code_features.append('generator_stop')
++except SyntaxError:
++    pass
+ 
+-# The getattr is necessary for pypy which does not set this attribute if
+-# no closure is on the function
+-unoptimize_before_dead_code = bool(
+-    getattr(unoptimize_before_dead_code(), '__closure__', None))
++# does this python version support yield from?
++try:
++    exec('def f(): yield from x()')
++except SyntaxError:
++    supports_yield_from = False
++else:
++    supports_yield_from = True
++
++
++def optimizeconst(f):
++    def new_func(self, node, frame, **kwargs):
++        # Only optimize if the frame is not volatile
++        if self.optimized and not frame.eval_ctx.volatile:
++            new_node = self.optimizer.visit(node, frame.eval_ctx)
++            if new_node != node:
++                return self.visit(new_node, frame)
++        return f(self, node, frame, **kwargs)
++    return update_wrapper(new_func, f)
+ 
+ 
+ def generate(node, environment, name, filename, stream=None,
+-             defer_init=False):
++             defer_init=False, optimized=True):
+     """Generate the python source for a node tree."""
+     if not isinstance(node, nodes.Template):
+         raise TypeError('Can\'t compile non template nodes')
+     generator = environment.code_generator_class(environment, name, filename,
+-                                                 stream, defer_init)
++                                                 stream, defer_init,
++                                                 optimized)
+     generator.visit(node)
+     if stream is None:
+         return generator.stream.getvalue()
+@@ -68,15 +88,14 @@ def has_safe_repr(value):
+     """Does the node have a safe representation?"""
+     if value is None or value is NotImplemented or value is Ellipsis:
+         return True
+-    if isinstance(value, (bool, int, float, complex, range_type,
+-            Markup) + string_types):
++    if type(value) in (bool, int, float, complex, range_type, Markup) + string_types:
+         return True
+-    if isinstance(value, (tuple, list, set, frozenset)):
++    if type(value) in (tuple, list, set, frozenset):
+         for item in value:
+             if not has_safe_repr(item):
+                 return False
+         return True
+-    elif isinstance(value, dict):
++    elif type(value) is dict:
+         for key, value in iteritems(value):
+             if not has_safe_repr(key):
+                 return False
+@@ -99,41 +118,13 @@ def find_undeclared(nodes, names):
+     return visitor.undeclared
+ 
+ 
+-class Identifiers(object):
+-    """Tracks the status of identifiers in frames."""
+-
+-    def __init__(self):
+-        # variables that are known to be declared (probably from outer
+-        # frames or because they are special for the frame)
+-        self.declared = set()
+-
+-        # undeclared variables from outer scopes
+-        self.outer_undeclared = set()
+-
+-        # names that are accessed without being explicitly declared by
+-        # this one or any of the outer scopes.  Names can appear both in
+-        # declared and undeclared.
+-        self.undeclared = set()
+-
+-        # names that are declared locally
+-        self.declared_locally = set()
+-
+-        # names that are declared by parameters
+-        self.declared_parameter = set()
+-
+-    def add_special(self, name):
+-        """Register a special name like `loop`."""
+-        self.undeclared.discard(name)
+-        self.declared.add(name)
++class MacroRef(object):
+ 
+-    def is_declared(self, name):
+-        """Check if a name is declared in this or an outer scope."""
+-        if name in self.declared_locally or name in self.declared_parameter:
+-            return True
+-        return name in self.declared
+-
+-    def copy(self):
+-        return deepcopy(self)
++    def __init__(self, node):
++        self.node = node
++        self.accesses_caller = False
++        self.accesses_kwargs = False
++        self.accesses_varargs = False
+ 
+ 
+ class Frame(object):
+@@ -141,7 +132,7 @@ class Frame(object):
+ 
+     def __init__(self, eval_ctx, parent=None):
+         self.eval_ctx = eval_ctx
+-        self.identifiers = Identifiers()
++        self.symbols = Symbols(parent and parent.symbols or None)
+ 
+         # a toplevel frame is the root + soft frames such as if conditions.
+         self.toplevel = False
+@@ -164,50 +155,19 @@ class Frame(object):
+         # the name of the block we're in, otherwise None.
+         self.block = parent and parent.block or None
+ 
+-        # a set of actually assigned names
+-        self.assigned_names = set()
+-
+         # the parent of this frame
+         self.parent = parent
+ 
+         if parent is not None:
+-            self.identifiers.declared.update(
+-                parent.identifiers.declared |
+-                parent.identifiers.declared_parameter |
+-                parent.assigned_names
+-            )
+-            self.identifiers.outer_undeclared.update(
+-                parent.identifiers.undeclared -
+-                self.identifiers.declared
+-            )
+             self.buffer = parent.buffer
+ 
+     def copy(self):
+         """Create a copy of the current one."""
+         rv = object.__new__(self.__class__)
+         rv.__dict__.update(self.__dict__)
+-        rv.identifiers = object.__new__(self.identifiers.__class__)
+-        rv.identifiers.__dict__.update(self.identifiers.__dict__)
++        rv.symbols = self.symbols.copy()
+         return rv
+ 
+-    def inspect(self, nodes):
+-        """Walk the node and check for identifiers.  If the scope is hard (eg:
+-        enforce on a python level) overrides from outer scopes are tracked
+-        differently.
+-        """
+-        visitor = FrameIdentifierVisitor(self.identifiers)
+-        for node in nodes:
+-            visitor.visit(node)
+-
+-    def find_shadowed(self, extra=()):
+-        """Find all the shadowed names.  extra is an iterable of variables
+-        that may be defined with `add_special` which may occour scoped.
+-        """
+-        i = self.identifiers
+-        return (i.declared | i.outer_undeclared) & \
+-               (i.declared_locally | i.declared_parameter) | \
+-               set(x for x in extra if i.is_declared(x))
+-
+     def inner(self):
+         """Return an inner frame."""
+         return Frame(self.eval_ctx, self)
+@@ -216,6 +176,8 @@ class Frame(object):
+         """Return a soft frame.  A soft frame may not be modified as
+         standalone thing as it shares the resources with the frame it
+         was created of, but it's not a rootlevel frame any longer.
++
++        This is only used to implement if-statements.
+         """
+         rv = self.copy()
+         rv.rootlevel = False
+@@ -269,95 +231,6 @@ class UndeclaredNameVisitor(NodeVisitor):
+         """Stop visiting a blocks."""
+ 
+ 
+-class FrameIdentifierVisitor(NodeVisitor):
+-    """A visitor for `Frame.inspect`."""
+-
+-    def __init__(self, identifiers):
+-        self.identifiers = identifiers
+-
+-    def visit_Name(self, node):
+-        """All assignments to names go through this function."""
+-        if node.ctx == 'store':
+-            self.identifiers.declared_locally.add(node.name)
+-        elif node.ctx == 'param':
+-            self.identifiers.declared_parameter.add(node.name)
+-        elif node.ctx == 'load' and not \
+-             self.identifiers.is_declared(node.name):
+-            self.identifiers.undeclared.add(node.name)
+-
+-    def visit_If(self, node):
+-        self.visit(node.test)
+-        real_identifiers = self.identifiers
+-
+-        old_names = real_identifiers.declared_locally | \
+-                    real_identifiers.declared_parameter
+-
+-        def inner_visit(nodes):
+-            if not nodes:
+-                return set()
+-            self.identifiers = real_identifiers.copy()
+-            for subnode in nodes:
+-                self.visit(subnode)
+-            rv = self.identifiers.declared_locally - old_names
+-            # we have to remember the undeclared variables of this branch
+-            # because we will have to pull them.
+-            real_identifiers.undeclared.update(self.identifiers.undeclared)
+-            self.identifiers = real_identifiers
+-            return rv
+-
+-        body = inner_visit(node.body)
+-        else_ = inner_visit(node.else_ or ())
+-
+-        # the differences between the two branches are also pulled as
+-        # undeclared variables
+-        real_identifiers.undeclared.update(body.symmetric_difference(else_) -
+-                                           real_identifiers.declared)
+-
+-        # remember those that are declared.
+-        real_identifiers.declared_locally.update(body | else_)
+-
+-    def visit_Macro(self, node):
+-        self.identifiers.declared_locally.add(node.name)
+-
+-    def visit_Import(self, node):
+-        self.generic_visit(node)
+-        self.identifiers.declared_locally.add(node.target)
+-
+-    def visit_FromImport(self, node):
+-        self.generic_visit(node)
+-        for name in node.names:
+-            if isinstance(name, tuple):
+-                self.identifiers.declared_locally.add(name[1])
+-            else:
+-                self.identifiers.declared_locally.add(name)
+-
+-    def visit_Assign(self, node):
+-        """Visit assignments in the correct order."""
+-        self.visit(node.node)
+-        self.visit(node.target)
+-
+-    def visit_For(self, node):
+-        """Visiting stops at for blocks.  However the block sequence
+-        is visited as part of the outer scope.
+-        """
+-        self.visit(node.iter)
+-
+-    def visit_CallBlock(self, node):
+-        self.visit(node.call)
+-
+-    def visit_FilterBlock(self, node):
+-        self.visit(node.filter)
+-
+-    def visit_AssignBlock(self, node):
+-        """Stop visiting at block assigns."""
+-
+-    def visit_Scope(self, node):
+-        """Stop visiting at scopes."""
+-
+-    def visit_Block(self, node):
+-        """Stop visiting at blocks."""
+-
+-
+ class CompilerExit(Exception):
+     """Raised if the compiler encountered a situation where it just
+     doesn't make sense to further process the code.  Any block that
+@@ -368,7 +241,7 @@ class CompilerExit(Exception):
+ class CodeGenerator(NodeVisitor):
+ 
+     def __init__(self, environment, name, filename, stream=None,
+-                 defer_init=False):
++                 defer_init=False, optimized=True):
+         if stream is None:
+             stream = NativeStringIO()
+         self.environment = environment
+@@ -377,6 +250,9 @@ class CodeGenerator(NodeVisitor):
+         self.stream = stream
+         self.created_block_context = False
+         self.defer_init = defer_init
++        self.optimized = optimized
++        if optimized:
++            self.optimizer = Optimizer(environment)
+ 
+         # aliases for imports
+         self.import_aliases = {}
+@@ -420,6 +296,12 @@ class CodeGenerator(NodeVisitor):
+         # the current indentation
+         self._indentation = 0
+ 
++        # Tracks toplevel assignments
++        self._assign_stack = []
++
++        # Tracks parameter definition blocks
++        self._param_def_block = []
++
+     # -- Various compilation helpers
+ 
+     def fail(self, msg, lineno):
+@@ -436,21 +318,23 @@ class CodeGenerator(NodeVisitor):
+         frame.buffer = self.temporary_identifier()
+         self.writeline('%s = []' % frame.buffer)
+ 
+-    def return_buffer_contents(self, frame):
++    def return_buffer_contents(self, frame, force_unescaped=False):
+         """Return the buffer contents of the frame."""
+-        if frame.eval_ctx.volatile:
+-            self.writeline('if context.eval_ctx.autoescape:')
+-            self.indent()
+-            self.writeline('return Markup(concat(%s))' % frame.buffer)
+-            self.outdent()
+-            self.writeline('else:')
+-            self.indent()
+-            self.writeline('return concat(%s)' % frame.buffer)
+-            self.outdent()
+-        elif frame.eval_ctx.autoescape:
+-            self.writeline('return Markup(concat(%s))' % frame.buffer)
+-        else:
+-            self.writeline('return concat(%s)' % frame.buffer)
++        if not force_unescaped:
++            if frame.eval_ctx.volatile:
++                self.writeline('if context.eval_ctx.autoescape:')
++                self.indent()
++                self.writeline('return Markup(concat(%s))' % frame.buffer)
++                self.outdent()
++                self.writeline('else:')
++                self.indent()
++                self.writeline('return concat(%s)' % frame.buffer)
++                self.outdent()
++                return
++            elif frame.eval_ctx.autoescape:
++                self.writeline('return Markup(concat(%s))' % frame.buffer)
++                return
++        self.writeline('return concat(%s)' % frame.buffer)
+ 
+     def indent(self):
+         """Indent by one."""
+@@ -480,14 +364,11 @@ class CodeGenerator(NodeVisitor):
+ 
+     def blockvisit(self, nodes, frame):
+         """Visit a list of nodes as block in a frame.  If the current frame
+-        is no buffer a dummy ``if 0: yield None`` is written automatically
+-        unless the force_generator parameter is set to False.
++        is no buffer a dummy ``if 0: yield None`` is written automatically.
+         """
+-        if frame.buffer is None:
+-            self.writeline('if 0: yield None')
+-        else:
+-            self.writeline('pass')
+         try:
++            if not nodes:
++                self.writeline('pass')
+             for node in nodes:
+                 self.visit(node, frame)
+         except CompilerExit:
+@@ -573,11 +454,6 @@ class CodeGenerator(NodeVisitor):
+             self.write(', **')
+             self.visit(node.dyn_kwargs, frame)
+ 
+-    def pull_locals(self, frame):
+-        """Pull all the references identifiers into the local scope."""
+-        for name in frame.identifiers.undeclared:
+-            self.writeline('l_%s = context.resolve(%r)' % (name, name))
+-
+     def pull_dependencies(self, nodes):
+         """Pull all the dependencies."""
+         visitor = DependencyFinderVisitor()
+@@ -591,163 +467,102 @@ class CodeGenerator(NodeVisitor):
+                 self.writeline('%s = environment.%s[%r]' %
+                                (mapping[name], dependency, name))
+ 
+-    def unoptimize_scope(self, frame):
+-        """Disable Python optimizations for the frame."""
+-        # XXX: this is not that nice but it has no real overhead.  It
+-        # mainly works because python finds the locals before dead code
+-        # is removed.  If that breaks we have to add a dummy function
+-        # that just accepts the arguments and does nothing.
+-        if frame.identifiers.declared:
+-            self.writeline('%sdummy(%s)' % (
+-                unoptimize_before_dead_code and 'if 0: ' or '',
+-                ', '.join('l_' + name for name in frame.identifiers.declared)
+-            ))
+-
+-    def push_scope(self, frame, extra_vars=()):
+-        """This function returns all the shadowed variables in a dict
+-        in the form name: alias and will write the required assignments
+-        into the current scope.  No indentation takes place.
+-
+-        This also predefines locally declared variables from the loop
+-        body because under some circumstances it may be the case that
+-
+-        `extra_vars` is passed to `Frame.find_shadowed`.
+-        """
+-        aliases = {}
+-        for name in frame.find_shadowed(extra_vars):
+-            aliases[name] = ident = self.temporary_identifier()
+-            self.writeline('%s = l_%s' % (ident, name))
+-        to_declare = set()
+-        for name in frame.identifiers.declared_locally:
+-            if name not in aliases:
+-                to_declare.add('l_' + name)
+-        if to_declare:
+-            self.writeline(' = '.join(to_declare) + ' = missing')
+-        return aliases
+-
+-    def pop_scope(self, aliases, frame):
+-        """Restore all aliases and delete unused variables."""
+-        for name, alias in iteritems(aliases):
+-            self.writeline('l_%s = %s' % (name, alias))
+-        to_delete = set()
+-        for name in frame.identifiers.declared_locally:
+-            if name not in aliases:
+-                to_delete.add('l_' + name)
+-        if to_delete:
+-            # we cannot use the del statement here because enclosed
+-            # scopes can trigger a SyntaxError:
+-            #   a = 42; b = lambda: a; del a
+-            self.writeline(' = '.join(to_delete) + ' = missing')
+-
+-    def function_scoping(self, node, frame, children=None,
+-                         find_special=True):
+-        """In Jinja a few statements require the help of anonymous
+-        functions.  Those are currently macros and call blocks and in
+-        the future also recursive loops.  As there is currently
+-        technical limitation that doesn't allow reading and writing a
+-        variable in a scope where the initial value is coming from an
+-        outer scope, this function tries to fall back with a common
+-        error message.  Additionally the frame passed is modified so
+-        that the argumetns are collected and callers are looked up.
+-
+-        This will return the modified frame.
+-        """
+-        # we have to iterate twice over it, make sure that works
+-        if children is None:
+-            children = node.iter_child_nodes()
+-        children = list(children)
+-        func_frame = frame.inner()
+-        func_frame.inspect(children)
+-
+-        # variables that are undeclared (accessed before declaration) and
+-        # declared locally *and* part of an outside scope raise a template
+-        # assertion error. Reason: we can't generate reasonable code from
+-        # it without aliasing all the variables.
+-        # this could be fixed in Python 3 where we have the nonlocal
+-        # keyword or if we switch to bytecode generation
+-        overridden_closure_vars = (
+-            func_frame.identifiers.undeclared &
+-            func_frame.identifiers.declared &
+-            (func_frame.identifiers.declared_locally |
+-             func_frame.identifiers.declared_parameter)
+-        )
+-        if overridden_closure_vars:
+-            self.fail('It\'s not possible to set and access variables '
+-                      'derived from an outer scope! (affects: %s)' %
+-                      ', '.join(sorted(overridden_closure_vars)), node.lineno)
+-
+-        # remove variables from a closure from the frame's undeclared
+-        # identifiers.
+-        func_frame.identifiers.undeclared -= (
+-            func_frame.identifiers.undeclared &
+-            func_frame.identifiers.declared
+-        )
+-
+-        # no special variables for this scope, abort early
+-        if not find_special:
+-            return func_frame
+-
+-        func_frame.accesses_kwargs = False
+-        func_frame.accesses_varargs = False
+-        func_frame.accesses_caller = False
+-        func_frame.arguments = args = ['l_' + x.name for x in node.args]
+-
+-        undeclared = find_undeclared(children, ('caller', 'kwargs', 'varargs'))
++    def enter_frame(self, frame):
++        undefs = []
++        for target, (action, param) in iteritems(frame.symbols.loads):
++            if action == VAR_LOAD_PARAMETER:
++                pass
++            elif action == VAR_LOAD_RESOLVE:
++                self.writeline('%s = resolve(%r)' %
++                               (target, param))
++            elif action == VAR_LOAD_ALIAS:
++                self.writeline('%s = %s' % (target, param))
++            elif action == VAR_LOAD_UNDEFINED:
++                undefs.append(target)
++            else:
++                raise NotImplementedError('unknown load instruction')
++        if undefs:
++            self.writeline('%s = missing' % ' = '.join(undefs))
++
++    def leave_frame(self, frame, with_python_scope=False):
++        if not with_python_scope:
++            undefs = []
++            for target, _ in iteritems(frame.symbols.loads):
++                undefs.append(target)
++            if undefs:
++                self.writeline('%s = missing' % ' = '.join(undefs))
++
++    def func(self, name):
++        if self.environment.is_async:
++            return 'async def %s' % name
++        return 'def %s' % name
++
++    def macro_body(self, node, frame):
++        """Dump the function def of a macro or call block."""
++        frame = frame.inner()
++        frame.symbols.analyze_node(node)
++        macro_ref = MacroRef(node)
++
++        args = []
++        for arg in node.args:
++            args.append(frame.symbols.ref(arg.name))
+ 
++        undeclared = find_undeclared(node.body, ('caller', 'kwargs', 'varargs'))
+         if 'caller' in undeclared:
+-            func_frame.accesses_caller = True
+-            func_frame.identifiers.add_special('caller')
+-            args.append('l_caller')
++            args.append(frame.symbols.declare_parameter('caller'))
++            macro_ref.accesses_caller = True
+         if 'kwargs' in undeclared:
+-            func_frame.accesses_kwargs = True
+-            func_frame.identifiers.add_special('kwargs')
+-            args.append('l_kwargs')
++            args.append(frame.symbols.declare_parameter('kwargs'))
++            macro_ref.accesses_kwargs = True
+         if 'varargs' in undeclared:
+-            func_frame.accesses_varargs = True
+-            func_frame.identifiers.add_special('varargs')
+-            args.append('l_varargs')
+-        return func_frame
++            args.append(frame.symbols.declare_parameter('varargs'))
++            macro_ref.accesses_varargs = True
+ 
+-    def macro_body(self, node, frame, children=None):
+-        """Dump the function def of a macro or call block."""
+-        frame = self.function_scoping(node, frame, children)
+         # macros are delayed, they never require output checks
+         frame.require_output_check = False
+-        args = frame.arguments
+-        # XXX: this is an ugly fix for the loop nesting bug
+-        # (tests.test_old_bugs.test_loop_call_bug).  This works around
+-        # a identifier nesting problem we have in general.  It's just more
+-        # likely to happen in loops which is why we work around it.  The
+-        # real solution would be "nonlocal" all the identifiers that are
+-        # leaking into a new python frame and might be used both unassigned
+-        # and assigned.
+-        if 'loop' in frame.identifiers.declared:
+-            args = args + ['l_loop=l_loop']
+-        self.writeline('def macro(%s):' % ', '.join(args), node)
++        frame.symbols.analyze_node(node)
++        self.writeline('%s(%s):' % (self.func('macro'), ', '.join(args)), node)
+         self.indent()
++
+         self.buffer(frame)
+-        self.pull_locals(frame)
++        self.enter_frame(frame)
++
++        self.push_parameter_definitions(frame)
++        for idx, arg in enumerate(node.args):
++            ref = frame.symbols.ref(arg.name)
++            self.writeline('if %s is missing:' % ref)
++            self.indent()
++            try:
++                default = node.defaults[idx - len(node.args)]
++            except IndexError:
++                self.writeline('%s = undefined(%r, name=%r)' % (
++                    ref,
++                    'parameter %r was not provided' % arg.name,
++                    arg.name))
++            else:
++                self.writeline('%s = ' % ref)
++                self.visit(default, frame)
++            self.mark_parameter_stored(ref)
++            self.outdent()
++        self.pop_parameter_definitions()
++
+         self.blockvisit(node.body, frame)
+-        self.return_buffer_contents(frame)
++        self.return_buffer_contents(frame, force_unescaped=True)
++        self.leave_frame(frame, with_python_scope=True)
+         self.outdent()
+-        return frame
+ 
+-    def macro_def(self, node, frame):
++        return frame, macro_ref
++
++    def macro_def(self, macro_ref, frame):
+         """Dump the macro definition for the def created by macro_body."""
+-        arg_tuple = ', '.join(repr(x.name) for x in node.args)
+-        name = getattr(node, 'name', None)
+-        if len(node.args) == 1:
++        arg_tuple = ', '.join(repr(x.name) for x in macro_ref.node.args)
++        name = getattr(macro_ref.node, 'name', None)
++        if len(macro_ref.node.args) == 1:
+             arg_tuple += ','
+-        self.write('Macro(environment, macro, %r, (%s), (' %
+-                   (name, arg_tuple))
+-        for arg in node.defaults:
+-            self.visit(arg, frame)
+-            self.write(', ')
+-        self.write('), %r, %r, %r)' % (
+-            bool(frame.accesses_kwargs),
+-            bool(frame.accesses_varargs),
+-            bool(frame.accesses_caller)
+-        ))
++        self.write('Macro(environment, macro, %r, (%s), %r, %r, %r, '
++                   'context.eval_ctx.autoescape)' %
++                   (name, arg_tuple, macro_ref.accesses_kwargs,
++                    macro_ref.accesses_varargs, macro_ref.accesses_caller))
+ 
+     def position(self, node):
+         """Return a human readable position for the node."""
+@@ -756,6 +571,78 @@ class CodeGenerator(NodeVisitor):
+             rv += ' in ' + repr(self.name)
+         return rv
+ 
++    def dump_local_context(self, frame):
++        return '{%s}' % ', '.join(
++            '%r: %s' % (name, target) for name, target
++            in iteritems(frame.symbols.dump_stores()))
++
++    def write_commons(self):
++        """Writes a common preamble that is used by root and block functions.
++        Primarily this sets up common local helpers and enforces a generator
++        through a dead branch.
++        """
++        self.writeline('resolve = context.resolve_or_missing')
++        self.writeline('undefined = environment.undefined')
++        self.writeline('if 0: yield None')
++
++    def push_parameter_definitions(self, frame):
++        """Pushes all parameter targets from the given frame into a local
++        stack that permits tracking of yet to be assigned parameters.  In
++        particular this enables the optimization from `visit_Name` to skip
++        undefined expressions for parameters in macros as macros can reference
++        otherwise unbound parameters.
++        """
++        self._param_def_block.append(frame.symbols.dump_param_targets())
++
++    def pop_parameter_definitions(self):
++        """Pops the current parameter definitions set."""
++        self._param_def_block.pop()
++
++    def mark_parameter_stored(self, target):
++        """Marks a parameter in the current parameter definitions as stored.
++        This will skip the enforced undefined checks.
++        """
++        if self._param_def_block:
++            self._param_def_block[-1].discard(target)
++
++    def parameter_is_undeclared(self, target):
++        """Checks if a given target is an undeclared parameter."""
++        if not self._param_def_block:
++            return False
++        return target in self._param_def_block[-1]
++
++    def push_assign_tracking(self):
++        """Pushes a new layer for assignment tracking."""
++        self._assign_stack.append(set())
++
++    def pop_assign_tracking(self, frame):
++        """Pops the topmost level for assignment tracking and updates the
++        context variables if necessary.
++        """
++        vars = self._assign_stack.pop()
++        if not frame.toplevel or not vars:
++            return
++        public_names = [x for x in vars if x[:1] != '_']
++        if len(vars) == 1:
++            name = next(iter(vars))
++            ref = frame.symbols.ref(name)
++            self.writeline('context.vars[%r] = %s' % (name, ref))
++        else:
++            self.writeline('context.vars.update({')
++            for idx, name in enumerate(vars):
++                if idx:
++                    self.write(', ')
++                ref = frame.symbols.ref(name)
++                self.write('%r: %s' % (name, ref))
++            self.write('})')
++        if public_names:
++            if len(public_names) == 1:
++                self.writeline('context.exported_vars.add(%r)' %
++                               public_names[0])
++            else:
++                self.writeline('context.exported_vars.update((%s))' %
++                               ', '.join(imap(repr, public_names)))
++
+     # -- Statement Visitors
+ 
+     def visit_Template(self, node, frame=None):
+@@ -763,10 +650,12 @@ class CodeGenerator(NodeVisitor):
+         eval_ctx = EvalContext(self.environment, self.name)
+ 
+         from jinja2.runtime import __all__ as exported
+-        self.writeline('from __future__ import division')
++        self.writeline('from __future__ import %s' % ', '.join(code_features))
+         self.writeline('from jinja2.runtime import ' + ', '.join(exported))
+-        if not unoptimize_before_dead_code:
+-            self.writeline('dummy = lambda *x: None')
++
++        if self.environment.is_async:
++            self.writeline('from jinja2.asyncsupport import auto_await, '
++                           'auto_aiter, make_async_loop_context')
+ 
+         # if we want a deferred initialization we cannot move the
+         # environment into a local name
+@@ -798,22 +687,25 @@ class CodeGenerator(NodeVisitor):
+         self.writeline('name = %r' % self.name)
+ 
+         # generate the root render function.
+-        self.writeline('def root(context%s):' % envenv, extra=1)
++        self.writeline('%s(context, missing=missing%s):' %
++                       (self.func('root'), envenv), extra=1)
++        self.indent()
++        self.write_commons()
+ 
+         # process the root
+         frame = Frame(eval_ctx)
+-        frame.inspect(node.body)
++        if 'self' in find_undeclared(node.body, ('self',)):
++            ref = frame.symbols.declare_parameter('self')
++            self.writeline('%s = TemplateReference(context)' % ref)
++        frame.symbols.analyze_node(node)
+         frame.toplevel = frame.rootlevel = True
+         frame.require_output_check = have_extends and not self.has_known_extends
+-        self.indent()
+         if have_extends:
+             self.writeline('parent_template = None')
+-        if 'self' in find_undeclared(node.body, ('self',)):
+-            frame.identifiers.add_special('self')
+-            self.writeline('l_self = TemplateReference(context)')
+-        self.pull_locals(frame)
++        self.enter_frame(frame)
+         self.pull_dependencies(node.body)
+         self.blockvisit(node.body, frame)
++        self.leave_frame(frame, with_python_scope=True)
+         self.outdent()
+ 
+         # make sure that the parent root is called.
+@@ -822,31 +714,42 @@ class CodeGenerator(NodeVisitor):
+                 self.indent()
+                 self.writeline('if parent_template is not None:')
+             self.indent()
+-            self.writeline('for event in parent_template.'
+-                           'root_render_func(context):')
+-            self.indent()
+-            self.writeline('yield event')
+-            self.outdent(2 + (not self.has_known_extends))
++            if supports_yield_from:
++                self.writeline('yield from parent_template.'
++                               'root_render_func(context)')
++            else:
++                self.writeline('for event in parent_template.'
++                               'root_render_func(context):')
++                self.indent()
++                self.writeline('yield event')
++                self.outdent()
++            self.outdent(1 + (not self.has_known_extends))
+ 
+         # at this point we now have the blocks collected and can visit them too.
+         for name, block in iteritems(self.blocks):
+-            block_frame = Frame(eval_ctx)
+-            block_frame.inspect(block.body)
+-            block_frame.block = name
+-            self.writeline('def block_%s(context%s):' % (name, envenv),
++            self.writeline('%s(context, missing=missing%s):' %
++                           (self.func('block_' + name), envenv),
+                            block, 1)
+             self.indent()
++            self.write_commons()
++            # It's important that we do not make this frame a child of the
++            # toplevel template.  This would cause a variety of
++            # interesting issues with identifier tracking.
++            block_frame = Frame(eval_ctx)
+             undeclared = find_undeclared(block.body, ('self', 'super'))
+             if 'self' in undeclared:
+-                block_frame.identifiers.add_special('self')
+-                self.writeline('l_self = TemplateReference(context)')
++                ref = block_frame.symbols.declare_parameter('self')
++                self.writeline('%s = TemplateReference(context)' % ref)
+             if 'super' in undeclared:
+-                block_frame.identifiers.add_special('super')
+-                self.writeline('l_super = context.super(%r, '
+-                               'block_%s)' % (name, name))
+-            self.pull_locals(block_frame)
++                ref = block_frame.symbols.declare_parameter('super')
++                self.writeline('%s = context.super(%r, '
++                               'block_%s)' % (ref, name, name))
++            block_frame.symbols.analyze_node(block)
++            block_frame.block = name
++            self.enter_frame(block_frame)
+             self.pull_dependencies(block.body)
+             self.blockvisit(block.body, block_frame)
++            self.leave_frame(block_frame, with_python_scope=True)
+             self.outdent()
+ 
+         self.writeline('blocks = {%s}' % ', '.join('%r: block_%s' % (x, x)
+@@ -859,7 +762,7 @@ class CodeGenerator(NodeVisitor):
+ 
+     def visit_Block(self, node, frame):
+         """Call a block and register it for the template."""
+-        level = 1
++        level = 0
+         if frame.toplevel:
+             # if we know that we are a child template, there is no need to
+             # check if we are one
+@@ -869,11 +772,20 @@ class CodeGenerator(NodeVisitor):
+                 self.writeline('if parent_template is None:')
+                 self.indent()
+                 level += 1
+-        context = node.scoped and 'context.derived(locals())' or 'context'
+-        self.writeline('for event in context.blocks[%r][0](%s):' % (
+-                       node.name, context), node)
+-        self.indent()
+-        self.simple_write('event', frame)
++        context = node.scoped and (
++            'context.derived(%s)' % self.dump_local_context(frame)) or 'context'
++
++        if supports_yield_from and not self.environment.is_async:
++            self.writeline('yield from context.blocks[%r][0](%s)' % (
++                           node.name, context), node)
++        else:
++            loop = self.environment.is_async and 'async for' or 'for'
++            self.writeline('%s event in context.blocks[%r][0](%s):' % (
++                           loop, node.name, context), node)
++            self.indent()
++            self.simple_write('event', frame)
++            self.outdent()
++
+         self.outdent(level)
+ 
+     def visit_Extends(self, node, frame):
+@@ -925,8 +837,6 @@ class CodeGenerator(NodeVisitor):
+ 
+     def visit_Include(self, node, frame):
+         """Handles includes."""
+-        if node.with_context:
+-            self.unoptimize_scope(frame)
+         if node.ignore_missing:
+             self.writeline('try:')
+             self.indent()
+@@ -952,48 +862,69 @@ class CodeGenerator(NodeVisitor):
+             self.writeline('else:')
+             self.indent()
+ 
++        skip_event_yield = False
+         if node.with_context:
+-            self.writeline('for event in template.root_render_func('
+-                           'template.new_context(context.parent, True, '
+-                           'locals())):')
++            loop = self.environment.is_async and 'async for' or 'for'
++            self.writeline('%s event in template.root_render_func('
++                           'template.new_context(context.get_all(), True, '
++                           '%s)):' % (loop, self.dump_local_context(frame)))
++        elif self.environment.is_async:
++            self.writeline('for event in (await '
++                           'template._get_default_module_async())'
++                           '._body_stream:')
+         else:
+-            self.writeline('for event in template.module._body_stream:')
++            if supports_yield_from:
++                self.writeline('yield from template._get_default_module()'
++                               '._body_stream')
++                skip_event_yield = True
++            else:
++                self.writeline('for event in template._get_default_module()'
++                               '._body_stream:')
+ 
+-        self.indent()
+-        self.simple_write('event', frame)
+-        self.outdent()
++        if not skip_event_yield:
++            self.indent()
++            self.simple_write('event', frame)
++            self.outdent()
+ 
+         if node.ignore_missing:
+             self.outdent()
+ 
+     def visit_Import(self, node, frame):
+         """Visit regular imports."""
+-        if node.with_context:
+-            self.unoptimize_scope(frame)
+-        self.writeline('l_%s = ' % node.target, node)
++        self.writeline('%s = ' % frame.symbols.ref(node.target), node)
+         if frame.toplevel:
+             self.write('context.vars[%r] = ' % node.target)
++        if self.environment.is_async:
++            self.write('await ')
+         self.write('environment.get_template(')
+         self.visit(node.template, frame)
+         self.write(', %r).' % self.name)
+         if node.with_context:
+-            self.write('make_module(context.parent, True, locals())')
++            self.write('make_module%s(context.get_all(), True, %s)'
++                       % (self.environment.is_async and '_async' or '',
++                          self.dump_local_context(frame)))
++        elif self.environment.is_async:
++            self.write('_get_default_module_async()')
+         else:
+-            self.write('module')
++            self.write('_get_default_module()')
+         if frame.toplevel and not node.target.startswith('_'):
+             self.writeline('context.exported_vars.discard(%r)' % node.target)
+-        frame.assigned_names.add(node.target)
+ 
+     def visit_FromImport(self, node, frame):
+         """Visit named imports."""
+         self.newline(node)
+-        self.write('included_template = environment.get_template(')
++        self.write('included_template = %senvironment.get_template('
++                   % (self.environment.is_async and 'await ' or ''))
+         self.visit(node.template, frame)
+         self.write(', %r).' % self.name)
+         if node.with_context:
+-            self.write('make_module(context.parent, True)')
++            self.write('make_module%s(context.get_all(), True, %s)'
++                       % (self.environment.is_async and '_async' or '',
++                          self.dump_local_context(frame)))
++        elif self.environment.is_async:
++            self.write('_get_default_module_async()')
+         else:
+-            self.write('module')
++            self.write('_get_default_module()')
+ 
+         var_names = []
+         discarded_names = []
+@@ -1002,15 +933,16 @@ class CodeGenerator(NodeVisitor):
+                 name, alias = name
+             else:
+                 alias = name
+-            self.writeline('l_%s = getattr(included_template, '
+-                           '%r, missing)' % (alias, name))
+-            self.writeline('if l_%s is missing:' % alias)
++            self.writeline('%s = getattr(included_template, '
++                           '%r, missing)' % (frame.symbols.ref(alias), name))
++            self.writeline('if %s is missing:' % frame.symbols.ref(alias))
+             self.indent()
+-            self.writeline('l_%s = environment.undefined(%r %% '
++            self.writeline('%s = undefined(%r %% '
+                            'included_template.__name__, '
+                            'name=%r)' %
+-                           (alias, 'the template %%r (imported on %s) does '
+-                           'not export the requested name %s' % (
++                           (frame.symbols.ref(alias),
++                            'the template %%r (imported on %s) does '
++                            'not export the requested name %s' % (
+                                 self.position(node),
+                                 repr(name)
+                            ), name))
+@@ -1019,15 +951,15 @@ class CodeGenerator(NodeVisitor):
+                 var_names.append(alias)
+                 if not alias.startswith('_'):
+                     discarded_names.append(alias)
+-            frame.assigned_names.add(alias)
+ 
+         if var_names:
+             if len(var_names) == 1:
+                 name = var_names[0]
+-                self.writeline('context.vars[%r] = l_%s' % (name, name))
++                self.writeline('context.vars[%r] = %s' %
++                               (name, frame.symbols.ref(name)))
+             else:
+                 self.writeline('context.vars.update({%s})' % ', '.join(
+-                    '%r: l_%s' % (name, name) for name in var_names
++                    '%r: %s' % (name, frame.symbols.ref(name)) for name in var_names
+                 ))
+         if discarded_names:
+             if len(discarded_names) == 1:
+@@ -1038,15 +970,8 @@ class CodeGenerator(NodeVisitor):
+                                'update((%s))' % ', '.join(imap(repr, discarded_names)))
+ 
+     def visit_For(self, node, frame):
+-        # when calculating the nodes for the inner frame we have to exclude
+-        # the iterator contents from it
+-        children = node.iter_child_nodes(exclude=('iter',))
+-        if node.recursive:
+-            loop_frame = self.function_scoping(node, frame, children,
+-                                               find_special=False)
+-        else:
+-            loop_frame = frame.inner()
+-            loop_frame.inspect(children)
++        loop_frame = frame.inner()
++        else_frame = frame.inner()
+ 
+         # try to figure out if we have an extended loop.  An extended loop
+         # is necessary if the loop is in recursive mode if the special loop
+@@ -1055,111 +980,122 @@ class CodeGenerator(NodeVisitor):
+                         find_undeclared(node.iter_child_nodes(
+                             only=('body',)), ('loop',))
+ 
++        loop_ref = None
++        if extended_loop:
++            loop_ref = loop_frame.symbols.declare_parameter('loop')
++        loop_frame.symbols.analyze_node(node)
++
++        if node.else_:
++            else_frame.symbols.analyze_node(node, for_branch='else')
++
+         # if we don't have an recursive loop we have to find the shadowed
+         # variables at that point.  Because loops can be nested but the loop
+         # variable is a special one we have to enforce aliasing for it.
+-        if not node.recursive:
+-            aliases = self.push_scope(loop_frame, ('loop',))
+-
+-        # otherwise we set up a buffer and add a function def
+-        else:
+-            self.writeline('def loop(reciter, loop_render_func, depth=0):', node)
++        if node.recursive:
++            self.writeline('%s(reciter, loop_render_func, depth=0):' %
++                           self.func('loop'), node)
+             self.indent()
+             self.buffer(loop_frame)
+-            aliases = {}
+ 
+         # make sure the loop variable is a special one and raise a template
+         # assertion error if a loop tries to write to loop
+         if extended_loop:
+-            self.writeline('l_loop = missing')
+-            loop_frame.identifiers.add_special('loop')
++            self.writeline('%s = missing' % loop_ref)
++
+         for name in node.find_all(nodes.Name):
+             if name.ctx == 'store' and name.name == 'loop':
+                 self.fail('Can\'t assign to special loop variable '
+                           'in for-loop target', name.lineno)
+ 
+-        self.pull_locals(loop_frame)
+         if node.else_:
+             iteration_indicator = self.temporary_identifier()
+             self.writeline('%s = 1' % iteration_indicator)
+ 
+-        # Create a fake parent loop if the else or test section of a
+-        # loop is accessing the special loop variable and no parent loop
+-        # exists.
+-        if 'loop' not in aliases and 'loop' in find_undeclared(
+-           node.iter_child_nodes(only=('else_', 'test')), ('loop',)):
+-            self.writeline("l_loop = environment.undefined(%r, name='loop')" %
+-                ("'loop' is undefined. the filter section of a loop as well "
+-                 "as the else block don't have access to the special 'loop'"
+-                 " variable of the current loop.  Because there is no parent "
+-                 "loop it's undefined.  Happened in loop on %s" %
+-                 self.position(node)))
+-
+-        self.writeline('for ', node)
++        self.writeline(self.environment.is_async and 'async for ' or 'for ', node)
+         self.visit(node.target, loop_frame)
+-        self.write(extended_loop and ', l_loop in LoopContext(' or ' in ')
++        if extended_loop:
++            if self.environment.is_async:
++                self.write(', %s in await make_async_loop_context(' % loop_ref)
++            else:
++                self.write(', %s in LoopContext(' % loop_ref)
++        else:
++            self.write(' in ')
+ 
+         # if we have an extened loop and a node test, we filter in the
+         # "outer frame".
+         if extended_loop and node.test is not None:
+             self.write('(')
+             self.visit(node.target, loop_frame)
+-            self.write(' for ')
++            self.write(self.environment.is_async and ' async for ' or ' for ')
+             self.visit(node.target, loop_frame)
+             self.write(' in ')
+             if node.recursive:
+                 self.write('reciter')
+             else:
++                if self.environment.is_async:
++                    self.write('auto_aiter(')
+                 self.visit(node.iter, loop_frame)
++                if self.environment.is_async:
++                    self.write(')')
+             self.write(' if (')
+-            test_frame = loop_frame.copy()
+-            self.visit(node.test, test_frame)
++            self.visit(node.test, loop_frame)
+             self.write('))')
+ 
+         elif node.recursive:
+             self.write('reciter')
+         else:
++            if self.environment.is_async and not extended_loop:
++                self.write('auto_aiter(')
+             self.visit(node.iter, loop_frame)
++            if self.environment.is_async and not extended_loop:
++                self.write(')')
+ 
+         if node.recursive:
+             self.write(', loop_render_func, depth):')
+         else:
+             self.write(extended_loop and '):' or ':')
+ 
++        self.indent()
++        self.enter_frame(loop_frame)
++
+         # tests in not extended loops become a continue
+         if not extended_loop and node.test is not None:
+-            self.indent()
+             self.writeline('if not ')
+             self.visit(node.test, loop_frame)
+             self.write(':')
+             self.indent()
+             self.writeline('continue')
+-            self.outdent(2)
++            self.outdent()
+ 
+-        self.indent()
+         self.blockvisit(node.body, loop_frame)
+         if node.else_:
+             self.writeline('%s = 0' % iteration_indicator)
+         self.outdent()
++        self.leave_frame(loop_frame, with_python_scope=node.recursive
++                         and not node.else_)
+ 
+         if node.else_:
+             self.writeline('if %s:' % iteration_indicator)
+             self.indent()
+-            self.blockvisit(node.else_, loop_frame)
++            self.enter_frame(else_frame)
++            self.blockvisit(node.else_, else_frame)
++            self.leave_frame(else_frame)
+             self.outdent()
+ 
+-        # reset the aliases if there are any.
+-        if not node.recursive:
+-            self.pop_scope(aliases, loop_frame)
+-
+         # if the node was recursive we have to return the buffer contents
+         # and start the iteration code
+         if node.recursive:
+             self.return_buffer_contents(loop_frame)
+             self.outdent()
+             self.start_write(frame, node)
++            if self.environment.is_async:
++                self.write('await ')
+             self.write('loop(')
++            if self.environment.is_async:
++                self.write('auto_aiter(')
+             self.visit(node.iter, frame)
++            if self.environment.is_async:
++                self.write(')')
+             self.write(', loop)')
+             self.end_write(frame)
+ 
+@@ -1178,36 +1114,34 @@ class CodeGenerator(NodeVisitor):
+             self.outdent()
+ 
+     def visit_Macro(self, node, frame):
+-        macro_frame = self.macro_body(node, frame)
++        macro_frame, macro_ref = self.macro_body(node, frame)
+         self.newline()
+         if frame.toplevel:
+             if not node.name.startswith('_'):
+                 self.write('context.exported_vars.add(%r)' % node.name)
++            ref = frame.symbols.ref(node.name)
+             self.writeline('context.vars[%r] = ' % node.name)
+-        self.write('l_%s = ' % node.name)
+-        self.macro_def(node, macro_frame)
+-        frame.assigned_names.add(node.name)
++        self.write('%s = ' % frame.symbols.ref(node.name))
++        self.macro_def(macro_ref, macro_frame)
+ 
+     def visit_CallBlock(self, node, frame):
+-        children = node.iter_child_nodes(exclude=('call',))
+-        call_frame = self.macro_body(node, frame, children)
++        call_frame, macro_ref = self.macro_body(node, frame)
+         self.writeline('caller = ')
+-        self.macro_def(node, call_frame)
++        self.macro_def(macro_ref, call_frame)
+         self.start_write(frame, node)
+         self.visit_Call(node.call, call_frame, forward_caller=True)
+         self.end_write(frame)
+ 
+     def visit_FilterBlock(self, node, frame):
+         filter_frame = frame.inner()
+-        filter_frame.inspect(node.iter_child_nodes())
+-        aliases = self.push_scope(filter_frame)
+-        self.pull_locals(filter_frame)
++        filter_frame.symbols.analyze_node(node)
++        self.enter_frame(filter_frame)
+         self.buffer(filter_frame)
+         self.blockvisit(node.body, filter_frame)
+         self.start_write(frame, node)
+         self.visit_Filter(node.filter, filter_frame)
+         self.end_write(frame)
+-        self.pop_scope(aliases, filter_frame)
++        self.leave_frame(filter_frame)
+ 
+     def visit_ExprStmt(self, node, frame):
+         self.newline(node)
+@@ -1286,7 +1220,7 @@ class CodeGenerator(NodeVisitor):
+                     if frame.buffer is None:
+                         self.writeline('yield ' + val)
+                     else:
+-                        self.writeline(val + ', ')
++                        self.writeline(val + ',')
+                 else:
+                     if frame.buffer is None:
+                         self.writeline('yield ', item)
+@@ -1294,8 +1228,8 @@ class CodeGenerator(NodeVisitor):
+                         self.newline(item)
+                     close = 1
+                     if frame.eval_ctx.volatile:
+-                        self.write('(context.eval_ctx.autoescape and'
+-                                   ' escape or to_string)(')
++                        self.write('(escape if context.eval_ctx.autoescape'
++                                   ' else to_string)(')
+                     elif frame.eval_ctx.autoescape:
+                         self.write('escape(')
+                     else:
+@@ -1309,7 +1243,7 @@ class CodeGenerator(NodeVisitor):
+                     self.visit(item, frame)
+                     self.write(')' * close)
+                     if frame.buffer is not None:
+-                        self.write(', ')
++                        self.write(',')
+             if frame.buffer is not None:
+                 # close the open parentheses
+                 self.outdent()
+@@ -1332,8 +1266,8 @@ class CodeGenerator(NodeVisitor):
+                 self.newline(argument)
+                 close = 0
+                 if frame.eval_ctx.volatile:
+-                    self.write('(context.eval_ctx.autoescape and'
+-                               ' escape or to_string)(')
++                    self.write('(escape if context.eval_ctx.autoescape else'
++                               ' to_string)(')
+                     close += 1
+                 elif frame.eval_ctx.autoescape:
+                     self.write('escape(')
+@@ -1358,73 +1292,55 @@ class CodeGenerator(NodeVisitor):
+         if outdent_later:
+             self.outdent()
+ 
+-    def make_assignment_frame(self, frame):
+-        # toplevel assignments however go into the local namespace and
+-        # the current template's context.  We create a copy of the frame
+-        # here and add a set so that the Name visitor can add the assigned
+-        # names here.
+-        if not frame.toplevel:
+-            return frame
+-        assignment_frame = frame.copy()
+-        assignment_frame.toplevel_assignments = set()
+-        return assignment_frame
+-
+-    def export_assigned_vars(self, frame, assignment_frame):
+-        if not frame.toplevel:
+-            return
+-        public_names = [x for x in assignment_frame.toplevel_assignments
+-                        if not x.startswith('_')]
+-        if len(assignment_frame.toplevel_assignments) == 1:
+-            name = next(iter(assignment_frame.toplevel_assignments))
+-            self.writeline('context.vars[%r] = l_%s' % (name, name))
+-        else:
+-            self.writeline('context.vars.update({')
+-            for idx, name in enumerate(assignment_frame.toplevel_assignments):
+-                if idx:
+-                    self.write(', ')
+-                self.write('%r: l_%s' % (name, name))
+-            self.write('})')
+-        if public_names:
+-            if len(public_names) == 1:
+-                self.writeline('context.exported_vars.add(%r)' %
+-                               public_names[0])
+-            else:
+-                self.writeline('context.exported_vars.update((%s))' %
+-                               ', '.join(imap(repr, public_names)))
+-
+     def visit_Assign(self, node, frame):
++        self.push_assign_tracking()
+         self.newline(node)
+-        assignment_frame = self.make_assignment_frame(frame)
+-        self.visit(node.target, assignment_frame)
++        self.visit(node.target, frame)
+         self.write(' = ')
+         self.visit(node.node, frame)
+-        self.export_assigned_vars(frame, assignment_frame)
++        self.pop_assign_tracking(frame)
+ 
+     def visit_AssignBlock(self, node, frame):
++        self.push_assign_tracking()
+         block_frame = frame.inner()
+-        block_frame.inspect(node.body)
+-        aliases = self.push_scope(block_frame)
+-        self.pull_locals(block_frame)
++        # This is a special case.  Since a set block always captures we
++        # will disable output checks.  This way one can use set blocks
++        # toplevel even in extended templates.
++        block_frame.require_output_check = False
++        block_frame.symbols.analyze_node(node)
++        self.enter_frame(block_frame)
+         self.buffer(block_frame)
+         self.blockvisit(node.body, block_frame)
+-        self.pop_scope(aliases, block_frame)
+-
+-        assignment_frame = self.make_assignment_frame(frame)
+         self.newline(node)
+-        self.visit(node.target, assignment_frame)
+-        self.write(' = concat(%s)' % block_frame.buffer)
+-        self.export_assigned_vars(frame, assignment_frame)
++        self.visit(node.target, frame)
++        self.write(' = (Markup if context.eval_ctx.autoescape '
++                   'else identity)(concat(%s))' % block_frame.buffer)
++        self.pop_assign_tracking(frame)
++        self.leave_frame(block_frame)
+ 
+     # -- Expression Visitors
+ 
+     def visit_Name(self, node, frame):
+         if node.ctx == 'store' and frame.toplevel:
+-            frame.toplevel_assignments.add(node.name)
+-        self.write('l_' + node.name)
+-        frame.assigned_names.add(node.name)
++            if self._assign_stack:
++                self._assign_stack[-1].add(node.name)
++        ref = frame.symbols.ref(node.name)
++
++        # If we are looking up a variable we might have to deal with the
++        # case where it's undefined.  We can skip that case if the load
++        # instruction indicates a parameter which are always defined.
++        if node.ctx == 'load':
++            load = frame.symbols.find_load(ref)
++            if not (load is not None and load[0] == VAR_LOAD_PARAMETER and \
++                    not self.parameter_is_undeclared(ref)):
++                self.write('(undefined(name=%r) if %s is missing else %s)' %
++                           (node.name, ref, ref))
++                return
++
++        self.write(ref)
+ 
+     def visit_Const(self, node, frame):
+-        val = node.value
++        val = node.as_const(frame.eval_ctx)
+         if isinstance(val, float):
+             self.write(str(val))
+         else:
+@@ -1434,7 +1350,7 @@ class CodeGenerator(NodeVisitor):
+         try:
+             self.write(repr(node.as_const(frame.eval_ctx)))
+         except nodes.Impossible:
+-            self.write('(context.eval_ctx.autoescape and Markup or identity)(%r)'
++            self.write('(Markup if context.eval_ctx.autoescape else identity)(%r)'
+                        % node.data)
+ 
+     def visit_Tuple(self, node, frame):
+@@ -1465,6 +1381,7 @@ class CodeGenerator(NodeVisitor):
+         self.write('}')
+ 
+     def binop(operator, interceptable=True):
++        @optimizeconst
+         def visitor(self, node, frame):
+             if self.environment.sandboxed and \
+                operator in self.environment.intercepted_binops:
+@@ -1481,6 +1398,7 @@ class CodeGenerator(NodeVisitor):
+         return visitor
+ 
+     def uaop(operator, interceptable=True):
++        @optimizeconst
+         def visitor(self, node, frame):
+             if self.environment.sandboxed and \
+                operator in self.environment.intercepted_unops:
+@@ -1506,6 +1424,7 @@ class CodeGenerator(NodeVisitor):
+     visit_Not = uaop('not ', interceptable=False)
+     del binop, uaop
+ 
++    @optimizeconst
+     def visit_Concat(self, node, frame):
+         if frame.eval_ctx.volatile:
+             func_name = '(context.eval_ctx.volatile and' \
+@@ -1520,6 +1439,7 @@ class CodeGenerator(NodeVisitor):
+             self.write(', ')
+         self.write('))')
+ 
++    @optimizeconst
+     def visit_Compare(self, node, frame):
+         self.visit(node.expr, frame)
+         for op in node.ops:
+@@ -1529,11 +1449,13 @@ class CodeGenerator(NodeVisitor):
+         self.write(' %s ' % operators[node.op])
+         self.visit(node.expr, frame)
+ 
++    @optimizeconst
+     def visit_Getattr(self, node, frame):
+         self.write('environment.getattr(')
+         self.visit(node.node, frame)
+         self.write(', %r)' % node.attr)
+ 
++    @optimizeconst
+     def visit_Getitem(self, node, frame):
+         # slices bypass the environment getitem method.
+         if isinstance(node.arg, nodes.Slice):
+@@ -1558,7 +1480,10 @@ class CodeGenerator(NodeVisitor):
+             self.write(':')
+             self.visit(node.step, frame)
+ 
++    @optimizeconst
+     def visit_Filter(self, node, frame):
++        if self.environment.is_async:
++            self.write('await auto_await(')
+         self.write(self.filters[node.name] + '(')
+         func = self.environment.filters.get(node.name)
+         if func is None:
+@@ -1584,7 +1509,10 @@ class CodeGenerator(NodeVisitor):
+             self.write('concat(%s)' % frame.buffer)
+         self.signature(node, frame)
+         self.write(')')
++        if self.environment.is_async:
++            self.write(')')
+ 
++    @optimizeconst
+     def visit_Test(self, node, frame):
+         self.write(self.tests[node.name] + '(')
+         if node.name not in self.environment.tests:
+@@ -1593,11 +1521,12 @@ class CodeGenerator(NodeVisitor):
+         self.signature(node, frame)
+         self.write(')')
+ 
++    @optimizeconst
+     def visit_CondExpr(self, node, frame):
+         def write_expr2():
+             if node.expr2 is not None:
+                 return self.visit(node.expr2, frame)
+-            self.write('environment.undefined(%r)' % ('the inline if-'
++            self.write('undefined(%r)' % ('the inline if-'
+                        'expression on %s evaluated to false and '
+                        'no else section was defined.' % self.position(node)))
+ 
+@@ -1609,7 +1538,10 @@ class CodeGenerator(NodeVisitor):
+         write_expr2()
+         self.write(')')
+ 
++    @optimizeconst
+     def visit_Call(self, node, frame, forward_caller=False):
++        if self.environment.is_async:
++            self.write('await auto_await(')
+         if self.environment.sandboxed:
+             self.write('environment.call(context, ')
+         else:
+@@ -1618,6 +1550,8 @@ class CodeGenerator(NodeVisitor):
+         extra_kwargs = forward_caller and {'caller': 'caller'} or None
+         self.signature(node, frame, extra_kwargs)
+         self.write(')')
++        if self.environment.is_async:
++            self.write(')')
+ 
+     def visit_Keyword(self, node, frame):
+         self.write(node.key + '=')
+@@ -1658,11 +1592,10 @@ class CodeGenerator(NodeVisitor):
+ 
+     def visit_Scope(self, node, frame):
+         scope_frame = frame.inner()
+-        scope_frame.inspect(node.iter_child_nodes())
+-        aliases = self.push_scope(scope_frame)
+-        self.pull_locals(scope_frame)
++        scope_frame.symbols.analyze_node(node)
++        self.enter_frame(scope_frame)
+         self.blockvisit(node.body, scope_frame)
+-        self.pop_scope(aliases, scope_frame)
++        self.leave_frame(scope_frame)
+ 
+     def visit_EvalContextModifier(self, node, frame):
+         for keyword in node.options:
+@@ -1677,10 +1610,10 @@ class CodeGenerator(NodeVisitor):
+ 
+     def visit_ScopedEvalContextModifier(self, node, frame):
+         old_ctx_name = self.temporary_identifier()
+-        safed_ctx = frame.eval_ctx.save()
++        saved_ctx = frame.eval_ctx.save()
+         self.writeline('%s = context.eval_ctx.save()' % old_ctx_name)
+         self.visit_EvalContextModifier(node, frame)
+         for child in node.body:
+             self.visit(child, frame)
+-        frame.eval_ctx.revert(safed_ctx)
++        frame.eval_ctx.revert(saved_ctx)
+         self.writeline('context.eval_ctx.revert(%s)' % old_ctx_name)
+
+diff --git a/jinja2/constants.py b/jinja2/constants.py
+index cab203c..11efd1e 100644
+--- a/jinja2/constants.py
++++ b/jinja2/constants.py
+@@ -5,7 +5,7 @@
+ 
+     Various constants.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD, see LICENSE for more details.
+ """
+ 
+
+diff --git a/jinja2/debug.py b/jinja2/debug.py
+index 3252748..07c21f1 100644
+--- a/jinja2/debug.py
++++ b/jinja2/debug.py
+@@ -7,7 +7,7 @@
+     ugly stuff with the Python traceback system in order to achieve tracebacks
+     with correct line numbers, locals and contents.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD, see LICENSE for more details.
+ """
+ import sys
+@@ -195,21 +195,43 @@ def translate_exception(exc_info, initial_skip=0):
+     return ProcessedTraceback(exc_info[0], exc_info[1], frames)
+ 
+ 
++def get_jinja_locals(real_locals):
++    ctx = real_locals.get('context')
++    if ctx:
++        locals = ctx.get_all()
++    else:
++        locals = {}
++
++    local_overrides = {}
++
++    for name, value in iteritems(real_locals):
++        if not name.startswith('l_') or value is missing:
++            continue
++        try:
++            _, depth, name = name.split('_', 2)
++            depth = int(depth)
++        except ValueError:
++            continue
++        cur_depth = local_overrides.get(name, (-1,))[0]
++        if cur_depth < depth:
++            local_overrides[name] = (depth, value)
++
++    for name, (_, value) in iteritems(local_overrides):
++        if value is missing:
++            locals.pop(name, None)
++        else:
++            locals[name] = value
++
++    return locals
++
++
+ def fake_exc_info(exc_info, filename, lineno):
+     """Helper for `translate_exception`."""
+     exc_type, exc_value, tb = exc_info
+ 
+     # figure the real context out
+     if tb is not None:
+-        real_locals = tb.tb_frame.f_locals.copy()
+-        ctx = real_locals.get('context')
+-        if ctx:
+-            locals = ctx.get_all()
+-        else:
+-            locals = {}
+-        for name, value in iteritems(real_locals):
+-            if name.startswith('l_') and value is not missing:
+-                locals[name[2:]] = value
++        locals = get_jinja_locals(tb.tb_frame.f_locals)
+ 
+         # if there is a local called __jinja_exception__, we get
+         # rid of it to not break the debug functionality.
+
+diff --git a/jinja2/defaults.py b/jinja2/defaults.py
+index 3717a72..e29ce56 100644
+--- a/jinja2/defaults.py
++++ b/jinja2/defaults.py
+@@ -5,7 +5,7 @@
+ 
+     Jinja default filters and tags.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD, see LICENSE for more details.
+ """
+ from jinja2._compat import range_type
+@@ -39,5 +39,15 @@ DEFAULT_NAMESPACE = {
+ }
+ 
+ 
++# default policies
++DEFAULT_POLICIES = {
++    'compiler.ascii_str':   True,
++    'urlize.rel':           'noopener',
++    'urlize.target':        None,
++    'json.dumps_function':  None,
++    'json.dumps_kwargs':    {'sort_keys': True},
++}
++
++
+ # export all constants
+ __all__ = tuple(x for x in locals().keys() if x.isupper())
+
+diff --git a/jinja2/environment.py b/jinja2/environment.py
+index 8b2572b..2a4d3d7 100644
+--- a/jinja2/environment.py
++++ b/jinja2/environment.py
+@@ -5,32 +5,32 @@
+ 
+     Provides a class that holds runtime and parsing time options.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD, see LICENSE for more details.
+ """
+ import os
+ import sys
++import weakref
++from functools import reduce, partial
+ from jinja2 import nodes
+ from jinja2.defaults import BLOCK_START_STRING, \
+      BLOCK_END_STRING, VARIABLE_START_STRING, VARIABLE_END_STRING, \
+      COMMENT_START_STRING, COMMENT_END_STRING, LINE_STATEMENT_PREFIX, \
+      LINE_COMMENT_PREFIX, TRIM_BLOCKS, NEWLINE_SEQUENCE, \
+      DEFAULT_FILTERS, DEFAULT_TESTS, DEFAULT_NAMESPACE, \
+-     KEEP_TRAILING_NEWLINE, LSTRIP_BLOCKS
++     DEFAULT_POLICIES, KEEP_TRAILING_NEWLINE, LSTRIP_BLOCKS
+ from jinja2.lexer import get_lexer, TokenStream
+ from jinja2.parser import Parser
+ from jinja2.nodes import EvalContext
+-from jinja2.optimizer import optimize
+ from jinja2.compiler import generate, CodeGenerator
+ from jinja2.runtime import Undefined, new_context, Context
+ from jinja2.exceptions import TemplateSyntaxError, TemplateNotFound, \
+      TemplatesNotFound, TemplateRuntimeError
+ from jinja2.utils import import_string, LRUCache, Markup, missing, \
+-     concat, consume, internalcode
++     concat, consume, internalcode, have_async_gen
+ from jinja2._compat import imap, ifilter, string_types, iteritems, \
+      text_type, reraise, implements_iterator, implements_to_string, \
+-     get_next, encode_filename, PY2, PYPY
+-from functools import reduce
++     encode_filename, PY2, PYPY
+ 
+ 
+ # for direct template usage we have up to ten living environments
+@@ -87,6 +87,16 @@ def load_extensions(environment, extensions):
+     return result
+ 
+ 
++def fail_for_missing_callable(string, name):
++    msg = string % name
++    if isinstance(name, Undefined):
++        try:
++            name._fail_with_undefined_error()
++        except Exception as e:
++            msg = '%s (%s; did you forget to quote the callable name?)' % (msg, e)
++    raise TemplateRuntimeError(msg)
++
++
+ def _environment_sanity_check(environment):
+     """Perform a sanity check on the environment."""
+     assert issubclass(environment.undefined, Undefined), 'undefined must ' \
+@@ -167,7 +177,7 @@ class Environment(object):
+             look at :ref:`the extensions documentation <jinja-extensions>`.
+ 
+         `optimized`
+-            should the optimizer be enabled?  Default is `True`.
++            should the optimizer be enabled?  Default is ``True``.
+ 
+         `undefined`
+             :class:`Undefined` or a subclass of it that is used to represent
+@@ -176,14 +186,14 @@ class Environment(object):
+         `finalize`
+             A callable that can be used to process the result of a variable
+             expression before it is output.  For example one can convert
+-            `None` implicitly into an empty string here.
++            ``None`` implicitly into an empty string here.
+ 
+         `autoescape`
+-            If set to true the XML/HTML autoescaping feature is enabled by
++            If set to ``True`` the XML/HTML autoescaping feature is enabled by
+             default.  For more details about autoescaping see
+             :class:`~jinja2.utils.Markup`.  As of Jinja 2.4 this can also
+             be a callable that is passed the template name and has to
+-            return `True` or `False` depending on autoescape should be
++            return ``True`` or ``False`` depending on autoescape should be
+             enabled by default.
+ 
+             .. versionchanged:: 2.4
+@@ -205,7 +215,7 @@ class Environment(object):
+         `auto_reload`
+             Some loaders load templates from locations where the template
+             sources may change (ie: file system or database).  If
+-            `auto_reload` is set to `True` (default) every time a template is
++            ``auto_reload`` is set to ``True`` (default) every time a template is
+             requested the loader checks if the source changed and if yes, it
+             will reload the template.  For higher performance it's possible to
+             disable that.
+@@ -216,6 +226,11 @@ class Environment(object):
+             have to be parsed if they were not changed.
+ 
+             See :ref:`bytecode-cache` for more information.
++
++        `enable_async`
++            If set to true this enables async template execution which allows
++            you to take advantage of newer Python features.  This requires
++            Python 3.6 or later.
+     """
+ 
+     #: if this environment is sandboxed.  Modifying this variable won't make
+@@ -267,7 +282,8 @@ class Environment(object):
+                  loader=None,
+                  cache_size=400,
+                  auto_reload=True,
+-                 bytecode_cache=None):
++                 bytecode_cache=None,
++                 enable_async=False):
+         # !!Important notice!!
+         #   The constructor accepts quite a few arguments that should be
+         #   passed by keyword rather than position.  However it's important to
+@@ -310,9 +326,15 @@ class Environment(object):
+         self.bytecode_cache = bytecode_cache
+         self.auto_reload = auto_reload
+ 
++        # configurable policies
++        self.policies = DEFAULT_POLICIES.copy()
++
+         # load extensions
+         self.extensions = load_extensions(self, extensions)
+ 
++        self.enable_async = enable_async
++        self.is_async = self.enable_async and have_async_gen
++
+         _environment_sanity_check(self)
+ 
+     def add_extension(self, extension):
+@@ -387,7 +409,7 @@ class Environment(object):
+         """Get an item or attribute of an object but prefer the item."""
+         try:
+             return obj[argument]
+-        except (TypeError, LookupError):
++        except (AttributeError, TypeError, LookupError):
+             if isinstance(argument, string_types):
+                 try:
+                     attr = str(argument)
+@@ -417,11 +439,16 @@ class Environment(object):
+                     context=None, eval_ctx=None):
+         """Invokes a filter on a value the same way the compiler does it.
+ 
++        Note that on Python 3 this might return a coroutine in case the
++        filter is running from an environment in async mode and the filter
++        supports async execution.  It's your responsibility to await this
++        if needed.
++
+         .. versionadded:: 2.7
+         """
+         func = self.filters.get(name)
+         if func is None:
+-            raise TemplateRuntimeError('no filter named %r' % name)
++            fail_for_missing_callable('no filter named %r', name)
+         args = [value] + list(args or ())
+         if getattr(func, 'contextfilter', False):
+             if context is None:
+@@ -446,7 +473,7 @@ class Environment(object):
+         """
+         func = self.tests.get(name)
+         if func is None:
+-            raise TemplateRuntimeError('no test named %r' % name)
++            fail_for_missing_callable('no test named %r', name)
+         return func(value, *(args or ()), **(kwargs or {}))
+ 
+     @internalcode
+@@ -512,7 +539,8 @@ class Environment(object):
+ 
+         .. versionadded:: 2.5
+         """
+-        return generate(source, self, name, filename, defer_init=defer_init)
++        return generate(source, self, name, filename, defer_init=defer_init,
++                        optimized=self.optimized)
+ 
+     def _compile(self, source, filename):
+         """Internal hook that can be overridden to hook a different compile
+@@ -549,8 +577,6 @@ class Environment(object):
+             if isinstance(source, string_types):
+                 source_hint = source
+                 source = self._parse(source, name, filename)
+-            if self.optimized:
+-                source = optimize(source, self)
+             source = self._generate(source, name, filename,
+                                     defer_init=defer_init)
+             if raw:
+@@ -769,15 +795,7 @@ class Environment(object):
+     def _load_template(self, name, globals):
+         if self.loader is None:
+             raise TypeError('no loader for this environment specified')
+-        try:
+-            # use abs path for cache key
+-            cache_key = self.loader.get_source(self, name)[1]
+-        except RuntimeError:
+-            # if loader does not implement get_source()
+-            cache_key = None
+-        # if template is not file, use name for cache key
+-        if cache_key is None:
+-            cache_key = name
++        cache_key = (weakref.ref(self.loader), name)
+         if self.cache is not None:
+             template = self.cache.get(cache_key)
+             if template is not None and (not self.auto_reload or
+@@ -915,14 +933,15 @@ class Template(object):
+                 optimized=True,
+                 undefined=Undefined,
+                 finalize=None,
+-                autoescape=False):
++                autoescape=False,
++                enable_async=False):
+         env = get_spontaneous_environment(
+             block_start_string, block_end_string, variable_start_string,
+             variable_end_string, comment_start_string, comment_end_string,
+             line_statement_prefix, line_comment_prefix, trim_blocks,
+             lstrip_blocks, newline_sequence, keep_trailing_newline,
+             frozenset(extensions), optimized, undefined, finalize, autoescape,
+-            None, 0, False, None)
++            None, 0, False, None, enable_async)
+         return env.from_string(source, template_class=cls)
+ 
+     @classmethod
+@@ -988,6 +1007,19 @@ class Template(object):
+             exc_info = sys.exc_info()
+         return self.environment.handle_exception(exc_info, True)
+ 
++    def render_async(self, *args, **kwargs):
++        """This works similar to :meth:`render` but returns a coroutine
++        that when awaited returns the entire rendered template string.  This
++        requires the async feature to be enabled.
++
++        Example usage::
++
++            await template.render_async(knights='that say nih; asynchronously')
++        """
++        # see asyncsupport for the actual implementation
++        raise NotImplementedError('This feature is not available for this '
++                                  'version of Python')
++
+     def stream(self, *args, **kwargs):
+         """Works exactly like :meth:`generate` but returns a
+         :class:`TemplateStream`.
+@@ -1012,6 +1044,14 @@ class Template(object):
+             return
+         yield self.environment.handle_exception(exc_info, True)
+ 
++    def generate_async(self, *args, **kwargs):
++        """An async version of :meth:`generate`.  Works very similarly but
++        returns an async iterator instead.
++        """
++        # see asyncsupport for the actual implementation
++        raise NotImplementedError('This feature is not available for this '
++                                  'version of Python')
++
+     def new_context(self, vars=None, shared=False, locals=None):
+         """Create a new :class:`Context` for this template.  The vars
+         provided will be passed to the template.  Per default the globals
+@@ -1032,6 +1072,23 @@ class Template(object):
+         """
+         return TemplateModule(self, self.new_context(vars, shared, locals))
+ 
++    def make_module_async(self, vars=None, shared=False, locals=None):
++        """As template module creation can invoke template code for
++        asynchronous exections this method must be used instead of the
++        normal :meth:`make_module` one.  Likewise the module attribute
++        becomes unavailable in async mode.
++        """
++        # see asyncsupport for the actual implementation
++        raise NotImplementedError('This feature is not available for this '
++                                  'version of Python')
++
++    @internalcode
++    def _get_default_module(self):
++        if self._module is not None:
++            return self._module
++        self._module = rv = self.make_module()
++        return rv
++
+     @property
+     def module(self):
+         """The template as module.  This is used for imports in the
+@@ -1043,11 +1100,10 @@ class Template(object):
+         '23'
+         >>> t.module.foo() == u'42'
+         True
++
++        This attribute is not available if async mode is enabled.
+         """
+-        if self._module is not None:
+-            return self._module
+-        self._module = rv = self.make_module()
+-        return rv
++        return self._get_default_module()
+ 
+     def get_corresponding_lineno(self, lineno):
+         """Return the source line number of a line number in the
+@@ -1086,8 +1142,15 @@ class TemplateModule(object):
+     converting it into an unicode- or bytestrings renders the contents.
+     """
+ 
+-    def __init__(self, template, context):
+-        self._body_stream = list(template.root_render_func(context))
++    def __init__(self, template, context, body_stream=None):
++        if body_stream is None:
++            if context.environment.is_async:
++                raise RuntimeError('Async mode requires a body stream '
++                                   'to be passed to a template module.  Use '
++                                   'the async methods of the API you are '
++                                   'using.')
++            body_stream = list(template.root_render_func(context))
++        self._body_stream = body_stream
+         self.__dict__.update(context.get_exported())
+         self.__name__ = template.name
+ 
+@@ -1171,35 +1234,35 @@ class TemplateStream(object):
+ 
+     def disable_buffering(self):
+         """Disable the output buffering."""
+-        self._next = get_next(self._gen)
++        self._next = partial(next, self._gen)
+         self.buffered = False
+ 
++    def _buffered_generator(self, size):
++        buf = []
++        c_size = 0
++        push = buf.append
++
++        while 1:
++            try:
++                while c_size < size:
++                    c = next(self._gen)
++                    push(c)
++                    if c:
++                        c_size += 1
++            except StopIteration:
++                if not c_size:
++                    return
++            yield concat(buf)
++            del buf[:]
++            c_size = 0
++
+     def enable_buffering(self, size=5):
+         """Enable buffering.  Buffer `size` items before yielding them."""
+         if size <= 1:
+             raise ValueError('buffer size too small')
+ 
+-        def generator(next):
+-            buf = []
+-            c_size = 0
+-            push = buf.append
+-
+-            while 1:
+-                try:
+-                    while c_size < size:
+-                        c = next()
+-                        push(c)
+-                        if c:
+-                            c_size += 1
+-                except StopIteration:
+-                    if not c_size:
+-                        return
+-                yield concat(buf)
+-                del buf[:]
+-                c_size = 0
+-
+         self.buffered = True
+-        self._next = get_next(generator(get_next(self._gen)))
++        self._next = partial(next, self._buffered_generator(size))
+ 
+     def __iter__(self):
+         return self
+
+diff --git a/jinja2/exceptions.py b/jinja2/exceptions.py
+index c9df6dc..c018a33 100644
+--- a/jinja2/exceptions.py
++++ b/jinja2/exceptions.py
+@@ -5,7 +5,7 @@
+ 
+     Jinja exceptions.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD, see LICENSE for more details.
+ """
+ from jinja2._compat import imap, text_type, PY2, implements_to_string
+
+diff --git a/jinja2/ext.py b/jinja2/ext.py
+index 562ab50..03c63e1 100644
+--- a/jinja2/ext.py
++++ b/jinja2/ext.py
+@@ -7,7 +7,7 @@
+     tags work.  By default two example extensions exist: an i18n and a cache
+     extension.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD.
+ """
+ from jinja2 import nodes
+@@ -411,38 +411,11 @@ class LoopControlExtension(Extension):
+ 
+ 
+ class WithExtension(Extension):
+-    """Adds support for a django-like with block."""
+-    tags = set(['with'])
+-
+-    def parse(self, parser):
+-        node = nodes.Scope(lineno=next(parser.stream).lineno)
+-        assignments = []
+-        while parser.stream.current.type != 'block_end':
+-            lineno = parser.stream.current.lineno
+-            if assignments:
+-                parser.stream.expect('comma')
+-            target = parser.parse_assign_target()
+-            parser.stream.expect('assign')
+-            expr = parser.parse_expression()
+-            assignments.append(nodes.Assign(target, expr, lineno=lineno))
+-        node.body = assignments + \
+-            list(parser.parse_statements(('name:endwith',),
+-                                         drop_needle=True))
+-        return node
++    pass
+ 
+ 
+ class AutoEscapeExtension(Extension):
+-    """Changes auto escape rules for a scope."""
+-    tags = set(['autoescape'])
+-
+-    def parse(self, parser):
+-        node = nodes.ScopedEvalContextModifier(lineno=next(parser.stream).lineno)
+-        node.options = [
+-            nodes.Keyword('autoescape', parser.parse_expression())
+-        ]
+-        node.body = parser.parse_statements(('name:endautoescape',),
+-                                            drop_needle=True)
+-        return nodes.Scope([node])
++    pass
+ 
+ 
+ def extract_from_ast(node, gettext_functions=GETTEXT_FUNCTIONS,
+
+diff --git a/jinja2/filters.py b/jinja2/filters.py
+index 96660a6..e13bc62 100644
+--- a/jinja2/filters.py
++++ b/jinja2/filters.py
+@@ -5,23 +5,24 @@
+ 
+     Bundled jinja filters.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD, see LICENSE for more details.
+ """
+ import re
+ import math
+ 
+ from random import choice
+-from operator import itemgetter
+ from itertools import groupby
++from collections import namedtuple
+ from jinja2.utils import Markup, escape, pformat, urlize, soft_unicode, \
+-     unicode_urlencode
++     unicode_urlencode, htmlsafe_json_dumps
+ from jinja2.runtime import Undefined
+ from jinja2.exceptions import FilterArgumentError
+ from jinja2._compat import imap, string_types, text_type, iteritems
+ 
+ 
+-_word_re = re.compile(r'\w+(?u)')
++_word_re = re.compile(r'\w+', re.UNICODE)
++_word_beginning_split_re = re.compile(r'([-\s\(\{\[\<]+)', re.UNICODE)
+ 
+ 
+ def contextfilter(f):
+@@ -44,7 +45,7 @@ def evalcontextfilter(f):
+ 
+ 
+ def environmentfilter(f):
+-    """Decorator for marking evironment dependent filters.  The current
++    """Decorator for marking environment dependent filters.  The current
+     :class:`Environment` is passed to the filter as first argument.
+     """
+     f.environmentfilter = True
+@@ -183,12 +184,10 @@ def do_title(s):
+     """Return a titlecased version of the value. I.e. words will start with
+     uppercase letters, all remaining characters are lowercase.
+     """
+-    rv = []
+-    for item in re.compile(r'([-\s]+)(?u)').split(soft_unicode(s)):
+-        if not item:
+-            continue
+-        rv.append(item[0].upper() + item[1:].lower())
+-    return ''.join(rv)
++    return ''.join(
++        [item[0].upper() + item[1:].lower()
++         for item in _word_beginning_split_re.split(soft_unicode(s))
++         if item])
+ 
+ 
+ def do_dictsort(value, case_sensitive=False, by='key'):
+@@ -410,7 +409,7 @@ def do_pprint(value, verbose=False):
+ 
+ @evalcontextfilter
+ def do_urlize(eval_ctx, value, trim_url_limit=None, nofollow=False,
+-              target=None):
++              target=None, rel=None):
+     """Converts URLs in plain text into clickable links.
+ 
+     If you pass the filter an additional integer it will shorten the urls
+@@ -432,7 +431,15 @@ def do_urlize(eval_ctx, value, trim_url_limit=None, nofollow=False,
+     .. versionchanged:: 2.8+
+        The *target* parameter was added.
+     """
+-    rv = urlize(value, trim_url_limit, nofollow, target)
++    policies = eval_ctx.environment.policies
++    rel = set((rel or '').split() or [])
++    if nofollow:
++        rel.add('nofollow')
++    rel.update((policies['urlize.rel'] or '').split())
++    if target is None:
++        target = policies['urlize.target']
++    rel = ' '.join(sorted(rel)) or None
++    rv = urlize(value, trim_url_limit, rel=rel, target=target)
+     if eval_ctx.autoescape:
+         rv = Markup(rv)
+     return rv
+@@ -456,31 +463,35 @@ def do_indent(s, width=4, indentfirst=False):
+     return rv
+ 
+ 
+-def do_truncate(s, length=255, killwords=False, end='...'):
++def do_truncate(s, length=255, killwords=False, end='...', leeway=5):
+     """Return a truncated copy of the string. The length is specified
+     with the first parameter which defaults to ``255``. If the second
+     parameter is ``true`` the filter will cut the text at length. Otherwise
+     it will discard the last word. If the text was in fact
+     truncated it will append an ellipsis sign (``"..."``). If you want a
+     different ellipsis sign than ``"..."`` you can specify it using the
+-    third parameter.
++    third parameter. Strings that only exceed the length by the tolerance
++    margin given in the fourth parameter will not be truncated.
+ 
+     .. sourcecode:: jinja
+ 
+-        {{ "foo bar baz"|truncate(9) }}
+-            -> "foo ..."
+-        {{ "foo bar baz"|truncate(9, True) }}
++        {{ "foo bar baz qux"|truncate(9) }}
++            -> "foo..."
++        {{ "foo bar baz qux"|truncate(9, True) }}
+             -> "foo ba..."
++        {{ "foo bar baz qux"|truncate(11) }}
++            -> "foo bar baz qux"
++        {{ "foo bar baz qux"|truncate(11, False, '...', 0) }}
++            -> "foo bar..."
+ 
+     """
+-    if len(s) <= length:
++    assert length >= len(end), 'expected length >= %s, got %s' % (len(end), length)
++    assert leeway >= 0, 'expected leeway >= 0, got %s' % leeway
++    if len(s) <= length + leeway:
+         return s
+-    elif killwords:
++    if killwords:
+         return s[:length - len(end)] + end
+-
+     result = s[:length - len(end)].rsplit(' ', 1)[0]
+-    if len(result) < length:
+-        result += ' '
+     return result + end
+ 
+ 
+@@ -672,6 +683,8 @@ def do_round(value, precision=0, method='common'):
+     return func(value * (10 ** precision)) / (10 ** precision)
+ 
+ 
++_GroupTuple = namedtuple('_GroupTuple', ['grouper', 'list'])
++
+ @environmentfilter
+ def do_groupby(environment, value, attribute):
+     """Group a sequence of objects by a common attribute.
+@@ -712,17 +725,8 @@ def do_groupby(environment, value, attribute):
+        attribute of another attribute.
+     """
+     expr = make_attrgetter(environment, attribute)
+-    return sorted(map(_GroupTuple, groupby(sorted(value, key=expr), expr)))
+-
+-
+-class _GroupTuple(tuple):
+-    __slots__ = ()
+-    grouper = property(itemgetter(0))
+-    list = property(itemgetter(1))
+-
+-    def __new__(cls, xxx_todo_changeme):
+-        (key, value) = xxx_todo_changeme
+-        return tuple.__new__(cls, (key, list(value)))
++    return [_GroupTuple(key, list(values)) for key, values
++            in groupby(sorted(value, key=expr), expr)]
+ 
+ 
+ @environmentfilter
+@@ -830,24 +834,7 @@ def do_map(*args, **kwargs):
+ 
+     .. versionadded:: 2.7
+     """
+-    context = args[0]
+-    seq = args[1]
+-
+-    if len(args) == 2 and 'attribute' in kwargs:
+-        attribute = kwargs.pop('attribute')
+-        if kwargs:
+-            raise FilterArgumentError('Unexpected keyword argument %r' %
+-                next(iter(kwargs)))
+-        func = make_attrgetter(context.environment, attribute)
+-    else:
+-        try:
+-            name = args[2]
+-            args = args[3:]
+-        except LookupError:
+-            raise FilterArgumentError('map requires a filter argument')
+-        func = lambda item: context.environment.call_filter(
+-            name, item, args, kwargs, context=context)
+-
++    seq, func = prepare_map(args, kwargs)
+     if seq:
+         for item in seq:
+             yield func(item)
+@@ -855,8 +842,10 @@ def do_map(*args, **kwargs):
+ 
+ @contextfilter
+ def do_select(*args, **kwargs):
+-    """Filters a sequence of objects by applying a test to the object and only
+-    selecting the ones with the test succeeding.
++    """Filters a sequence of objects by applying a test to each object,
++    and only selecting the objects with the test succeeding.
++
++    If no test is specified, each object will be evaluated as a boolean.
+ 
+     Example usage:
+ 
+@@ -867,13 +856,15 @@ def do_select(*args, **kwargs):
+ 
+     .. versionadded:: 2.7
+     """
+-    return _select_or_reject(args, kwargs, lambda x: x, False)
++    return select_or_reject(args, kwargs, lambda x: x, False)
+ 
+ 
+ @contextfilter
+ def do_reject(*args, **kwargs):
+-    """Filters a sequence of objects by applying a test to the object and
+-    rejecting the ones with the test succeeding.
++    """Filters a sequence of objects by applying a test to each object,
++    and rejecting the objects with the test succeeding.
++
++    If no test is specified, each object will be evaluated as a boolean.
+ 
+     Example usage:
+ 
+@@ -883,13 +874,17 @@ def do_reject(*args, **kwargs):
+ 
+     .. versionadded:: 2.7
+     """
+-    return _select_or_reject(args, kwargs, lambda x: not x, False)
++    return select_or_reject(args, kwargs, lambda x: not x, False)
+ 
+ 
+ @contextfilter
+ def do_selectattr(*args, **kwargs):
+-    """Filters a sequence of objects by applying a test to an attribute of an
+-    object and only selecting the ones with the test succeeding.
++    """Filters a sequence of objects by applying a test to the specified
++    attribute of each object, and only selecting the objects with the
++    test succeeding.
++
++    If no test is specified, the attribute's value will be evaluated as
++    a boolean.
+ 
+     Example usage:
+ 
+@@ -900,13 +895,17 @@ def do_selectattr(*args, **kwargs):
+ 
+     .. versionadded:: 2.7
+     """
+-    return _select_or_reject(args, kwargs, lambda x: x, True)
++    return select_or_reject(args, kwargs, lambda x: x, True)
+ 
+ 
+ @contextfilter
+ def do_rejectattr(*args, **kwargs):
+-    """Filters a sequence of objects by applying a test to an attribute of an
+-    object or the attribute and rejecting the ones with the test succeeding.
++    """Filters a sequence of objects by applying a test to the specified
++    attribute of each object, and rejecting the objects with the test
++    succeeding.
++
++    If no test is specified, the attribute's value will be evaluated as
++    a boolean.
+ 
+     .. sourcecode:: jinja
+ 
+@@ -915,10 +914,67 @@ def do_rejectattr(*args, **kwargs):
+ 
+     .. versionadded:: 2.7
+     """
+-    return _select_or_reject(args, kwargs, lambda x: not x, True)
++    return select_or_reject(args, kwargs, lambda x: not x, True)
++
++
++@evalcontextfilter
++def do_tojson(eval_ctx, value, indent=None):
++    """Dumps a structure to JSON so that it's safe to use in ``<script>``
++    tags.  It accepts the same arguments and returns a JSON string.  Note that
++    this is available in templates through the ``|tojson`` filter which will
++    also mark the result as safe.  Due to how this function escapes certain
++    characters this is safe even if used outside of ``<script>`` tags.
+ 
++    The following characters are escaped in strings:
+ 
+-def _select_or_reject(args, kwargs, modfunc, lookup_attr):
++    -   ``<``
++    -   ``>``
++    -   ``&``
++    -   ``'``
++
++    This makes it safe to embed such strings in any place in HTML with the
++    notable exception of double quoted attributes.  In that case single
++    quote your attributes or HTML escape it in addition.
++
++    The indent parameter can be used to enable pretty printing.  Set it to
++    the number of spaces that the structures should be indented with.
++
++    Note that this filter is for use in HTML contexts only.
++
++    .. versionadded:: 2.9
++    """
++    policies = eval_ctx.environment.policies
++    dumper = policies['json.dumps_function']
++    options = policies['json.dumps_kwargs']
++    if indent is not None:
++        options = dict(options)
++        options['indent'] = indent
++    return htmlsafe_json_dumps(value, dumper=dumper, **options)
++
++
++def prepare_map(args, kwargs):
++    context = args[0]
++    seq = args[1]
++
++    if len(args) == 2 and 'attribute' in kwargs:
++        attribute = kwargs.pop('attribute')
++        if kwargs:
++            raise FilterArgumentError('Unexpected keyword argument %r' %
++                next(iter(kwargs)))
++        func = make_attrgetter(context.environment, attribute)
++    else:
++        try:
++            name = args[2]
++            args = args[3:]
++        except LookupError:
++            raise FilterArgumentError('map requires a filter argument')
++        func = lambda item: context.environment.call_filter(
++            name, item, args, kwargs, context=context)
++
++    return seq, func
++
++
++def prepare_select_or_reject(args, kwargs, modfunc, lookup_attr):
+     context = args[0]
+     seq = args[1]
+     if lookup_attr:
+@@ -940,9 +996,14 @@ def _select_or_reject(args, kwargs, modfunc, lookup_attr):
+     except LookupError:
+         func = bool
+ 
++    return seq, lambda item: modfunc(func(transfunc(item)))
++
++
++def select_or_reject(args, kwargs, modfunc, lookup_attr):
++    seq, func = prepare_select_or_reject(args, kwargs, modfunc, lookup_attr)
+     if seq:
+         for item in seq:
+-            if modfunc(func(transfunc(item))):
++            if func(item):
+                 yield item
+ 
+ 
+@@ -996,4 +1057,5 @@ FILTERS = {
+     'wordcount':            do_wordcount,
+     'wordwrap':             do_wordwrap,
+     'xmlattr':              do_xmlattr,
++    'tojson':               do_tojson,
+ }
+
+diff --git a/jinja2/idtracking.py b/jinja2/idtracking.py
+new file mode 100644
+index 0000000..87ef510
+--- /dev/null
++++ b/jinja2/idtracking.py
+@@ -0,0 +1,248 @@
++from jinja2.visitor import NodeVisitor
++from jinja2._compat import iteritems
++
++
++VAR_LOAD_PARAMETER = 'param'
++VAR_LOAD_RESOLVE = 'resolve'
++VAR_LOAD_ALIAS = 'alias'
++VAR_LOAD_UNDEFINED = 'undefined'
++
++
++def find_symbols(nodes, parent_symbols=None):
++    sym = Symbols(parent=parent_symbols)
++    visitor = FrameSymbolVisitor(sym)
++    for node in nodes:
++        visitor.visit(node)
++    return sym
++
++
++def symbols_for_node(node, parent_symbols=None):
++    sym = Symbols(parent=parent_symbols)
++    sym.analyze_node(node)
++    return sym
++
++
++class Symbols(object):
++
++    def __init__(self, parent=None):
++        if parent is None:
++            self.level = 0
++        else:
++            self.level = parent.level + 1
++        self.parent = parent
++        self.refs = {}
++        self.loads = {}
++        self.stores = set()
++
++    def analyze_node(self, node, **kwargs):
++        visitor = RootVisitor(self)
++        visitor.visit(node, **kwargs)
++
++    def _define_ref(self, name, load=None):
++        ident = 'l_%d_%s' % (self.level, name)
++        self.refs[name] = ident
++        if load is not None:
++            self.loads[ident] = load
++        return ident
++
++    def find_load(self, target):
++        if target in self.loads:
++            return self.loads[target]
++        if self.parent is not None:
++            return self.parent.find_load(target)
++
++    def find_ref(self, name):
++        if name in self.refs:
++            return self.refs[name]
++        if self.parent is not None:
++            return self.parent.find_ref(name)
++
++    def ref(self, name):
++        rv = self.find_ref(name)
++        if rv is None:
++            raise AssertionError('Tried to resolve a name to a reference that '
++                                 'was unknown to the frame (%r)' % name)
++        return rv
++
++    def copy(self):
++        rv = object.__new__(self.__class__)
++        rv.__dict__.update(self.__dict__)
++        rv.refs = self.refs.copy()
++        rv.loads = self.loads.copy()
++        rv.stores = self.stores.copy()
++        return rv
++
++    def store(self, name):
++        # We already have that name locally, so we can just bail
++        if name not in self.refs:
++            self._define_ref(name, load=(VAR_LOAD_UNDEFINED, None))
++        self.stores.add(name)
++
++    def declare_parameter(self, name):
++        self.stores.add(name)
++        return self._define_ref(name, load=(VAR_LOAD_PARAMETER, None))
++
++    def load(self, name):
++        target = self.find_ref(name)
++        if target is None:
++            self._define_ref(name, load=(VAR_LOAD_RESOLVE, name))
++
++    def branch_update(self, branch_symbols):
++        stores = {}
++        for branch in branch_symbols:
++            for target in branch.stores:
++                if target in self.stores:
++                    continue
++                stores[target] = stores.get(target, 0) + 1
++
++        for sym in branch_symbols:
++            self.refs.update(sym.refs)
++            self.loads.update(sym.loads)
++            self.stores.update(sym.stores)
++
++        for name, branch_count in iteritems(stores):
++            if branch_count == len(branch_symbols):
++                continue
++            target = self.find_ref(name)
++            assert target is not None, 'should not happen'
++
++            if self.parent is not None:
++                outer_target = self.parent.find_ref(name)
++                if outer_target is not None:
++                    self.loads[target] = (VAR_LOAD_ALIAS, outer_target)
++                    continue
++            self.loads[target] = (VAR_LOAD_RESOLVE, name)
++
++    def dump_stores(self):
++        rv = {}
++        node = self
++        while node is not None:
++            for name in node.stores:
++                if name not in rv:
++                    rv[name] = self.find_ref(name)
++            node = node.parent
++        return rv
++
++    def dump_param_targets(self):
++        rv = set()
++        node = self
++        while node is not None:
++            for target, (instr, _) in iteritems(self.loads):
++                if instr == VAR_LOAD_PARAMETER:
++                    rv.add(target)
++            node = node.parent
++        return rv
++
++
++class RootVisitor(NodeVisitor):
++
++    def __init__(self, symbols):
++        self.sym_visitor = FrameSymbolVisitor(symbols)
++
++    def _simple_visit(self, node, **kwargs):
++        for child in node.iter_child_nodes():
++            self.sym_visitor.visit(child)
++
++    visit_Template = visit_Block = visit_Macro = visit_FilterBlock = \
++        visit_Scope = visit_If = visit_ScopedEvalContextModifier = \
++        _simple_visit
++
++    def visit_AssignBlock(self, node, **kwargs):
++        for child in node.body:
++            self.sym_visitor.visit(child)
++
++    def visit_CallBlock(self, node, **kwargs):
++        for child in node.iter_child_nodes(exclude=('call',)):
++            self.sym_visitor.visit(child)
++
++    def visit_For(self, node, for_branch='body', **kwargs):
++        if node.test is not None:
++            self.sym_visitor.visit(node.test)
++        if for_branch == 'body':
++            self.sym_visitor.visit(node.target, store_as_param=True)
++            branch = node.body
++        elif for_branch == 'else':
++            branch = node.else_
++        else:
++            raise RuntimeError('Unknown for branch')
++        for item in branch or ():
++            self.sym_visitor.visit(item)
++
++    def generic_visit(self, node, *args, **kwargs):
++        raise NotImplementedError('Cannot find symbols for %r' %
++                                  node.__class__.__name__)
++
++
++class FrameSymbolVisitor(NodeVisitor):
++    """A visitor for `Frame.inspect`."""
++
++    def __init__(self, symbols):
++        self.symbols = symbols
++
++    def visit_Name(self, node, store_as_param=False, **kwargs):
++        """All assignments to names go through this function."""
++        if store_as_param or node.ctx == 'param':
++            self.symbols.declare_parameter(node.name)
++        elif node.ctx == 'store':
++            self.symbols.store(node.name)
++        elif node.ctx == 'load':
++            self.symbols.load(node.name)
++
++    def visit_If(self, node, **kwargs):
++        self.visit(node.test, **kwargs)
++
++        original_symbols = self.symbols
++
++        def inner_visit(nodes):
++            self.symbols = rv = original_symbols.copy()
++            for subnode in nodes:
++                self.visit(subnode, **kwargs)
++            self.symbols = original_symbols
++            return rv
++
++        body_symbols = inner_visit(node.body)
++        else_symbols = inner_visit(node.else_ or ())
++
++        self.symbols.branch_update([body_symbols, else_symbols])
++
++    def visit_Macro(self, node, **kwargs):
++        self.symbols.store(node.name)
++
++    def visit_Import(self, node, **kwargs):
++        self.generic_visit(node, **kwargs)
++        self.symbols.store(node.target)
++
++    def visit_FromImport(self, node, **kwargs):
++        self.generic_visit(node, **kwargs)
++        for name in node.names:
++            if isinstance(name, tuple):
++                self.symbols.store(name[1])
++            else:
++                self.symbols.store(name)
++
++    def visit_Assign(self, node, **kwargs):
++        """Visit assignments in the correct order."""
++        self.visit(node.node, **kwargs)
++        self.visit(node.target, **kwargs)
++
++    def visit_For(self, node, **kwargs):
++        """Visiting stops at for blocks.  However the block sequence
++        is visited as part of the outer scope.
++        """
++        self.visit(node.iter, **kwargs)
++
++    def visit_CallBlock(self, node, **kwargs):
++        self.visit(node.call, **kwargs)
++
++    def visit_FilterBlock(self, node, **kwargs):
++        self.visit(node.filter, **kwargs)
++
++    def visit_AssignBlock(self, node, **kwargs):
++        """Stop visiting at block assigns."""
++        self.visit(node.target, **kwargs)
++
++    def visit_Scope(self, node, **kwargs):
++        """Stop visiting at scopes."""
++
++    def visit_Block(self, node, **kwargs):
++        """Stop visiting at blocks."""
+
+diff --git a/jinja2/lexer.py b/jinja2/lexer.py
+index c8dac21..ca2914a 100644
+--- a/jinja2/lexer.py
++++ b/jinja2/lexer.py
+@@ -11,7 +11,7 @@
+     operators we don't allow in templates. On the other hand it separates
+     template code and python code in expressions.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD, see LICENSE for more details.
+ """
+ import re
+@@ -574,15 +574,6 @@ class Lexer(object):
+                 except Exception as e:
+                     msg = str(e).split(':')[-1].strip()
+                     raise TemplateSyntaxError(msg, lineno, name, filename)
+-                # if we can express it as bytestring (ascii only)
+-                # we do that for support of semi broken APIs
+-                # as datetime.datetime.strftime.  On python 3 this
+-                # call becomes a noop thanks to 2to3
+-                if PY2:
+-                    try:
+-                        value = value.encode('ascii')
+-                    except UnicodeError:
+-                        pass
+             elif token == 'integer':
+                 value = int(value)
+             elif token == 'float':
+
+diff --git a/jinja2/loaders.py b/jinja2/loaders.py
+index 44aa392..4c79793 100644
+--- a/jinja2/loaders.py
++++ b/jinja2/loaders.py
+@@ -5,7 +5,7 @@
+ 
+     Jinja loader classes.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD, see LICENSE for more details.
+ """
+ import os
+@@ -351,7 +351,7 @@ class PrefixLoader(BaseLoader):
+         try:
+             return loader.get_source(environment, name)
+         except TemplateNotFound:
+-            # re-raise the exception with the correct fileame here.
++            # re-raise the exception with the correct filename here.
+             # (the one that includes the prefix)
+             raise TemplateNotFound(template)
+ 
+@@ -361,7 +361,7 @@ class PrefixLoader(BaseLoader):
+         try:
+             return loader.load(environment, local_name, globals)
+         except TemplateNotFound:
+-            # re-raise the exception with the correct fileame here.
++            # re-raise the exception with the correct filename here.
+             # (the one that includes the prefix)
+             raise TemplateNotFound(name)
+ 
+
+diff --git a/jinja2/meta.py b/jinja2/meta.py
+index 3dbab7c..7421914 100644
+--- a/jinja2/meta.py
++++ b/jinja2/meta.py
+@@ -6,12 +6,12 @@
+     This module implements various functions that exposes information about
+     templates that might be interesting for various kinds of applications.
+ 
+-    :copyright: (c) 2010 by the Jinja Team, see AUTHORS for more details.
++    :copyright: (c) 2017 by the Jinja Team, see AUTHORS for more details.
+     :license: BSD, see LICENSE for more details.
+ """
+ from jinja2 import nodes
+ from jinja2.compiler import CodeGenerator
+-from jinja2._compat import string_types
++from jinja2._compat import string_types, iteritems
+ 
+ 
+ class TrackingCodeGenerator(CodeGenerator):
+@@ -25,9 +25,12 @@ class TrackingCodeGenerator(CodeGenerator):
+     def write(self, x):
+         """Don't write."""
+ 
+-    def pull_locals(self, frame):
++    def enter_frame(self, frame):
+         """Remember all undeclared identifiers."""
+-        self.undeclared_identifiers.update(frame.identifiers.undeclared)
++        CodeGenerator.enter_frame(self, frame)
++        for _, (action, param) in iteritems(frame.symbols.loads):
++            if action == 'resolve':
++                self.undeclared_identifiers.add(param)
+ 
+ 
+ def find_undeclared_variables(ast):
+
+diff --git a/jinja2/nodes.py b/jinja2/nodes.py
+index 6d4593b..d1a4c38 100644
+--- a/jinja2/nodes.py
++++ b/jinja2/nodes.py
+@@ -9,7 +9,7 @@
+     `get_nodes` used by the parser and translator in order to normalize
+     python and jinja nodes.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD, see LICENSE for more details.
+ """
+ import types
+@@ -17,7 +17,7 @@ import operator
+ 
+ from collections import deque
+ from jinja2.utils import Markup
+-from jinja2._compat import izip, with_metaclass, text_type
++from jinja2._compat import izip, with_metaclass, text_type, PY2
+ 
+ 
+ #: the types we support for context functions
+@@ -242,6 +242,35 @@ class Node(with_metaclass(NodeType, object)):
+                       arg in self.fields)
+         )
+ 
++    def dump(self):
++        def _dump(node):
++            if not isinstance(node, Node):
++                buf.append(repr(node))
++                return
++
++            buf.append('nodes.%s(' % node.__class__.__name__)
++            if not node.fields:
++                buf.append(')')
++                return
++            for idx, field in enumerate(node.fields):
++                if idx:
++                    buf.append(', ')
++                value = getattr(node, field)
++                if isinstance(value, list):
++                    buf.append('[')
++                    for idx, item in enumerate(value):
++                        if idx:
++                            buf.append(', ')
++                        _dump(item)
++                    buf.append(']')
++                else:
++                    _dump(value)
++            buf.append(')')
++        buf = []
++        _dump(self)
++        return ''.join(buf)
++
++
+ 
+ class Stmt(Node):
+     """Base node for all statements."""
+@@ -441,7 +470,14 @@ class Const(Literal):
+     fields = ('value',)
+ 
+     def as_const(self, eval_ctx=None):
+-        return self.value
++        rv = self.value
++        if PY2 and type(rv) is text_type and \
++           self.environment.policies['compiler.ascii_str']:
++            try:
++                rv = rv.encode('ascii')
++            except UnicodeError:
++                pass
++        return rv
+ 
+     @classmethod
+     def from_untrusted(cls, value, lineno=None, environment=None):
+@@ -563,8 +599,15 @@ class Filter(Expr):
+         filter_ = self.environment.filters.get(self.name)
+         if filter_ is None or getattr(filter_, 'contextfilter', False):
+             raise Impossible()
++
++        # We cannot constant handle async filters, so we need to make sure
++        # to not go down this path.
++        if eval_ctx.environment.is_async and \
++           getattr(filter_, 'asyncfiltervariant', False):
++            raise Impossible()
++
+         obj = self.node.as_const(eval_ctx)
+-        args = [x.as_const(eval_ctx) for x in self.args]
++        args = [obj] + [x.as_const(eval_ctx) for x in self.args]
+         if getattr(filter_, 'evalcontextfilter', False):
+             args.insert(0, eval_ctx)
+         elif getattr(filter_, 'environmentfilter', False):
+@@ -581,7 +624,7 @@ class Filter(Expr):
+             except Exception:
+                 raise Impossible()
+         try:
+-            return filter_(obj, *args, **kwargs)
++            return filter_(*args, **kwargs)
+         except Exception:
+             raise Impossible()
+ 
+@@ -602,38 +645,6 @@ class Call(Expr):
+     """
+     fields = ('node', 'args', 'kwargs', 'dyn_args', 'dyn_kwargs')
+ 
+-    def as_const(self, eval_ctx=None):
+-        eval_ctx = get_eval_context(self, eval_ctx)
+-        if eval_ctx.volatile or eval_ctx.environment.sandboxed:
+-            raise Impossible()
+-        obj = self.node.as_const(eval_ctx)
+-
+-        # don't evaluate context functions
+-        args = [x.as_const(eval_ctx) for x in self.args]
+-        if isinstance(obj, _context_function_types):
+-            if getattr(obj, 'contextfunction', False):
+-                raise Impossible()
+-            elif getattr(obj, 'evalcontextfunction', False):
+-                args.insert(0, eval_ctx)
+-            elif getattr(obj, 'environmentfunction', False):
+-                args.insert(0, self.environment)
+-
+-        kwargs = dict(x.as_const(eval_ctx) for x in self.kwargs)
+-        if self.dyn_args is not None:
+-            try:
+-                args.extend(self.dyn_args.as_const(eval_ctx))
+-            except Exception:
+-                raise Impossible()
+-        if self.dyn_kwargs is not None:
+-            try:
+-                kwargs.update(self.dyn_kwargs.as_const(eval_ctx))
+-            except Exception:
+-                raise Impossible()
+-        try:
+-            return obj(*args, **kwargs)
+-        except Exception:
+-            raise Impossible()
+-
+ 
+ class Getitem(Expr):
+     """Get an attribute or item from an expression and prefer the item."""
+
+diff --git a/jinja2/optimizer.py b/jinja2/optimizer.py
+index 00eab11..65ab3ce 100644
+--- a/jinja2/optimizer.py
++++ b/jinja2/optimizer.py
+@@ -13,7 +13,7 @@
+ 
+     The solution would be a second syntax tree that has the scoping rules stored.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD.
+ """
+ from jinja2 import nodes
+@@ -32,30 +32,11 @@ class Optimizer(NodeTransformer):
+     def __init__(self, environment):
+         self.environment = environment
+ 
+-    def visit_If(self, node):
+-        """Eliminate dead code."""
+-        # do not optimize ifs that have a block inside so that it doesn't
+-        # break super().
+-        if node.find(nodes.Block) is not None:
+-            return self.generic_visit(node)
+-        try:
+-            val = self.visit(node.test).as_const()
+-        except nodes.Impossible:
+-            return self.generic_visit(node)
+-        if val:
+-            body = node.body
+-        else:
+-            body = node.else_
+-        result = []
+-        for node in body:
+-            result.extend(self.visit_list(node))
+-        return result
+-
+-    def fold(self, node):
++    def fold(self, node, eval_ctx=None):
+         """Do constant folding."""
+         node = self.generic_visit(node)
+         try:
+-            return nodes.Const.from_untrusted(node.as_const(),
++            return nodes.Const.from_untrusted(node.as_const(eval_ctx),
+                                               lineno=node.lineno,
+                                               environment=self.environment)
+         except nodes.Impossible:
+
+diff --git a/jinja2/parser.py b/jinja2/parser.py
+index d24da18..9742a27 100644
+--- a/jinja2/parser.py
++++ b/jinja2/parser.py
+@@ -5,7 +5,7 @@
+ 
+     Implements the template parser.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD, see LICENSE for more details.
+ """
+ from jinja2 import nodes
+@@ -16,9 +16,18 @@ from jinja2._compat import imap
+ 
+ _statement_keywords = frozenset(['for', 'if', 'block', 'extends', 'print',
+                                  'macro', 'include', 'from', 'import',
+-                                 'set'])
++                                 'set', 'with', 'autoescape'])
+ _compare_operators = frozenset(['eq', 'ne', 'lt', 'lteq', 'gt', 'gteq'])
+ 
++_math_nodes = {
++    'add': nodes.Add,
++    'sub': nodes.Sub,
++    'mul': nodes.Mul,
++    'div': nodes.Div,
++    'floordiv': nodes.FloorDiv,
++    'mod': nodes.Mod,
++}
++
+ 
+ class Parser(object):
+     """This is the central parsing class Jinja2 uses.  It's passed to
+@@ -215,6 +224,31 @@ class Parser(object):
+             break
+         return result
+ 
++    def parse_with(self):
++        node = nodes.Scope(lineno=next(self.stream).lineno)
++        assignments = []
++        while self.stream.current.type != 'block_end':
++            lineno = self.stream.current.lineno
++            if assignments:
++                self.stream.expect('comma')
++            target = self.parse_assign_target()
++            self.stream.expect('assign')
++            expr = self.parse_expression()
++            assignments.append(nodes.Assign(target, expr, lineno=lineno))
++        node.body = assignments + \
++            list(self.parse_statements(('name:endwith',),
++                                         drop_needle=True))
++        return node
++
++    def parse_autoescape(self):
++        node = nodes.ScopedEvalContextModifier(lineno=next(self.stream).lineno)
++        node.options = [
++            nodes.Keyword('autoescape', self.parse_expression())
++        ]
++        node.body = self.parse_statements(('name:endautoescape',),
++                                            drop_needle=True)
++        return nodes.Scope([node])
++
+     def parse_block(self):
+         node = nodes.Block(lineno=next(self.stream).lineno)
+         node.name = self.stream.expect('name').value
+@@ -429,19 +463,19 @@ class Parser(object):
+ 
+     def parse_compare(self):
+         lineno = self.stream.current.lineno
+-        expr = self.parse_add()
++        expr = self.parse_math1()
+         ops = []
+         while 1:
+             token_type = self.stream.current.type
+             if token_type in _compare_operators:
+                 next(self.stream)
+-                ops.append(nodes.Operand(token_type, self.parse_add()))
++                ops.append(nodes.Operand(token_type, self.parse_math1()))
+             elif self.stream.skip_if('name:in'):
+-                ops.append(nodes.Operand('in', self.parse_add()))
++                ops.append(nodes.Operand('in', self.parse_math1()))
+             elif (self.stream.current.test('name:not') and
+                   self.stream.look().test('name:in')):
+                 self.stream.skip(2)
+-                ops.append(nodes.Operand('notin', self.parse_add()))
++                ops.append(nodes.Operand('notin', self.parse_math1()))
+             else:
+                 break
+             lineno = self.stream.current.lineno
+@@ -449,73 +483,35 @@ class Parser(object):
+             return expr
+         return nodes.Compare(expr, ops, lineno=lineno)
+ 
+-    def parse_add(self):
+-        lineno = self.stream.current.lineno
+-        left = self.parse_sub()
+-        while self.stream.current.type == 'add':
+-            next(self.stream)
+-            right = self.parse_sub()
+-            left = nodes.Add(left, right, lineno=lineno)
+-            lineno = self.stream.current.lineno
+-        return left
+-
+-    def parse_sub(self):
++    def parse_math1(self):
+         lineno = self.stream.current.lineno
+         left = self.parse_concat()
+-        while self.stream.current.type == 'sub':
++        while self.stream.current.type in ('add', 'sub'):
++            cls = _math_nodes[self.stream.current.type]
+             next(self.stream)
+             right = self.parse_concat()
+-            left = nodes.Sub(left, right, lineno=lineno)
++            left = cls(left, right, lineno=lineno)
+             lineno = self.stream.current.lineno
+         return left
+ 
+     def parse_concat(self):
+         lineno = self.stream.current.lineno
+-        args = [self.parse_mul()]
++        args = [self.parse_math2()]
+         while self.stream.current.type == 'tilde':
+             next(self.stream)
+-            args.append(self.parse_mul())
++            args.append(self.parse_math2())
+         if len(args) == 1:
+             return args[0]
+         return nodes.Concat(args, lineno=lineno)
+ 
+-    def parse_mul(self):
+-        lineno = self.stream.current.lineno
+-        left = self.parse_div()
+-        while self.stream.current.type == 'mul':
+-            next(self.stream)
+-            right = self.parse_div()
+-            left = nodes.Mul(left, right, lineno=lineno)
+-            lineno = self.stream.current.lineno
+-        return left
+-
+-    def parse_div(self):
+-        lineno = self.stream.current.lineno
+-        left = self.parse_floordiv()
+-        while self.stream.current.type == 'div':
+-            next(self.stream)
+-            right = self.parse_floordiv()
+-            left = nodes.Div(left, right, lineno=lineno)
+-            lineno = self.stream.current.lineno
+-        return left
+-
+-    def parse_floordiv(self):
+-        lineno = self.stream.current.lineno
+-        left = self.parse_mod()
+-        while self.stream.current.type == 'floordiv':
+-            next(self.stream)
+-            right = self.parse_mod()
+-            left = nodes.FloorDiv(left, right, lineno=lineno)
+-            lineno = self.stream.current.lineno
+-        return left
+-
+-    def parse_mod(self):
++    def parse_math2(self):
+         lineno = self.stream.current.lineno
+         left = self.parse_pow()
+-        while self.stream.current.type == 'mod':
++        while self.stream.current.type in ('mul', 'div', 'floordiv', 'mod'):
++            cls = _math_nodes[self.stream.current.type]
+             next(self.stream)
+             right = self.parse_pow()
+-            left = nodes.Mod(left, right, lineno=lineno)
++            left = cls(left, right, lineno=lineno)
+             lineno = self.stream.current.lineno
+         return left
+ 
+@@ -835,7 +831,7 @@ class Parser(object):
+                                            'name:and')):
+             if self.stream.current.test('name:is'):
+                 self.fail('You cannot chain multiple tests with is')
+-            args = [self.parse_expression()]
++            args = [self.parse_primary()]
+         else:
+             args = []
+         node = nodes.Test(node, name, args, kwargs, dyn_args,
+
+diff --git a/jinja2/runtime.py b/jinja2/runtime.py
+index 685a12d..9a3c16a 100644
+--- a/jinja2/runtime.py
++++ b/jinja2/runtime.py
+@@ -5,7 +5,7 @@
+ 
+     Runtime helpers.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD.
+ """
+ import sys
+@@ -13,7 +13,7 @@ import sys
+ from itertools import chain
+ from jinja2.nodes import EvalContext, _context_function_types
+ from jinja2.utils import Markup, soft_unicode, escape, missing, concat, \
+-     internalcode, object_type_repr
++     internalcode, object_type_repr, evalcontextfunction
+ from jinja2.exceptions import UndefinedError, TemplateRuntimeError, \
+      TemplateNotFound
+ from jinja2._compat import imap, text_type, iteritems, \
+@@ -24,7 +24,7 @@ from jinja2._compat import imap, text_type, iteritems, \
+ __all__ = ['LoopContext', 'TemplateReference', 'Macro', 'Markup',
+            'TemplateRuntimeError', 'missing', 'concat', 'escape',
+            'markup_join', 'unicode_join', 'to_string', 'identity',
+-           'TemplateNotFound', 'make_logging_undefined']
++           'TemplateNotFound']
+ 
+ #: the name of the function that is used to convert something into
+ #: a string.  We can just use the text type here.
+@@ -67,8 +67,8 @@ def new_context(environment, template_name, blocks, vars=None,
+         if shared:
+             parent = dict(parent)
+         for key, value in iteritems(locals):
+-            if key[:2] == 'l_' and value is not missing:
+-                parent[key[2:]] = value
++            if value is not missing:
++                parent[key] = value
+     return environment.context_class(environment, parent, template_name,
+                                      blocks)
+ 
+@@ -150,20 +150,34 @@ class Context(object):
+         """Looks up a variable like `__getitem__` or `get` but returns an
+         :class:`Undefined` object with the name of the name looked up.
+         """
++        rv = self.resolve_or_missing(key)
++        if rv is missing:
++            return self.environment.undefined(name=key)
++        return rv
++
++    def resolve_or_missing(self, key):
++        """Resolves a variable like :meth:`resolve` but returns the
++        special `missing` value if it cannot be found.
++        """
+         if key in self.vars:
+             return self.vars[key]
+         if key in self.parent:
+             return self.parent[key]
+-        return self.environment.undefined(name=key)
++        return missing
+ 
+     def get_exported(self):
+         """Get a new dict with the exported variables."""
+         return dict((k, self.vars[k]) for k in self.exported_vars)
+ 
+     def get_all(self):
+-        """Return a copy of the complete context as dict including the
+-        exported variables.
++        """Return the complete context as dict including the exported
++        variables.  For optimizations reasons this might not return an
++        actual copy so be careful with using it.
+         """
++        if not self.vars:
++            return self.parent
++        if not self.parent:
++            return self.vars
+         return dict(self.parent, **self.vars)
+ 
+     @internalcode
+@@ -232,8 +246,8 @@ class Context(object):
+         """Lookup a variable or raise `KeyError` if the variable is
+         undefined.
+         """
+-        item = self.resolve(key)
+-        if isinstance(item, Undefined):
++        item = self.resolve_or_missing(key)
++        if item is missing:
+             raise KeyError(key)
+         return item
+ 
+@@ -280,25 +294,17 @@ class BlockReference(object):
+         return rv
+ 
+ 
+-class LoopContext(object):
++class LoopContextBase(object):
+     """A loop context for dynamic iteration."""
+ 
+-    def __init__(self, iterable, recurse=None, depth0=0):
+-        self._iterator = iter(iterable)
++    _after = _last_iteration
++    _length = None
++
++    def __init__(self, recurse=None, depth0=0):
+         self._recurse = recurse
+-        self._after = self._safe_next()
+         self.index0 = -1
+         self.depth0 = depth0
+ 
+-        # try to get the length of the iterable early.  This must be done
+-        # here because there are some broken iterators around where there
+-        # __len__ is the number of iterations left (i'm looking at your
+-        # listreverseiterator!).
+-        try:
+-            self._length = len(iterable)
+-        except (TypeError, AttributeError):
+-            self._length = None
+-
+     def cycle(self, *args):
+         """Cycles among the arguments with the current loop index."""
+         if not args:
+@@ -315,15 +321,6 @@ class LoopContext(object):
+     def __len__(self):
+         return self.length
+ 
+-    def __iter__(self):
+-        return LoopContextIterator(self)
+-
+-    def _safe_next(self):
+-        try:
+-            return next(self._iterator)
+-        except StopIteration:
+-            return _last_iteration
+-
+     @internalcode
+     def loop(self, iterable):
+         if self._recurse is None:
+@@ -336,6 +333,30 @@ class LoopContext(object):
+     __call__ = loop
+     del loop
+ 
++    def __repr__(self):
++        return '<%s %r/%r>' % (
++            self.__class__.__name__,
++            self.index,
++            self.length
++        )
++
++
++class LoopContext(LoopContextBase):
++
++    def __init__(self, iterable, recurse=None, depth0=0):
++        LoopContextBase.__init__(self, recurse, depth0)
++        self._iterator = iter(iterable)
++
++        # try to get the length of the iterable early.  This must be done
++        # here because there are some broken iterators around where there
++        # __len__ is the number of iterations left (i'm looking at your
++        # listreverseiterator!).
++        try:
++            self._length = len(iterable)
++        except (TypeError, AttributeError):
++            self._length = None
++        self._after = self._safe_next()
++
+     @property
+     def length(self):
+         if self._length is None:
+@@ -349,12 +370,14 @@ class LoopContext(object):
+             self._length = len(iterable) + iterations_done
+         return self._length
+ 
+-    def __repr__(self):
+-        return '<%s %r/%r>' % (
+-            self.__class__.__name__,
+-            self.index,
+-            self.length
+-        )
++    def __iter__(self):
++        return LoopContextIterator(self)
++
++    def _safe_next(self):
++        try:
++            return next(self._iterator)
++        except StopIteration:
++            return _last_iteration
+ 
+ 
+ @implements_iterator
+@@ -381,20 +404,47 @@ class LoopContextIterator(object):
+ class Macro(object):
+     """Wraps a macro function."""
+ 
+-    def __init__(self, environment, func, name, arguments, defaults,
+-                 catch_kwargs, catch_varargs, caller):
++    def __init__(self, environment, func, name, arguments,
++                 catch_kwargs, catch_varargs, caller,
++                 default_autoescape=None):
+         self._environment = environment
+         self._func = func
+         self._argument_count = len(arguments)
+         self.name = name
+         self.arguments = arguments
+-        self.defaults = defaults
+         self.catch_kwargs = catch_kwargs
+         self.catch_varargs = catch_varargs
+         self.caller = caller
++        if default_autoescape is None:
++            default_autoescape = environment.autoescape
++        self._default_autoescape = default_autoescape
+ 
+     @internalcode
++    @evalcontextfunction
+     def __call__(self, *args, **kwargs):
++        # This requires a bit of explanation,  In the past we used to
++        # decide largely based on compile-time information if a macro is
++        # safe or unsafe.  While there was a volatile mode it was largely
++        # unused for deciding on escaping.  This turns out to be
++        # problemtic for macros because if a macro is safe or not not so
++        # much depends on the escape mode when it was defined but when it
++        # was used.
++        #
++        # Because however we export macros from the module system and
++        # there are historic callers that do not pass an eval context (and
++        # will continue to not pass one), we need to perform an instance
++        # check here.
++        #
++        # This is considered safe because an eval context is not a valid
++        # argument to callables otherwise anwyays.  Worst case here is
++        # that if no eval context is passed we fall back to the compile
++        # time autoescape flag.
++        if args and isinstance(args[0], EvalContext):
++            autoescape = args[0].autoescape
++            args = args[1:]
++        else:
++            autoescape = self._default_autoescape
++
+         # try to consume the positional arguments
+         arguments = list(args[:self._argument_count])
+         off = len(arguments)
+@@ -407,11 +457,7 @@ class Macro(object):
+                 try:
+                     value = kwargs.pop(name)
+                 except KeyError:
+-                    try:
+-                        value = self.defaults[idx - self._argument_count + off]
+-                    except IndexError:
+-                        value = self._environment.undefined(
+-                            'parameter %r was not provided' % name, name=name)
++                    value = missing
+                 arguments.append(value)
+ 
+         # it's important that the order of these arguments does not change
+@@ -433,7 +479,11 @@ class Macro(object):
+         elif len(args) > self._argument_count:
+             raise TypeError('macro %r takes not more than %d argument(s)' %
+                             (self.name, len(self.arguments)))
+-        return self._func(*arguments)
++
++        rv = self._func(*arguments)
++        if autoescape:
++            rv = Markup(rv)
++        return rv
+ 
+     def __repr__(self):
+         return '<%s %s>' % (
+@@ -498,8 +548,8 @@ class Undefined(object):
+         __truediv__ = __rtruediv__ = __floordiv__ = __rfloordiv__ = \
+         __mod__ = __rmod__ = __pos__ = __neg__ = __call__ = \
+         __getitem__ = __lt__ = __le__ = __gt__ = __ge__ = __int__ = \
+-        __float__ = __complex__ = __pow__ = __rpow__ = \
+-        _fail_with_undefined_error
++        __float__ = __complex__ = __pow__ = __rpow__ = __sub__ = \
++        __rsub__ = _fail_with_undefined_error
+ 
+     def __eq__(self, other):
+         return type(self) is type(other)
+
+diff --git a/jinja2/sandbox.py b/jinja2/sandbox.py
+index c035dde..9e00322 100644
+--- a/jinja2/sandbox.py
++++ b/jinja2/sandbox.py
+@@ -9,7 +9,7 @@
+ 
+     The behavior can be changed by subclassing the environment.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD.
+ """
+ import types
+@@ -20,11 +20,8 @@ from jinja2.exceptions import SecurityError
+ from jinja2._compat import string_types, text_type, PY2
+ from jinja2.utils import Markup
+ 
+-has_format = False
+-if hasattr(text_type, 'format'):
+-    from markupsafe import EscapeFormatter
+-    from string import Formatter
+-    has_format = True
++from markupsafe import EscapeFormatter
++from string import Formatter
+ 
+ 
+ #: maximum number of items a range may produce
+@@ -82,13 +79,11 @@ except ImportError:
+     pass
+ 
+ #: register Python 2.6 abstract base classes
+-try:
+-    from collections import MutableSet, MutableMapping, MutableSequence
+-    _mutable_set_types += (MutableSet,)
+-    _mutable_mapping_types += (MutableMapping,)
+-    _mutable_sequence_types += (MutableSequence,)
+-except ImportError:
+-    pass
++from collections import MutableSet, MutableMapping, MutableSequence
++_mutable_set_types += (MutableSet,)
++_mutable_mapping_types += (MutableMapping,)
++_mutable_sequence_types += (MutableSequence,)
++
+ 
+ _mutable_spec = (
+     (_mutable_set_types, frozenset([
+@@ -140,8 +135,6 @@ class _MagicFormatMapping(Mapping):
+ 
+ 
+ def inspect_format_method(callable):
+-    if not has_format:
+-        return None
+     if not isinstance(callable, (types.MethodType,
+                                  types.BuiltinMethodType)) or \
+        callable.__name__ != 'format':
+@@ -206,7 +199,7 @@ def is_internal_attribute(obj, attr):
+         if attr in UNSAFE_COROUTINE_ATTRIBUTES:
+             return True
+     elif hasattr(types, 'AsyncGeneratorType') and isinstance(obj, types.AsyncGeneratorType):
+-        if attri in UNSAFE_ASYNC_GENERATOR_ATTRIBUTES:
++        if attr in UNSAFE_ASYNC_GENERATOR_ATTRIBUTES:
+             return True
+     return attr.startswith('__')
+ 
+@@ -446,35 +439,37 @@ class ImmutableSandboxedEnvironment(SandboxedEnvironment):
+         return not modifies_known_mutable(obj, attr)
+ 
+ 
+-if has_format:
+-    # This really is not a public API apparenlty.
+-    try:
+-        from _string import formatter_field_name_split
+-    except ImportError:
+-        def formatter_field_name_split(field_name):
+-            return field_name._formatter_field_name_split()
++# This really is not a public API apparenlty.
++try:
++    from _string import formatter_field_name_split
++except ImportError:
++    def formatter_field_name_split(field_name):
++        return field_name._formatter_field_name_split()
+ 
+-    class SandboxedFormatterMixin(object):
+ 
+-        def __init__(self, env):
+-            self._env = env
++class SandboxedFormatterMixin(object):
+ 
+-        def get_field(self, field_name, args, kwargs):
+-            first, rest = formatter_field_name_split(field_name)
+-            obj = self.get_value(first, args, kwargs)
+-            for is_attr, i in rest:
+-                if is_attr:
+-                    obj = self._env.getattr(obj, i)
+-                else:
+-                    obj = self._env.getitem(obj, i)
+-            return obj, first
+-
+-    class SandboxedFormatter(SandboxedFormatterMixin, Formatter):
+-        def __init__(self, env):
+-            SandboxedFormatterMixin.__init__(self, env)
+-            Formatter.__init__(self)
+-
+-    class SandboxedEscapeFormatter(SandboxedFormatterMixin, EscapeFormatter):
+-        def __init__(self, env, escape):
+-            SandboxedFormatterMixin.__init__(self, env)
+-            EscapeFormatter.__init__(self, escape)
++    def __init__(self, env):
++        self._env = env
++
++    def get_field(self, field_name, args, kwargs):
++        first, rest = formatter_field_name_split(field_name)
++        obj = self.get_value(first, args, kwargs)
++        for is_attr, i in rest:
++            if is_attr:
++                obj = self._env.getattr(obj, i)
++            else:
++                obj = self._env.getitem(obj, i)
++        return obj, first
++
++class SandboxedFormatter(SandboxedFormatterMixin, Formatter):
++
++    def __init__(self, env):
++        SandboxedFormatterMixin.__init__(self, env)
++        Formatter.__init__(self)
++
++class SandboxedEscapeFormatter(SandboxedFormatterMixin, EscapeFormatter):
++
++    def __init__(self, env, escape):
++        SandboxedFormatterMixin.__init__(self, env)
++        EscapeFormatter.__init__(self, escape)
+
+diff --git a/jinja2/tests.py b/jinja2/tests.py
+index bb32349..bd843b7 100644
+--- a/jinja2/tests.py
++++ b/jinja2/tests.py
+@@ -5,7 +5,7 @@
+ 
+     Jinja test functions. Used with the "is" operator.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD, see LICENSE for more details.
+ """
+ import re
+@@ -152,6 +152,16 @@ def test_escaped(value):
+     return hasattr(value, '__html__')
+ 
+ 
++def test_greaterthan(value, other):
++    """Check if value is greater than other."""
++    return value > other
++
++
++def test_lessthan(value, other):
++    """Check if value is less than other."""
++    return value < other
++
++
+ TESTS = {
+     'odd':              test_odd,
+     'even':             test_even,
+@@ -169,5 +179,7 @@ TESTS = {
+     'callable':         test_callable,
+     'sameas':           test_sameas,
+     'equalto':          test_equalto,
+-    'escaped':          test_escaped
++    'escaped':          test_escaped,
++    'greaterthan':      test_greaterthan,
++    'lessthan':         test_lessthan
+ }
+
+diff --git a/jinja2/utils.py b/jinja2/utils.py
+index 612d5c3..b96d309 100644
+--- a/jinja2/utils.py
++++ b/jinja2/utils.py
+@@ -5,10 +5,11 @@
+ 
+     Utility functions.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD, see LICENSE for more details.
+ """
+ import re
++import json
+ import errno
+ from collections import deque
+ from threading import Lock
+@@ -37,6 +38,8 @@ internal_code = set()
+ 
+ concat = u''.join
+ 
++_slash_escape = '\\/' not in json.dumps('/')
++
+ 
+ def contextfunction(f):
+     """This decorator can be used to mark a function or method context callable.
+@@ -109,7 +112,7 @@ def clear_caches():
+     """Jinja2 keeps internal caches for environments and lexers.  These are
+     used so that Jinja2 doesn't have to recreate environments and lexers all
+     the time.  Normally you don't have to care about that but if you are
+-    messuring memory consumption you may want to clean the caches.
++    measuring memory consumption you may want to clean the caches.
+     """
+     from jinja2.environment import _spontaneous_environments
+     from jinja2.lexer import _lexer_cache
+@@ -183,7 +186,7 @@ def pformat(obj, verbose=False):
+         return pformat(obj)
+ 
+ 
+-def urlize(text, trim_url_limit=None, nofollow=False, target=None):
++def urlize(text, trim_url_limit=None, rel=None, target=None):
+     """Converts any URLs in text into clickable links. Works on http://,
+     https:// and www. links. Links can have trailing punctuation (periods,
+     commas, close-parens) and leading punctuation (opening parens) and
+@@ -201,11 +204,9 @@ def urlize(text, trim_url_limit=None, nofollow=False, target=None):
+                          and (x[:limit] + (len(x) >=limit and '...'
+                          or '')) or x
+     words = _word_split_re.split(text_type(escape(text)))
+-    nofollow_attr = nofollow and ' rel="nofollow"' or ''
+-    if target is not None and isinstance(target, string_types):
+-        target_attr = ' target="%s"' % target
+-    else:
+-        target_attr = ''
++    rel_attr = rel and ' rel="%s"' % text_type(escape(rel)) or ''
++    target_attr = target and ' target="%s"' % escape(target) or ''
++
+     for i, word in enumerate(words):
+         match = _punctuation_re.match(word)
+         if match:
+@@ -221,11 +222,11 @@ def urlize(text, trim_url_limit=None, nofollow=False, target=None):
+                     middle.endswith('.com')
+                 )):
+                 middle = '<a href="http://%s"%s%s>%s</a>' % (middle,
+-                    nofollow_attr, target_attr, trim_url(middle))
++                    rel_attr, target_attr, trim_url(middle))
+             if middle.startswith('http://') or \
+                middle.startswith('https://'):
+                 middle = '<a href="%s"%s%s>%s</a>' % (middle,
+-                    nofollow_attr, target_attr, trim_url(middle))
++                    rel_attr, target_attr, trim_url(middle))
+             if '@' in middle and not middle.startswith('www.') and \
+                not ':' in middle and _simple_email_re.match(middle):
+                 middle = '<a href="mailto:%s">%s</a>' % (middle, middle)
+@@ -487,6 +488,88 @@ except ImportError:
+     pass
+ 
+ 
++def select_autoescape(enabled_extensions=('html', 'htm', 'xml'),
++                      disabled_extensions=(),
++                      default_for_string=True,
++                      default=False):
++    """Intelligently sets the initial value of autoescaping based on the
++    filename of the template.  This is the recommended way to configure
++    autoescaping if you do not want to write a custom function yourself.
++
++    If you want to enable it for all templates created from strings or
++    for all templates with `.html` and `.xml` extensions::
++
++        from jinja2 import Environment, select_autoescape
++        env = Environment(autoescape=select_autoescape(
++            enabled_extensions=('html', 'xml'),
++            default_for_string=True,
++        ))
++
++    Example configuration to turn it on at all times except if the template
++    ends with `.txt`::
++
++        from jinja2 import Environment, select_autoescape
++        env = Environment(autoescape=select_autoescape(
++            disabled_extensions=('txt',),
++            default_for_string=True,
++            default=True,
++        ))
++
++    The `enabled_extensions` is an iterable of all the extensions that
++    autoescaping should be enabled for.  Likewise `disabled_extensions` is
++    a list of all templates it should be disabled for.  If a template is
++    loaded from a string then the default from `default_for_string` is used.
++    If nothing matches then the initial value of autoescaping is set to the
++    value of `default`.
++
++    For security reasons this function operates case insensitive.
++
++    .. versionadded:: 2.9
++    """
++    enabled_patterns = tuple('.' + x.lstrip('.').lower()
++                             for x in enabled_extensions)
++    disabled_patterns = tuple('.' + x.lstrip('.').lower()
++                              for x in disabled_extensions)
++    def autoescape(template_name):
++        if template_name is None:
++            return default_for_string
++        template_name = template_name.lower()
++        if template_name.endswith(enabled_patterns):
++            return True
++        if template_name.endswith(disabled_patterns):
++            return False
++        return default
++    return autoescape
++
++
++def htmlsafe_json_dumps(obj, dumper=None, **kwargs):
++    """Works exactly like :func:`dumps` but is safe for use in ``<script>``
++    tags.  It accepts the same arguments and returns a JSON string.  Note that
++    this is available in templates through the ``|tojson`` filter which will
++    also mark the result as safe.  Due to how this function escapes certain
++    characters this is safe even if used outside of ``<script>`` tags.
++
++    The following characters are escaped in strings:
++
++    -   ``<``
++    -   ``>``
++    -   ``&``
++    -   ``'``
++
++    This makes it safe to embed such strings in any place in HTML with the
++    notable exception of double quoted attributes.  In that case single
++    quote your attributes or HTML escape it in addition.
++    """
++    if dumper is None:
++        dumper = json.dumps
++    rv = dumper(obj, **kwargs) \
++        .replace(u'<', u'\\u003c') \
++        .replace(u'>', u'\\u003e') \
++        .replace(u'&', u'\\u0026') \
++        .replace(u"'", u'\\u0027')
++    return rv
++
++
+ @implements_iterator
+ class Cycler(object):
+     """A cycle helper for templates."""
+@@ -506,12 +589,14 @@ class Cycler(object):
+         """Returns the current item."""
+         return self.items[self.pos]
+ 
+-    def __next__(self):
++    def next(self):
+         """Goes one item ahead and returns it."""
+         rv = self.current
+         self.pos = (self.pos + 1) % len(self.items)
+         return rv
+ 
++    __next__ = next
++
+ 
+ class Joiner(object):
+     """A joining helper for templates."""
+@@ -527,5 +612,13 @@ class Joiner(object):
+         return self.sep
+ 
+ 
++# does this python version support async for in and async generators?
++try:
++    exec('async def _():\n async for _ in ():\n  yield _')
++    have_async_gen = True
++except SyntaxError:
++    have_async_gen = False
++
++
+ # Imported here because that's where it was in the past
+ from markupsafe import Markup, escape, soft_unicode
+
+diff --git a/jinja2/visitor.py b/jinja2/visitor.py
+index 413e7c3..ba526df 100644
+--- a/jinja2/visitor.py
++++ b/jinja2/visitor.py
+@@ -5,7 +5,7 @@
+ 
+     This module implements a visitor for the nodes.
+ 
+-    :copyright: (c) 2010 by the Jinja Team.
++    :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD.
+ """
+ from jinja2.nodes import Node
+
+diff --git a/scripts/make-release.py b/scripts/make-release.py
+index c28eb9f..6fd98fe 100644
+--- a/scripts/make-release.py
++++ b/scripts/make-release.py
+@@ -92,7 +92,7 @@ def set_setup_version(version):
+ 
+ 
+ def build_and_upload():
+-    cmd = [sys.executable, 'setup.py', 'release', 'sdist', 'upload']
++    cmd = [sys.executable, 'setup.py', 'release', 'sdist', 'bdist_wheel', 'upload']
+     if wheel is not None:
+         cmd.insert(4, 'bdist_wheel')
+     Popen(cmd).wait()
+@@ -133,7 +133,7 @@ def main():
+         fail('Could not parse changelog')
+ 
+     version, release_date, codename = rv
+-    dev_version = bump_version(version) + '-dev'
++    dev_version = bump_version(version) + '.dev'
+ 
+     info('Releasing %s (codename %s, release date %s)',
+          version, codename, release_date.strftime('%d/%m/%Y'))
+
+diff --git a/setup.py b/setup.py
+index f19b394..ff180ed 100644
+--- a/setup.py
++++ b/setup.py
+@@ -40,7 +40,7 @@ from setuptools import setup
+ 
+ setup(
+     name='Jinja2',
+-    version='2.8.1',
++    version='2.9',
+     url='http://jinja.pocoo.org/',
+     license='BSD',
+     author='Armin Ronacher',
+@@ -62,12 +62,14 @@ setup(
+         'Programming Language :: Python :: 2.7',
+         'Programming Language :: Python :: 3',
+         'Programming Language :: Python :: 3.3',
++        'Programming Language :: Python :: 3.4',
++        'Programming Language :: Python :: 3.5',
+         'Topic :: Internet :: WWW/HTTP :: Dynamic Content',
+         'Topic :: Software Development :: Libraries :: Python Modules',
+         'Topic :: Text Processing :: Markup :: HTML'
+     ],
+     packages=['jinja2'],
+-    install_requires=['MarkupSafe'],
++    install_requires=['MarkupSafe>=0.23'],
+     extras_require={'i18n': ['Babel>=0.8']},
+     include_package_data=True,
+     entry_points="""

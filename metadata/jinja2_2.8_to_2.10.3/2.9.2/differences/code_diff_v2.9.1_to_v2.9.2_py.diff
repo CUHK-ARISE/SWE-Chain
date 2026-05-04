@@ -1,0 +1,149 @@
+diff --git a/jinja2/__init__.py b/jinja2/__init__.py
+index 6ab9e6f..e6581ca 100644
+--- a/jinja2/__init__.py
++++ b/jinja2/__init__.py
+@@ -27,7 +27,7 @@
+     :license: BSD, see LICENSE for more details.
+ """
+ __docformat__ = 'restructuredtext en'
+-__version__ = '2.9.1'
++__version__ = '2.9.2'
+ 
+ # high level interface
+ from jinja2.environment import Environment, Template
+
+diff --git a/jinja2/compiler.py b/jinja2/compiler.py
+index a9042a5..9051ced 100644
+--- a/jinja2/compiler.py
++++ b/jinja2/compiler.py
+@@ -503,18 +503,39 @@ class CodeGenerator(NodeVisitor):
+         frame.symbols.analyze_node(node)
+         macro_ref = MacroRef(node)
+ 
++        explicit_caller = None
++        skip_special_params = set()
+         args = []
+-        for arg in node.args:
++        for idx, arg in enumerate(node.args):
++            if arg.name == 'caller':
++                explicit_caller = idx
++            if arg.name in ('kwargs', 'varargs'):
++                skip_special_params.add(arg.name)
+             args.append(frame.symbols.ref(arg.name))
+ 
+         undeclared = find_undeclared(node.body, ('caller', 'kwargs', 'varargs'))
++
+         if 'caller' in undeclared:
+-            args.append(frame.symbols.declare_parameter('caller'))
++            # In older Jinja2 versions there was a bug that allowed caller
++            # to retain the special behavior even if it was mentioned in
++            # the argument list.  However thankfully this was only really
++            # working if it was the last argument.  So we are explicitly
++            # checking this now and error out if it is anywhere else in
++            # the argument list.
++            if explicit_caller is not None:
++                try:
++                    node.defaults[explicit_caller - len(node.args)]
++                except IndexError:
++                    self.fail('When defining macros or call blocks the '
++                              'special "caller" argument must be omitted '
++                              'or be given a default.', node.lineno)
++            else:
++                args.append(frame.symbols.declare_parameter('caller'))
+             macro_ref.accesses_caller = True
+-        if 'kwargs' in undeclared:
++        if 'kwargs' in undeclared and not 'kwargs' in skip_special_params:
+             args.append(frame.symbols.declare_parameter('kwargs'))
+             macro_ref.accesses_kwargs = True
+-        if 'varargs' in undeclared:
++        if 'varargs' in undeclared and not 'varargs' in skip_special_params:
+             args.append(frame.symbols.declare_parameter('varargs'))
+             macro_ref.accesses_varargs = True
+ 
+@@ -1034,7 +1055,7 @@ class CodeGenerator(NodeVisitor):
+             else:
+                 if self.environment.is_async:
+                     self.write('auto_aiter(')
+-                self.visit(node.iter, loop_frame)
++                self.visit(node.iter, frame)
+                 if self.environment.is_async:
+                     self.write(')')
+             self.write(' if (')
+@@ -1046,7 +1067,7 @@ class CodeGenerator(NodeVisitor):
+         else:
+             if self.environment.is_async and not extended_loop:
+                 self.write('auto_aiter(')
+-            self.visit(node.iter, loop_frame)
++            self.visit(node.iter, frame)
+             if self.environment.is_async and not extended_loop:
+                 self.write(')')
+ 
+
+diff --git a/jinja2/runtime.py b/jinja2/runtime.py
+index 9a3c16a..958ddfd 100644
+--- a/jinja2/runtime.py
++++ b/jinja2/runtime.py
+@@ -415,6 +415,7 @@ class Macro(object):
+         self.catch_kwargs = catch_kwargs
+         self.catch_varargs = catch_varargs
+         self.caller = caller
++        self.explicit_caller = 'caller' in arguments
+         if default_autoescape is None:
+             default_autoescape = environment.autoescape
+         self._default_autoescape = default_autoescape
+@@ -449,6 +450,10 @@ class Macro(object):
+         arguments = list(args[:self._argument_count])
+         off = len(arguments)
+ 
++        # For information why this is necessary refer to the handling
++        # of caller in the `macro_body` handler in the compiler.
++        found_caller = False
++
+         # if the number of arguments consumed is not the number of
+         # arguments expected we start filling in keyword arguments
+         # and defaults.
+@@ -458,20 +463,29 @@ class Macro(object):
+                     value = kwargs.pop(name)
+                 except KeyError:
+                     value = missing
++                if name == 'caller':
++                    found_caller = True
+                 arguments.append(value)
++        else:
++            found_caller = self.explicit_caller
+ 
+         # it's important that the order of these arguments does not change
+         # if not also changed in the compiler's `function_scoping` method.
+         # the order is caller, keyword arguments, positional arguments!
+-        if self.caller:
++        if self.caller and not found_caller:
+             caller = kwargs.pop('caller', None)
+             if caller is None:
+                 caller = self._environment.undefined('No caller defined',
+                                                      name='caller')
+             arguments.append(caller)
++
+         if self.catch_kwargs:
+             arguments.append(kwargs)
+         elif kwargs:
++            if 'caller' in kwargs:
++                raise TypeError('macro %r was invoked with two values for '
++                                'the special caller argument.  This is '
++                                'most likely a bug.' % self.name)
+             raise TypeError('macro %r takes no keyword argument %r' %
+                             (self.name, next(iter(kwargs))))
+         if self.catch_varargs:
+
+diff --git a/setup.py b/setup.py
+index ec8e0f0..faff1c4 100644
+--- a/setup.py
++++ b/setup.py
+@@ -40,7 +40,7 @@ from setuptools import setup
+ 
+ setup(
+     name='Jinja2',
+-    version='2.9.1',
++    version='2.9.2',
+     url='http://jinja.pocoo.org/',
+     license='BSD',
+     author='Armin Ronacher',

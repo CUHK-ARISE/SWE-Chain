@@ -1,0 +1,1006 @@
+{
+  "old_dir": ".packages/flask/2.1.3",
+  "new_dir": ".packages/flask/2.2.0",
+  "extracted_at": "2026-03-26T20:28:24.009227",
+  "diff_file": "metadata/flask_upgrade/v2.1.3_v2.2.0/test_diff_v2.1.3_to_v2.2.0.diff",
+  "diff_content": "diff --git a/tests/conftest.py b/tests/conftest.py\nindex 17ff2f3..670acc8 100644\n--- a/tests/conftest.py\n+++ b/tests/conftest.py\n@@ -6,8 +6,8 @@ import textwrap\n import pytest\n from _pytest import monkeypatch\n \n-import flask\n-from flask import Flask as _Flask\n+from flask import Flask\n+from flask.globals import request_ctx\n \n \n @pytest.fixture(scope=\"session\", autouse=True)\n@@ -18,6 +18,7 @@ def _standard_os_environ():\n     \"\"\"\n     mp = monkeypatch.MonkeyPatch()\n     out = (\n+        (os.environ, \"FLASK_ENV_FILE\", monkeypatch.notset),\n         (os.environ, \"FLASK_APP\", monkeypatch.notset),\n         (os.environ, \"FLASK_ENV\", monkeypatch.notset),\n         (os.environ, \"FLASK_DEBUG\", monkeypatch.notset),\n@@ -43,14 +44,13 @@ def _reset_os_environ(monkeypatch, _standard_os_environ):\n     monkeypatch._setitem.extend(_standard_os_environ)\n \n \n-class Flask(_Flask):\n-    testing = True\n-    secret_key = \"test key\"\n-\n-\n @pytest.fixture\n def app():\n     app = Flask(\"flask_test\", root_path=os.path.dirname(__file__))\n+    app.config.update(\n+        TESTING=True,\n+        SECRET_KEY=\"test key\",\n+    )\n     return app\n \n \n@@ -91,8 +91,10 @@ def leak_detector():\n     # make sure we're not leaking a request context since we are\n     # testing flask internally in debug mode in a few cases\n     leaks = []\n-    while flask._request_ctx_stack.top is not None:\n-        leaks.append(flask._request_ctx_stack.pop())\n+    while request_ctx:\n+        leaks.append(request_ctx._get_current_object())\n+        request_ctx.pop()\n+\n     assert leaks == []\n \n \n\ndiff --git a/tests/test_appctx.py b/tests/test_appctx.py\nindex aeb75a5..f5ca0bd 100644\n--- a/tests/test_appctx.py\n+++ b/tests/test_appctx.py\n@@ -1,6 +1,8 @@\n import pytest\n \n import flask\n+from flask.globals import app_ctx\n+from flask.globals import request_ctx\n \n \n def test_basic_url_generation(app):\n@@ -29,14 +31,14 @@ def test_url_generation_without_context_fails():\n \n def test_request_context_means_app_context(app):\n     with app.test_request_context():\n-        assert flask.current_app._get_current_object() == app\n-    assert flask._app_ctx_stack.top is None\n+        assert flask.current_app._get_current_object() is app\n+    assert not flask.current_app\n \n \n def test_app_context_provides_current_app(app):\n     with app.app_context():\n-        assert flask.current_app._get_current_object() == app\n-    assert flask._app_ctx_stack.top is None\n+        assert flask.current_app._get_current_object() is app\n+    assert not flask.current_app\n \n \n def test_app_tearing_down(app):\n@@ -175,11 +177,11 @@ def test_context_refcounts(app, client):\n \n     @app.route(\"/\")\n     def index():\n-        with flask._app_ctx_stack.top:\n-            with flask._request_ctx_stack.top:\n+        with app_ctx:\n+            with request_ctx:\n                 pass\n-        env = flask._request_ctx_stack.top.request.environ\n-        assert env[\"werkzeug.request\"] is not None\n+\n+        assert flask.request.environ[\"werkzeug.request\"] is not None\n         return \"\"\n \n     res = client.get(\"/\")\n\ndiff --git a/tests/test_async.py b/tests/test_async.py\nindex c8bb9bf..38be27c 100644\n--- a/tests/test_async.py\n+++ b/tests/test_async.py\n@@ -107,10 +107,12 @@ def test_async_before_after_request():\n     def index():\n         return \"\"\n \n-    @app.before_first_request\n-    async def before_first():\n-        nonlocal app_first_called\n-        app_first_called = True\n+    with pytest.deprecated_call():\n+\n+        @app.before_first_request\n+        async def before_first():\n+            nonlocal app_first_called\n+            app_first_called = True\n \n     @app.before_request\n     async def before():\n\ndiff --git a/tests/test_basic.py b/tests/test_basic.py\nindex 3dc3a0e..d547012 100644\n--- a/tests/test_basic.py\n+++ b/tests/test_basic.py\n@@ -5,6 +5,7 @@ import uuid\n import warnings\n import weakref\n from datetime import datetime\n+from datetime import timezone\n from platform import python_implementation\n from threading import Thread\n \n@@ -329,6 +330,11 @@ def test_session_using_session_settings(app, client):\n         flask.session[\"testing\"] = 42\n         return \"Hello World\"\n \n+    @app.route(\"/clear\")\n+    def clear():\n+        flask.session.pop(\"testing\", None)\n+        return \"Goodbye World\"\n+\n     rv = client.get(\"/\", \"http://www.example.com:8080/test/\")\n     cookie = rv.headers[\"set-cookie\"].lower()\n     assert \"domain=.example.com\" in cookie\n@@ -337,11 +343,6 @@ def test_session_using_session_settings(app, client):\n     assert \"httponly\" not in cookie\n     assert \"samesite\" in cookie\n \n-    @app.route(\"/clear\")\n-    def clear():\n-        flask.session.pop(\"testing\", None)\n-        return \"Goodbye World\"\n-\n     rv = client.get(\"/clear\", \"http://www.example.com:8080/test/\")\n     cookie = rv.headers[\"set-cookie\"].lower()\n     assert \"session=;\" in cookie\n@@ -436,7 +437,7 @@ def test_session_expiration(app, client):\n     assert \"set-cookie\" in rv.headers\n     match = re.search(r\"(?i)\\bexpires=([^;]+)\", rv.headers[\"set-cookie\"])\n     expires = parse_date(match.group())\n-    expected = datetime.utcnow() + app.permanent_session_lifetime\n+    expected = datetime.now(timezone.utc) + app.permanent_session_lifetime\n     assert expires.year == expected.year\n     assert expires.month == expected.month\n     assert expires.day == expected.day\n@@ -466,7 +467,7 @@ def test_session_stored_last(app, client):\n \n \n def test_session_special_types(app, client):\n-    now = datetime.utcnow().replace(microsecond=0)\n+    now = datetime.now(timezone.utc).replace(microsecond=0)\n     the_uuid = uuid.uuid4()\n \n     @app.route(\"/\")\n@@ -899,13 +900,6 @@ def test_error_handling(app, client):\n     assert b\"forbidden\" == rv.data\n \n \n-def test_error_handler_unknown_code(app):\n-    with pytest.raises(KeyError) as exc_info:\n-        app.register_error_handler(999, lambda e: (\"999\", 999))\n-\n-    assert \"Use a subclass\" in exc_info.value.args[0]\n-\n-\n def test_error_handling_processing(app, client):\n     app.testing = False\n \n@@ -934,13 +928,8 @@ def test_baseexception_error_handling(app, client):\n     def broken_func():\n         raise KeyboardInterrupt()\n \n-    with client:\n-        with pytest.raises(KeyboardInterrupt):\n-            client.get(\"/\")\n-\n-        ctx = flask._request_ctx_stack.top\n-        assert ctx.preserved\n-        assert type(ctx._preserved_exc) is KeyboardInterrupt\n+    with pytest.raises(KeyboardInterrupt):\n+        client.get(\"/\")\n \n \n def test_before_request_and_routing_errors(app, client):\n@@ -1038,7 +1027,14 @@ def test_errorhandler_precedence(app, client):\n     assert rv.data == b\"E2\"\n \n \n-def test_trapping_of_bad_request_key_errors(app, client):\n+@pytest.mark.parametrize(\n+    (\"debug\", \"trap\", \"expect_key\", \"expect_abort\"),\n+    [(False, None, True, True), (True, None, False, True), (False, True, False, False)],\n+)\n+def test_trap_bad_request_key_error(app, client, debug, trap, expect_key, expect_abort):\n+    app.config[\"DEBUG\"] = debug\n+    app.config[\"TRAP_BAD_REQUEST_ERRORS\"] = trap\n+\n     @app.route(\"/key\")\n     def fail():\n         flask.request.form[\"missing_key\"]\n@@ -1047,26 +1043,23 @@ def test_trapping_of_bad_request_key_errors(app, client):\n     def allow_abort():\n         flask.abort(400)\n \n-    rv = client.get(\"/key\")\n-    assert rv.status_code == 400\n-    assert b\"missing_key\" not in rv.data\n-    rv = client.get(\"/abort\")\n-    assert rv.status_code == 400\n+    if expect_key:\n+        rv = client.get(\"/key\")\n+        assert rv.status_code == 400\n+        assert b\"missing_key\" not in rv.data\n+    else:\n+        with pytest.raises(KeyError) as exc_info:\n+            client.get(\"/key\")\n \n-    app.debug = True\n-    with pytest.raises(KeyError) as e:\n-        client.get(\"/key\")\n-    assert e.errisinstance(BadRequest)\n-    assert \"missing_key\" in e.value.get_description()\n-    rv = client.get(\"/abort\")\n-    assert rv.status_code == 400\n+        assert exc_info.errisinstance(BadRequest)\n+        assert \"missing_key\" in exc_info.value.get_description()\n \n-    app.debug = False\n-    app.config[\"TRAP_BAD_REQUEST_ERRORS\"] = True\n-    with pytest.raises(KeyError):\n-        client.get(\"/key\")\n-    with pytest.raises(BadRequest):\n-        client.get(\"/abort\")\n+    if expect_abort:\n+        rv = client.get(\"/abort\")\n+        assert rv.status_code == 400\n+    else:\n+        with pytest.raises(BadRequest):\n+            client.get(\"/abort\")\n \n \n def test_trapping_of_all_http_exceptions(app, client):\n@@ -1117,14 +1110,10 @@ def test_enctype_debug_helper(app, client):\n     def index():\n         return flask.request.files[\"foo\"].filename\n \n-    # with statement is important because we leave an exception on the\n-    # stack otherwise and we want to ensure that this is not the case\n-    # to not negatively affect other tests.\n-    with client:\n-        with pytest.raises(DebugFilesKeyError) as e:\n-            client.post(\"/fail\", data={\"foo\": \"index.txt\"})\n-        assert \"no file contents were transmitted\" in str(e.value)\n-        assert \"This was submitted: 'index.txt'\" in str(e.value)\n+    with pytest.raises(DebugFilesKeyError) as e:\n+        client.post(\"/fail\", data={\"foo\": \"index.txt\"})\n+    assert \"no file contents were transmitted\" in str(e.value)\n+    assert \"This was submitted: 'index.txt'\" in str(e.value)\n \n \n def test_response_types(app, client):\n@@ -1173,6 +1162,10 @@ def test_response_types(app, client):\n     def from_dict():\n         return {\"foo\": \"bar\"}, 201\n \n+    @app.route(\"/list\")\n+    def from_list():\n+        return [\"foo\", \"bar\"], 201\n+\n     assert client.get(\"/text\").data == \"Hällo Wörld\".encode()\n     assert client.get(\"/bytes\").data == \"Hällo Wörld\".encode()\n \n@@ -1212,6 +1205,10 @@ def test_response_types(app, client):\n     assert rv.json == {\"foo\": \"bar\"}\n     assert rv.status_code == 201\n \n+    rv = client.get(\"/list\")\n+    assert rv.json == [\"foo\", \"bar\"]\n+    assert rv.status_code == 201\n+\n \n def test_response_type_errors():\n     app = flask.Flask(__name__)\n@@ -1278,6 +1275,11 @@ def test_make_response(app, req_ctx):\n     assert rv.data == b\"W00t\"\n     assert rv.mimetype == \"text/html\"\n \n+    rv = flask.make_response(c for c in \"Hello\")\n+    assert rv.status_code == 200\n+    assert rv.data == b\"Hello\"\n+    assert rv.mimetype == \"text/html\"\n+\n \n def test_make_response_with_response_instance(app, req_ctx):\n     rv = flask.make_response(flask.jsonify({\"msg\": \"W00t\"}), 400)\n@@ -1300,28 +1302,17 @@ def test_make_response_with_response_instance(app, req_ctx):\n     assert rv.headers[\"X-Foo\"] == \"bar\"\n \n \n-def test_jsonify_no_prettyprint(app, req_ctx):\n-    app.config.update({\"JSONIFY_PRETTYPRINT_REGULAR\": False})\n-    compressed_msg = b'{\"msg\":{\"submsg\":\"W00t\"},\"msg2\":\"foobar\"}\\n'\n-    uncompressed_msg = {\"msg\": {\"submsg\": \"W00t\"}, \"msg2\": \"foobar\"}\n-\n-    rv = flask.make_response(flask.jsonify(uncompressed_msg), 200)\n-    assert rv.data == compressed_msg\n-\n-\n-def test_jsonify_prettyprint(app, req_ctx):\n-    app.config.update({\"JSONIFY_PRETTYPRINT_REGULAR\": True})\n-    compressed_msg = {\"msg\": {\"submsg\": \"W00t\"}, \"msg2\": \"foobar\"}\n-    pretty_response = (\n-        b'{\\n  \"msg\": {\\n    \"submsg\": \"W00t\"\\n  }, \\n  \"msg2\": \"foobar\"\\n}\\n'\n-    )\n-\n-    rv = flask.make_response(flask.jsonify(compressed_msg), 200)\n-    assert rv.data == pretty_response\n+@pytest.mark.parametrize(\"compact\", [True, False])\n+def test_jsonify_no_prettyprint(app, compact):\n+    app.json.compact = compact\n+    rv = app.json.response({\"msg\": {\"submsg\": \"W00t\"}, \"msg2\": \"foobar\"})\n+    data = rv.data.strip()\n+    assert (b\" \" not in data) is compact\n+    assert (b\"\\n\" not in data) is compact\n \n \n def test_jsonify_mimetype(app, req_ctx):\n-    app.config.update({\"JSONIFY_MIMETYPE\": \"application/vnd.api+json\"})\n+    app.json.mimetype = \"application/vnd.api+json\"\n     msg = {\"msg\": {\"submsg\": \"W00t\"}}\n     rv = flask.make_response(flask.jsonify(msg), 200)\n     assert rv.mimetype == \"application/vnd.api+json\"\n@@ -1331,15 +1322,15 @@ def test_json_dump_dataclass(app, req_ctx):\n     from dataclasses import make_dataclass\n \n     Data = make_dataclass(\"Data\", [(\"name\", str)])\n-    value = flask.json.dumps(Data(\"Flask\"), app=app)\n-    value = flask.json.loads(value, app=app)\n+    value = app.json.dumps(Data(\"Flask\"))\n+    value = app.json.loads(value)\n     assert value == {\"name\": \"Flask\"}\n \n \n def test_jsonify_args_and_kwargs_check(app, req_ctx):\n     with pytest.raises(TypeError) as e:\n         flask.jsonify(\"fake args\", kwargs=\"fake\")\n-    assert \"behavior undefined\" in str(e.value)\n+    assert \"args or kwargs\" in str(e.value)\n \n \n def test_url_generation(app, req_ctx):\n@@ -1542,29 +1533,21 @@ def test_server_name_subdomain():\n     assert rv.data == b\"subdomain\"\n \n \n-@pytest.mark.filterwarnings(\"ignore::pytest.PytestUnraisableExceptionWarning\")\n-@pytest.mark.filterwarnings(\"ignore::pytest.PytestUnhandledThreadExceptionWarning\")\n-def test_exception_propagation(app, client):\n-    def apprunner(config_key):\n-        @app.route(\"/\")\n-        def index():\n-            1 // 0\n+@pytest.mark.parametrize(\"key\", [\"TESTING\", \"PROPAGATE_EXCEPTIONS\", \"DEBUG\", None])\n+def test_exception_propagation(app, client, key):\n+    app.testing = False\n \n-        if config_key is not None:\n-            app.config[config_key] = True\n-            with pytest.raises(Exception):\n-                client.get(\"/\")\n-        else:\n-            assert client.get(\"/\").status_code == 500\n+    @app.route(\"/\")\n+    def index():\n+        1 // 0\n+\n+    if key is not None:\n+        app.config[key] = True\n \n-    # we have to run this test in an isolated thread because if the\n-    # debug flag is set to true and an exception happens the context is\n-    # not torn down.  This causes other tests that run after this fail\n-    # when they expect no exception on the stack.\n-    for config_key in \"TESTING\", \"PROPAGATE_EXCEPTIONS\", \"DEBUG\", None:\n-        t = Thread(target=apprunner, args=(config_key,))\n-        t.start()\n-        t.join()\n+        with pytest.raises(ZeroDivisionError):\n+            client.get(\"/\")\n+    else:\n+        assert client.get(\"/\").status_code == 500\n \n \n @pytest.mark.parametrize(\"debug\", [True, False])\n@@ -1668,7 +1651,7 @@ def test_nonascii_pathinfo(app, client):\n     assert rv.data == b\"Hello World!\"\n \n \n-def test_debug_mode_complains_after_first_request(app, client):\n+def test_no_setup_after_first_request(app, client):\n     app.debug = True\n \n     @app.route(\"/\")\n@@ -1678,27 +1661,20 @@ def test_debug_mode_complains_after_first_request(app, client):\n     assert not app.got_first_request\n     assert client.get(\"/\").data == b\"Awesome\"\n \n-    with pytest.raises(AssertionError) as e:\n+    with pytest.raises(AssertionError) as exc_info:\n         app.add_url_rule(\"/foo\", endpoint=\"late\")\n \n-    assert \"A setup function was called\" in str(e.value)\n-\n-    app.debug = False\n-\n-    @app.route(\"/foo\")\n-    def working():\n-        return \"Meh\"\n-\n-    assert client.get(\"/foo\").data == b\"Meh\"\n-    assert app.got_first_request\n+    assert \"setup method 'add_url_rule'\" in str(exc_info.value)\n \n \n def test_before_first_request_functions(app, client):\n     got = []\n \n-    @app.before_first_request\n-    def foo():\n-        got.append(42)\n+    with pytest.deprecated_call():\n+\n+        @app.before_first_request\n+        def foo():\n+            got.append(42)\n \n     client.get(\"/\")\n     assert got == [42]\n@@ -1710,10 +1686,12 @@ def test_before_first_request_functions(app, client):\n def test_before_first_request_functions_concurrent(app, client):\n     got = []\n \n-    @app.before_first_request\n-    def foo():\n-        time.sleep(0.2)\n-        got.append(42)\n+    with pytest.deprecated_call():\n+\n+        @app.before_first_request\n+        def foo():\n+            time.sleep(0.2)\n+            got.append(42)\n \n     def get_and_assert():\n         client.get(\"/\")\n@@ -1727,28 +1705,23 @@ def test_before_first_request_functions_concurrent(app, client):\n \n \n def test_routing_redirect_debugging(monkeypatch, app, client):\n-    @app.route(\"/foo/\", methods=[\"GET\", \"POST\"])\n-    def foo():\n-        return \"success\"\n-\n-    app.debug = False\n-    rv = client.post(\"/foo\", data={}, follow_redirects=True)\n-    assert rv.data == b\"success\"\n+    app.config[\"DEBUG\"] = True\n \n-    app.debug = True\n+    @app.route(\"/user/\", methods=[\"GET\", \"POST\"])\n+    def user():\n+        return flask.request.form[\"status\"]\n \n-    with client:\n-        rv = client.post(\"/foo\", data={}, follow_redirects=True)\n-        assert rv.data == b\"success\"\n-        rv = client.get(\"/foo\", data={}, follow_redirects=True)\n-        assert rv.data == b\"success\"\n+    # default redirect code preserves form data\n+    rv = client.post(\"/user\", data={\"status\": \"success\"}, follow_redirects=True)\n+    assert rv.data == b\"success\"\n \n+    # 301 and 302 raise error\n     monkeypatch.setattr(RequestRedirect, \"code\", 301)\n \n-    with client, pytest.raises(AssertionError) as e:\n-        client.post(\"/foo\", data={})\n+    with client, pytest.raises(AssertionError) as exc_info:\n+        client.post(\"/user\", data={\"status\": \"error\"}, follow_redirects=True)\n \n-    assert \"canonical URL 'http://localhost/foo/'\" in str(e.value)\n+    assert \"canonical URL 'http://localhost/user/'\" in str(exc_info.value)\n \n \n def test_route_decorator_custom_endpoint(app, client):\n@@ -1776,57 +1749,6 @@ def test_route_decorator_custom_endpoint(app, client):\n     assert client.get(\"/bar/123\").data == b\"123\"\n \n \n-def test_preserve_only_once(app, client):\n-    app.debug = True\n-\n-    @app.route(\"/fail\")\n-    def fail_func():\n-        1 // 0\n-\n-    for _x in range(3):\n-        with pytest.raises(ZeroDivisionError):\n-            client.get(\"/fail\")\n-\n-    assert flask._request_ctx_stack.top is not None\n-    assert flask._app_ctx_stack.top is not None\n-    # implicit appctx disappears too\n-    flask._request_ctx_stack.top.pop()\n-    assert flask._request_ctx_stack.top is None\n-    assert flask._app_ctx_stack.top is None\n-\n-\n-def test_preserve_remembers_exception(app, client):\n-    app.debug = True\n-    errors = []\n-\n-    @app.route(\"/fail\")\n-    def fail_func():\n-        1 // 0\n-\n-    @app.route(\"/success\")\n-    def success_func():\n-        return \"Okay\"\n-\n-    @app.teardown_request\n-    def teardown_handler(exc):\n-        errors.append(exc)\n-\n-    # After this failure we did not yet call the teardown handler\n-    with pytest.raises(ZeroDivisionError):\n-        client.get(\"/fail\")\n-    assert errors == []\n-\n-    # But this request triggers it, and it's an error\n-    client.get(\"/success\")\n-    assert len(errors) == 2\n-    assert isinstance(errors[0], ZeroDivisionError)\n-\n-    # At this point another request does nothing.\n-    client.get(\"/success\")\n-    assert len(errors) == 3\n-    assert errors[1] is None\n-\n-\n def test_get_method_on_g(app_ctx):\n     assert flask.g.get(\"x\") is None\n     assert flask.g.get(\"x\", 11) == 11\n\ndiff --git a/tests/test_blueprints.py b/tests/test_blueprints.py\nindex fbe9eee..1bf130f 100644\n--- a/tests/test_blueprints.py\n+++ b/tests/test_blueprints.py\n@@ -722,9 +722,11 @@ def test_app_request_processing(app, client):\n     bp = flask.Blueprint(\"bp\", __name__)\n     evts = []\n \n-    @bp.before_app_first_request\n-    def before_first_request():\n-        evts.append(\"first\")\n+    with pytest.deprecated_call():\n+\n+        @bp.before_app_first_request\n+        def before_first_request():\n+            evts.append(\"first\")\n \n     @bp.before_app_request\n     def before_app():\n\ndiff --git a/tests/test_cli.py b/tests/test_cli.py\nindex 676e074..0d9625b 100644\n--- a/tests/test_cli.py\n+++ b/tests/test_cli.py\n@@ -1,7 +1,6 @@\n # This file was part of Flask-CLI and was modified under the terms of\n # its Revised BSD License. Copyright © 2015 CERN.\n import os\n-import platform\n import ssl\n import sys\n import types\n@@ -17,7 +16,6 @@ from flask import Blueprint\n from flask import current_app\n from flask import Flask\n from flask.cli import AppGroup\n-from flask.cli import DispatchingApp\n from flask.cli import find_best_app\n from flask.cli import FlaskGroup\n from flask.cli import get_version\n@@ -290,24 +288,22 @@ def test_scriptinfo(test_apps, monkeypatch):\n     assert app.name == \"testapp\"\n \n \n-@pytest.mark.xfail(platform.python_implementation() == \"PyPy\", reason=\"flaky on pypy\")\n-def test_lazy_load_error(monkeypatch):\n-    \"\"\"When using lazy loading, the correct exception should be\n-    re-raised.\n-    \"\"\"\n-\n-    class BadExc(Exception):\n-        pass\n+def test_app_cli_has_app_context(app, runner):\n+    def _param_cb(ctx, param, value):\n+        # current_app should be available in parameter callbacks\n+        return bool(current_app)\n \n-    def bad_load():\n-        raise BadExc\n+    @app.cli.command()\n+    @click.argument(\"value\", callback=_param_cb)\n+    def check(value):\n+        app = click.get_current_context().obj.load_app()\n+        # the loaded app should be the same as current_app\n+        same_app = current_app._get_current_object() is app\n+        return same_app, value\n \n-    lazy = DispatchingApp(bad_load, use_eager_loading=False)\n-\n-    # reduce flakiness by waiting for the internal loading lock\n-    with lazy._lock:\n-        with pytest.raises(BadExc):\n-            lazy._flush_bg_loading_exception()\n+    cli = FlaskGroup(create_app=lambda: app)\n+    result = runner.invoke(cli, [\"check\", \"x\"], standalone_mode=False)\n+    assert result.return_value == (True, True)\n \n \n def test_with_appcontext(runner):\n@@ -323,12 +319,12 @@ def test_with_appcontext(runner):\n     assert result.output == \"testapp\\n\"\n \n \n-def test_appgroup(runner):\n+def test_appgroup_app_context(runner):\n     @click.group(cls=AppGroup)\n     def cli():\n         pass\n \n-    @cli.command(with_appcontext=True)\n+    @cli.command()\n     def test():\n         click.echo(current_app.name)\n \n@@ -336,7 +332,7 @@ def test_appgroup(runner):\n     def subgroup():\n         pass\n \n-    @subgroup.command(with_appcontext=True)\n+    @subgroup.command()\n     def test2():\n         click.echo(current_app.name)\n \n@@ -351,7 +347,7 @@ def test_appgroup(runner):\n     assert result.output == \"testappgroup\\n\"\n \n \n-def test_flaskgroup(runner):\n+def test_flaskgroup_app_context(runner):\n     def create_app():\n         return Flask(\"flaskgroup\")\n \n@@ -388,6 +384,19 @@ def test_flaskgroup_debug(runner, set_debug_flag):\n     assert result.output == f\"{not set_debug_flag}\\n\"\n \n \n+def test_flaskgroup_nested(app, runner):\n+    cli = click.Group(\"cli\")\n+    flask_group = FlaskGroup(name=\"flask\", create_app=lambda: app)\n+    cli.add_command(flask_group)\n+\n+    @flask_group.command()\n+    def show():\n+        click.echo(current_app.name)\n+\n+    result = runner.invoke(cli, [\"flask\", \"show\"])\n+    assert result.output == \"flask_test\\n\"\n+\n+\n def test_no_command_echo_loading_error():\n     from flask.cli import cli\n \n\ndiff --git a/tests/test_config.py b/tests/test_config.py\nindex 944b93d..76c5d27 100644\n--- a/tests/test_config.py\n+++ b/tests/test_config.py\n@@ -1,7 +1,6 @@\n import json\n import os\n import textwrap\n-from datetime import timedelta\n \n import pytest\n \n@@ -113,6 +112,10 @@ def test_config_from_mapping():\n     app.config.from_mapping(SECRET_KEY=\"config\", TEST_KEY=\"foo\")\n     common_object_test(app)\n \n+    app = flask.Flask(__name__)\n+    app.config.from_mapping(SECRET_KEY=\"config\", TEST_KEY=\"foo\", skip_key=\"skip\")\n+    common_object_test(app)\n+\n     app = flask.Flask(__name__)\n     with pytest.raises(TypeError):\n         app.config.from_mapping({}, {})\n@@ -203,14 +206,6 @@ def test_session_lifetime():\n     assert app.permanent_session_lifetime.seconds == 42\n \n \n-def test_send_file_max_age():\n-    app = flask.Flask(__name__)\n-    app.config[\"SEND_FILE_MAX_AGE_DEFAULT\"] = 3600\n-    assert app.send_file_max_age_default.seconds == 3600\n-    app.config[\"SEND_FILE_MAX_AGE_DEFAULT\"] = timedelta(hours=2)\n-    assert app.send_file_max_age_default.seconds == 7200\n-\n-\n def test_get_namespace():\n     app = flask.Flask(__name__)\n     app.config[\"FOO_OPTION_1\"] = \"foo option 1\"\n\ndiff --git a/tests/test_helpers.py b/tests/test_helpers.py\nindex 58bf3c0..0e6a885 100644\n--- a/tests/test_helpers.py\n+++ b/tests/test_helpers.py\n@@ -2,10 +2,10 @@ import io\n import os\n \n import pytest\n+import werkzeug.exceptions\n \n import flask\n from flask.helpers import get_debug_flag\n-from flask.helpers import get_env\n \n \n class FakePath:\n@@ -118,11 +118,15 @@ class TestUrlFor:\n         )\n \n     def test_url_for_with_scheme_not_external(self, app, req_ctx):\n-        @app.route(\"/\")\n-        def index():\n-            return \"42\"\n+        app.add_url_rule(\"/\", endpoint=\"index\")\n \n-        pytest.raises(ValueError, flask.url_for, \"index\", _scheme=\"https\")\n+        # Implicit external with scheme.\n+        url = flask.url_for(\"index\", _scheme=\"https\")\n+        assert url == \"https://localhost/\"\n+\n+        # Error when external=False with scheme\n+        with pytest.raises(ValueError):\n+            flask.url_for(\"index\", _scheme=\"https\", _external=False)\n \n     def test_url_for_with_alternating_schemes(self, app, req_ctx):\n         @app.route(\"/\")\n@@ -158,6 +162,51 @@ class TestUrlFor:\n         assert flask.url_for(\"myview\", _method=\"POST\") == \"/myview/create\"\n \n \n+def test_redirect_no_app():\n+    response = flask.redirect(\"https://localhost\", 307)\n+    assert response.location == \"https://localhost\"\n+    assert response.status_code == 307\n+\n+\n+def test_redirect_with_app(app):\n+    def redirect(location, code=302):\n+        raise ValueError\n+\n+    app.redirect = redirect\n+\n+    with app.app_context(), pytest.raises(ValueError):\n+        flask.redirect(\"other\")\n+\n+\n+def test_abort_no_app():\n+    with pytest.raises(werkzeug.exceptions.Unauthorized):\n+        flask.abort(401)\n+\n+    with pytest.raises(LookupError):\n+        flask.abort(900)\n+\n+\n+def test_app_aborter_class():\n+    class MyAborter(werkzeug.exceptions.Aborter):\n+        pass\n+\n+    class MyFlask(flask.Flask):\n+        aborter_class = MyAborter\n+\n+    app = MyFlask(__name__)\n+    assert isinstance(app.aborter, MyAborter)\n+\n+\n+def test_abort_with_app(app):\n+    class My900Error(werkzeug.exceptions.HTTPException):\n+        code = 900\n+\n+    app.aborter.mapping[900] = My900Error\n+\n+    with app.app_context(), pytest.raises(My900Error):\n+        flask.abort(900)\n+\n+\n class TestNoImports:\n     \"\"\"Test Flasks are created without import.\n \n@@ -272,20 +321,6 @@ class TestHelpers:\n             assert get_debug_flag() == expected_flag\n         assert get_debug_flag() == expected_default_flag\n \n-    @pytest.mark.parametrize(\n-        \"env, ref_env, debug\",\n-        [\n-            (\"\", \"production\", False),\n-            (\"production\", \"production\", False),\n-            (\"development\", \"development\", True),\n-            (\"other\", \"other\", False),\n-        ],\n-    )\n-    def test_get_env(self, monkeypatch, env, ref_env, debug):\n-        monkeypatch.setenv(\"FLASK_ENV\", env)\n-        assert get_debug_flag() == debug\n-        assert get_env() == ref_env\n-\n     def test_make_response(self):\n         app = flask.Flask(__name__)\n         with app.test_request_context():\n\ndiff --git a/tests/test_json.py b/tests/test_json.py\nindex 9210275..ba9f38d 100644\n--- a/tests/test_json.py\n+++ b/tests/test_json.py\n@@ -8,6 +8,7 @@ from werkzeug.http import http_date\n \n import flask\n from flask import json\n+from flask.json.provider import DefaultJSONProvider\n \n \n @pytest.mark.parametrize(\"debug\", (True, False))\n@@ -48,9 +49,8 @@ def test_json_custom_mimetypes(app, client):\n     \"test_value,expected\", [(True, '\"\\\\u2603\"'), (False, '\"\\u2603\"')]\n )\n def test_json_as_unicode(test_value, expected, app, app_ctx):\n-\n-    app.config[\"JSON_AS_ASCII\"] = test_value\n-    rv = flask.json.dumps(\"\\N{SNOWMAN}\")\n+    app.json.ensure_ascii = test_value\n+    rv = app.json.dumps(\"\\N{SNOWMAN}\")\n     assert rv == expected\n \n \n@@ -170,7 +170,7 @@ def test_jsonify_aware_datetimes(tz):\n     dt = datetime.datetime(2017, 1, 1, 12, 34, 56, tzinfo=tzinfo)\n     gmt = FixedOffset(hours=0, name=\"GMT\")\n     expected = dt.astimezone(gmt).strftime('\"%a, %d %b %Y %H:%M:%S %Z\"')\n-    assert flask.json.JSONEncoder().encode(dt) == expected\n+    assert flask.json.dumps(dt) == expected\n \n \n def test_jsonify_uuid_types(app, client):\n@@ -225,74 +225,32 @@ def test_json_customization(app, client):\n         def __init__(self, val):\n             self.val = val\n \n-    class MyEncoder(flask.json.JSONEncoder):\n-        def default(self, o):\n-            if isinstance(o, X):\n-                return f\"<{o.val}>\"\n-            return flask.json.JSONEncoder.default(self, o)\n+    def default(o):\n+        if isinstance(o, X):\n+            return f\"<{o.val}>\"\n \n-    class MyDecoder(flask.json.JSONDecoder):\n-        def __init__(self, *args, **kwargs):\n-            kwargs.setdefault(\"object_hook\", self.object_hook)\n-            flask.json.JSONDecoder.__init__(self, *args, **kwargs)\n+        return DefaultJSONProvider.default(o)\n \n+    class CustomProvider(DefaultJSONProvider):\n         def object_hook(self, obj):\n             if len(obj) == 1 and \"_foo\" in obj:\n                 return X(obj[\"_foo\"])\n-            return obj\n-\n-    app.json_encoder = MyEncoder\n-    app.json_decoder = MyDecoder\n-\n-    @app.route(\"/\", methods=[\"POST\"])\n-    def index():\n-        return flask.json.dumps(flask.request.get_json()[\"x\"])\n-\n-    rv = client.post(\n-        \"/\",\n-        data=flask.json.dumps({\"x\": {\"_foo\": 42}}),\n-        content_type=\"application/json\",\n-    )\n-    assert rv.data == b'\"<42>\"'\n-\n \n-def test_blueprint_json_customization(app, client):\n-    class X:\n-        __slots__ = (\"val\",)\n-\n-        def __init__(self, val):\n-            self.val = val\n-\n-    class MyEncoder(flask.json.JSONEncoder):\n-        def default(self, o):\n-            if isinstance(o, X):\n-                return f\"<{o.val}>\"\n-\n-            return flask.json.JSONEncoder.default(self, o)\n+            return obj\n \n-    class MyDecoder(flask.json.JSONDecoder):\n-        def __init__(self, *args, **kwargs):\n+        def loads(self, s, **kwargs):\n             kwargs.setdefault(\"object_hook\", self.object_hook)\n-            flask.json.JSONDecoder.__init__(self, *args, **kwargs)\n-\n-        def object_hook(self, obj):\n-            if len(obj) == 1 and \"_foo\" in obj:\n-                return X(obj[\"_foo\"])\n-\n-            return obj\n+            return super().loads(s, **kwargs)\n \n-    bp = flask.Blueprint(\"bp\", __name__)\n-    bp.json_encoder = MyEncoder\n-    bp.json_decoder = MyDecoder\n+    app.json = CustomProvider(app)\n+    app.json.default = default\n \n-    @bp.route(\"/bp\", methods=[\"POST\"])\n+    @app.route(\"/\", methods=[\"POST\"])\n     def index():\n         return flask.json.dumps(flask.request.get_json()[\"x\"])\n \n-    app.register_blueprint(bp)\n-\n     rv = client.post(\n-        \"/bp\",\n+        \"/\",\n         data=flask.json.dumps({\"x\": {\"_foo\": 42}}),\n         content_type=\"application/json\",\n     )\n@@ -330,8 +288,7 @@ def test_modified_url_encoding(app, client):\n \n def test_json_key_sorting(app, client):\n     app.debug = True\n-\n-    assert app.config[\"JSON_SORT_KEYS\"]\n+    assert app.json.sort_keys\n     d = dict.fromkeys(range(20), \"foo\")\n \n     @app.route(\"/\")\n\ndiff --git a/tests/test_reqctx.py b/tests/test_reqctx.py\nindex 1a47891..abfacb9 100644\n--- a/tests/test_reqctx.py\n+++ b/tests/test_reqctx.py\n@@ -3,6 +3,7 @@ import warnings\n import pytest\n \n import flask\n+from flask.globals import request_ctx\n from flask.sessions import SecureCookieSessionInterface\n from flask.sessions import SessionInterface\n \n@@ -116,7 +117,7 @@ def test_context_binding(app):\n         assert index() == \"Hello World!\"\n     with app.test_request_context(\"/meh\"):\n         assert meh() == \"http://localhost/meh\"\n-    assert flask._request_ctx_stack.top is None\n+    assert not flask.request\n \n \n def test_context_test(app):\n@@ -152,7 +153,7 @@ class TestGreenletContextCopying:\n         @app.route(\"/\")\n         def index():\n             flask.session[\"fizz\"] = \"buzz\"\n-            reqctx = flask._request_ctx_stack.top.copy()\n+            reqctx = request_ctx.copy()\n \n             def g():\n                 assert not flask.request\n\ndiff --git a/tests/test_session_interface.py b/tests/test_session_interface.py\nindex 39562f5..613da37 100644\n--- a/tests/test_session_interface.py\n+++ b/tests/test_session_interface.py\n@@ -1,4 +1,5 @@\n import flask\n+from flask.globals import request_ctx\n from flask.sessions import SessionInterface\n \n \n@@ -13,7 +14,7 @@ def test_open_session_with_endpoint():\n             pass\n \n         def open_session(self, app, request):\n-            flask._request_ctx_stack.top.match_request()\n+            request_ctx.match_request()\n             assert request.endpoint is not None\n \n     app = flask.Flask(__name__)\n\ndiff --git a/tests/test_signals.py b/tests/test_signals.py\nindex 719eb3e..8aa6983 100644\n--- a/tests/test_signals.py\n+++ b/tests/test_signals.py\n@@ -123,8 +123,7 @@ def test_request_exception_signal():\n         flask.got_request_exception.disconnect(record, app)\n \n \n-def test_appcontext_signals():\n-    app = flask.Flask(__name__)\n+def test_appcontext_signals(app, client):\n     recorded = []\n \n     def record_push(sender, **kwargs):\n@@ -140,10 +139,8 @@ def test_appcontext_signals():\n     flask.appcontext_pushed.connect(record_push, app)\n     flask.appcontext_popped.connect(record_pop, app)\n     try:\n-        with app.test_client() as c:\n-            rv = c.get(\"/\")\n-            assert rv.data == b\"Hello\"\n-            assert recorded == [\"push\"]\n+        rv = client.get(\"/\")\n+        assert rv.data == b\"Hello\"\n         assert recorded == [\"push\", \"pop\"]\n     finally:\n         flask.appcontext_pushed.disconnect(record_push, app)\n@@ -174,12 +171,12 @@ def test_flash_signal(app):\n         flask.message_flashed.disconnect(record, app)\n \n \n-def test_appcontext_tearing_down_signal():\n-    app = flask.Flask(__name__)\n+def test_appcontext_tearing_down_signal(app, client):\n+    app.testing = False\n     recorded = []\n \n-    def record_teardown(sender, **kwargs):\n-        recorded.append((\"tear_down\", kwargs))\n+    def record_teardown(sender, exc):\n+        recorded.append(exc)\n \n     @app.route(\"/\")\n     def index():\n@@ -187,10 +184,9 @@ def test_appcontext_tearing_down_signal():\n \n     flask.appcontext_tearing_down.connect(record_teardown, app)\n     try:\n-        with app.test_client() as c:\n-            rv = c.get(\"/\")\n-            assert rv.status_code == 500\n-            assert recorded == []\n-        assert recorded == [(\"tear_down\", {\"exc\": None})]\n+        rv = client.get(\"/\")\n+        assert rv.status_code == 500\n+        assert len(recorded) == 1\n+        assert isinstance(recorded[0], ZeroDivisionError)\n     finally:\n         flask.appcontext_tearing_down.disconnect(record_teardown, app)\n\ndiff --git a/tests/test_templating.py b/tests/test_templating.py\nindex a53120e..863417c 100644\n--- a/tests/test_templating.py\n+++ b/tests/test_templating.py\n@@ -29,6 +29,15 @@ def test_original_win(app, client):\n     assert rv.data == b\"42\"\n \n \n+def test_simple_stream(app, client):\n+    @app.route(\"/\")\n+    def index():\n+        return flask.stream_template_string(\"{{ config }}\", config=42)\n+\n+    rv = client.get(\"/\")\n+    assert rv.data == b\"42\"\n+\n+\n def test_request_less_rendering(app, app_ctx):\n     app.config[\"WORLD_NAME\"] = \"Special World\"\n \n@@ -388,11 +397,9 @@ def test_templates_auto_reload_debug_run(app, monkeypatch):\n     monkeypatch.setattr(werkzeug.serving, \"run_simple\", run_simple_mock)\n \n     app.run()\n-    assert not app.templates_auto_reload\n     assert not app.jinja_env.auto_reload\n \n     app.run(debug=True)\n-    assert app.templates_auto_reload\n     assert app.jinja_env.auto_reload\n \n \n\ndiff --git a/tests/test_testing.py b/tests/test_testing.py\nindex a78502f..40f6fe1 100644\n--- a/tests/test_testing.py\n+++ b/tests/test_testing.py\n@@ -5,6 +5,7 @@ import werkzeug\n import flask\n from flask import appcontext_popped\n from flask.cli import ScriptInfo\n+from flask.globals import _cv_request\n from flask.json import jsonify\n from flask.testing import EnvironBuilder\n from flask.testing import FlaskCliRunner\n@@ -111,7 +112,7 @@ def test_path_is_url(app):\n \n def test_environbuilder_json_dumps(app):\n     \"\"\"EnvironBuilder.json_dumps() takes settings from the app.\"\"\"\n-    app.config[\"JSON_AS_ASCII\"] = False\n+    app.json.ensure_ascii = False\n     eb = EnvironBuilder(app, json=\"\\u20ac\")\n     assert eb.input_stream.read().decode(\"utf8\") == '\"\\u20ac\"'\n \n@@ -187,7 +188,6 @@ def test_session_transactions(app, client):\n \n def test_session_transactions_no_null_sessions():\n     app = flask.Flask(__name__)\n-    app.testing = True\n \n     with app.test_client() as c:\n         with pytest.raises(RuntimeError) as e:\n@@ -254,29 +254,6 @@ def test_reuse_client(client):\n         assert client.get(\"/\").status_code == 404\n \n \n-def test_test_client_calls_teardown_handlers(app, client):\n-    called = []\n-\n-    @app.teardown_request\n-    def remember(error):\n-        called.append(error)\n-\n-    with client:\n-        assert called == []\n-        client.get(\"/\")\n-        assert called == []\n-    assert called == [None]\n-\n-    del called[:]\n-    with client:\n-        assert called == []\n-        client.get(\"/\")\n-        assert called == []\n-        client.get(\"/\")\n-        assert called == [None]\n-    assert called == [None, None]\n-\n-\n def test_full_url_request(app, client):\n     @app.route(\"/action\", methods=[\"POST\"])\n     def action():\n@@ -412,13 +389,15 @@ def test_cli_custom_obj(app):\n def test_client_pop_all_preserved(app, req_ctx, client):\n     @app.route(\"/\")\n     def index():\n-        # stream_with_context pushes a third context, preserved by client\n-        return flask.Response(flask.stream_with_context(\"hello\"))\n+        # stream_with_context pushes a third context, preserved by response\n+        return flask.stream_with_context(\"hello\")\n \n-    # req_ctx fixture pushed an initial context, not marked preserved\n+    # req_ctx fixture pushed an initial context\n     with client:\n         # request pushes a second request context, preserved by client\n-        client.get(\"/\")\n+        rv = client.get(\"/\")\n \n+    # close the response, releasing the context held by stream_with_context\n+    rv.close()\n     # only req_ctx fixture should still be pushed\n-    assert flask._request_ctx_stack.top is req_ctx\n+    assert _cv_request.get(None) is req_ctx\n\ndiff --git a/tests/test_user_error_handler.py b/tests/test_user_error_handler.py\nindex d9f94a3..79c5a73 100644\n--- a/tests/test_user_error_handler.py\n+++ b/tests/test_user_error_handler.py\n@@ -11,29 +11,35 @@ def test_error_handler_no_match(app, client):\n     class CustomException(Exception):\n         pass\n \n-    class UnacceptableCustomException(BaseException):\n-        pass\n-\n     @app.errorhandler(CustomException)\n     def custom_exception_handler(e):\n         assert isinstance(e, CustomException)\n         return \"custom\"\n \n-    with pytest.raises(\n-        AssertionError, match=\"Custom exceptions must be subclasses of Exception.\"\n-    ):\n-        app.register_error_handler(UnacceptableCustomException, None)\n+    with pytest.raises(TypeError) as exc_info:\n+        app.register_error_handler(CustomException(), None)\n+\n+    assert \"CustomException() is an instance, not a class.\" in str(exc_info.value)\n+\n+    with pytest.raises(ValueError) as exc_info:\n+        app.register_error_handler(list, None)\n+\n+    assert \"'list' is not a subclass of Exception.\" in str(exc_info.value)\n \n     @app.errorhandler(500)\n     def handle_500(e):\n         assert isinstance(e, InternalServerError)\n-        original = getattr(e, \"original_exception\", None)\n \n-        if original is not None:\n-            return f\"wrapped {type(original).__name__}\"\n+        if e.original_exception is not None:\n+            return f\"wrapped {type(e.original_exception).__name__}\"\n \n         return \"direct\"\n \n+    with pytest.raises(ValueError) as exc_info:\n+        app.register_error_handler(999, None)\n+\n+    assert \"Use a subclass of HTTPException\" in str(exc_info.value)\n+\n     @app.route(\"/custom\")\n     def custom_test():\n         raise CustomException()\n\ndiff --git a/tests/test_views.py b/tests/test_views.py\nindex 0e21525..8d870de 100644\n--- a/tests/test_views.py\n+++ b/tests/test_views.py\n@@ -240,3 +240,21 @@ def test_remove_method_from_parent(app, client):\n     assert client.get(\"/\").data == b\"GET\"\n     assert client.post(\"/\").status_code == 405\n     assert sorted(View.methods) == [\"GET\"]\n+\n+\n+def test_init_once(app, client):\n+    n = 0\n+\n+    class CountInit(flask.views.View):\n+        init_every_request = False\n+\n+        def __init__(self):\n+            nonlocal n\n+            n += 1\n+\n+        def dispatch_request(self):\n+            return str(n)\n+\n+    app.add_url_rule(\"/\", view_func=CountInit.as_view(\"index\"))\n+    assert client.get(\"/\").data == b\"1\"\n+    assert client.get(\"/\").data == b\"1\"\n\ndiff --git a/tests/typing/typing_app_decorators.py b/tests/typing/typing_app_decorators.py\nnew file mode 100644\nindex 0000000..3df3e71\n--- /dev/null\n+++ b/tests/typing/typing_app_decorators.py\n@@ -0,0 +1,38 @@\n+from __future__ import annotations\n+\n+import typing as t\n+\n+from flask import Flask\n+from flask import Response\n+\n+app = Flask(__name__)\n+\n+\n+@app.after_request\n+def after_sync(response: Response) -> Response:\n+    ...\n+\n+\n+@app.after_request\n+async def after_async(response: Response) -> Response:\n+    ...\n+\n+\n+@app.before_request\n+def before_sync() -> None:\n+    ...\n+\n+\n+@app.before_request\n+async def before_async() -> None:\n+    ...\n+\n+\n+@app.teardown_appcontext\n+def teardown_sync(exc: t.Optional[BaseException]) -> None:\n+    ...\n+\n+\n+@app.teardown_appcontext\n+async def teardown_async(exc: t.Optional[BaseException]) -> None:\n+    ...\n\ndiff --git a/tests/typing/typing_route.py b/tests/typing/typing_route.py\nindex ba49d13..566280c 100644\n--- a/tests/typing/typing_route.py\n+++ b/tests/typing/typing_route.py\n@@ -1,9 +1,13 @@\n from __future__ import annotations\n \n+import typing as t\n from http import HTTPStatus\n \n+import typing_extensions as te\n+\n from flask import Flask\n from flask import jsonify\n+from flask import stream_template\n from flask.templating import render_template\n from flask.views import View\n from flask.wrappers import Response\n@@ -23,7 +27,45 @@ def hello_bytes() -> bytes:\n \n @app.route(\"/json\")\n def hello_json() -> Response:\n-    return jsonify({\"response\": \"Hello, World!\"})\n+    return jsonify(\"Hello, World!\")\n+\n+\n+@app.route(\"/json/dict\")\n+def hello_json_dict() -> t.Dict[str, t.Any]:\n+    return {\"response\": \"Hello, World!\"}\n+\n+\n+@app.route(\"/json/dict\")\n+def hello_json_list() -> t.List[t.Any]:\n+    return [{\"message\": \"Hello\"}, {\"message\": \"World\"}]\n+\n+\n+class StatusJSON(te.TypedDict):\n+    status: str\n+\n+\n+@app.route(\"/typed-dict\")\n+def typed_dict() -> StatusJSON:\n+    return {\"status\": \"ok\"}\n+\n+\n+@app.route(\"/generator\")\n+def hello_generator() -> t.Generator[str, None, None]:\n+    def show() -> t.Generator[str, None, None]:\n+        for x in range(100):\n+            yield f\"data:{x}\\n\\n\"\n+\n+    return show()\n+\n+\n+@app.route(\"/generator-expression\")\n+def hello_generator_expression() -> t.Iterator[bytes]:\n+    return (f\"data:{x}\\n\\n\".encode() for x in range(100))\n+\n+\n+@app.route(\"/iterator\")\n+def hello_iterator() -> t.Iterator[str]:\n+    return iter([f\"data:{x}\\n\\n\" for x in range(100)])\n \n \n @app.route(\"/status\")\n@@ -48,6 +90,16 @@ def return_template(name: str | None = None) -> str:\n     return render_template(\"index.html\", name=name)\n \n \n+@app.route(\"/template\")\n+def return_template_stream() -> t.Iterator[str]:\n+    return stream_template(\"index.html\", name=\"Hello\")\n+\n+\n+@app.route(\"/async\")\n+async def async_route() -> str:\n+    return \"Hello\"\n+\n+\n class RenderTemplateView(View):\n     def __init__(self: RenderTemplateView, template_name: str) -> None:\n         self.template_name = template_name\n",
+  "structured_diff": {
+    "tests/conftest.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -6,8 +6,8 @@",
+          "snippet": " import textwrap\n import pytest\n from _pytest import monkeypatch\n \n-import flask\n-from flask import Flask as _Flask\n+from flask import Flask\n+from flask.globals import request_ctx\n \n \n @pytest.fixture(scope=\"session\", autouse=True)",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "tests/conftest.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -18,6 +18,7 @@",
+          "snippet": " def _standard_os_environ():\n     \"\"\"\n     mp = monkeypatch.MonkeyPatch()\n     out = (\n+        (os.environ, \"FLASK_ENV_FILE\", monkeypatch.notset),\n         (os.environ, \"FLASK_APP\", monkeypatch.notset),\n         (os.environ, \"FLASK_ENV\", monkeypatch.notset),\n         (os.environ, \"FLASK_DEBUG\", monkeypatch.notset),",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/conftest.py::_standard_os_environ"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -43,14 +44,13 @@",
+          "snippet": " def _reset_os_environ(monkeypatch, _standard_os_environ):\n     monkeypatch._setitem.extend(_standard_os_environ)\n \n \n-class Flask(_Flask):\n-    testing = True\n-    secret_key = \"test key\"\n-\n-\n @pytest.fixture\n def app():\n     app = Flask(\"flask_test\", root_path=os.path.dirname(__file__))\n+    app.config.update(\n+        TESTING=True,\n+        SECRET_KEY=\"test key\",\n+    )\n     return app\n \n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/conftest.py::app"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -91,8 +91,10 @@",
+          "snippet": " def leak_detector():\n     # make sure we're not leaking a request context since we are\n     # testing flask internally in debug mode in a few cases\n     leaks = []\n-    while flask._request_ctx_stack.top is not None:\n-        leaks.append(flask._request_ctx_stack.pop())\n+    while request_ctx:\n+        leaks.append(request_ctx._get_current_object())\n+        request_ctx.pop()\n+\n     assert leaks == []\n \n \n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/conftest.py::leak_detector"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/test_appctx.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,6 +1,8 @@",
+          "snippet": " import pytest\n \n import flask\n+from flask.globals import app_ctx\n+from flask.globals import request_ctx\n \n \n def test_basic_url_generation(app):",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "tests/test_appctx.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -29,14 +31,14 @@",
+          "snippet": " def test_url_generation_without_context_fails():\n \n def test_request_context_means_app_context(app):\n     with app.test_request_context():\n-        assert flask.current_app._get_current_object() == app\n-    assert flask._app_ctx_stack.top is None\n+        assert flask.current_app._get_current_object() is app\n+    assert not flask.current_app\n \n \n def test_app_context_provides_current_app(app):\n     with app.app_context():\n-        assert flask.current_app._get_current_object() == app\n-    assert flask._app_ctx_stack.top is None\n+        assert flask.current_app._get_current_object() is app\n+    assert not flask.current_app\n \n \n def test_app_tearing_down(app):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_appctx.py::test_request_context_means_app_context"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_appctx.py::test_app_context_provides_current_app"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -175,11 +177,11 @@",
+          "snippet": " def test_context_refcounts(app, client):\n \n     @app.route(\"/\")\n     def index():\n-        with flask._app_ctx_stack.top:\n-            with flask._request_ctx_stack.top:\n+        with app_ctx:\n+            with request_ctx:\n                 pass\n-        env = flask._request_ctx_stack.top.request.environ\n-        assert env[\"werkzeug.request\"] is not None\n+\n+        assert flask.request.environ[\"werkzeug.request\"] is not None\n         return \"\"\n \n     res = client.get(\"/\")\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_appctx.py::index"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/test_async.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -107,10 +107,12 @@",
+          "snippet": " def test_async_before_after_request():\n     def index():\n         return \"\"\n \n-    @app.before_first_request\n-    async def before_first():\n-        nonlocal app_first_called\n-        app_first_called = True\n+    with pytest.deprecated_call():\n+\n+        @app.before_first_request\n+        async def before_first():\n+            nonlocal app_first_called\n+            app_first_called = True\n \n     @app.before_request\n     async def before():\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_async.py::test_async_before_after_request"
+            },
+            {
+              "kind": "async_function",
+              "node": "tests/test_async.py::before_first"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/test_basic.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -5,6 +5,7 @@",
+          "snippet": " import uuid\n import warnings\n import weakref\n from datetime import datetime\n+from datetime import timezone\n from platform import python_implementation\n from threading import Thread\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "tests/test_basic.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -329,6 +330,11 @@",
+          "snippet": " def test_session_using_session_settings(app, client):\n         flask.session[\"testing\"] = 42\n         return \"Hello World\"\n \n+    @app.route(\"/clear\")\n+    def clear():\n+        flask.session.pop(\"testing\", None)\n+        return \"Goodbye World\"\n+\n     rv = client.get(\"/\", \"http://www.example.com:8080/test/\")\n     cookie = rv.headers[\"set-cookie\"].lower()\n     assert \"domain=.example.com\" in cookie",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_session_using_session_settings"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::clear"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -337,11 +343,6 @@",
+          "snippet": " def test_session_using_session_settings(app, client):\n     assert \"httponly\" not in cookie\n     assert \"samesite\" in cookie\n \n-    @app.route(\"/clear\")\n-    def clear():\n-        flask.session.pop(\"testing\", None)\n-        return \"Goodbye World\"\n-\n     rv = client.get(\"/clear\", \"http://www.example.com:8080/test/\")\n     cookie = rv.headers[\"set-cookie\"].lower()\n     assert \"session=;\" in cookie",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_session_using_session_settings"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -436,7 +437,7 @@",
+          "snippet": " def test_session_expiration(app, client):\n     assert \"set-cookie\" in rv.headers\n     match = re.search(r\"(?i)\\bexpires=([^;]+)\", rv.headers[\"set-cookie\"])\n     expires = parse_date(match.group())\n-    expected = datetime.utcnow() + app.permanent_session_lifetime\n+    expected = datetime.now(timezone.utc) + app.permanent_session_lifetime\n     assert expires.year == expected.year\n     assert expires.month == expected.month\n     assert expires.day == expected.day",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_session_expiration"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -466,7 +467,7 @@",
+          "snippet": " def test_session_stored_last(app, client):\n \n \n def test_session_special_types(app, client):\n-    now = datetime.utcnow().replace(microsecond=0)\n+    now = datetime.now(timezone.utc).replace(microsecond=0)\n     the_uuid = uuid.uuid4()\n \n     @app.route(\"/\")",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_session_special_types"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -899,13 +900,6 @@",
+          "snippet": " def test_error_handling(app, client):\n     assert b\"forbidden\" == rv.data\n \n \n-def test_error_handler_unknown_code(app):\n-    with pytest.raises(KeyError) as exc_info:\n-        app.register_error_handler(999, lambda e: (\"999\", 999))\n-\n-    assert \"Use a subclass\" in exc_info.value.args[0]\n-\n-\n def test_error_handling_processing(app, client):\n     app.testing = False\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_error_handling_processing"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -934,13 +928,8 @@",
+          "snippet": " def test_baseexception_error_handling(app, client):\n     def broken_func():\n         raise KeyboardInterrupt()\n \n-    with client:\n-        with pytest.raises(KeyboardInterrupt):\n-            client.get(\"/\")\n-\n-        ctx = flask._request_ctx_stack.top\n-        assert ctx.preserved\n-        assert type(ctx._preserved_exc) is KeyboardInterrupt\n+    with pytest.raises(KeyboardInterrupt):\n+        client.get(\"/\")\n \n \n def test_before_request_and_routing_errors(app, client):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_baseexception_error_handling"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1038,7 +1027,14 @@",
+          "snippet": " def test_errorhandler_precedence(app, client):\n     assert rv.data == b\"E2\"\n \n \n-def test_trapping_of_bad_request_key_errors(app, client):\n+@pytest.mark.parametrize(\n+    (\"debug\", \"trap\", \"expect_key\", \"expect_abort\"),\n+    [(False, None, True, True), (True, None, False, True), (False, True, False, False)],\n+)\n+def test_trap_bad_request_key_error(app, client, debug, trap, expect_key, expect_abort):\n+    app.config[\"DEBUG\"] = debug\n+    app.config[\"TRAP_BAD_REQUEST_ERRORS\"] = trap\n+\n     @app.route(\"/key\")\n     def fail():\n         flask.request.form[\"missing_key\"]",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_trap_bad_request_key_error"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1047,26 +1043,23 @@",
+          "snippet": " def test_trapping_of_bad_request_key_errors(app, client):\n     def allow_abort():\n         flask.abort(400)\n \n-    rv = client.get(\"/key\")\n-    assert rv.status_code == 400\n-    assert b\"missing_key\" not in rv.data\n-    rv = client.get(\"/abort\")\n-    assert rv.status_code == 400\n+    if expect_key:\n+        rv = client.get(\"/key\")\n+        assert rv.status_code == 400\n+        assert b\"missing_key\" not in rv.data\n+    else:\n+        with pytest.raises(KeyError) as exc_info:\n+            client.get(\"/key\")\n \n-    app.debug = True\n-    with pytest.raises(KeyError) as e:\n-        client.get(\"/key\")\n-    assert e.errisinstance(BadRequest)\n-    assert \"missing_key\" in e.value.get_description()\n-    rv = client.get(\"/abort\")\n-    assert rv.status_code == 400\n+        assert exc_info.errisinstance(BadRequest)\n+        assert \"missing_key\" in exc_info.value.get_description()\n \n-    app.debug = False\n-    app.config[\"TRAP_BAD_REQUEST_ERRORS\"] = True\n-    with pytest.raises(KeyError):\n-        client.get(\"/key\")\n-    with pytest.raises(BadRequest):\n-        client.get(\"/abort\")\n+    if expect_abort:\n+        rv = client.get(\"/abort\")\n+        assert rv.status_code == 400\n+    else:\n+        with pytest.raises(BadRequest):\n+            client.get(\"/abort\")\n \n \n def test_trapping_of_all_http_exceptions(app, client):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_trap_bad_request_key_error"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1117,14 +1110,10 @@",
+          "snippet": " def test_enctype_debug_helper(app, client):\n     def index():\n         return flask.request.files[\"foo\"].filename\n \n-    # with statement is important because we leave an exception on the\n-    # stack otherwise and we want to ensure that this is not the case\n-    # to not negatively affect other tests.\n-    with client:\n-        with pytest.raises(DebugFilesKeyError) as e:\n-            client.post(\"/fail\", data={\"foo\": \"index.txt\"})\n-        assert \"no file contents were transmitted\" in str(e.value)\n-        assert \"This was submitted: 'index.txt'\" in str(e.value)\n+    with pytest.raises(DebugFilesKeyError) as e:\n+        client.post(\"/fail\", data={\"foo\": \"index.txt\"})\n+    assert \"no file contents were transmitted\" in str(e.value)\n+    assert \"This was submitted: 'index.txt'\" in str(e.value)\n \n \n def test_response_types(app, client):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_enctype_debug_helper"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1173,6 +1162,10 @@",
+          "snippet": " def test_response_types(app, client):\n     def from_dict():\n         return {\"foo\": \"bar\"}, 201\n \n+    @app.route(\"/list\")\n+    def from_list():\n+        return [\"foo\", \"bar\"], 201\n+\n     assert client.get(\"/text\").data == \"Hällo Wörld\".encode()\n     assert client.get(\"/bytes\").data == \"Hällo Wörld\".encode()\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_response_types"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::from_list"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1212,6 +1205,10 @@",
+          "snippet": " def test_response_types(app, client):\n     assert rv.json == {\"foo\": \"bar\"}\n     assert rv.status_code == 201\n \n+    rv = client.get(\"/list\")\n+    assert rv.json == [\"foo\", \"bar\"]\n+    assert rv.status_code == 201\n+\n \n def test_response_type_errors():\n     app = flask.Flask(__name__)",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_response_types"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1278,6 +1275,11 @@",
+          "snippet": " def test_make_response(app, req_ctx):\n     assert rv.data == b\"W00t\"\n     assert rv.mimetype == \"text/html\"\n \n+    rv = flask.make_response(c for c in \"Hello\")\n+    assert rv.status_code == 200\n+    assert rv.data == b\"Hello\"\n+    assert rv.mimetype == \"text/html\"\n+\n \n def test_make_response_with_response_instance(app, req_ctx):\n     rv = flask.make_response(flask.jsonify({\"msg\": \"W00t\"}), 400)",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_make_response"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1300,28 +1302,17 @@",
+          "snippet": " def test_make_response_with_response_instance(app, req_ctx):\n     assert rv.headers[\"X-Foo\"] == \"bar\"\n \n \n-def test_jsonify_no_prettyprint(app, req_ctx):\n-    app.config.update({\"JSONIFY_PRETTYPRINT_REGULAR\": False})\n-    compressed_msg = b'{\"msg\":{\"submsg\":\"W00t\"},\"msg2\":\"foobar\"}\\n'\n-    uncompressed_msg = {\"msg\": {\"submsg\": \"W00t\"}, \"msg2\": \"foobar\"}\n-\n-    rv = flask.make_response(flask.jsonify(uncompressed_msg), 200)\n-    assert rv.data == compressed_msg\n-\n-\n-def test_jsonify_prettyprint(app, req_ctx):\n-    app.config.update({\"JSONIFY_PRETTYPRINT_REGULAR\": True})\n-    compressed_msg = {\"msg\": {\"submsg\": \"W00t\"}, \"msg2\": \"foobar\"}\n-    pretty_response = (\n-        b'{\\n  \"msg\": {\\n    \"submsg\": \"W00t\"\\n  }, \\n  \"msg2\": \"foobar\"\\n}\\n'\n-    )\n-\n-    rv = flask.make_response(flask.jsonify(compressed_msg), 200)\n-    assert rv.data == pretty_response\n+@pytest.mark.parametrize(\"compact\", [True, False])\n+def test_jsonify_no_prettyprint(app, compact):\n+    app.json.compact = compact\n+    rv = app.json.response({\"msg\": {\"submsg\": \"W00t\"}, \"msg2\": \"foobar\"})\n+    data = rv.data.strip()\n+    assert (b\" \" not in data) is compact\n+    assert (b\"\\n\" not in data) is compact\n \n \n def test_jsonify_mimetype(app, req_ctx):\n-    app.config.update({\"JSONIFY_MIMETYPE\": \"application/vnd.api+json\"})\n+    app.json.mimetype = \"application/vnd.api+json\"\n     msg = {\"msg\": {\"submsg\": \"W00t\"}}\n     rv = flask.make_response(flask.jsonify(msg), 200)\n     assert rv.mimetype == \"application/vnd.api+json\"",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_jsonify_no_prettyprint"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_jsonify_mimetype"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1331,15 +1322,15 @@",
+          "snippet": " def test_json_dump_dataclass(app, req_ctx):\n     from dataclasses import make_dataclass\n \n     Data = make_dataclass(\"Data\", [(\"name\", str)])\n-    value = flask.json.dumps(Data(\"Flask\"), app=app)\n-    value = flask.json.loads(value, app=app)\n+    value = app.json.dumps(Data(\"Flask\"))\n+    value = app.json.loads(value)\n     assert value == {\"name\": \"Flask\"}\n \n \n def test_jsonify_args_and_kwargs_check(app, req_ctx):\n     with pytest.raises(TypeError) as e:\n         flask.jsonify(\"fake args\", kwargs=\"fake\")\n-    assert \"behavior undefined\" in str(e.value)\n+    assert \"args or kwargs\" in str(e.value)\n \n \n def test_url_generation(app, req_ctx):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_json_dump_dataclass"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_jsonify_args_and_kwargs_check"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1542,29 +1533,21 @@",
+          "snippet": " def test_server_name_subdomain():\n     assert rv.data == b\"subdomain\"\n \n \n-@pytest.mark.filterwarnings(\"ignore::pytest.PytestUnraisableExceptionWarning\")\n-@pytest.mark.filterwarnings(\"ignore::pytest.PytestUnhandledThreadExceptionWarning\")\n-def test_exception_propagation(app, client):\n-    def apprunner(config_key):\n-        @app.route(\"/\")\n-        def index():\n-            1 // 0\n+@pytest.mark.parametrize(\"key\", [\"TESTING\", \"PROPAGATE_EXCEPTIONS\", \"DEBUG\", None])\n+def test_exception_propagation(app, client, key):\n+    app.testing = False\n \n-        if config_key is not None:\n-            app.config[config_key] = True\n-            with pytest.raises(Exception):\n-                client.get(\"/\")\n-        else:\n-            assert client.get(\"/\").status_code == 500\n+    @app.route(\"/\")\n+    def index():\n+        1 // 0\n+\n+    if key is not None:\n+        app.config[key] = True\n \n-    # we have to run this test in an isolated thread because if the\n-    # debug flag is set to true and an exception happens the context is\n-    # not torn down.  This causes other tests that run after this fail\n-    # when they expect no exception on the stack.\n-    for config_key in \"TESTING\", \"PROPAGATE_EXCEPTIONS\", \"DEBUG\", None:\n-        t = Thread(target=apprunner, args=(config_key,))\n-        t.start()\n-        t.join()\n+        with pytest.raises(ZeroDivisionError):\n+            client.get(\"/\")\n+    else:\n+        assert client.get(\"/\").status_code == 500\n \n \n @pytest.mark.parametrize(\"debug\", [True, False])",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_exception_propagation"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::index"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1668,7 +1651,7 @@",
+          "snippet": " def test_nonascii_pathinfo(app, client):\n     assert rv.data == b\"Hello World!\"\n \n \n-def test_debug_mode_complains_after_first_request(app, client):\n+def test_no_setup_after_first_request(app, client):\n     app.debug = True\n \n     @app.route(\"/\")",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_no_setup_after_first_request"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1678,27 +1661,20 @@",
+          "snippet": " def test_debug_mode_complains_after_first_request(app, client):\n     assert not app.got_first_request\n     assert client.get(\"/\").data == b\"Awesome\"\n \n-    with pytest.raises(AssertionError) as e:\n+    with pytest.raises(AssertionError) as exc_info:\n         app.add_url_rule(\"/foo\", endpoint=\"late\")\n \n-    assert \"A setup function was called\" in str(e.value)\n-\n-    app.debug = False\n-\n-    @app.route(\"/foo\")\n-    def working():\n-        return \"Meh\"\n-\n-    assert client.get(\"/foo\").data == b\"Meh\"\n-    assert app.got_first_request\n+    assert \"setup method 'add_url_rule'\" in str(exc_info.value)\n \n \n def test_before_first_request_functions(app, client):\n     got = []\n \n-    @app.before_first_request\n-    def foo():\n-        got.append(42)\n+    with pytest.deprecated_call():\n+\n+        @app.before_first_request\n+        def foo():\n+            got.append(42)\n \n     client.get(\"/\")\n     assert got == [42]",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_no_setup_after_first_request"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_before_first_request_functions"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::foo"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1710,10 +1686,12 @@",
+          "snippet": " def test_before_first_request_functions(app, client):\n def test_before_first_request_functions_concurrent(app, client):\n     got = []\n \n-    @app.before_first_request\n-    def foo():\n-        time.sleep(0.2)\n-        got.append(42)\n+    with pytest.deprecated_call():\n+\n+        @app.before_first_request\n+        def foo():\n+            time.sleep(0.2)\n+            got.append(42)\n \n     def get_and_assert():\n         client.get(\"/\")",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_before_first_request_functions_concurrent"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::foo"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1727,28 +1705,23 @@",
+          "snippet": " def test_before_first_request_functions_concurrent(app, client):\n \n \n def test_routing_redirect_debugging(monkeypatch, app, client):\n-    @app.route(\"/foo/\", methods=[\"GET\", \"POST\"])\n-    def foo():\n-        return \"success\"\n-\n-    app.debug = False\n-    rv = client.post(\"/foo\", data={}, follow_redirects=True)\n-    assert rv.data == b\"success\"\n+    app.config[\"DEBUG\"] = True\n \n-    app.debug = True\n+    @app.route(\"/user/\", methods=[\"GET\", \"POST\"])\n+    def user():\n+        return flask.request.form[\"status\"]\n \n-    with client:\n-        rv = client.post(\"/foo\", data={}, follow_redirects=True)\n-        assert rv.data == b\"success\"\n-        rv = client.get(\"/foo\", data={}, follow_redirects=True)\n-        assert rv.data == b\"success\"\n+    # default redirect code preserves form data\n+    rv = client.post(\"/user\", data={\"status\": \"success\"}, follow_redirects=True)\n+    assert rv.data == b\"success\"\n \n+    # 301 and 302 raise error\n     monkeypatch.setattr(RequestRedirect, \"code\", 301)\n \n-    with client, pytest.raises(AssertionError) as e:\n-        client.post(\"/foo\", data={})\n+    with client, pytest.raises(AssertionError) as exc_info:\n+        client.post(\"/user\", data={\"status\": \"error\"}, follow_redirects=True)\n \n-    assert \"canonical URL 'http://localhost/foo/'\" in str(e.value)\n+    assert \"canonical URL 'http://localhost/user/'\" in str(exc_info.value)\n \n \n def test_route_decorator_custom_endpoint(app, client):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_routing_redirect_debugging"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::user"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1776,57 +1749,6 @@",
+          "snippet": " def test_route_decorator_custom_endpoint(app, client):\n     assert client.get(\"/bar/123\").data == b\"123\"\n \n \n-def test_preserve_only_once(app, client):\n-    app.debug = True\n-\n-    @app.route(\"/fail\")\n-    def fail_func():\n-        1 // 0\n-\n-    for _x in range(3):\n-        with pytest.raises(ZeroDivisionError):\n-            client.get(\"/fail\")\n-\n-    assert flask._request_ctx_stack.top is not None\n-    assert flask._app_ctx_stack.top is not None\n-    # implicit appctx disappears too\n-    flask._request_ctx_stack.top.pop()\n-    assert flask._request_ctx_stack.top is None\n-    assert flask._app_ctx_stack.top is None\n-\n-\n-def test_preserve_remembers_exception(app, client):\n-    app.debug = True\n-    errors = []\n-\n-    @app.route(\"/fail\")\n-    def fail_func():\n-        1 // 0\n-\n-    @app.route(\"/success\")\n-    def success_func():\n-        return \"Okay\"\n-\n-    @app.teardown_request\n-    def teardown_handler(exc):\n-        errors.append(exc)\n-\n-    # After this failure we did not yet call the teardown handler\n-    with pytest.raises(ZeroDivisionError):\n-        client.get(\"/fail\")\n-    assert errors == []\n-\n-    # But this request triggers it, and it's an error\n-    client.get(\"/success\")\n-    assert len(errors) == 2\n-    assert isinstance(errors[0], ZeroDivisionError)\n-\n-    # At this point another request does nothing.\n-    client.get(\"/success\")\n-    assert len(errors) == 3\n-    assert errors[1] is None\n-\n-\n def test_get_method_on_g(app_ctx):\n     assert flask.g.get(\"x\") is None\n     assert flask.g.get(\"x\", 11) == 11\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_basic.py::test_get_method_on_g"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/test_blueprints.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -722,9 +722,11 @@",
+          "snippet": " def test_app_request_processing(app, client):\n     bp = flask.Blueprint(\"bp\", __name__)\n     evts = []\n \n-    @bp.before_app_first_request\n-    def before_first_request():\n-        evts.append(\"first\")\n+    with pytest.deprecated_call():\n+\n+        @bp.before_app_first_request\n+        def before_first_request():\n+            evts.append(\"first\")\n \n     @bp.before_app_request\n     def before_app():\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_blueprints.py::test_app_request_processing"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_blueprints.py::before_first_request"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/test_cli.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,7 +1,6 @@",
+          "snippet": " # This file was part of Flask-CLI and was modified under the terms of\n # its Revised BSD License. Copyright © 2015 CERN.\n import os\n-import platform\n import ssl\n import sys\n import types",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "tests/test_cli.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -17,7 +16,6 @@",
+          "snippet": " from flask import Blueprint\n from flask import current_app\n from flask import Flask\n from flask.cli import AppGroup\n-from flask.cli import DispatchingApp\n from flask.cli import find_best_app\n from flask.cli import FlaskGroup\n from flask.cli import get_version",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "tests/test_cli.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -290,24 +288,22 @@",
+          "snippet": " def test_scriptinfo(test_apps, monkeypatch):\n     assert app.name == \"testapp\"\n \n \n-@pytest.mark.xfail(platform.python_implementation() == \"PyPy\", reason=\"flaky on pypy\")\n-def test_lazy_load_error(monkeypatch):\n-    \"\"\"When using lazy loading, the correct exception should be\n-    re-raised.\n-    \"\"\"\n-\n-    class BadExc(Exception):\n-        pass\n+def test_app_cli_has_app_context(app, runner):\n+    def _param_cb(ctx, param, value):\n+        # current_app should be available in parameter callbacks\n+        return bool(current_app)\n \n-    def bad_load():\n-        raise BadExc\n+    @app.cli.command()\n+    @click.argument(\"value\", callback=_param_cb)\n+    def check(value):\n+        app = click.get_current_context().obj.load_app()\n+        # the loaded app should be the same as current_app\n+        same_app = current_app._get_current_object() is app\n+        return same_app, value\n \n-    lazy = DispatchingApp(bad_load, use_eager_loading=False)\n-\n-    # reduce flakiness by waiting for the internal loading lock\n-    with lazy._lock:\n-        with pytest.raises(BadExc):\n-            lazy._flush_bg_loading_exception()\n+    cli = FlaskGroup(create_app=lambda: app)\n+    result = runner.invoke(cli, [\"check\", \"x\"], standalone_mode=False)\n+    assert result.return_value == (True, True)\n \n \n def test_with_appcontext(runner):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_cli.py::test_app_cli_has_app_context"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_cli.py::_param_cb"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_cli.py::check"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -323,12 +319,12 @@",
+          "snippet": " def test_with_appcontext(runner):\n     assert result.output == \"testapp\\n\"\n \n \n-def test_appgroup(runner):\n+def test_appgroup_app_context(runner):\n     @click.group(cls=AppGroup)\n     def cli():\n         pass\n \n-    @cli.command(with_appcontext=True)\n+    @cli.command()\n     def test():\n         click.echo(current_app.name)\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_cli.py::test_appgroup_app_context"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -336,7 +332,7 @@",
+          "snippet": " def test_appgroup(runner):\n     def subgroup():\n         pass\n \n-    @subgroup.command(with_appcontext=True)\n+    @subgroup.command()\n     def test2():\n         click.echo(current_app.name)\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_cli.py::test_appgroup_app_context"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -351,7 +347,7 @@",
+          "snippet": " def test_appgroup(runner):\n     assert result.output == \"testappgroup\\n\"\n \n \n-def test_flaskgroup(runner):\n+def test_flaskgroup_app_context(runner):\n     def create_app():\n         return Flask(\"flaskgroup\")\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_cli.py::test_flaskgroup_app_context"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -388,6 +384,19 @@",
+          "snippet": " def test_flaskgroup_debug(runner, set_debug_flag):\n     assert result.output == f\"{not set_debug_flag}\\n\"\n \n \n+def test_flaskgroup_nested(app, runner):\n+    cli = click.Group(\"cli\")\n+    flask_group = FlaskGroup(name=\"flask\", create_app=lambda: app)\n+    cli.add_command(flask_group)\n+\n+    @flask_group.command()\n+    def show():\n+        click.echo(current_app.name)\n+\n+    result = runner.invoke(cli, [\"flask\", \"show\"])\n+    assert result.output == \"flask_test\\n\"\n+\n+\n def test_no_command_echo_loading_error():\n     from flask.cli import cli\n \n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_cli.py::test_flaskgroup_nested"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_cli.py::show"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/test_config.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,7 +1,6 @@",
+          "snippet": " import json\n import os\n import textwrap\n-from datetime import timedelta\n \n import pytest\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "tests/test_config.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -113,6 +112,10 @@",
+          "snippet": " def test_config_from_mapping():\n     app.config.from_mapping(SECRET_KEY=\"config\", TEST_KEY=\"foo\")\n     common_object_test(app)\n \n+    app = flask.Flask(__name__)\n+    app.config.from_mapping(SECRET_KEY=\"config\", TEST_KEY=\"foo\", skip_key=\"skip\")\n+    common_object_test(app)\n+\n     app = flask.Flask(__name__)\n     with pytest.raises(TypeError):\n         app.config.from_mapping({}, {})",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_config.py::test_config_from_mapping"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -203,14 +206,6 @@",
+          "snippet": " def test_session_lifetime():\n     assert app.permanent_session_lifetime.seconds == 42\n \n \n-def test_send_file_max_age():\n-    app = flask.Flask(__name__)\n-    app.config[\"SEND_FILE_MAX_AGE_DEFAULT\"] = 3600\n-    assert app.send_file_max_age_default.seconds == 3600\n-    app.config[\"SEND_FILE_MAX_AGE_DEFAULT\"] = timedelta(hours=2)\n-    assert app.send_file_max_age_default.seconds == 7200\n-\n-\n def test_get_namespace():\n     app = flask.Flask(__name__)\n     app.config[\"FOO_OPTION_1\"] = \"foo option 1\"\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_config.py::test_get_namespace"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/test_helpers.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -2,10 +2,10 @@",
+          "snippet": " import io\n import os\n \n import pytest\n+import werkzeug.exceptions\n \n import flask\n from flask.helpers import get_debug_flag\n-from flask.helpers import get_env\n \n \n class FakePath:",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "tests/test_helpers.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -118,11 +118,15 @@",
+          "snippet": " class TestUrlFor:\n         )\n \n     def test_url_for_with_scheme_not_external(self, app, req_ctx):\n-        @app.route(\"/\")\n-        def index():\n-            return \"42\"\n+        app.add_url_rule(\"/\", endpoint=\"index\")\n \n-        pytest.raises(ValueError, flask.url_for, \"index\", _scheme=\"https\")\n+        # Implicit external with scheme.\n+        url = flask.url_for(\"index\", _scheme=\"https\")\n+        assert url == \"https://localhost/\"\n+\n+        # Error when external=False with scheme\n+        with pytest.raises(ValueError):\n+            flask.url_for(\"index\", _scheme=\"https\", _external=False)\n \n     def test_url_for_with_alternating_schemes(self, app, req_ctx):\n         @app.route(\"/\")",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "tests/test_helpers.py::TestUrlFor::test_url_for_with_scheme_not_external"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -158,6 +162,51 @@",
+          "snippet": " class TestUrlFor:\n         assert flask.url_for(\"myview\", _method=\"POST\") == \"/myview/create\"\n \n \n+def test_redirect_no_app():\n+    response = flask.redirect(\"https://localhost\", 307)\n+    assert response.location == \"https://localhost\"\n+    assert response.status_code == 307\n+\n+\n+def test_redirect_with_app(app):\n+    def redirect(location, code=302):\n+        raise ValueError\n+\n+    app.redirect = redirect\n+\n+    with app.app_context(), pytest.raises(ValueError):\n+        flask.redirect(\"other\")\n+\n+\n+def test_abort_no_app():\n+    with pytest.raises(werkzeug.exceptions.Unauthorized):\n+        flask.abort(401)\n+\n+    with pytest.raises(LookupError):\n+        flask.abort(900)\n+\n+\n+def test_app_aborter_class():\n+    class MyAborter(werkzeug.exceptions.Aborter):\n+        pass\n+\n+    class MyFlask(flask.Flask):\n+        aborter_class = MyAborter\n+\n+    app = MyFlask(__name__)\n+    assert isinstance(app.aborter, MyAborter)\n+\n+\n+def test_abort_with_app(app):\n+    class My900Error(werkzeug.exceptions.HTTPException):\n+        code = 900\n+\n+    app.aborter.mapping[900] = My900Error\n+\n+    with app.app_context(), pytest.raises(My900Error):\n+        flask.abort(900)\n+\n+\n class TestNoImports:\n     \"\"\"Test Flasks are created without import.\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_helpers.py::test_redirect_no_app"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_helpers.py::test_redirect_with_app"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_helpers.py::redirect"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_helpers.py::test_abort_no_app"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_helpers.py::test_app_aborter_class"
+            },
+            {
+              "kind": "class",
+              "node": "tests/test_helpers.py::MyAborter"
+            },
+            {
+              "kind": "class",
+              "node": "tests/test_helpers.py::MyFlask"
+            },
+            {
+              "kind": "attribute",
+              "node": "tests/test_helpers.py::MyFlask::aborter_class"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_helpers.py::test_abort_with_app"
+            },
+            {
+              "kind": "class",
+              "node": "tests/test_helpers.py::My900Error"
+            },
+            {
+              "kind": "attribute",
+              "node": "tests/test_helpers.py::My900Error::code"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -272,20 +321,6 @@",
+          "snippet": " class TestHelpers:\n             assert get_debug_flag() == expected_flag\n         assert get_debug_flag() == expected_default_flag\n \n-    @pytest.mark.parametrize(\n-        \"env, ref_env, debug\",\n-        [\n-            (\"\", \"production\", False),\n-            (\"production\", \"production\", False),\n-            (\"development\", \"development\", True),\n-            (\"other\", \"other\", False),\n-        ],\n-    )\n-    def test_get_env(self, monkeypatch, env, ref_env, debug):\n-        monkeypatch.setenv(\"FLASK_ENV\", env)\n-        assert get_debug_flag() == debug\n-        assert get_env() == ref_env\n-\n     def test_make_response(self):\n         app = flask.Flask(__name__)\n         with app.test_request_context():\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "tests/test_helpers.py::TestHelpers::test_make_response"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/test_json.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -8,6 +8,7 @@",
+          "snippet": " from werkzeug.http import http_date\n \n import flask\n from flask import json\n+from flask.json.provider import DefaultJSONProvider\n \n \n @pytest.mark.parametrize(\"debug\", (True, False))",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "tests/test_json.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -48,9 +49,8 @@",
+          "snippet": " def test_json_custom_mimetypes(app, client):\n     \"test_value,expected\", [(True, '\"\\\\u2603\"'), (False, '\"\\u2603\"')]\n )\n def test_json_as_unicode(test_value, expected, app, app_ctx):\n-\n-    app.config[\"JSON_AS_ASCII\"] = test_value\n-    rv = flask.json.dumps(\"\\N{SNOWMAN}\")\n+    app.json.ensure_ascii = test_value\n+    rv = app.json.dumps(\"\\N{SNOWMAN}\")\n     assert rv == expected\n \n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_json.py::test_json_as_unicode"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -170,7 +170,7 @@",
+          "snippet": " def test_jsonify_aware_datetimes(tz):\n     dt = datetime.datetime(2017, 1, 1, 12, 34, 56, tzinfo=tzinfo)\n     gmt = FixedOffset(hours=0, name=\"GMT\")\n     expected = dt.astimezone(gmt).strftime('\"%a, %d %b %Y %H:%M:%S %Z\"')\n-    assert flask.json.JSONEncoder().encode(dt) == expected\n+    assert flask.json.dumps(dt) == expected\n \n \n def test_jsonify_uuid_types(app, client):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_json.py::test_jsonify_aware_datetimes"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -225,74 +225,32 @@",
+          "snippet": " def test_json_customization(app, client):\n         def __init__(self, val):\n             self.val = val\n \n-    class MyEncoder(flask.json.JSONEncoder):\n-        def default(self, o):\n-            if isinstance(o, X):\n-                return f\"<{o.val}>\"\n-            return flask.json.JSONEncoder.default(self, o)\n+    def default(o):\n+        if isinstance(o, X):\n+            return f\"<{o.val}>\"\n \n-    class MyDecoder(flask.json.JSONDecoder):\n-        def __init__(self, *args, **kwargs):\n-            kwargs.setdefault(\"object_hook\", self.object_hook)\n-            flask.json.JSONDecoder.__init__(self, *args, **kwargs)\n+        return DefaultJSONProvider.default(o)\n \n+    class CustomProvider(DefaultJSONProvider):\n         def object_hook(self, obj):\n             if len(obj) == 1 and \"_foo\" in obj:\n                 return X(obj[\"_foo\"])\n-            return obj\n-\n-    app.json_encoder = MyEncoder\n-    app.json_decoder = MyDecoder\n-\n-    @app.route(\"/\", methods=[\"POST\"])\n-    def index():\n-        return flask.json.dumps(flask.request.get_json()[\"x\"])\n-\n-    rv = client.post(\n-        \"/\",\n-        data=flask.json.dumps({\"x\": {\"_foo\": 42}}),\n-        content_type=\"application/json\",\n-    )\n-    assert rv.data == b'\"<42>\"'\n-\n \n-def test_blueprint_json_customization(app, client):\n-    class X:\n-        __slots__ = (\"val\",)\n-\n-        def __init__(self, val):\n-            self.val = val\n-\n-    class MyEncoder(flask.json.JSONEncoder):\n-        def default(self, o):\n-            if isinstance(o, X):\n-                return f\"<{o.val}>\"\n-\n-            return flask.json.JSONEncoder.default(self, o)\n+            return obj\n \n-    class MyDecoder(flask.json.JSONDecoder):\n-        def __init__(self, *args, **kwargs):\n+        def loads(self, s, **kwargs):\n             kwargs.setdefault(\"object_hook\", self.object_hook)\n-            flask.json.JSONDecoder.__init__(self, *args, **kwargs)\n-\n-        def object_hook(self, obj):\n-            if len(obj) == 1 and \"_foo\" in obj:\n-                return X(obj[\"_foo\"])\n-\n-            return obj\n+            return super().loads(s, **kwargs)\n \n-    bp = flask.Blueprint(\"bp\", __name__)\n-    bp.json_encoder = MyEncoder\n-    bp.json_decoder = MyDecoder\n+    app.json = CustomProvider(app)\n+    app.json.default = default\n \n-    @bp.route(\"/bp\", methods=[\"POST\"])\n+    @app.route(\"/\", methods=[\"POST\"])\n     def index():\n         return flask.json.dumps(flask.request.get_json()[\"x\"])\n \n-    app.register_blueprint(bp)\n-\n     rv = client.post(\n-        \"/bp\",\n+        \"/\",\n         data=flask.json.dumps({\"x\": {\"_foo\": 42}}),\n         content_type=\"application/json\",\n     )",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_json.py::default"
+            },
+            {
+              "kind": "class",
+              "node": "tests/test_json.py::CustomProvider"
+            },
+            {
+              "kind": "method",
+              "node": "tests/test_json.py::CustomProvider::object_hook"
+            },
+            {
+              "kind": "method",
+              "node": "tests/test_json.py::CustomProvider::loads"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_json.py::test_json_customization"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -330,8 +288,7 @@",
+          "snippet": " def test_modified_url_encoding(app, client):\n \n def test_json_key_sorting(app, client):\n     app.debug = True\n-\n-    assert app.config[\"JSON_SORT_KEYS\"]\n+    assert app.json.sort_keys\n     d = dict.fromkeys(range(20), \"foo\")\n \n     @app.route(\"/\")\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_json.py::test_json_key_sorting"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/test_reqctx.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -3,6 +3,7 @@",
+          "snippet": " import warnings\n import pytest\n \n import flask\n+from flask.globals import request_ctx\n from flask.sessions import SecureCookieSessionInterface\n from flask.sessions import SessionInterface\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "tests/test_reqctx.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -116,7 +117,7 @@",
+          "snippet": " def test_context_binding(app):\n         assert index() == \"Hello World!\"\n     with app.test_request_context(\"/meh\"):\n         assert meh() == \"http://localhost/meh\"\n-    assert flask._request_ctx_stack.top is None\n+    assert not flask.request\n \n \n def test_context_test(app):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_reqctx.py::test_context_binding"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -152,7 +153,7 @@",
+          "snippet": " class TestGreenletContextCopying:\n         @app.route(\"/\")\n         def index():\n             flask.session[\"fizz\"] = \"buzz\"\n-            reqctx = flask._request_ctx_stack.top.copy()\n+            reqctx = request_ctx.copy()\n \n             def g():\n                 assert not flask.request\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "tests/test_reqctx.py::TestGreenletContextCopying::index"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/test_session_interface.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,4 +1,5 @@",
+          "snippet": " import flask\n+from flask.globals import request_ctx\n from flask.sessions import SessionInterface\n \n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "tests/test_session_interface.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -13,7 +14,7 @@",
+          "snippet": " def test_open_session_with_endpoint():\n             pass\n \n         def open_session(self, app, request):\n-            flask._request_ctx_stack.top.match_request()\n+            request_ctx.match_request()\n             assert request.endpoint is not None\n \n     app = flask.Flask(__name__)\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "tests/test_session_interface.py::MySessionInterface::open_session"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/test_signals.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -123,8 +123,7 @@",
+          "snippet": " def test_request_exception_signal():\n         flask.got_request_exception.disconnect(record, app)\n \n \n-def test_appcontext_signals():\n-    app = flask.Flask(__name__)\n+def test_appcontext_signals(app, client):\n     recorded = []\n \n     def record_push(sender, **kwargs):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_signals.py::test_appcontext_signals"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -140,10 +139,8 @@",
+          "snippet": " def test_appcontext_signals():\n     flask.appcontext_pushed.connect(record_push, app)\n     flask.appcontext_popped.connect(record_pop, app)\n     try:\n-        with app.test_client() as c:\n-            rv = c.get(\"/\")\n-            assert rv.data == b\"Hello\"\n-            assert recorded == [\"push\"]\n+        rv = client.get(\"/\")\n+        assert rv.data == b\"Hello\"\n         assert recorded == [\"push\", \"pop\"]\n     finally:\n         flask.appcontext_pushed.disconnect(record_push, app)",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_signals.py::test_appcontext_signals"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -174,12 +171,12 @@",
+          "snippet": " def test_flash_signal(app):\n         flask.message_flashed.disconnect(record, app)\n \n \n-def test_appcontext_tearing_down_signal():\n-    app = flask.Flask(__name__)\n+def test_appcontext_tearing_down_signal(app, client):\n+    app.testing = False\n     recorded = []\n \n-    def record_teardown(sender, **kwargs):\n-        recorded.append((\"tear_down\", kwargs))\n+    def record_teardown(sender, exc):\n+        recorded.append(exc)\n \n     @app.route(\"/\")\n     def index():",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_signals.py::test_appcontext_tearing_down_signal"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_signals.py::record_teardown"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -187,10 +184,9 @@",
+          "snippet": " def test_appcontext_tearing_down_signal():\n \n     flask.appcontext_tearing_down.connect(record_teardown, app)\n     try:\n-        with app.test_client() as c:\n-            rv = c.get(\"/\")\n-            assert rv.status_code == 500\n-            assert recorded == []\n-        assert recorded == [(\"tear_down\", {\"exc\": None})]\n+        rv = client.get(\"/\")\n+        assert rv.status_code == 500\n+        assert len(recorded) == 1\n+        assert isinstance(recorded[0], ZeroDivisionError)\n     finally:\n         flask.appcontext_tearing_down.disconnect(record_teardown, app)\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_signals.py::test_appcontext_tearing_down_signal"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/test_templating.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -29,6 +29,15 @@",
+          "snippet": " def test_original_win(app, client):\n     assert rv.data == b\"42\"\n \n \n+def test_simple_stream(app, client):\n+    @app.route(\"/\")\n+    def index():\n+        return flask.stream_template_string(\"{{ config }}\", config=42)\n+\n+    rv = client.get(\"/\")\n+    assert rv.data == b\"42\"\n+\n+\n def test_request_less_rendering(app, app_ctx):\n     app.config[\"WORLD_NAME\"] = \"Special World\"\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_templating.py::test_simple_stream"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_templating.py::index"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -388,11 +397,9 @@",
+          "snippet": " def test_templates_auto_reload_debug_run(app, monkeypatch):\n     monkeypatch.setattr(werkzeug.serving, \"run_simple\", run_simple_mock)\n \n     app.run()\n-    assert not app.templates_auto_reload\n     assert not app.jinja_env.auto_reload\n \n     app.run(debug=True)\n-    assert app.templates_auto_reload\n     assert app.jinja_env.auto_reload\n \n \n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_templating.py::test_templates_auto_reload_debug_run"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/test_testing.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -5,6 +5,7 @@",
+          "snippet": " import werkzeug\n import flask\n from flask import appcontext_popped\n from flask.cli import ScriptInfo\n+from flask.globals import _cv_request\n from flask.json import jsonify\n from flask.testing import EnvironBuilder\n from flask.testing import FlaskCliRunner",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "tests/test_testing.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -111,7 +112,7 @@",
+          "snippet": " def test_path_is_url(app):\n \n def test_environbuilder_json_dumps(app):\n     \"\"\"EnvironBuilder.json_dumps() takes settings from the app.\"\"\"\n-    app.config[\"JSON_AS_ASCII\"] = False\n+    app.json.ensure_ascii = False\n     eb = EnvironBuilder(app, json=\"\\u20ac\")\n     assert eb.input_stream.read().decode(\"utf8\") == '\"\\u20ac\"'\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_testing.py::test_environbuilder_json_dumps"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -187,7 +188,6 @@",
+          "snippet": " def test_session_transactions(app, client):\n \n def test_session_transactions_no_null_sessions():\n     app = flask.Flask(__name__)\n-    app.testing = True\n \n     with app.test_client() as c:\n         with pytest.raises(RuntimeError) as e:",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_testing.py::test_session_transactions_no_null_sessions"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -254,29 +254,6 @@",
+          "snippet": " def test_reuse_client(client):\n         assert client.get(\"/\").status_code == 404\n \n \n-def test_test_client_calls_teardown_handlers(app, client):\n-    called = []\n-\n-    @app.teardown_request\n-    def remember(error):\n-        called.append(error)\n-\n-    with client:\n-        assert called == []\n-        client.get(\"/\")\n-        assert called == []\n-    assert called == [None]\n-\n-    del called[:]\n-    with client:\n-        assert called == []\n-        client.get(\"/\")\n-        assert called == []\n-        client.get(\"/\")\n-        assert called == [None]\n-    assert called == [None, None]\n-\n-\n def test_full_url_request(app, client):\n     @app.route(\"/action\", methods=[\"POST\"])\n     def action():",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_testing.py::test_full_url_request"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -412,13 +389,15 @@",
+          "snippet": " def test_cli_custom_obj(app):\n def test_client_pop_all_preserved(app, req_ctx, client):\n     @app.route(\"/\")\n     def index():\n-        # stream_with_context pushes a third context, preserved by client\n-        return flask.Response(flask.stream_with_context(\"hello\"))\n+        # stream_with_context pushes a third context, preserved by response\n+        return flask.stream_with_context(\"hello\")\n \n-    # req_ctx fixture pushed an initial context, not marked preserved\n+    # req_ctx fixture pushed an initial context\n     with client:\n         # request pushes a second request context, preserved by client\n-        client.get(\"/\")\n+        rv = client.get(\"/\")\n \n+    # close the response, releasing the context held by stream_with_context\n+    rv.close()\n     # only req_ctx fixture should still be pushed\n-    assert flask._request_ctx_stack.top is req_ctx\n+    assert _cv_request.get(None) is req_ctx\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_testing.py::index"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_testing.py::test_client_pop_all_preserved"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/test_user_error_handler.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -11,29 +11,35 @@",
+          "snippet": " def test_error_handler_no_match(app, client):\n     class CustomException(Exception):\n         pass\n \n-    class UnacceptableCustomException(BaseException):\n-        pass\n-\n     @app.errorhandler(CustomException)\n     def custom_exception_handler(e):\n         assert isinstance(e, CustomException)\n         return \"custom\"\n \n-    with pytest.raises(\n-        AssertionError, match=\"Custom exceptions must be subclasses of Exception.\"\n-    ):\n-        app.register_error_handler(UnacceptableCustomException, None)\n+    with pytest.raises(TypeError) as exc_info:\n+        app.register_error_handler(CustomException(), None)\n+\n+    assert \"CustomException() is an instance, not a class.\" in str(exc_info.value)\n+\n+    with pytest.raises(ValueError) as exc_info:\n+        app.register_error_handler(list, None)\n+\n+    assert \"'list' is not a subclass of Exception.\" in str(exc_info.value)\n \n     @app.errorhandler(500)\n     def handle_500(e):\n         assert isinstance(e, InternalServerError)\n-        original = getattr(e, \"original_exception\", None)\n \n-        if original is not None:\n-            return f\"wrapped {type(original).__name__}\"\n+        if e.original_exception is not None:\n+            return f\"wrapped {type(e.original_exception).__name__}\"\n \n         return \"direct\"\n \n+    with pytest.raises(ValueError) as exc_info:\n+        app.register_error_handler(999, None)\n+\n+    assert \"Use a subclass of HTTPException\" in str(exc_info.value)\n+\n     @app.route(\"/custom\")\n     def custom_test():\n         raise CustomException()\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_user_error_handler.py::test_error_handler_no_match"
+            },
+            {
+              "kind": "function",
+              "node": "tests/test_user_error_handler.py::handle_500"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/test_views.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -240,3 +240,21 @@",
+          "snippet": " def test_remove_method_from_parent(app, client):\n     assert client.get(\"/\").data == b\"GET\"\n     assert client.post(\"/\").status_code == 405\n     assert sorted(View.methods) == [\"GET\"]\n+\n+\n+def test_init_once(app, client):\n+    n = 0\n+\n+    class CountInit(flask.views.View):\n+        init_every_request = False\n+\n+        def __init__(self):\n+            nonlocal n\n+            n += 1\n+\n+        def dispatch_request(self):\n+            return str(n)\n+\n+    app.add_url_rule(\"/\", view_func=CountInit.as_view(\"index\"))\n+    assert client.get(\"/\").data == b\"1\"\n+    assert client.get(\"/\").data == b\"1\"\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/test_views.py::test_init_once"
+            },
+            {
+              "kind": "class",
+              "node": "tests/test_views.py::CountInit"
+            },
+            {
+              "kind": "attribute",
+              "node": "tests/test_views.py::CountInit::init_every_request"
+            },
+            {
+              "kind": "method",
+              "node": "tests/test_views.py::CountInit::__init__"
+            },
+            {
+              "kind": "method",
+              "node": "tests/test_views.py::CountInit::dispatch_request"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/typing/typing_app_decorators.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -0,0 +1,38 @@",
+          "snippet": "+from __future__ import annotations\n+\n+import typing as t\n+\n+from flask import Flask\n+from flask import Response\n+\n+app = Flask(__name__)\n+\n+\n+@app.after_request\n+def after_sync(response: Response) -> Response:\n+    ...\n+\n+\n+@app.after_request\n+async def after_async(response: Response) -> Response:\n+    ...\n+\n+\n+@app.before_request\n+def before_sync() -> None:\n+    ...\n+\n+\n+@app.before_request\n+async def before_async() -> None:\n+    ...\n+\n+\n+@app.teardown_appcontext\n+def teardown_sync(exc: t.Optional[BaseException]) -> None:\n+    ...\n+\n+\n+@app.teardown_appcontext\n+async def teardown_async(exc: t.Optional[BaseException]) -> None:\n+    ...\n",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "tests/typing/typing_app_decorators.py::app"
+            },
+            {
+              "kind": "function",
+              "node": "tests/typing/typing_app_decorators.py::after_sync"
+            },
+            {
+              "kind": "async_function",
+              "node": "tests/typing/typing_app_decorators.py::after_async"
+            },
+            {
+              "kind": "function",
+              "node": "tests/typing/typing_app_decorators.py::before_sync"
+            },
+            {
+              "kind": "async_function",
+              "node": "tests/typing/typing_app_decorators.py::before_async"
+            },
+            {
+              "kind": "function",
+              "node": "tests/typing/typing_app_decorators.py::teardown_sync"
+            },
+            {
+              "kind": "async_function",
+              "node": "tests/typing/typing_app_decorators.py::teardown_async"
+            }
+          ]
+        }
+      ],
+      "messages": [
+        "new file mode 100644"
+      ]
+    },
+    "tests/typing/typing_route.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,9 +1,13 @@",
+          "snippet": " from __future__ import annotations\n \n+import typing as t\n from http import HTTPStatus\n \n+import typing_extensions as te\n+\n from flask import Flask\n from flask import jsonify\n+from flask import stream_template\n from flask.templating import render_template\n from flask.views import View\n from flask.wrappers import Response",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "tests/typing/typing_route.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -23,7 +27,45 @@",
+          "snippet": " def hello_bytes() -> bytes:\n \n @app.route(\"/json\")\n def hello_json() -> Response:\n-    return jsonify({\"response\": \"Hello, World!\"})\n+    return jsonify(\"Hello, World!\")\n+\n+\n+@app.route(\"/json/dict\")\n+def hello_json_dict() -> t.Dict[str, t.Any]:\n+    return {\"response\": \"Hello, World!\"}\n+\n+\n+@app.route(\"/json/dict\")\n+def hello_json_list() -> t.List[t.Any]:\n+    return [{\"message\": \"Hello\"}, {\"message\": \"World\"}]\n+\n+\n+class StatusJSON(te.TypedDict):\n+    status: str\n+\n+\n+@app.route(\"/typed-dict\")\n+def typed_dict() -> StatusJSON:\n+    return {\"status\": \"ok\"}\n+\n+\n+@app.route(\"/generator\")\n+def hello_generator() -> t.Generator[str, None, None]:\n+    def show() -> t.Generator[str, None, None]:\n+        for x in range(100):\n+            yield f\"data:{x}\\n\\n\"\n+\n+    return show()\n+\n+\n+@app.route(\"/generator-expression\")\n+def hello_generator_expression() -> t.Iterator[bytes]:\n+    return (f\"data:{x}\\n\\n\".encode() for x in range(100))\n+\n+\n+@app.route(\"/iterator\")\n+def hello_iterator() -> t.Iterator[str]:\n+    return iter([f\"data:{x}\\n\\n\" for x in range(100)])\n \n \n @app.route(\"/status\")",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/typing/typing_route.py::hello_json"
+            },
+            {
+              "kind": "function",
+              "node": "tests/typing/typing_route.py::hello_json_dict"
+            },
+            {
+              "kind": "function",
+              "node": "tests/typing/typing_route.py::hello_json_list"
+            },
+            {
+              "kind": "class",
+              "node": "tests/typing/typing_route.py::StatusJSON"
+            },
+            {
+              "kind": "attribute",
+              "node": "tests/typing/typing_route.py::StatusJSON::status"
+            },
+            {
+              "kind": "function",
+              "node": "tests/typing/typing_route.py::typed_dict"
+            },
+            {
+              "kind": "function",
+              "node": "tests/typing/typing_route.py::hello_generator"
+            },
+            {
+              "kind": "function",
+              "node": "tests/typing/typing_route.py::show"
+            },
+            {
+              "kind": "function",
+              "node": "tests/typing/typing_route.py::hello_generator_expression"
+            },
+            {
+              "kind": "function",
+              "node": "tests/typing/typing_route.py::hello_iterator"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -48,6 +90,16 @@",
+          "snippet": " def return_template(name: str | None = None) -> str:\n     return render_template(\"index.html\", name=name)\n \n \n+@app.route(\"/template\")\n+def return_template_stream() -> t.Iterator[str]:\n+    return stream_template(\"index.html\", name=\"Hello\")\n+\n+\n+@app.route(\"/async\")\n+async def async_route() -> str:\n+    return \"Hello\"\n+\n+\n class RenderTemplateView(View):\n     def __init__(self: RenderTemplateView, template_name: str) -> None:\n         self.template_name = template_name",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/typing/typing_route.py::return_template_stream"
+            },
+            {
+              "kind": "async_function",
+              "node": "tests/typing/typing_route.py::async_route"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

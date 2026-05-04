@@ -1,0 +1,436 @@
+{
+  "task_3": {
+    "task_id": "task_3",
+    "title": "Close CONNECT tunnel responses on older Python",
+    "type": "FIX",
+    "runtime_impact": true,
+    "description": "The 2.2.3 update fixes a ResourceWarning that could occur during HTTP CONNECT proxy tunneling on Python versions older than 3.11.4 by ensuring the transient tunnel response is closed after it is processed.",
+    "synthesized_requirement": {
+      "problem_statement": "Ensure that CONNECT-based proxy tunneling does not leave the intermediate proxy response unclosed on Python versions older than 3.11.4, preventing ResourceWarning emissions while preserving existing tunnel success and failure behavior.",
+      "expectation": {
+        "grounded": "For urllib3 HTTPConnection instances that establish a tunnel with set_tunnel on Python < 3.11.4, the tunnel setup path must close the response object used to read the proxy CONNECT status and headers. Successful CONNECT responses should complete tunnel setup without ResourceWarning. Non-OK CONNECT responses should close the connection and raise OSError. Overlong proxy response header lines should still raise http.client.LineTooLong.",
+        "conceptual": "Proxy tunnel setup should clean up temporary network resources reliably. Successful tunnels should not produce unclosed-response warnings, and failed tunnels should continue to report connection failure instead of silently proceeding."
+      },
+      "constraints": {
+        "grounded": "The fix applies only to Python runtimes affected by the standard-library tunnel response leak, specifically versions before 3.11.4. It must not alter the CONNECT request contract, the handling of successful tunnel establishment, non-OK status handling, header consumption, debug output behavior, or newer Python runtimes that already include the upstream fix.",
+        "conceptual": "Limit the change to eliminating the resource leak in affected environments while keeping proxy tunneling behavior compatible for existing users."
+      },
+      "behavior": [
+        "On Python < 3.11.4, CONNECT tunnel setup explicitly closes the temporary proxy response after reading the status line and response headers.",
+        "Successful CONNECT responses continue to establish the tunnel, but no unclosed-response ResourceWarning should be emitted from the tunnel response.",
+        "If the proxy returns a non-OK CONNECT status, the connection is closed and OSError is raised.",
+        "Proxy response headers are consumed until the header terminator or EOF, with overlong header lines rejected through http.client.LineTooLong.",
+        "Debug-level header reporting during tunnel setup remains available while the proxy response headers are consumed."
+      ],
+      "acceptance_criteria": [
+        "Given Python older than 3.11.4 and a successful CONNECT proxy tunnel, when urllib3 establishes the tunnel, then the temporary CONNECT response should be closed and no ResourceWarning for an unclosed response should be produced.",
+        "Given Python older than 3.11.4 and a CONNECT proxy response with a non-OK status, when urllib3 attempts to establish the tunnel, then it should close the underlying connection and raise OSError.",
+        "Given Python older than 3.11.4 and a CONNECT proxy response containing an overlong header line, when urllib3 reads the tunnel response headers, then it should raise http.client.LineTooLong.",
+        "Given Python 3.11.4 or newer, when urllib3 establishes a CONNECT proxy tunnel, then behavior should remain governed by the runtime's fixed standard-library implementation."
+      ]
+    },
+    "significance": "medium",
+    "confidence": "high",
+    "difficulty": "medium"
+  },
+  "task_9": {
+    "task_id": "task_9",
+    "title": "Probe and reuse HTTP/2 connections",
+    "type": "FEATURE",
+    "runtime_impact": true,
+    "description": "The update adds opt-in HTTP/2 capability detection through ALPN and changes HTTP/2 connection handling so a successful HTTP/2 connection is not closed immediately after each response. This lets urllib3 remember whether an HTTPS origin supports HTTP/2 and makes future requests to that origin eligible to reuse the same HTTP/2 socket where the pool allows it.",
+    "synthesized_requirement": {
+      "problem_statement": "Ensure that urllib3 can determine whether an HTTPS origin supports HTTP/2 through ALPN and keep successful HTTP/2 connections available for subsequent requests instead of closing them after every response.",
+      "expectation": {
+        "grounded": "When HTTP/2 support is enabled through urllib3.http2.inject_into_urllib3(), HTTPSConnection.connect() should use ALPN negotiation to determine whether the target host and port support HTTP/2, cache that result per origin, and expose HTTP/2 responses through HTTP2Response with HTTP/2 version metadata. HTTP2Connection.getresponse() should return the response without closing the connection, while HTTP2Connection.close() should remain responsible for sending the HTTP/2 close signal, resetting HTTP/2 state, and closing the underlying socket. HTTP2Connection should support request bodies supplied as bytes, strings, iterables, or file-like objects, reject unsupported HTTP/2 proxy tunneling paths with NotImplementedError, and validate HTTP/2 header names and values before sending them.",
+        "conceptual": "When HTTP/2 is enabled, urllib3 should automatically discover whether each HTTPS origin can use HTTP/2, remember that decision, and preserve working HTTP/2 connections for reuse. Responses should still look like normal urllib3 responses, while unsupported HTTP/2 cases should fail explicitly instead of silently behaving incorrectly."
+      },
+      "constraints": {
+        "grounded": "Do not perform an HTTP/2 probe when HTTP/2 is not included in the ALPN protocols being offered. Preserve existing HTTPS connection setup behavior, certificate verification behavior, proxy verification behavior, timeout handling, and HTTP/1.1 fallback behavior. Concurrent connection attempts to the same origin must not perform conflicting probes; waiting callers must observe the completed cached result or an inconclusive result if the probing connection fails. urllib3.http2.inject_into_urllib3() must reject unsupported h2 major versions, and urllib3.http2.extract_from_urllib3() must restore the HTTPSConnection class and ALPN protocol defaults.",
+        "conceptual": "The feature must be opt-in, must not alter normal HTTP/1.1 behavior when HTTP/2 is not offered, and must handle connection failures and concurrent callers without leaving the origin capability state locked or inconsistent."
+      },
+      "behavior": [
+        "HTTPS origins are probed for HTTP/2 support only when the active ALPN protocol list includes HTTP/2.",
+        "A successful TLS handshake records whether the selected ALPN protocol is HTTP/2 for the target origin.",
+        "The HTTP/2 support decision is cached per host and port so later connections can reuse the known capability result.",
+        "When a connection attempt fails before a definitive ALPN result is available, the origin capability is recorded as inconclusive and the probe lock is released.",
+        "Concurrent probes for the same origin are serialized so only one caller determines the result while the others wait for the cached outcome.",
+        "HTTP2Connection.getresponse() no longer closes the connection after returning a response, allowing the socket and HTTP/2 state to remain available for future requests.",
+        "HTTP2Connection.close() explicitly closes the HTTP/2 connection, clears stream and header state, and then closes the underlying HTTPS connection.",
+        "HTTP2Connection.request() can send request bodies and omits unsupported chunked transfer encoding headers for HTTP/2 requests.",
+        "HTTP/2 request header names are normalized to lowercase and invalid HTTP/2 header names or values raise ValueError before the request is sent.",
+        "HTTP/2 proxy construction and tunnel setup paths raise NotImplementedError rather than attempting unsupported proxy or CONNECT tunnel behavior.",
+        "The PyOpenSSL wrapped socket exposes the negotiated ALPN protocol so the probe can make the same HTTP/2 support decision when PyOpenSSL is active."
+      ],
+      "acceptance_criteria": [
+        "Given HTTP/2 support is enabled and the offered ALPN protocols include HTTP/2, when an HTTPS connection succeeds, then urllib3 should record whether the origin selected HTTP/2.",
+        "Given an origin has already been probed successfully, when another connection to the same host and port is opened, then urllib3 should use the cached support decision instead of requiring a new independent probe.",
+        "Given multiple threads connect to the same unprobed origin at the same time, when the probe is in progress, then only one connection should determine the result and the remaining callers should proceed from the completed or inconclusive cached state.",
+        "Given an HTTP/2 response has been received, when the response is returned to the caller, then the underlying connection should remain open for reuse unless explicitly closed or otherwise invalidated.",
+        "Given an HTTP/2 request includes a supported body form, when the request is sent, then the body should be transmitted on the HTTP/2 stream and the stream should be ended correctly.",
+        "Given an HTTP/2 request includes invalid header names or header values, when headers are added, then urllib3 should reject them before sending the request.",
+        "Given HTTP/2 is not in the offered ALPN protocols, when an HTTPS connection is made, then urllib3 should avoid HTTP/2 probing and preserve existing non-HTTP/2 behavior.",
+        "Given HTTP/2 is enabled with an unsupported h2 library major version, when injection is requested, then urllib3 should raise ImportError instead of enabling incompatible HTTP/2 support.",
+        "Given HTTP/2 is enabled and a proxy tunnel is requested, when tunnel setup is attempted, then urllib3 should raise NotImplementedError rather than attempting unsupported HTTP/2 tunneling."
+      ]
+    },
+    "significance": "medium",
+    "confidence": "high",
+    "difficulty": "hard"
+  },
+  "task_7": {
+    "task_id": "task_7",
+    "title": "Omit chunked transfer encoding for HTTP/2 bodies",
+    "type": "FIX",
+    "runtime_impact": true,
+    "description": "HTTP/2 requests should accept callers that use chunked request-body semantics without emitting the HTTP/1.1-only Transfer-Encoding: chunked header or applying chunked transfer framing. Request bodies should be sent as valid HTTP/2 body data while preserving normal request behavior for supported body forms.",
+    "synthesized_requirement": {
+      "problem_statement": "Ensure that HTTP/2 requests using chunked request-body semantics remain valid by omitting the HTTP/1.1 chunked transfer header and sending the body normally over HTTP/2.",
+      "expectation": {
+        "grounded": "HTTP2Connection.request should tolerate the chunked keyword for HTTP/2 requests, omit a Transfer-Encoding header whose value is chunked, and still send any supplied body. HTTP2Connection.endheaders should keep the HTTP/2 stream open when a body is present, and HTTP2Connection.send should transmit supported body forms including bytes, strings, iterables of chunks, and file-like objects. Invalid HTTP/2 header names or values should raise ValueError, and send or endheaders before putrequest should raise ConnectionError.",
+        "conceptual": "A caller should be able to make an HTTP/2 request that was marked as chunked without producing an invalid HTTP/2 header or losing the request body. The library should translate the request into valid HTTP/2 semantics, reject malformed headers, and surface misuse through the existing connection errors."
+      },
+      "constraints": {
+        "grounded": "Do not emit Transfer-Encoding: chunked on HTTP/2 requests, including when the caller passes that header explicitly. Do not reject a request solely because chunked=True was provided. Preserve valid non-chunked headers, preserve the default User-Agent behavior when no user-agent header is supplied, and continue to reject unsupported HTTP/2 connection features such as proxies, tunnels, skip_host, and skip_accept_encoding.",
+        "conceptual": "The fix should be limited to making chunked-style HTTP/2 request bodies valid. It should not broaden unsupported HTTP/2 features, drop unrelated valid headers, or weaken header validation."
+      },
+      "behavior": [
+        "HTTP/2 requests that include chunked=True continue through the request flow instead of failing due to the chunked option.",
+        "A Transfer-Encoding header with the chunked value is excluded from the outgoing HTTP/2 header set.",
+        "When a request body is present, headers are sent without ending the stream so the body can follow.",
+        "Request bodies are sent over the HTTP/2 data stream for supported body inputs: bytes, strings, iterables of chunks, and file-like objects.",
+        "Bodyless HTTP/2 requests end the stream with the headers.",
+        "Ordinary HTTP/2 request headers are normalized and validated before being sent, with malformed names or values rejected via ValueError.",
+        "Calling send or endheaders before a request stream has been opened raises ConnectionError.",
+        "Unsupported body input types raise TypeError rather than being sent."
+      ],
+      "acceptance_criteria": [
+        "Given an HTTP/2 request with chunked=True and a request body, when the request is sent, it should not include Transfer-Encoding: chunked and the body should still be transmitted.",
+        "Given an HTTP/2 request whose headers explicitly include Transfer-Encoding: chunked, when the request is sent, that header should be omitted while other valid headers remain eligible to be sent.",
+        "Given a bodyless HTTP/2 request, when headers are sent, the request stream should be completed with the header block.",
+        "Given an HTTP/2 request body supplied as bytes, text, an iterable of chunks, or a readable file-like object, when the request is sent, the body should be delivered using HTTP/2 body data and the stream should close after the final body data.",
+        "Given an invalid HTTP/2 header name or value, when the caller adds the header, the connection should raise ValueError instead of sending the invalid header.",
+        "Given send or endheaders is called before putrequest has opened a stream, the connection should raise ConnectionError."
+      ]
+    },
+    "significance": "medium",
+    "confidence": "high",
+    "difficulty": "medium"
+  },
+  "task_12": {
+    "task_id": "task_12",
+    "title": "Drop EOL PyPy Support",
+    "type": "DEPENDENCY",
+    "runtime_impact": false,
+    "description": "Version 2.2.3 updates the supported interpreter policy by dropping support for end-of-life PyPy3.8 and PyPy3.9, leaving currently supported PyPy3.10 as the PyPy target. No code diff was provided, so no runtime behavior changes are evidenced for supported environments.",
+    "synthesized_requirement": {
+      "problem_statement": "Ensure that the library no longer presents or maintains support for end-of-life PyPy3.8 and PyPy3.9, and that supported PyPy usage is aligned with currently supported PyPy3.10.",
+      "expectation": {
+        "grounded": "The supported runtime policy for the 2.2.3 update must remove PyPy3.8 and PyPy3.9 from the set of supported PyPy versions and retain PyPy3.10 as the supported PyPy version referenced by the release note. No public API behavior, return values, warning behavior, or exception behavior is changed by the provided code diff.",
+        "conceptual": "Users should understand that this release narrows official PyPy support to current PyPy versions and no longer treats older end-of-life PyPy runtimes as supported environments."
+      },
+      "constraints": {
+        "grounded": "The support drop must be limited to end-of-life PyPy3.8 and PyPy3.9. Existing behavior on supported CPython versions and supported PyPy3.10 must not be treated as changed unless separately specified by another release item.",
+        "conceptual": "The update should change compatibility expectations for obsolete runtimes without introducing new observable behavior changes for users on supported runtimes."
+      },
+      "behavior": [
+        "PyPy3.8 is no longer an officially supported runtime.",
+        "PyPy3.9 is no longer an officially supported runtime.",
+        "PyPy3.10 remains the supported PyPy runtime identified by this release item.",
+        "No runtime behavioral change is evidenced by the provided code diff."
+      ],
+      "acceptance_criteria": [
+        "When users review supported runtime expectations for version 2.2.3, PyPy3.8 should not be represented as supported.",
+        "When users review supported runtime expectations for version 2.2.3, PyPy3.9 should not be represented as supported.",
+        "When users review PyPy compatibility for version 2.2.3, PyPy3.10 should be the supported PyPy target indicated by this release item.",
+        "When the library is used on supported runtimes, it should not exhibit new public API behavior changes solely because of this support-policy update."
+      ]
+    },
+    "significance": "medium",
+    "confidence": "medium",
+    "difficulty": "easy"
+  },
+  "task_6": {
+    "task_id": "task_6",
+    "title": "Allow typed socket option extension",
+    "type": "TYPING",
+    "runtime_impact": false,
+    "description": "The update corrects urllib3's socket option typing so the documented pattern of extending HTTPConnection.default_socket_options with additional socket option tuples is accepted by static type checkers. This addresses a mypy error caused by treating socket options as a generic Sequence even though users are expected to concatenate list entries when adding options such as TCP keepalives.",
+    "synthesized_requirement": {
+      "problem_statement": "Ensure that users can extend HTTPConnection.default_socket_options with additional socket option tuples without static type checkers reporting an unsupported addition operation.",
+      "expectation": {
+        "grounded": "HTTPConnection.default_socket_options and related socket_options typing should model a mutable list of socket option tuples so that adding or in-place extending with another list of valid socket option tuples is type-compatible. Each socket option entry remains a three-item tuple containing integer socket identifiers and an integer or bytes value.",
+        "conceptual": "The documented TCP keepalive customization pattern should be valid for typed users: extending the default socket options should be accepted by mypy while preserving the existing socket option shape and behavior."
+      },
+      "constraints": {
+        "grounded": "The accepted socket option value types must remain limited to int or bytes, and the tuple shape must remain compatible with existing urllib3 connection socket option handling. This change must not alter connection creation behavior, socket option application, or the runtime contents of the default options.",
+        "conceptual": "The update should improve static typing only, without changing how connections work or broadening the supported socket option data format."
+      },
+      "behavior": [
+        "Static typing for urllib3 connection socket options now represents the collection as a list rather than an arbitrary sequence.",
+        "Typed code can concatenate or in-place add a list of valid socket option tuples to HTTPConnection.default_socket_options or a connection's socket_options without an unsupported-operator mypy error.",
+        "The socket option tuple contract remains unchanged: entries contain socket level, option name, and a value that may be an integer or bytes.",
+        "Runtime behavior for constructing connections and applying socket options remains unchanged."
+      ],
+      "acceptance_criteria": [
+        "When a typed user extends HTTPConnection.default_socket_options with a list containing a valid socket option tuple, static type checking should accept the addition operation.",
+        "When a typed user performs in-place addition on a connection's socket_options with a list of valid socket option tuples, static type checking should accept the operation.",
+        "When existing code reads or passes socket option entries using the established three-item tuple structure, it should remain compatible.",
+        "When urllib3 creates a connection and applies socket options, it should behave the same as before this typing change."
+      ]
+    },
+    "significance": "low",
+    "confidence": "high",
+    "difficulty": "easy"
+  },
+  "task_11": {
+    "task_id": "task_11",
+    "title": "Generate package version metadata at build time",
+    "type": "DEPENDENCY",
+    "runtime_impact": true,
+    "description": "The update moves version metadata generation out of a tracked static version file and into the build process while preserving runtime access to the package version. Built distributions should continue exposing version values for consumers and downstream tooling, with the release reporting 2.2.3.",
+    "synthesized_requirement": {
+      "problem_statement": "Ensure that package version metadata is generated from the build context for distributors while preserving existing runtime version access for users and tooling.",
+      "expectation": {
+        "grounded": "For urllib3 2.2.3, builds should generate the version metadata at build time using the VCS-derived release information described by hatch-vcs. The runtime version module must still expose __version__ with the release value 2.2.3, provide a matching version alias, and expose tuple-form version values through __version_tuple__ and version_tuple. Tagged clean builds should use the tag-derived release version, while non-tagged builds may produce development versions without local version suffixes where package indexes reject them.",
+        "conceptual": "Published builds should carry accurate package version information without relying on a manually maintained generated file, and existing consumers that read the package version at runtime should continue to receive consistent string and tuple representations."
+      },
+      "constraints": {
+        "grounded": "Do not remove or break runtime access to __version__ for 2.2.3 consumers. Keep the string and tuple version representations consistent with each other. Preserve compatibility for downstream distributors that build packages from source or VCS state, including environments that validate package versions for publication.",
+        "conceptual": "The packaging change must not make version discovery less reliable for users, tools, or distributors, and it must not introduce inconsistent version values across supported access patterns."
+      },
+      "behavior": [
+        "The runtime version string exposed by the version module changes from 2.2.2 to 2.2.3.",
+        "A version alias is exposed with the same string value as __version__.",
+        "Tuple-form version metadata is exposed for the 2.2.3 release and is consistent across the tuple aliases.",
+        "The version metadata module is treated as generated output rather than a manually maintained source artifact."
+      ],
+      "acceptance_criteria": [
+        "Given a built urllib3 2.2.3 distribution, when runtime version metadata is inspected through __version__, it should report 2.2.3.",
+        "When runtime version metadata is inspected through the version alias, it should match __version__.",
+        "When tuple-form version metadata is inspected, both tuple accessors should report the same 2.2.3 tuple representation.",
+        "When a downstream distributor builds from a clean release tag, the resulting package should use the release version derived from that tag.",
+        "When a downstream distributor builds from a non-tagged VCS state, the resulting package version should be VCS-derived and suitable for package publication systems that reject local version suffixes."
+      ]
+    },
+    "significance": "medium",
+    "confidence": "high",
+    "difficulty": "medium"
+  },
+  "task_5": {
+    "task_id": "task_5",
+    "title": "Avoid import crashes when hash algorithms are unavailable",
+    "type": "FIX",
+    "runtime_impact": true,
+    "description": "urllib3 no longer fails during import in restricted Python environments, such as FIPS-configured builds, where standard hashlib algorithms may be unavailable. Certificate fingerprint validation continues to recognize the existing MD5, SHA1, and SHA256 fingerprint lengths, but now reports an SSL error at validation time if the required hash implementation is missing.",
+    "synthesized_requirement": {
+      "problem_statement": "Ensure that urllib3 remains importable and generally usable in restricted Python environments where selected standard library hash functions, such as MD5, are unavailable, while preserving clear failure behavior for certificate fingerprint checks that require a missing hash algorithm.",
+      "expectation": {
+        "grounded": "The urllib3.util.ssl_ module must not require hashlib.md5, hashlib.sha1, or hashlib.sha256 to exist at module import time. assert_fingerprint(cert, fingerprint) must continue to classify normalized hexadecimal fingerprint lengths of 32, 40, and 64 characters as the recognized MD5, SHA1, and SHA256 cases. If the recognized hash function for the supplied fingerprint length is unavailable, assert_fingerprint must raise urllib3.exceptions.SSLError instead of failing with an import error or an unexpected callable error. Fingerprint lengths outside the recognized set must continue to raise urllib3.exceptions.SSLError as invalid lengths.",
+        "conceptual": "Applications should be able to import and use urllib3 in environments that disable particular hash algorithms for policy reasons. Certificate fingerprint verification should only fail when it actually needs an unavailable algorithm, and that failure should be reported as a normal SSL validation error."
+      },
+      "constraints": {
+        "grounded": "Do not change the recognized fingerprint length contract for assert_fingerprint: 32, 40, and 64 normalized hexadecimal characters remain the only supported digest lengths. Do not change successful fingerprint matching behavior when the required hash implementation is available. Do not collapse an unavailable recognized hash algorithm into the same behavior as an unrecognized fingerprint length.",
+        "conceptual": "The fix should avoid broad compatibility regressions for normal TLS fingerprint verification, keep existing invalid-input handling intact, and distinguish unsupported fingerprint formats from policy-restricted hash availability."
+      },
+      "behavior": [
+        "Importing urllib3.util.ssl_ no longer directly imports individual hashlib hash constructors, so module import can succeed even when one of those constructors is absent from hashlib.",
+        "The fingerprint length to hash-function mapping still recognizes normalized hexadecimal lengths 32, 40, and 64 for the existing supported fingerprint algorithms.",
+        "When a supplied fingerprint has a length outside the recognized set, assert_fingerprint raises SSLError for an invalid fingerprint length as before.",
+        "When a supplied fingerprint has a recognized length but the corresponding hash function is unavailable in the runtime, assert_fingerprint raises SSLError indicating that the hash implementation is unavailable for that fingerprint length.",
+        "When the corresponding hash function is available, assert_fingerprint proceeds with the existing digest comparison behavior."
+      ],
+      "acceptance_criteria": [
+        "Given a Python environment where hashlib lacks md5, when urllib3 or urllib3.util.ssl_ is imported, it should import without raising an ImportError caused by the missing md5 function.",
+        "Given a certificate fingerprint whose normalized hexadecimal length is 32, 40, or 64 characters and the matching hash function exists, when assert_fingerprint is called, it should perform the normal fingerprint comparison behavior.",
+        "Given a certificate fingerprint whose normalized hexadecimal length is 32, 40, or 64 characters and the matching hash function is unavailable, when assert_fingerprint is called, it should raise SSLError describing unavailable hash support for that fingerprint length.",
+        "Given a certificate fingerprint whose normalized hexadecimal length is not 32, 40, or 64 characters, when assert_fingerprint is called, it should raise SSLError for an invalid fingerprint length.",
+        "Given an environment where SHA1 or SHA256 is unavailable, when urllib3.util.ssl_ is imported, the missing algorithm should not cause an import-time failure."
+      ]
+    },
+    "significance": "medium",
+    "confidence": "high",
+    "difficulty": "easy"
+  },
+  "task_10": {
+    "task_id": "task_10",
+    "title": "Support HTTP/2 request bodies",
+    "type": "FEATURE",
+    "runtime_impact": true,
+    "description": "HTTP/2 connections now support sending non-empty request bodies instead of rejecting them, while preserving correct stream-ending behavior for requests without bodies. The update also tightens HTTP/2 request semantics around header validity, unsupported transfer modes, stream lifecycle, and response handling.",
+    "synthesized_requirement": {
+      "problem_statement": "Ensure that HTTP/2 requests can carry request bodies without breaking bodyless requests or emitting protocol-unfriendly empty data events.",
+      "expectation": {
+        "grounded": "HTTP2Connection.request should accept a body and send it over HTTP/2 after headers. HTTP2Connection.endheaders should mark the headers as the end of the stream only when there is no message body. HTTP2Connection.send should support str, bytes, iterables, and file-like objects, close the stream after body data is sent, raise ConnectionError when used before putrequest, and raise TypeError for unsupported body types. putheader should normalize header names to lowercase, reject HTTP/2-invalid header names or values with ValueError, and request should omit Transfer-Encoding: chunked while still allowing the request to proceed.",
+        "conceptual": "Applications using HTTP/2 should be able to send requests with bodies in the normal request flow, and requests without bodies should complete at the header frame without generating empty body data. Invalid HTTP/2 headers and unsupported request modes should fail clearly before malformed traffic is sent."
+      },
+      "constraints": {
+        "grounded": "Do not send a DATA event for a request that has no body. Preserve HTTP/2-specific unsupported boundaries by rejecting proxy or tunnel usage, set_tunnel, skip_host, and skip_accept_encoding. Do not forward chunked transfer encoding as an HTTP/2 header. Keep HTTP2Response reporting HTTP/2 metadata and buffered response data, and keep close available to reset HTTP/2 connection state.",
+        "conceptual": "Maintain HTTP/2 protocol compatibility: body support must not regress bodyless requests, must not rely on HTTP/1.1-only transfer semantics, and must fail early for malformed headers or unsupported connection features."
+      },
+      "behavior": [
+        "Requests with no body send headers with the stream already ended and do not emit an empty data frame.",
+        "Requests with a non-empty body send headers without ending the stream, then send body data and end the stream after the body is complete.",
+        "Bytes bodies are sent as a single body payload and end the stream.",
+        "String bodies are encoded before being sent as body data.",
+        "Iterable bodies are sent chunk by chunk and the stream is ended after iteration completes.",
+        "File-like bodies are read in blocks, each non-empty block is sent as body data, and the stream is ended after the readable object is exhausted.",
+        "Unsupported body objects raise TypeError when send cannot iterate or transmit them.",
+        "Calling send or endheaders before putrequest raises ConnectionError.",
+        "Header names are lowercased before sending and invalid HTTP/2 header names or values raise ValueError.",
+        "Transfer-Encoding: chunked is not forwarded on HTTP/2 requests, and a chunked request flag does not by itself prevent the request from being sent.",
+        "HTTP/2 proxy tunneling and skip_host or skip_accept_encoding request options remain unsupported and raise NotImplementedError.",
+        "Receiving a response continues to collect HTTP/2 status, headers, and data into an HTTP2Response without requiring automatic connection closure."
+      ],
+      "acceptance_criteria": [
+        "Given an HTTP/2 request with no body, when it is sent, then the header event should end the stream and no data event should be emitted for the body.",
+        "Given an HTTP/2 request with a non-empty bytes or string body, when it is sent, then headers should leave the stream open, the body should be transmitted, and the stream should end after the body.",
+        "Given an iterable or file-like request body, when it is sent, then produced body chunks should be transmitted in order and the stream should end only after the body source is exhausted.",
+        "When a caller supplies Transfer-Encoding: chunked or a chunked flag for an HTTP/2 request, it should not send a chunked transfer-encoding header and should still send the request using HTTP/2 framing.",
+        "When a caller supplies a malformed HTTP/2 header name or value, the request should fail with ValueError before the header is sent.",
+        "When send or endheaders is called before a request stream is initialized, it should fail with ConnectionError.",
+        "When a caller attempts proxy tunneling or unsupported request options such as skip_host or skip_accept_encoding, the HTTP/2 connection should reject the operation with NotImplementedError.",
+        "When an HTTP/2 response is received, the returned response should expose HTTP/2 status, headers, version metadata, and buffered response data."
+      ]
+    },
+    "significance": "medium",
+    "confidence": "high",
+    "difficulty": "medium"
+  },
+  "task_8": {
+    "task_id": "task_8",
+    "title": "Validate h2 Version for HTTP/2",
+    "type": "DEPENDENCY",
+    "runtime_impact": true,
+    "description": "HTTP/2 activation now verifies the installed h2 dependency before urllib3 switches to HTTP/2 behavior. Only h2 4.x releases are accepted; unsupported major versions are rejected with an ImportError so users receive an explicit compatibility failure instead of running urllib3 against an unsupported HTTP/2 implementation.",
+    "synthesized_requirement": {
+      "problem_statement": "Ensure that enabling urllib3 HTTP/2 support accepts only supported h2 4.x installations and fails clearly when an unsupported h2 major version is installed.",
+      "expectation": {
+        "grounded": "When `urllib3.http2.inject_into_urllib3()` is called, it must check the installed `h2` package version before activating HTTP/2 support. Versions whose major version is not 4 must cause an `ImportError`; supported 4.x versions must allow activation to proceed. The `urllib3.http2` module should continue to expose `inject_into_urllib3` and `extract_from_urllib3`, and successful activation should continue to switch HTTPS handling to the HTTP/2 connection implementation with HTTP/2 ALPN selection.",
+        "conceptual": "HTTP/2 support should only be enabled when the installed HTTP/2 dependency is in the supported compatibility range. If the dependency is outside that range, users should get an immediate dependency compatibility error instead of urllib3 enabling an unsupported configuration."
+      },
+      "constraints": {
+        "grounded": "`inject_into_urllib3()` must not activate HTTP/2 connection classes or change ALPN protocol selection when the installed `h2` version is outside 4.x. `extract_from_urllib3()` must preserve the ability to restore HTTPS handling and ALPN protocol selection back to HTTP/1.1 after HTTP/2 has been enabled. Importing `urllib3.http2` alone should not be the point where the HTTP/2 connection implementation is activated.",
+        "conceptual": "Unsupported dependency versions must fail before observable HTTP/2 side effects occur, while existing opt-in and opt-out HTTP/2 behavior must remain available for supported installations."
+      },
+      "behavior": [
+        "`urllib3.http2.inject_into_urllib3()` checks the installed `h2` distribution version before importing or activating the HTTP/2 connection implementation.",
+        "If the installed `h2` version is not in the 4.x major-version range, `inject_into_urllib3()` raises `ImportError` and does not complete HTTP/2 activation.",
+        "If the installed `h2` version is in the 4.x range, `inject_into_urllib3()` proceeds with the existing HTTP/2 opt-in behavior, including replacing the HTTPS connection class used by urllib3 connection pools.",
+        "Successful HTTP/2 activation sets ALPN protocol selection to HTTP/2 in both exposed urllib3 utility locations that carry the ALPN protocol list.",
+        "`extract_from_urllib3()` restores the original HTTPS connection handling and resets ALPN protocol selection to HTTP/1.1."
+      ],
+      "acceptance_criteria": [
+        "Given an environment with h2 4.x installed, when `urllib3.http2.inject_into_urllib3()` is called, it should complete without a dependency compatibility error and enable urllib3's HTTP/2 connection behavior.",
+        "Given an environment with an h2 major version older than 4, when `urllib3.http2.inject_into_urllib3()` is called, it should raise `ImportError` before HTTP/2 behavior is enabled.",
+        "Given an environment with an h2 major version newer than 4, when `urllib3.http2.inject_into_urllib3()` is called, it should raise `ImportError` before HTTP/2 behavior is enabled.",
+        "When HTTP/2 activation succeeds, urllib3 should advertise HTTP/2 through its ALPN protocol configuration used for TLS negotiation.",
+        "When `urllib3.http2.extract_from_urllib3()` is called after successful activation, urllib3 should return HTTPS handling and ALPN protocol configuration to HTTP/1.1 behavior."
+      ]
+    },
+    "significance": "medium",
+    "confidence": "high",
+    "difficulty": "easy"
+  },
+  "task_2": {
+    "task_id": "task_2",
+    "title": "Use UTF-8 for chunked request bodies",
+    "type": "FIX",
+    "runtime_impact": true,
+    "description": "urllib3 2.2.3 fixes an inconsistency in how chunked request bodies are encoded. Text data sent as a chunked request body is now encoded as UTF-8 instead of ISO-8859-1, matching the encoding behavior used by other request body paths since urllib3 2.0 and preventing incorrect byte counts or mismatched request payloads for non-ASCII and control-character-containing strings.",
+    "synthesized_requirement": {
+      "problem_statement": "Ensure that chunked request bodies supplied as text are encoded consistently as UTF-8, so requests containing non-ASCII or control characters produce the expected byte payload and do not diverge from other urllib3 request body submission paths.",
+      "expectation": {
+        "grounded": "When urllib3 sends a request with chunked transfer enabled through public request APIs such as PoolManager.urlopen or HTTPConnectionPool.urlopen, any chunked body data that must be encoded from text to bytes must use UTF-8. This applies to text chunks read from readable request bodies and should preserve the existing behavior of byte-oriented body data.",
+        "conceptual": "Chunked text request bodies should be transmitted using the same UTF-8 encoding contract as other request bodies, making the bytes sent over the network predictable and consistent across body input styles."
+      },
+      "constraints": {
+        "grounded": "Do not change the chunked transfer framing behavior, the use of Transfer-Encoding: chunked, or byte-preserving behavior for request body data that is already bytes. The fix should only affect the default text-to-bytes encoding used for chunked request body content.",
+        "conceptual": "The change should correct text encoding without altering unrelated request semantics or modifying payloads that callers already provided as bytes."
+      },
+      "behavior": [
+        "Chunked request body text is encoded to UTF-8 before transmission instead of ISO-8859-1.",
+        "Chunked request bodies containing non-ASCII characters are sent with UTF-8 byte sequences, aligning them with other urllib3 request body mechanisms.",
+        "Requests whose chunked body data is already bytes continue to send those bytes without text re-encoding.",
+        "Chunked transfer framing remains unchanged; only the default text encoding for body chunks changes."
+      ],
+      "acceptance_criteria": [
+        "Given a chunked request body supplied as text containing non-ASCII characters, when urllib3 sends the request, it should transmit the UTF-8 encoded bytes for that text.",
+        "Given a chunked request body supplied as text containing control characters, when urllib3 sends the request, the transmitted payload length and content should reflect UTF-8 encoding consistently with other request body paths.",
+        "Given a chunked request body supplied as bytes, when urllib3 sends the request, it should preserve and transmit the original byte content.",
+        "When chunked transfer is enabled for a request body, urllib3 should continue to use chunked transfer framing while applying the corrected text encoding behavior."
+      ]
+    },
+    "significance": "medium",
+    "confidence": "high",
+    "difficulty": "easy"
+  },
+  "task_1": {
+    "task_id": "task_1",
+    "title": "Support Python 3.13 TLS compatibility",
+    "type": "FEATURE",
+    "runtime_impact": true,
+    "description": "urllib3 2.2.3 adds Python 3.13 support and aligns SSLTransport with the TLS APIs available on that runtime by dropping the legacy NPN selected-protocol surface while retaining ALPN and existing TLS inspection behavior.",
+    "synthesized_requirement": {
+      "problem_statement": "Ensure that urllib3 supports Python 3.13 by avoiding reliance on legacy TLS Next Protocol Negotiation selected-protocol behavior, while preserving the supported TLS negotiation and inspection capabilities users already depend on.",
+      "expectation": {
+        "grounded": "urllib3 should be usable on Python 3.13, and urllib3.util.ssltransport.SSLTransport should continue to expose selected_alpn_protocol() and shared_ciphers() with their existing observable behavior. SSLTransport should no longer expose selected_npn_protocol(), and use of SSLTransport should not require the underlying ssl object to provide NPN selected-protocol support.",
+        "conceptual": "The library should work on Python 3.13 without depending on removed or unavailable legacy NPN TLS negotiation APIs. Modern ALPN negotiation remains supported, and legacy NPN selection is no longer an advertised capability."
+      },
+      "constraints": {
+        "grounded": "Do not change the observable return semantics of SSLTransport.selected_alpn_protocol() or SSLTransport.shared_ciphers(). Removing NPN selected-protocol support must not introduce new failures in normal SSLTransport connection handling, TLS handshakes, reads, writes, unwrap behavior, or cipher inspection.",
+        "conceptual": "Python 3.13 compatibility should be added without regressing normal TLS transport behavior, except that legacy NPN selected-protocol access is no longer part of the supported surface."
+      },
+      "behavior": [
+        "Python 3.13 is treated as a supported runtime for urllib3 2.2.3.",
+        "SSLTransport instances no longer provide selected_npn_protocol() as an available method.",
+        "SSLTransport.selected_alpn_protocol() continues to return the negotiated ALPN protocol or None according to the underlying TLS state.",
+        "SSLTransport.shared_ciphers() continues to expose shared cipher information with the same return contract as before.",
+        "Using SSLTransport on Python or ssl implementations without NPN selected-protocol support should not fail because that legacy capability is unavailable."
+      ],
+      "acceptance_criteria": [
+        "Given urllib3 is running on Python 3.13, when applications import and use urllib3 TLS functionality, it should operate without NPN-related compatibility failures.",
+        "When an SSLTransport-backed connection has no negotiated ALPN protocol, selected_alpn_protocol() should return None without requiring any NPN fallback.",
+        "When applications inspect an SSLTransport instance, selected_npn_protocol() should not be available as a supported method.",
+        "When applications inspect shared cipher information through SSLTransport, the existing shared_ciphers() return behavior should be preserved.",
+        "When applications perform normal SSLTransport connection operations, the removal of NPN selected-protocol support should not change handshake, read, write, unwrap, or cipher behavior."
+      ]
+    },
+    "significance": "medium",
+    "confidence": "high",
+    "difficulty": "easy"
+  },
+  "task_4": {
+    "task_id": "task_4",
+    "title": "Stabilize Windows timeout timing validation",
+    "type": "FIX",
+    "runtime_impact": false,
+    "description": "Version 2.2.3 addresses a Windows-specific timing precision issue that could make timeout validation appear to fail even when the intended timeout behavior was preserved. The production code diff is empty, so this update should not change urllib3's runtime APIs, timeout semantics, retry behavior, or emitted exceptions.",
+    "synthesized_requirement": {
+      "problem_statement": "Ensure that Windows-specific clock precision does not cause false timeout failures during validation of urllib3 timeout behavior.",
+      "expectation": {
+        "grounded": "Elapsed-time checks around urllib3 request timeout behavior should account for Windows timing precision so that very small measurement shortfalls, including sub-15 ms differences, are not treated as behavioral failures. Existing observable urllib3 behavior, including request-level timeout precedence, timeout exceptions, and Retry-After handling, must remain unchanged.",
+        "conceptual": "Timeout behavior should be evaluated reliably across supported platforms. Small timing-measurement differences on Windows should not be mistaken for a user-visible timeout regression."
+      },
+      "constraints": {
+        "grounded": "Do not introduce runtime changes to urllib3's public APIs, connection pooling behavior, request timeout precedence, raised timeout error types, retry scheduling, or Retry-After semantics.",
+        "conceptual": "This update must improve platform stability without changing how applications experience urllib3 networking, timeouts, or retries."
+      },
+      "behavior": [
+        "No production code behavior changes are introduced by the library update.",
+        "Windows elapsed-time validation for short timeout intervals is treated with a wider tolerance to avoid false failures caused by clock precision.",
+        "Request-level timeout behavior remains the effective behavior being preserved when it differs from a pool-level timeout.",
+        "Retry-After behavior remains tied to wall-clock semantics and is not changed by this update."
+      ],
+      "acceptance_criteria": [
+        "When urllib3 is used on Windows, small elapsed-time measurement differences around request timeout validation should not be reported as timeout behavior failures.",
+        "When a request-specific timeout is supplied alongside a pool-level timeout, urllib3 should continue to honor the request-specific timeout semantics.",
+        "When urllib3 raises timeout-related errors, the public exception behavior should remain compatible with version 2.2.2.",
+        "When retry behavior depends on Retry-After timing, applications should observe the same behavior as before the update."
+      ]
+    },
+    "significance": "low",
+    "confidence": "high",
+    "difficulty": "easy"
+  }
+}

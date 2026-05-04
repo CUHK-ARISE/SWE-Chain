@@ -1,0 +1,338 @@
+diff --git a/jinja2/__init__.py b/jinja2/__init__.py
+index 06babb4..360b54f 100644
+--- a/jinja2/__init__.py
++++ b/jinja2/__init__.py
+@@ -27,7 +27,7 @@
+     :license: BSD, see LICENSE for more details.
+ """
+ __docformat__ = 'restructuredtext en'
+-__version__ = '2.9.3'
++__version__ = '2.9.4'
+ 
+ # high level interface
+ from jinja2.environment import Environment, Template
+
+diff --git a/jinja2/asyncsupport.py b/jinja2/asyncsupport.py
+index 33a1a07..6e82d75 100644
+--- a/jinja2/asyncsupport.py
++++ b/jinja2/asyncsupport.py
+@@ -14,7 +14,7 @@ import asyncio
+ import inspect
+ from functools import update_wrapper
+ 
+-from jinja2.utils import concat, internalcode, concat, Markup
++from jinja2.utils import concat, internalcode, Markup
+ from jinja2.environment import TemplateModule
+ from jinja2.runtime import LoopContextBase, _last_iteration
+ 
+
+diff --git a/jinja2/bccache.py b/jinja2/bccache.py
+index e58633e..d687d03 100644
+--- a/jinja2/bccache.py
++++ b/jinja2/bccache.py
+@@ -45,7 +45,7 @@ else:
+         return marshal.loads(f.read())
+ 
+ 
+-bc_version = 2
++bc_version = 3
+ 
+ # magic version used to only change with new jinja versions.  With 2.6
+ # we change this to also take Python version changes into account.  The
+
+diff --git a/jinja2/compiler.py b/jinja2/compiler.py
+index cdfe38e..48f3210 100644
+--- a/jinja2/compiler.py
++++ b/jinja2/compiler.py
+@@ -367,8 +367,7 @@ class CodeGenerator(NodeVisitor):
+         is no buffer a dummy ``if 0: yield None`` is written automatically.
+         """
+         try:
+-            if not nodes:
+-                self.writeline('pass')
++            self.writeline('pass')
+             for node in nodes:
+                 self.visit(node, frame)
+         except CompilerExit:
+@@ -993,6 +992,7 @@ class CodeGenerator(NodeVisitor):
+ 
+     def visit_For(self, node, frame):
+         loop_frame = frame.inner()
++        test_frame = frame.inner()
+         else_frame = frame.inner()
+ 
+         # try to figure out if we have an extended loop.  An extended loop
+@@ -1005,11 +1005,32 @@ class CodeGenerator(NodeVisitor):
+         loop_ref = None
+         if extended_loop:
+             loop_ref = loop_frame.symbols.declare_parameter('loop')
+-        loop_frame.symbols.analyze_node(node)
+ 
++        loop_frame.symbols.analyze_node(node, for_branch='body')
+         if node.else_:
+             else_frame.symbols.analyze_node(node, for_branch='else')
+ 
++        if node.test:
++            loop_filter_func = self.temporary_identifier()
++            test_frame.symbols.analyze_node(node, for_branch='test')
++            self.writeline('%s(fiter):' % self.func(loop_filter_func), node.test)
++            self.indent()
++            self.enter_frame(test_frame)
++            self.writeline(self.environment.is_async and 'async for ' or 'for ')
++            self.visit(node.target, loop_frame)
++            self.write(' in ')
++            self.write(self.environment.is_async and 'auto_aiter(fiter)' or 'fiter')
++            self.write(':')
++            self.indent()
++            self.writeline('if ', node.test)
++            self.visit(node.test, test_frame)
++            self.write(':')
++            self.indent()
++            self.writeline('yield ')
++            self.visit(node.target, loop_frame)
++            self.outdent(3)
++            self.leave_frame(test_frame, with_python_scope=True)
++
+         # if we don't have an recursive loop we have to find the shadowed
+         # variables at that point.  Because loops can be nested but the loop
+         # variable is a special one we have to enforce aliasing for it.
+@@ -1043,27 +1064,9 @@ class CodeGenerator(NodeVisitor):
+         else:
+             self.write(' in ')
+ 
+-        # if we have an extened loop and a node test, we filter in the
+-        # "outer frame".
+-        if extended_loop and node.test is not None:
+-            self.write('(')
+-            self.visit(node.target, loop_frame)
+-            self.write(self.environment.is_async and ' async for ' or ' for ')
+-            self.visit(node.target, loop_frame)
+-            self.write(' in ')
+-            if node.recursive:
+-                self.write('reciter')
+-            else:
+-                if self.environment.is_async:
+-                    self.write('auto_aiter(')
+-                self.visit(node.iter, frame)
+-                if self.environment.is_async:
+-                    self.write(')')
+-            self.write(' if (')
+-            self.visit(node.test, loop_frame)
+-            self.write('))')
+-
+-        elif node.recursive:
++        if node.test:
++            self.write('%s(' % loop_filter_func)
++        if node.recursive:
+             self.write('reciter')
+         else:
+             if self.environment.is_async and not extended_loop:
+@@ -1071,6 +1074,8 @@ class CodeGenerator(NodeVisitor):
+             self.visit(node.iter, frame)
+             if self.environment.is_async and not extended_loop:
+                 self.write(')')
++        if node.test:
++            self.write(')')
+ 
+         if node.recursive:
+             self.write(', loop_render_func, depth):')
+@@ -1080,15 +1085,6 @@ class CodeGenerator(NodeVisitor):
+         self.indent()
+         self.enter_frame(loop_frame)
+ 
+-        # tests in not extended loops become a continue
+-        if not extended_loop and node.test is not None:
+-            self.writeline('if not ')
+-            self.visit(node.test, loop_frame)
+-            self.write(':')
+-            self.indent()
+-            self.writeline('continue')
+-            self.outdent()
+-
+         self.blockvisit(node.body, loop_frame)
+         if node.else_:
+             self.writeline('%s = 0' % iteration_indicator)
+
+diff --git a/jinja2/defaults.py b/jinja2/defaults.py
+index e29ce56..3590388 100644
+--- a/jinja2/defaults.py
++++ b/jinja2/defaults.py
+@@ -44,6 +44,7 @@ DEFAULT_POLICIES = {
+     'compiler.ascii_str':   True,
+     'urlize.rel':           'noopener',
+     'urlize.target':        None,
++    'truncate.leeway':      5,
+     'json.dumps_function':  None,
+     'json.dumps_kwargs':    {'sort_keys': True},
+ }
+
+diff --git a/jinja2/ext.py b/jinja2/ext.py
+index 03c63e1..75e1f3b 100644
+--- a/jinja2/ext.py
++++ b/jinja2/ext.py
+@@ -87,7 +87,7 @@ class Extension(with_metaclass(ExtensionRegistry, object)):
+     def filter_stream(self, stream):
+         """It's passed a :class:`~jinja2.lexer.TokenStream` that can be used
+         to filter tokens returned.  This method has to return an iterable of
+-        :class:`~jinja2.lexer.Token`\s, but it doesn't have to return a
++        :class:`~jinja2.lexer.Token`\\s, but it doesn't have to return a
+         :class:`~jinja2.lexer.TokenStream`.
+ 
+         In the `ext` folder of the Jinja2 source distribution there is a file
+
+diff --git a/jinja2/filters.py b/jinja2/filters.py
+index e13bc62..f4cd796 100644
+--- a/jinja2/filters.py
++++ b/jinja2/filters.py
+@@ -463,7 +463,8 @@ def do_indent(s, width=4, indentfirst=False):
+     return rv
+ 
+ 
+-def do_truncate(s, length=255, killwords=False, end='...', leeway=5):
++@environmentfilter
++def do_truncate(env, s, length=255, killwords=False, end='...', leeway=None):
+     """Return a truncated copy of the string. The length is specified
+     with the first parameter which defaults to ``255``. If the second
+     parameter is ``true`` the filter will cut the text at length. Otherwise
+@@ -484,7 +485,11 @@ def do_truncate(s, length=255, killwords=False, end='...', leeway=5):
+         {{ "foo bar baz qux"|truncate(11, False, '...', 0) }}
+             -> "foo bar..."
+ 
++    The default leeway on newer Jinja2 versions is 5 and was 0 before but
++    can be reconfigured globally.
+     """
++    if leeway is None:
++        leeway = env.policies['truncate.leeway']
+     assert length >= len(end), 'expected length >= %s, got %s' % (len(end), length)
+     assert leeway >= 0, 'expected leeway >= 0, got %s' % leeway
+     if len(s) <= length + leeway:
+
+diff --git a/jinja2/idtracking.py b/jinja2/idtracking.py
+index 433b92c..8479b72 100644
+--- a/jinja2/idtracking.py
++++ b/jinja2/idtracking.py
+@@ -168,13 +168,16 @@ class RootVisitor(NodeVisitor):
+             self.sym_visitor.visit(child)
+ 
+     def visit_For(self, node, for_branch='body', **kwargs):
+-        if node.test is not None:
+-            self.sym_visitor.visit(node.test)
+         if for_branch == 'body':
+             self.sym_visitor.visit(node.target, store_as_param=True)
+             branch = node.body
+         elif for_branch == 'else':
+             branch = node.else_
++        elif for_branch == 'test':
++            self.sym_visitor.visit(node.target, store_as_param=True)
++            if node.test is not None:
++                self.sym_visitor.visit(node.test)
++            return
+         else:
+             raise RuntimeError('Unknown for branch')
+         for item in branch or ():
+
+diff --git a/jinja2/lexer.py b/jinja2/lexer.py
+index ca2914a..13c62da 100644
+--- a/jinja2/lexer.py
++++ b/jinja2/lexer.py
+@@ -20,8 +20,7 @@ from operator import itemgetter
+ from collections import deque
+ from jinja2.exceptions import TemplateSyntaxError
+ from jinja2.utils import LRUCache
+-from jinja2._compat import iteritems, implements_iterator, text_type, \
+-     intern, PY2
++from jinja2._compat import iteritems, implements_iterator, text_type, intern
+ 
+ 
+ # cache for the lexers. Exists in order to be able to have multiple
+@@ -288,7 +287,7 @@ class TokenStreamIterator(object):
+ 
+ @implements_iterator
+ class TokenStream(object):
+-    """A token stream is an iterable that yields :class:`Token`\s.  The
++    """A token stream is an iterable that yields :class:`Token`\\s.  The
+     parser however does not iterate over it but calls :meth:`next` to go
+     one token ahead.  The current active token is stored as :attr:`current`.
+     """
+@@ -500,7 +499,7 @@ class Lexer(object):
+             ],
+             # blocks
+             TOKEN_BLOCK_BEGIN: [
+-                (c('(?:\-%s\s*|%s)%s' % (
++                (c(r'(?:\-%s\s*|%s)%s' % (
+                     e(environment.block_end_string),
+                     e(environment.block_end_string),
+                     block_suffix_re
+@@ -508,14 +507,14 @@ class Lexer(object):
+             ] + tag_rules,
+             # variables
+             TOKEN_VARIABLE_BEGIN: [
+-                (c('\-%s\s*|%s' % (
++                (c(r'\-%s\s*|%s' % (
+                     e(environment.variable_end_string),
+                     e(environment.variable_end_string)
+                 )), TOKEN_VARIABLE_END, '#pop')
+             ] + tag_rules,
+             # raw block
+             TOKEN_RAW_BEGIN: [
+-                (c('(.*?)((?:\s*%s\-|%s)\s*endraw\s*(?:\-%s\s*|%s%s))' % (
++                (c(r'(.*?)((?:\s*%s\-|%s)\s*endraw\s*(?:\-%s\s*|%s%s))' % (
+                     e(environment.block_start_string),
+                     block_prefix_re,
+                     e(environment.block_end_string),
+
+diff --git a/jinja2/nodes.py b/jinja2/nodes.py
+index 2c6a296..aa4df72 100644
+--- a/jinja2/nodes.py
++++ b/jinja2/nodes.py
+@@ -721,7 +721,7 @@ class Concat(Expr):
+ 
+ class Compare(Expr):
+     """Compares an expression with some other expressions.  `ops` must be a
+-    list of :class:`Operand`\s.
++    list of :class:`Operand`\\s.
+     """
+     fields = ('expr', 'ops')
+ 
+
+diff --git a/jinja2/runtime.py b/jinja2/runtime.py
+index 5c2089b..03e303f 100644
+--- a/jinja2/runtime.py
++++ b/jinja2/runtime.py
+@@ -100,7 +100,7 @@ class Context(object):
+     The context is immutable.  Modifications on :attr:`parent` **must not**
+     happen and modifications on :attr:`vars` are allowed from generated
+     template code only.  Template filters and global functions marked as
+-    :func:`contextfunction`\s get the active context passed as first argument
++    :func:`contextfunction`\\s get the active context passed as first argument
+     and are allowed to access the context read-only.
+ 
+     The template context supports read only dict operations (`get`,
+
+diff --git a/jinja2/sandbox.py b/jinja2/sandbox.py
+index 9e00322..32e2435 100644
+--- a/jinja2/sandbox.py
++++ b/jinja2/sandbox.py
+@@ -17,7 +17,7 @@ import operator
+ from collections import Mapping
+ from jinja2.environment import Environment
+ from jinja2.exceptions import SecurityError
+-from jinja2._compat import string_types, text_type, PY2
++from jinja2._compat import string_types, PY2
+ from jinja2.utils import Markup
+ 
+ from markupsafe import EscapeFormatter
+
+diff --git a/setup.py b/setup.py
+index 3e3e7bc..3c74b64 100644
+--- a/setup.py
++++ b/setup.py
+@@ -40,7 +40,7 @@ from setuptools import setup
+ 
+ setup(
+     name='Jinja2',
+-    version='2.9.3',
++    version='2.9.4',
+     url='http://jinja.pocoo.org/',
+     license='BSD',
+     author='Armin Ronacher',

@@ -1,0 +1,207 @@
+{
+  "old_dir": ".packages/urllib3/2.3.0",
+  "new_dir": ".packages/urllib3/2.4.0",
+  "extracted_at": "2026-05-02T02:18:34.441642",
+  "diff_file": "confirmed/urllib3/2.4.0/differences/test_diff_v2.3.0_to_v2.4.0.diff",
+  "diff_content": "diff --git a/test/contrib/emscripten/test_emscripten.py b/test/contrib/emscripten/test_emscripten.py\nindex 9317a09..4872e5b 100644\n--- a/test/contrib/emscripten/test_emscripten.py\n+++ b/test/contrib/emscripten/test_emscripten.py\n@@ -1058,6 +1058,44 @@ def test_streaming_jspi(\n     )\n \n \n+# another streaming test - uses chunked read\n+# and streaming to check that it works okay\n+# (see https://github.com/urllib3/urllib3/issues/3555 )\n+@pytest.mark.with_jspi\n+def test_streaming2_jspi(\n+    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo\n+) -> None:\n+    bigfile_url = (\n+        f\"http://{testserver_http.http_host}:{testserver_http.http_port}/dripfeed\"\n+    )\n+\n+    @run_in_pyodide\n+    def pyodide_test(selenium, host, port, bigfile_url):  # type: ignore[no-untyped-def]\n+        from urllib3.connection import HTTPConnection\n+        from urllib3.response import BaseHTTPResponse\n+\n+        conn = HTTPConnection(host, port)\n+        conn.request(\"GET\", bigfile_url, preload_content=False)\n+        response = conn.getresponse()\n+        assert isinstance(response, BaseHTTPResponse)\n+        # get first data\n+        all_data = response.read(32768)\n+        # now get the rest in chunks\n+        # to make sure that streaming works\n+        # correctly even if the low level read doesn't\n+        # always return a full buffer (which it doesn't)\n+        while not response._response.body.closed:  # type: ignore[attr-defined]\n+            all_data += response.read(32768)\n+        assert len(all_data.decode(\"utf-8\")) == 17825792\n+\n+    pyodide_test(\n+        selenium_coverage,\n+        testserver_http.http_host,\n+        testserver_http.http_port,\n+        bigfile_url,\n+    )\n+\n+\n @pytest.mark.node_without_jspi\n def test_non_jspi_fail_in_node(\n     selenium_coverage: typing.Any, testserver_http: PyodideServerInfo\n\ndiff --git a/test/test_exceptions.py b/test/test_exceptions.py\nindex ef103d1..081877b 100644\n--- a/test/test_exceptions.py\n+++ b/test/test_exceptions.py\n@@ -30,6 +30,7 @@ class TestPickle:\n         [\n             HTTPError(None),\n             MaxRetryError(DUMMY_POOL, \"\", None),\n+            MaxRetryError(DUMMY_POOL, \"\", Exception(\"Error occured\")),\n             LocationParseError(\"\"),\n             ConnectTimeoutError(None),\n             HTTPError(\"foo\"),\n@@ -40,14 +41,30 @@ class TestPickle:\n             EmptyPoolError(HTTPConnectionPool(\"localhost\"), \"\"),\n             HostChangedError(HTTPConnectionPool(\"localhost\"), \"/\", 0),\n             ReadTimeoutError(HTTPConnectionPool(\"localhost\"), \"/\", \"\"),\n+            ReadTimeoutError(HTTPConnectionPool(\"localhost\"), \"/\", \"message\"),\n             NewConnectionError(HTTPConnection(\"localhost\"), \"\"),\n             NameResolutionError(\"\", HTTPConnection(\"localhost\"), socket.gaierror()),\n+            NameResolutionError(\n+                \"host\", HTTPConnection(\"localhost\"), socket.gaierror(\"error\")\n+            ),\n         ],\n     )\n     def test_exceptions(self, exception: Exception) -> None:\n         result = pickle.loads(pickle.dumps(exception))\n         assert isinstance(result, type(exception))\n \n+        if hasattr(exception, \"_message\"):\n+            assert exception._message == result._message  # type: ignore[attr-defined]\n+            assert exception._message in str(result)\n+\n+        if hasattr(exception, \"_host\"):\n+            # host is likely a string so directly comparable\n+            assert exception._host == result._host  # type: ignore[attr-defined]\n+\n+        if hasattr(exception, \"_reason\"):\n+            # reason is likely an exception so do string comparison instead\n+            assert str(exception._reason) == str(result._reason)  # type: ignore[attr-defined]\n+\n \n class TestFormat:\n     def test_header_parsing_errors(self) -> None:\n\ndiff --git a/test/test_ssl.py b/test/test_ssl.py\nindex 43073cb..e1b33dc 100644\n--- a/test/test_ssl.py\n+++ b/test/test_ssl.py\n@@ -1,6 +1,7 @@\n from __future__ import annotations\n \n import ssl\n+import sys\n import typing\n from unittest import mock\n \n@@ -63,6 +64,25 @@ class TestSSL:\n             with pytest.raises(TypeError):\n                 ssl_.create_urllib3_context()\n \n+    def test_create_urllib3_context_default_verify_flags(self) -> None:\n+        context = ssl_.create_urllib3_context()\n+        if sys.version_info >= (3, 13):\n+            assert context.verify_flags & ssl.VERIFY_X509_PARTIAL_CHAIN\n+            assert context.verify_flags & ssl.VERIFY_X509_STRICT\n+        else:\n+            # Needed for Python 3.9 which does not define this\n+            assert not (\n+                context.verify_flags\n+                & getattr(ssl, \"VERIFY_X509_PARTIAL_CHAIN\", 0x80000)\n+            )\n+            assert not (context.verify_flags & ssl.VERIFY_X509_STRICT)\n+\n+    def test_create_urllib3_context_custom_verify_flags(self) -> None:\n+        context = ssl_.create_urllib3_context()\n+        assert not (context.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)\n+        context = ssl_.create_urllib3_context(verify_flags=ssl.VERIFY_CRL_CHECK_LEAF)\n+        assert context.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF\n+\n     def test_wrap_socket_given_context_no_load_default_certs(self) -> None:\n         context = mock.create_autospec(ssl_.SSLContext)\n         context.load_default_certs = mock.Mock()\n\ndiff --git a/test/test_ssltransport.py b/test/test_ssltransport.py\nindex 4f0880d..0097179 100644\n--- a/test/test_ssltransport.py\n+++ b/test/test_ssltransport.py\n@@ -122,7 +122,7 @@ class SingleTLSLayerTestCase(SocketDummyServerTestCase):\n                         return\n                     validate_request(request)\n                     ssock.send(sample_response())\n-            except (ConnectionAbortedError, ConnectionResetError):\n+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):\n                 return\n \n         chosen_handler = handler if handler else socket_handler\n\ndiff --git a/test/with_dummyserver/test_https.py b/test/with_dummyserver/test_https.py\nindex 162d089..c6dff91 100644\n--- a/test/with_dummyserver/test_https.py\n+++ b/test/with_dummyserver/test_https.py\n@@ -1140,6 +1140,11 @@ class BaseTestHTTPS(HTTPSHypercornDummyServerTestCase):\n         assert ctx.minimum_version == self.tls_version()\n         assert ctx.maximum_version == self.tls_version()\n \n+    def test_default_ssl_context_verify_flags(self) -> None:\n+        ctx = urllib3.util.ssl_.create_urllib3_context()\n+        ssl_ctx = ssl.create_default_context()\n+        assert ctx.verify_flags == ssl_ctx.verify_flags\n+\n     def test_assert_missing_hashfunc(self, monkeypatch: pytest.MonkeyPatch) -> None:\n         fingerprint = \"55:39:BF:70:05:12:43:FA:1F:D1:BF:4E:E8:1B:07:1D\"\n         with HTTPSConnectionPool(\n@@ -1208,14 +1213,16 @@ class TestHTTPS_Hostname:\n                 MaxRetryError,\n             ) as e:\n                 https_pool.request(\"GET\", \"/\")\n-            assert \"mismatch, certificate is not valid\" in str(\n-                e.value\n-            ) or \"no appropriate subjectAltName\" in str(e.value)\n+            assert (\n+                \"mismatch, certificate is not valid\" in str(e.value)\n+                or \"no appropriate subjectAltName\" in str(e.value)\n+                or \"Empty Subject Alternative Name extension\" in str(e.value)\n+            )\n \n     def test_common_name_without_san_with_different_common_name(\n         self, no_san_server_with_different_commmon_name: ServerConfig\n     ) -> None:\n-        ctx = urllib3.util.ssl_.create_urllib3_context()\n+        ctx = urllib3.util.ssl_.create_urllib3_context(verify_flags=0)\n         try:\n             ctx.hostname_checks_common_name = True\n         except AttributeError:\n@@ -1238,7 +1245,7 @@ class TestHTTPS_Hostname:\n     def test_hostname_checks_common_name_respected(\n         self, no_san_server: ServerConfig, use_assert_hostname: bool\n     ) -> None:\n-        ctx = urllib3.util.ssl_.create_urllib3_context()\n+        ctx = urllib3.util.ssl_.create_urllib3_context(verify_flags=0)\n         if not hasattr(ctx, \"hostname_checks_common_name\"):\n             pytest.skip(\"Test requires 'SSLContext.hostname_checks_common_name'\")\n         ctx.load_verify_locations(no_san_server.ca_certs)\n@@ -1291,11 +1298,13 @@ class TestHTTPS_Hostname:\n         self, no_san_server_with_different_commmon_name: ServerConfig\n     ) -> None:\n         \"\"\"Ensure CN errors are not raised while assert_hostname is false\"\"\"\n+        ctx = urllib3.util.ssl_.create_urllib3_context(verify_flags=0)\n         with HTTPSConnectionPool(\n             no_san_server_with_different_commmon_name.host,\n             no_san_server_with_different_commmon_name.port,\n             cert_reqs=\"CERT_REQUIRED\",\n             ca_certs=no_san_server_with_different_commmon_name.ca_certs,\n+            ssl_context=ctx,\n             assert_hostname=False,\n         ) as https_pool:\n             https_pool.request(\"GET\", \"/\")\n\ndiff --git a/test/with_dummyserver/test_proxy_poolmanager.py b/test/with_dummyserver/test_proxy_poolmanager.py\nindex b3e09b5..4a932c0 100644\n--- a/test/with_dummyserver/test_proxy_poolmanager.py\n+++ b/test/with_dummyserver/test_proxy_poolmanager.py\n@@ -731,10 +731,12 @@ class TestHTTPSProxyVerification:\n         proxy_url = f\"https://{proxy.host}:{proxy.port}\"\n         destination_url = f\"https://{server.host}:{server.port}\"\n \n+        proxy_ctx = urllib3.util.ssl_.create_urllib3_context(verify_flags=0)\n         proxy_fingerprint = self._get_proxy_fingerprint_md5(proxy.ca_certs)\n         with proxy_from_url(\n             proxy_url,\n             ca_certs=proxy.ca_certs,\n+            proxy_ssl_context=proxy_ctx,\n             proxy_assert_fingerprint=proxy_fingerprint,\n         ) as https:\n             https.request(\"GET\", destination_url)\n@@ -746,6 +748,7 @@ class TestHTTPSProxyVerification:\n         proxy_url = f\"https://{proxy.host}:{proxy.port}\"\n         destination_url = f\"https://{server.host}:{server.port}\"\n \n+        proxy_ctx = urllib3.util.ssl_.create_urllib3_context(verify_flags=0)\n         proxy_fingerprint = self._get_proxy_fingerprint_md5(proxy.ca_certs)\n         new_char = \"b\" if proxy_fingerprint[5] == \"a\" else \"a\"\n         proxy_fingerprint = proxy_fingerprint[:5] + new_char + proxy_fingerprint[6:]\n@@ -753,6 +756,7 @@ class TestHTTPSProxyVerification:\n         with proxy_from_url(\n             proxy_url,\n             ca_certs=proxy.ca_certs,\n+            proxy_ssl_context=proxy_ctx,\n             proxy_assert_fingerprint=proxy_fingerprint,\n         ) as https:\n             with pytest.raises(MaxRetryError) as e:\n@@ -856,10 +860,11 @@ class TestHTTPSProxyVerification:\n \n             ssl_error = e.value.reason.original_error\n             assert isinstance(ssl_error, SSLError)\n-            assert \"no appropriate subjectAltName fields were found\" in str(\n-                ssl_error\n-            ) or \"Hostname mismatch, certificate is not valid for 'localhost'\" in str(\n-                ssl_error\n+            assert (\n+                \"no appropriate subjectAltName fields were found\" in str(ssl_error)\n+                or \"Hostname mismatch, certificate is not valid for 'localhost'\"\n+                in str(ssl_error)\n+                or \"Empty Subject Alternative Name extension\" in str(ssl_error)\n             )\n \n     def test_https_proxy_no_san_hostname_checks_common_name(\n@@ -869,7 +874,7 @@ class TestHTTPSProxyVerification:\n         proxy_url = f\"https://{proxy.host}:{proxy.port}\"\n         destination_url = f\"https://{server.host}:{server.port}\"\n \n-        proxy_ctx = urllib3.util.ssl_.create_urllib3_context()\n+        proxy_ctx = urllib3.util.ssl_.create_urllib3_context(verify_flags=0)\n         try:\n             proxy_ctx.hostname_checks_common_name = True\n         # PyPy doesn't like us setting 'hostname_checks_common_name'\n",
+  "structured_diff": {
+    "test/contrib/emscripten/test_emscripten.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1058,6 +1058,44 @@",
+          "snippet": " def test_streaming_jspi(\n     )\n \n \n+# another streaming test - uses chunked read\n+# and streaming to check that it works okay\n+# (see https://github.com/urllib3/urllib3/issues/3555 )\n+@pytest.mark.with_jspi\n+def test_streaming2_jspi(\n+    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo\n+) -> None:\n+    bigfile_url = (\n+        f\"http://{testserver_http.http_host}:{testserver_http.http_port}/dripfeed\"\n+    )\n+\n+    @run_in_pyodide\n+    def pyodide_test(selenium, host, port, bigfile_url):  # type: ignore[no-untyped-def]\n+        from urllib3.connection import HTTPConnection\n+        from urllib3.response import BaseHTTPResponse\n+\n+        conn = HTTPConnection(host, port)\n+        conn.request(\"GET\", bigfile_url, preload_content=False)\n+        response = conn.getresponse()\n+        assert isinstance(response, BaseHTTPResponse)\n+        # get first data\n+        all_data = response.read(32768)\n+        # now get the rest in chunks\n+        # to make sure that streaming works\n+        # correctly even if the low level read doesn't\n+        # always return a full buffer (which it doesn't)\n+        while not response._response.body.closed:  # type: ignore[attr-defined]\n+            all_data += response.read(32768)\n+        assert len(all_data.decode(\"utf-8\")) == 17825792\n+\n+    pyodide_test(\n+        selenium_coverage,\n+        testserver_http.http_host,\n+        testserver_http.http_port,\n+        bigfile_url,\n+    )\n+\n+\n @pytest.mark.node_without_jspi\n def test_non_jspi_fail_in_node(\n     selenium_coverage: typing.Any, testserver_http: PyodideServerInfo\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_streaming2_jspi"
+            },
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::pyodide_test"
+            }
+          ]
+        }
+      ]
+    },
+    "test/test_exceptions.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -30,6 +30,7 @@",
+          "snippet": " class TestPickle:\n         [\n             HTTPError(None),\n             MaxRetryError(DUMMY_POOL, \"\", None),\n+            MaxRetryError(DUMMY_POOL, \"\", Exception(\"Error occured\")),\n             LocationParseError(\"\"),\n             ConnectTimeoutError(None),\n             HTTPError(\"foo\"),",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "test/test_exceptions.py::TestPickle"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -40,14 +41,30 @@",
+          "snippet": " class TestPickle:\n             EmptyPoolError(HTTPConnectionPool(\"localhost\"), \"\"),\n             HostChangedError(HTTPConnectionPool(\"localhost\"), \"/\", 0),\n             ReadTimeoutError(HTTPConnectionPool(\"localhost\"), \"/\", \"\"),\n+            ReadTimeoutError(HTTPConnectionPool(\"localhost\"), \"/\", \"message\"),\n             NewConnectionError(HTTPConnection(\"localhost\"), \"\"),\n             NameResolutionError(\"\", HTTPConnection(\"localhost\"), socket.gaierror()),\n+            NameResolutionError(\n+                \"host\", HTTPConnection(\"localhost\"), socket.gaierror(\"error\")\n+            ),\n         ],\n     )\n     def test_exceptions(self, exception: Exception) -> None:\n         result = pickle.loads(pickle.dumps(exception))\n         assert isinstance(result, type(exception))\n \n+        if hasattr(exception, \"_message\"):\n+            assert exception._message == result._message  # type: ignore[attr-defined]\n+            assert exception._message in str(result)\n+\n+        if hasattr(exception, \"_host\"):\n+            # host is likely a string so directly comparable\n+            assert exception._host == result._host  # type: ignore[attr-defined]\n+\n+        if hasattr(exception, \"_reason\"):\n+            # reason is likely an exception so do string comparison instead\n+            assert str(exception._reason) == str(result._reason)  # type: ignore[attr-defined]\n+\n \n class TestFormat:\n     def test_header_parsing_errors(self) -> None:\n",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "test/test_exceptions.py::TestPickle"
+            },
+            {
+              "kind": "method",
+              "node": "test/test_exceptions.py::TestPickle::test_exceptions"
+            }
+          ]
+        }
+      ]
+    },
+    "test/test_ssl.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,6 +1,7 @@",
+          "snippet": " from __future__ import annotations\n \n import ssl\n+import sys\n import typing\n from unittest import mock\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "test/test_ssl.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -63,6 +64,25 @@",
+          "snippet": " class TestSSL:\n             with pytest.raises(TypeError):\n                 ssl_.create_urllib3_context()\n \n+    def test_create_urllib3_context_default_verify_flags(self) -> None:\n+        context = ssl_.create_urllib3_context()\n+        if sys.version_info >= (3, 13):\n+            assert context.verify_flags & ssl.VERIFY_X509_PARTIAL_CHAIN\n+            assert context.verify_flags & ssl.VERIFY_X509_STRICT\n+        else:\n+            # Needed for Python 3.9 which does not define this\n+            assert not (\n+                context.verify_flags\n+                & getattr(ssl, \"VERIFY_X509_PARTIAL_CHAIN\", 0x80000)\n+            )\n+            assert not (context.verify_flags & ssl.VERIFY_X509_STRICT)\n+\n+    def test_create_urllib3_context_custom_verify_flags(self) -> None:\n+        context = ssl_.create_urllib3_context()\n+        assert not (context.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)\n+        context = ssl_.create_urllib3_context(verify_flags=ssl.VERIFY_CRL_CHECK_LEAF)\n+        assert context.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF\n+\n     def test_wrap_socket_given_context_no_load_default_certs(self) -> None:\n         context = mock.create_autospec(ssl_.SSLContext)\n         context.load_default_certs = mock.Mock()\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/test_ssl.py::TestSSL::test_create_urllib3_context_default_verify_flags"
+            },
+            {
+              "kind": "class",
+              "node": "test/test_ssl.py::TestSSL"
+            },
+            {
+              "kind": "method",
+              "node": "test/test_ssl.py::TestSSL::test_create_urllib3_context_custom_verify_flags"
+            }
+          ]
+        }
+      ]
+    },
+    "test/test_ssltransport.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -122,7 +122,7 @@",
+          "snippet": " class SingleTLSLayerTestCase(SocketDummyServerTestCase):\n                         return\n                     validate_request(request)\n                     ssock.send(sample_response())\n-            except (ConnectionAbortedError, ConnectionResetError):\n+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):\n                 return\n \n         chosen_handler = handler if handler else socket_handler\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/test_ssltransport.py::SingleTLSLayerTestCase::socket_handler"
+            }
+          ]
+        }
+      ]
+    },
+    "test/with_dummyserver/test_https.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1140,6 +1140,11 @@",
+          "snippet": " class BaseTestHTTPS(HTTPSHypercornDummyServerTestCase):\n         assert ctx.minimum_version == self.tls_version()\n         assert ctx.maximum_version == self.tls_version()\n \n+    def test_default_ssl_context_verify_flags(self) -> None:\n+        ctx = urllib3.util.ssl_.create_urllib3_context()\n+        ssl_ctx = ssl.create_default_context()\n+        assert ctx.verify_flags == ssl_ctx.verify_flags\n+\n     def test_assert_missing_hashfunc(self, monkeypatch: pytest.MonkeyPatch) -> None:\n         fingerprint = \"55:39:BF:70:05:12:43:FA:1F:D1:BF:4E:E8:1B:07:1D\"\n         with HTTPSConnectionPool(",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/with_dummyserver/test_https.py::BaseTestHTTPS::test_default_ssl_context_verify_flags"
+            },
+            {
+              "kind": "class",
+              "node": "test/with_dummyserver/test_https.py::BaseTestHTTPS"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1208,14 +1213,16 @@",
+          "snippet": " class TestHTTPS_Hostname:\n                 MaxRetryError,\n             ) as e:\n                 https_pool.request(\"GET\", \"/\")\n-            assert \"mismatch, certificate is not valid\" in str(\n-                e.value\n-            ) or \"no appropriate subjectAltName\" in str(e.value)\n+            assert (\n+                \"mismatch, certificate is not valid\" in str(e.value)\n+                or \"no appropriate subjectAltName\" in str(e.value)\n+                or \"Empty Subject Alternative Name extension\" in str(e.value)\n+            )\n \n     def test_common_name_without_san_with_different_common_name(\n         self, no_san_server_with_different_commmon_name: ServerConfig\n     ) -> None:\n-        ctx = urllib3.util.ssl_.create_urllib3_context()\n+        ctx = urllib3.util.ssl_.create_urllib3_context(verify_flags=0)\n         try:\n             ctx.hostname_checks_common_name = True\n         except AttributeError:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/with_dummyserver/test_https.py::TestHTTPS_Hostname::test_common_name_without_san_fails"
+            },
+            {
+              "kind": "method",
+              "node": "test/with_dummyserver/test_https.py::TestHTTPS_Hostname::test_common_name_without_san_with_different_common_name"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1238,7 +1245,7 @@",
+          "snippet": " class TestHTTPS_Hostname:\n     def test_hostname_checks_common_name_respected(\n         self, no_san_server: ServerConfig, use_assert_hostname: bool\n     ) -> None:\n-        ctx = urllib3.util.ssl_.create_urllib3_context()\n+        ctx = urllib3.util.ssl_.create_urllib3_context(verify_flags=0)\n         if not hasattr(ctx, \"hostname_checks_common_name\"):\n             pytest.skip(\"Test requires 'SSLContext.hostname_checks_common_name'\")\n         ctx.load_verify_locations(no_san_server.ca_certs)",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/with_dummyserver/test_https.py::TestHTTPS_Hostname::test_hostname_checks_common_name_respected"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1291,11 +1298,13 @@",
+          "snippet": " class TestHTTPS_Hostname:\n         self, no_san_server_with_different_commmon_name: ServerConfig\n     ) -> None:\n         \"\"\"Ensure CN errors are not raised while assert_hostname is false\"\"\"\n+        ctx = urllib3.util.ssl_.create_urllib3_context(verify_flags=0)\n         with HTTPSConnectionPool(\n             no_san_server_with_different_commmon_name.host,\n             no_san_server_with_different_commmon_name.port,\n             cert_reqs=\"CERT_REQUIRED\",\n             ca_certs=no_san_server_with_different_commmon_name.ca_certs,\n+            ssl_context=ctx,\n             assert_hostname=False,\n         ) as https_pool:\n             https_pool.request(\"GET\", \"/\")\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/with_dummyserver/test_https.py::TestHTTPS_Hostname::test_assert_hostname_invalid_cn"
+            }
+          ]
+        }
+      ]
+    },
+    "test/with_dummyserver/test_proxy_poolmanager.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -731,10 +731,12 @@",
+          "snippet": " class TestHTTPSProxyVerification:\n         proxy_url = f\"https://{proxy.host}:{proxy.port}\"\n         destination_url = f\"https://{server.host}:{server.port}\"\n \n+        proxy_ctx = urllib3.util.ssl_.create_urllib3_context(verify_flags=0)\n         proxy_fingerprint = self._get_proxy_fingerprint_md5(proxy.ca_certs)\n         with proxy_from_url(\n             proxy_url,\n             ca_certs=proxy.ca_certs,\n+            proxy_ssl_context=proxy_ctx,\n             proxy_assert_fingerprint=proxy_fingerprint,\n         ) as https:\n             https.request(\"GET\", destination_url)",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/with_dummyserver/test_proxy_poolmanager.py::TestHTTPSProxyVerification::test_https_proxy_assert_fingerprint_md5"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -746,6 +748,7 @@",
+          "snippet": " class TestHTTPSProxyVerification:\n         proxy_url = f\"https://{proxy.host}:{proxy.port}\"\n         destination_url = f\"https://{server.host}:{server.port}\"\n \n+        proxy_ctx = urllib3.util.ssl_.create_urllib3_context(verify_flags=0)\n         proxy_fingerprint = self._get_proxy_fingerprint_md5(proxy.ca_certs)\n         new_char = \"b\" if proxy_fingerprint[5] == \"a\" else \"a\"\n         proxy_fingerprint = proxy_fingerprint[:5] + new_char + proxy_fingerprint[6:]",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/with_dummyserver/test_proxy_poolmanager.py::TestHTTPSProxyVerification::test_https_proxy_assert_fingerprint_md5_non_matching"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -753,6 +756,7 @@",
+          "snippet": " class TestHTTPSProxyVerification:\n         with proxy_from_url(\n             proxy_url,\n             ca_certs=proxy.ca_certs,\n+            proxy_ssl_context=proxy_ctx,\n             proxy_assert_fingerprint=proxy_fingerprint,\n         ) as https:\n             with pytest.raises(MaxRetryError) as e:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/with_dummyserver/test_proxy_poolmanager.py::TestHTTPSProxyVerification::test_https_proxy_assert_fingerprint_md5_non_matching"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -856,10 +860,11 @@",
+          "snippet": " class TestHTTPSProxyVerification:\n \n             ssl_error = e.value.reason.original_error\n             assert isinstance(ssl_error, SSLError)\n-            assert \"no appropriate subjectAltName fields were found\" in str(\n-                ssl_error\n-            ) or \"Hostname mismatch, certificate is not valid for 'localhost'\" in str(\n-                ssl_error\n+            assert (\n+                \"no appropriate subjectAltName fields were found\" in str(ssl_error)\n+                or \"Hostname mismatch, certificate is not valid for 'localhost'\"\n+                in str(ssl_error)\n+                or \"Empty Subject Alternative Name extension\" in str(ssl_error)\n             )\n \n     def test_https_proxy_no_san_hostname_checks_common_name(",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/with_dummyserver/test_proxy_poolmanager.py::TestHTTPSProxyVerification::test_https_proxy_no_san"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -869,7 +874,7 @@",
+          "snippet": " class TestHTTPSProxyVerification:\n         proxy_url = f\"https://{proxy.host}:{proxy.port}\"\n         destination_url = f\"https://{server.host}:{server.port}\"\n \n-        proxy_ctx = urllib3.util.ssl_.create_urllib3_context()\n+        proxy_ctx = urllib3.util.ssl_.create_urllib3_context(verify_flags=0)\n         try:\n             proxy_ctx.hostname_checks_common_name = True\n         # PyPy doesn't like us setting 'hostname_checks_common_name'",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/with_dummyserver/test_proxy_poolmanager.py::TestHTTPSProxyVerification::test_https_proxy_no_san_hostname_checks_common_name"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

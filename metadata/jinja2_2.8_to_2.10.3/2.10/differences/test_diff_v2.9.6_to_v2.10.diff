@@ -1,0 +1,941 @@
+diff --git a/tests/test_async.py b/tests/test_async.py
+index 279a4bb..2f17747 100644
+--- a/tests/test_async.py
++++ b/tests/test_async.py
+@@ -304,6 +304,21 @@ class TestAsyncForLoop(object):
+         output = tmpl.render(seq=list(range(4)), through=('<1>', '<2>'))
+         assert output == '<1><2>' * 4
+ 
++    def test_lookaround(self, test_env_async):
++        tmpl = test_env_async.from_string('''{% for item in seq -%}
++            {{ loop.previtem|default('x') }}-{{ item }}-{{
++            loop.nextitem|default('x') }}|
++        {%- endfor %}''')
++        output = tmpl.render(seq=list(range(4)))
++        assert output == 'x-0-1|0-1-2|1-2-3|2-3-x|'
++
++    def test_changed(self, test_env_async):
++        tmpl = test_env_async.from_string('''{% for item in seq -%}
++            {{ loop.changed(item) }},
++        {%- endfor %}''')
++        output = tmpl.render(seq=[None, None, 1, 2, 2, 3, 4, 4, 4])
++        assert output == 'True,False,True,True,False,True,True,False,False,'
++
+     def test_scope(self, test_env_async):
+         tmpl = test_env_async.from_string('{% for item in seq %}{% endfor %}{{ item }}')
+         output = tmpl.render(seq=list(range(10)))
+@@ -331,6 +346,18 @@ class TestAsyncForLoop(object):
+             dict(a=3, b=[dict(a='a')])
+         ]) == '[1<[1][2]>][2<[1][2]>][3<[a]>]'
+ 
++    def test_recursive_lookaround(self, test_env_async):
++        tmpl = test_env_async.from_string('''{% for item in seq recursive -%}
++            [{{ loop.previtem.a if loop.previtem is defined else 'x' }}.{{
++            item.a }}.{{ loop.nextitem.a if loop.nextitem is defined else 'x'
++            }}{% if item.b %}<{{ loop(item.b) }}>{% endif %}]
++        {%- endfor %}''')
++        assert tmpl.render(seq=[
++            dict(a=1, b=[dict(a=1), dict(a=2)]),
++            dict(a=2, b=[dict(a=1), dict(a=2)]),
++            dict(a=3, b=[dict(a='a')])
++        ]) == '[x.1.2<[x.1.2][1.2.x]>][1.2.3<[x.1.2][1.2.x]>][2.3.x<[x.a.x]>]'
++
+     def test_recursive_depth0(self, test_env_async):
+         tmpl = test_env_async.from_string('''{% for item in seq recursive -%}
+             [{{ loop.depth0 }}:{{ item.a }}{% if item.b %}<{{ loop(item.b) }}>{% endif %}]
+
+diff --git a/tests/test_bytecode_cache.py b/tests/test_bytecode_cache.py
+index 42ff840..caef36b 100644
+--- a/tests/test_bytecode_cache.py
++++ b/tests/test_bytecode_cache.py
+@@ -8,9 +8,12 @@
+     :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD, see LICENSE for more details.
+ """
++
+ import pytest
++
+ from jinja2 import Environment
+-from jinja2.bccache import FileSystemBytecodeCache
++from jinja2.bccache import Bucket, FileSystemBytecodeCache, \
++    MemcachedBytecodeCache
+ from jinja2.exceptions import TemplateNotFound
+ 
+ 
+@@ -30,3 +33,60 @@ class TestByteCodeCache(object):
+         tmpl = env.get_template('test.html')
+         assert tmpl.render().strip() == 'BAR'
+         pytest.raises(TemplateNotFound, env.get_template, 'missing.html')
++
++
++class MockMemcached(object):
++    class Error(Exception):
++        pass
++
++    key = None
++    value = None
++    timeout = None
++
++    def get(self, key):
++        return self.value
++
++    def set(self, key, value, timeout=None):
++        self.key = key
++        self.value = value
++        self.timeout = timeout
++
++    def get_side_effect(self, key):
++        raise self.Error()
++
++    def set_side_effect(self, *args):
++        raise self.Error()
++
++
++class TestMemcachedBytecodeCache(object):
++    def test_dump_load(self):
++        memcached = MockMemcached()
++        m = MemcachedBytecodeCache(memcached)
++
++        b = Bucket(None, 'key', '')
++        b.code = 'code'
++        m.dump_bytecode(b)
++        assert memcached.key == 'jinja2/bytecode/key'
++
++        b = Bucket(None, 'key', '')
++        m.load_bytecode(b)
++        assert b.code == 'code'
++
++    def test_exception(self):
++        memcached = MockMemcached()
++        memcached.get = memcached.get_side_effect
++        memcached.set = memcached.set_side_effect
++        m = MemcachedBytecodeCache(memcached)
++        b = Bucket(None, 'key', '')
++        b.code = 'code'
++
++        m.dump_bytecode(b)
++        m.load_bytecode(b)
++
++        m.ignore_memcache_errors = False
++
++        with pytest.raises(MockMemcached.Error):
++            m.dump_bytecode(b)
++
++        with pytest.raises(MockMemcached.Error):
++            m.load_bytecode(b)
+
+diff --git a/tests/test_core_tags.py b/tests/test_core_tags.py
+index f48d8b4..3b51e97 100644
+--- a/tests/test_core_tags.py
++++ b/tests/test_core_tags.py
+@@ -9,8 +9,8 @@
+     :license: BSD, see LICENSE for more details.
+ """
+ import pytest
+-from jinja2 import Environment, TemplateSyntaxError, UndefinedError, \
+-     DictLoader
++from jinja2 import Environment, TemplateSyntaxError, TemplateRuntimeError, \
++     UndefinedError, DictLoader
+ 
+ 
+ @pytest.fixture
+@@ -68,6 +68,21 @@ class TestForLoop(object):
+         output = tmpl.render(seq=list(range(4)), through=('<1>', '<2>'))
+         assert output == '<1><2>' * 4
+ 
++    def test_lookaround(self, env):
++        tmpl = env.from_string('''{% for item in seq -%}
++            {{ loop.previtem|default('x') }}-{{ item }}-{{
++            loop.nextitem|default('x') }}|
++        {%- endfor %}''')
++        output = tmpl.render(seq=list(range(4)))
++        assert output == 'x-0-1|0-1-2|1-2-3|2-3-x|'
++
++    def test_changed(self, env):
++        tmpl = env.from_string('''{% for item in seq -%}
++            {{ loop.changed(item) }},
++        {%- endfor %}''')
++        output = tmpl.render(seq=[None, None, 1, 2, 2, 3, 4, 4, 4])
++        assert output == 'True,False,True,True,False,True,True,False,False,'
++
+     def test_scope(self, env):
+         tmpl = env.from_string('{% for item in seq %}{% endfor %}{{ item }}')
+         output = tmpl.render(seq=list(range(10)))
+@@ -95,6 +110,18 @@ class TestForLoop(object):
+             dict(a=3, b=[dict(a='a')])
+         ]) == '[1<[1][2]>][2<[1][2]>][3<[a]>]'
+ 
++    def test_recursive_lookaround(self, env):
++        tmpl = env.from_string('''{% for item in seq recursive -%}
++            [{{ loop.previtem.a if loop.previtem is defined else 'x' }}.{{
++            item.a }}.{{ loop.nextitem.a if loop.nextitem is defined else 'x'
++            }}{% if item.b %}<{{ loop(item.b) }}>{% endif %}]
++        {%- endfor %}''')
++        assert tmpl.render(seq=[
++            dict(a=1, b=[dict(a=1), dict(a=2)]),
++            dict(a=2, b=[dict(a=1), dict(a=2)]),
++            dict(a=3, b=[dict(a='a')])
++        ]) == '[x.1.2<[x.1.2][1.2.x]>][1.2.3<[x.1.2][1.2.x]>][2.3.x<[x.a.x]>]'
++
+     def test_recursive_depth0(self, env):
+         tmpl = env.from_string('''{% for item in seq recursive -%}
+             [{{ loop.depth0 }}:{{ item.a }}{% if item.b %}<{{ loop(item.b) }}>{% endif %}]
+@@ -222,6 +249,15 @@ class TestIfCondition(object):
+             %}...{% else %}XXX{% endif %}''')
+         assert tmpl.render() == '...'
+ 
++    def test_elif_deep(self, env):
++        elifs = '\n'.join('{{% elif a == {0} %}}{0}'.format(i)
++                          for i in range(1, 1000))
++        tmpl = env.from_string('{{% if a == 0 %}}0{0}{{% else %}}x{{% endif %}}'
++                               .format(elifs))
++        for x in (0, 10, 999):
++            assert tmpl.render(a=x).strip() == str(x)
++        assert tmpl.render(a=1000).strip() == 'x'
++
+     def test_else(self, env):
+         tmpl = env.from_string('{% if false %}XXX{% else %}...{% endif %}')
+         assert tmpl.render() == '...'
+@@ -364,6 +400,86 @@ class TestSet(object):
+                                '{% endset %}foo: {{ foo }}')
+         assert tmpl.render(test='<unsafe>') == 'foo: <em>&lt;unsafe&gt;</em>'
+ 
++    def test_set_invalid(self, env_trim):
++        pytest.raises(TemplateSyntaxError, env_trim.from_string,
++                      "{% set foo['bar'] = 1 %}")
++        tmpl = env_trim.from_string('{% set foo.bar = 1 %}')
++        exc_info = pytest.raises(TemplateRuntimeError, tmpl.render, foo={})
++        assert 'non-namespace object' in exc_info.value.message
++
++    def test_namespace_redefined(self, env_trim):
++        tmpl = env_trim.from_string('{% set ns = namespace() %}'
++                                    '{% set ns.bar = "hi" %}')
++        exc_info = pytest.raises(TemplateRuntimeError, tmpl.render,
++                                 namespace=dict)
++        assert 'non-namespace object' in exc_info.value.message
++
++    def test_namespace(self, env_trim):
++        tmpl = env_trim.from_string('{% set ns = namespace() %}'
++                                    '{% set ns.bar = "42" %}'
++                                    '{{ ns.bar }}')
++        assert tmpl.render() == '42'
++
++    def test_namespace_block(self, env_trim):
++        tmpl = env_trim.from_string('{% set ns = namespace() %}'
++                                    '{% set ns.bar %}42{% endset %}'
++                                    '{{ ns.bar }}')
++        assert tmpl.render() == '42'
++
++    def test_init_namespace(self, env_trim):
++        tmpl = env_trim.from_string('{% set ns = namespace(d, self=37) %}'
++                                    '{% set ns.b = 42 %}'
++                                    '{{ ns.a }}|{{ ns.self }}|{{ ns.b }}')
++        assert tmpl.render(d={'a': 13}) == '13|37|42'
++
++    def test_namespace_loop(self, env_trim):
++        tmpl = env_trim.from_string('{% set ns = namespace(found=false) %}'
++                                    '{% for x in range(4) %}'
++                                    '{% if x == v %}'
++                                    '{% set ns.found = true %}'
++                                    '{% endif %}'
++                                    '{% endfor %}'
++                                    '{{ ns.found }}')
++        assert tmpl.render(v=3) == 'True'
++        assert tmpl.render(v=4) == 'False'
++
++    def test_namespace_macro(self, env_trim):
++        tmpl = env_trim.from_string('{% set ns = namespace() %}'
++                                    '{% set ns.a = 13 %}'
++                                    '{% macro magic(x) %}'
++                                    '{% set x.b = 37 %}'
++                                    '{% endmacro %}'
++                                    '{{ magic(ns) }}'
++                                    '{{ ns.a }}|{{ ns.b }}')
++        assert tmpl.render() == '13|37'
++
++    def test_block_escaping_filtered(self):
++        env = Environment(autoescape=True)
++        tmpl = env.from_string('{% set foo | trim %}<em>{{ test }}</em>    '
++                               '{% endset %}foo: {{ foo }}')
++        assert tmpl.render(test='<unsafe>') == 'foo: <em>&lt;unsafe&gt;</em>'
++
++    def test_block_filtered(self, env_trim):
++        tmpl = env_trim.from_string(
++            '{% set foo | trim | length | string %} 42    {% endset %}'
++            '{{ foo }}')
++        assert tmpl.render() == '2'
++        assert tmpl.module.foo == u'2'
++
++    def test_block_filtered_set(self, env_trim):
++        def _myfilter(val, arg):
++            assert arg == ' xxx '
++            return val
++        env_trim.filters['myfilter'] = _myfilter
++        tmpl = env_trim.from_string(
++            '{% set a = " xxx " %}'
++            '{% set foo | myfilter(a) | trim | length | string %}'
++            ' {% set b = " yy " %} 42 {{ a }}{{ b }}   '
++            '{% endset %}'
++            '{{ foo }}')
++        assert tmpl.render() == '11'
++        assert tmpl.module.foo == u'11'
++
+ 
+ @pytest.mark.core_tags
+ @pytest.mark.with_
+
+diff --git a/tests/test_ext.py b/tests/test_ext.py
+index 30f5931..c3b028f 100644
+--- a/tests/test_ext.py
++++ b/tests/test_ext.py
+@@ -91,6 +91,13 @@ i18n_env.globals.update({
+     'gettext':      gettext,
+     'ngettext':     ngettext
+ })
++i18n_env_trimmed = Environment(extensions=['jinja2.ext.i18n'])
++i18n_env_trimmed.policies['ext.i18n.trimmed'] = True
++i18n_env_trimmed.globals.update({
++    '_':            gettext,
++    'gettext':      gettext,
++    'ngettext':     ngettext
++})
+ 
+ newstyle_i18n_env = Environment(
+     loader=DictLoader(newstyle_i18n_templates),
+@@ -270,6 +277,36 @@ class TestInternationalization(object):
+         tmpl = i18n_env.get_template('stringformat.html')
+         assert tmpl.render(LANGUAGE='de', user_count=5) == 'Benutzer: 5'
+ 
++    def test_trimmed(self):
++        tmpl = i18n_env.from_string(
++            '{%- trans trimmed %}  hello\n  world  {% endtrans -%}')
++        assert tmpl.render() == 'hello world'
++
++    def test_trimmed_policy(self):
++        s = '{%- trans %}  hello\n  world  {% endtrans -%}'
++        tmpl = i18n_env.from_string(s)
++        trimmed_tmpl = i18n_env_trimmed.from_string(s)
++        assert tmpl.render() == '  hello\n  world  '
++        assert trimmed_tmpl.render() == 'hello world'
++
++    def test_trimmed_policy_override(self):
++        tmpl = i18n_env_trimmed.from_string(
++            '{%- trans notrimmed %}  hello\n  world  {% endtrans -%}')
++        assert tmpl.render() == '  hello\n  world  '
++
++    def test_trimmed_vars(self):
++        tmpl = i18n_env.from_string(
++            '{%- trans trimmed x="world" %}  hello\n  {{ x }} {% endtrans -%}')
++        assert tmpl.render() == 'hello world'
++
++    def test_trimmed_varname_trimmed(self):
++        # unlikely variable name, but when used as a variable
++        # it should not enable trimming
++        tmpl = i18n_env.from_string(
++            '{%- trans trimmed = "world" %}  hello\n  {{ trimmed }}  '
++            '{% endtrans -%}')
++        assert tmpl.render() == '  hello\n  world  '
++
+     def test_extract(self):
+         from jinja2.ext import babel_extract
+         source = BytesIO('''
+@@ -284,6 +321,37 @@ class TestInternationalization(object):
+             (4, 'ngettext', (u'%(users)s user', u'%(users)s users', None), [])
+         ]
+ 
++    def test_extract_trimmed(self):
++        from jinja2.ext import babel_extract
++        source = BytesIO('''
++        {{ gettext(' Hello  \n  World') }}
++        {% trans trimmed %} Hello  \n  World{% endtrans %}
++        {% trans trimmed %}{{ users }} \n user
++        {%- pluralize %}{{ users }} \n users{% endtrans %}
++        '''.encode('ascii'))  # make python 3 happy
++        assert list(babel_extract(source,
++                                  ('gettext', 'ngettext', '_'), [], {})) == [
++            (2, 'gettext', u' Hello  \n  World', []),
++            (4, 'gettext', u'Hello World', []),
++            (6, 'ngettext', (u'%(users)s user', u'%(users)s users', None), [])
++        ]
++
++    def test_extract_trimmed_option(self):
++        from jinja2.ext import babel_extract
++        source = BytesIO('''
++        {{ gettext(' Hello  \n  World') }}
++        {% trans %} Hello  \n  World{% endtrans %}
++        {% trans %}{{ users }} \n user
++        {%- pluralize %}{{ users }} \n users{% endtrans %}
++        '''.encode('ascii'))  # make python 3 happy
++        opts = {'trimmed': 'true'}
++        assert list(babel_extract(source,
++                                  ('gettext', 'ngettext', '_'), [], opts)) == [
++            (2, 'gettext', u' Hello  \n  World', []),
++            (4, 'gettext', u'Hello World', []),
++            (6, 'ngettext', (u'%(users)s user', u'%(users)s users', None), [])
++        ]
++
+     def test_comment_extract(self):
+         from jinja2.ext import babel_extract
+         source = BytesIO('''
+@@ -495,3 +563,26 @@ class TestAutoEscape(object):
+                           autoescape=True)
+         pysource = env.compile(tmplsource, raw=True)
+         assert '&lt;testing&gt;\\n' in pysource
++
++    def test_overlay_scopes(self):
++        class MagicScopeExtension(Extension):
++            tags = set(['overlay'])
++            def parse(self, parser):
++                node = nodes.OverlayScope(lineno=next(parser.stream).lineno)
++                node.body = list(parser.parse_statements(('name:endoverlay',),
++                                                         drop_needle=True))
++                node.context = self.call_method('get_scope')
++                return node
++            def get_scope(self):
++                return {'x': [1, 2, 3]}
++
++        env = Environment(extensions=[MagicScopeExtension])
++
++        tmpl = env.from_string('''
++            {{- x }}|{% set z = 99 %}
++            {%- overlay %}
++                {{- y }}|{{ z }}|{% for item in x %}[{{ item }}]{% endfor %}
++            {%- endoverlay %}|
++            {{- x -}}
++        ''')
++        assert tmpl.render(x=42, y=23) == '42|23|99|[1][2][3]|42'
+
+diff --git a/tests/test_filters.py b/tests/test_filters.py
+index 318a347..8962ced 100644
+--- a/tests/test_filters.py
++++ b/tests/test_filters.py
+@@ -8,11 +8,21 @@
+     :copyright: (c) 2017 by the Jinja Team.
+     :license: BSD, see LICENSE for more details.
+ """
++import random
+ import pytest
+ from jinja2 import Markup, Environment
+ from jinja2._compat import text_type, implements_to_string
+ 
+ 
++@implements_to_string
++class Magic(object):
++    def __init__(self, value):
++        self.value = value
++
++    def __str__(self):
++        return text_type(self.value)
++
++
+ @pytest.mark.filter
+ class TestFilter(object):
+ 
+@@ -35,16 +45,16 @@ class TestFilter(object):
+         )
+         assert tmpl.render(given='yes') == 'no|False|no|yes'
+ 
+-    def test_dictsort(self, env):
+-        tmpl = env.from_string(
+-            '{{ foo|dictsort }}|'
+-            '{{ foo|dictsort(true) }}|'
+-            '{{ foo|dictsort(false, "value") }}'
+-        )
+-        out = tmpl.render(foo={"aa": 0, "b": 1, "c": 2, "AB": 3})
+-        assert out == ("[('aa', 0), ('AB', 3), ('b', 1), ('c', 2)]|"
+-                       "[('AB', 3), ('aa', 0), ('b', 1), ('c', 2)]|"
+-                       "[('aa', 0), ('b', 1), ('c', 2), ('AB', 3)]")
++    @pytest.mark.parametrize('args,expect', (
++        ('', "[('aa', 0), ('AB', 3), ('b', 1), ('c', 2)]"),
++        ('true',  "[('AB', 3), ('aa', 0), ('b', 1), ('c', 2)]"),
++        ('by="value"',  "[('aa', 0), ('b', 1), ('c', 2), ('AB', 3)]"),
++        ('reverse=true', "[('c', 2), ('b', 1), ('AB', 3), ('aa', 0)]")
++    ))
++    def test_dictsort(self, env, args, expect):
++        t = env.from_string('{{{{ foo|dictsort({args}) }}}}'.format(args=args))
++        out = t.render(foo={"aa": 0, "b": 1, "c": 2, "AB": 3})
++        assert out == expect
+ 
+     def test_batch(self, env):
+         tmpl = env.from_string("{{ foo|batch(3)|list }}|"
+@@ -126,11 +136,26 @@ class TestFilter(object):
+         assert out == 'a|b'
+ 
+     def test_indent(self, env):
+-        tmpl = env.from_string('{{ foo|indent(2) }}|{{ foo|indent(2, true) }}')
+-        text = '\n'.join([' '.join(['foo', 'bar'] * 2)] * 2)
+-        out = tmpl.render(foo=text)
+-        assert out == ('foo bar foo bar\n  foo bar foo bar|  '
+-                       'foo bar foo bar\n  foo bar foo bar')
++        text = '\n'.join(['', 'foo bar', ''])
++        t = env.from_string('{{ foo|indent(2, false, false) }}')
++        assert t.render(foo=text) == '\n  foo bar\n'
++        t = env.from_string('{{ foo|indent(2, false, true) }}')
++        assert t.render(foo=text) == '\n  foo bar\n  '
++        t = env.from_string('{{ foo|indent(2, true, false) }}')
++        assert t.render(foo=text) == '  \n  foo bar\n'
++        t = env.from_string('{{ foo|indent(2, true, true) }}')
++        assert t.render(foo=text) == '  \n  foo bar\n  '
++
++        t = env.from_string('{{ "jinja"|indent }}')
++        assert t.render() == 'jinja'
++        t = env.from_string('{{ "jinja"|indent(first=true) }}')
++        assert t.render() == '    jinja'
++        t = env.from_string('{{ "jinja"|indent(blank=true) }}')
++        assert t.render() == 'jinja'
++
++    def test_indentfirst_deprecated(self, env):
++        with pytest.warns(DeprecationWarning):
++            env.from_string('{{ "jinja"|indent(indentfirst=true) }}').render()
+ 
+     def test_int(self, env):
+         class IntIsh(object):
+@@ -182,11 +207,21 @@ class TestFilter(object):
+         data = list(range(1000))
+         assert tmpl.render(data=data) == pformat(data)
+ 
+-    def test_random(self, env):
+-        tmpl = env.from_string('''{{ seq|random }}''')
+-        seq = list(range(100))
+-        for _ in range(10):
+-            assert int(tmpl.render(seq=seq)) in seq
++    def test_random(self, env, request):
++        # restore the random state when the test ends
++        state = random.getstate()
++        request.addfinalizer(lambda: random.setstate(state))
++        # generate the random values from a known seed
++        random.seed('jinja')
++        expected = [random.choice('1234567890') for _ in range(10)]
++
++        # check that the random sequence is generated again by a template
++        # ensures that filter result is not constant folded
++        random.seed('jinja')
++        t = env.from_string('{{ "1234567890"|random }}')
++
++        for value in expected:
++            assert t.render() == value
+ 
+     def test_reverse(self, env):
+         tmpl = env.from_string('{{ "foobar"|reverse|join }}|'
+@@ -368,16 +403,41 @@ class TestFilter(object):
+         assert tmpl.render() == "['Bar', 'blah', 'foo']"
+ 
+     def test_sort4(self, env):
+-        @implements_to_string
+-        class Magic(object):
+-            def __init__(self, value):
+-                self.value = value
+-
+-            def __str__(self):
+-                return text_type(self.value)
+         tmpl = env.from_string('''{{ items|sort(attribute='value')|join }}''')
+         assert tmpl.render(items=map(Magic, [3, 2, 4, 1])) == '1234'
+ 
++    def test_unique(self, env):
++        t = env.from_string('{{ "".join(["b", "A", "a", "b"]|unique) }}')
++        assert t.render() == "bA"
++
++    def test_unique_case_sensitive(self, env):
++        t = env.from_string('{{ "".join(["b", "A", "a", "b"]|unique(true)) }}')
++        assert t.render() == "bAa"
++
++    def test_unique_attribute(self, env):
++        t = env.from_string("{{ items|unique(attribute='value')|join }}")
++        assert t.render(items=map(Magic, [3, 2, 4, 1, 2])) == '3241'
++
++    @pytest.mark.parametrize('source,expect', (
++        ('{{ ["a", "B"]|min }}', 'a'),
++        ('{{ ["a", "B"]|min(case_sensitive=true) }}', 'B'),
++        ('{{ []|min }}', ''),
++        ('{{ ["a", "B"]|max }}', 'B'),
++        ('{{ ["a", "B"]|max(case_sensitive=true) }}', 'a'),
++        ('{{ []|max }}', ''),
++    ))
++    def test_min_max(self, env, source, expect):
++        t = env.from_string(source)
++        assert t.render() == expect
++
++    @pytest.mark.parametrize('name,expect', (
++        ('min', '1'),
++        ('max', '9'),
++    ))
++    def test_min_max_attribute(self, env, name, expect):
++        t = env.from_string('{{ items|' + name + '(attribute="value") }}')
++        assert t.render(items=map(Magic, [5, 1, 9])) == expect
++
+     def test_groupby(self, env):
+         tmpl = env.from_string('''
+         {%- for grouper, list in [{'foo': 1, 'bar': 2},
+@@ -580,8 +640,9 @@ class TestFilter(object):
+     def test_json_dump(self):
+         env = Environment(autoescape=True)
+         t = env.from_string('{{ x|tojson }}')
+-        assert t.render(x={'foo': 'bar'}) == '{&#34;foo&#34;: &#34;bar&#34;}'
+-        assert t.render(x='"bar\'') == r'&#34;\&#34;bar\u0027&#34;'
++        assert t.render(x={'foo': 'bar'}) == '{"foo": "bar"}'
++        assert t.render(x='"ba&r\'') == r'"\"ba\u0026r\u0027"'
++        assert t.render(x='<bar>') == r'"\u003cbar\u003e"'
+ 
+         def my_dumps(value, **options):
+             assert options == {'foo': 'bar'}
+
+diff --git a/tests/test_idtracking.py b/tests/test_idtracking.py
+index ea01b17..29312d3 100644
+--- a/tests/test_idtracking.py
++++ b/tests/test_idtracking.py
+@@ -61,7 +61,7 @@ def test_complex():
+                     nodes.Output([
+                         nodes.Name('title_upper', 'load'),
+                         nodes.Call(nodes.Name('render_title', 'load'), [
+-                            nodes.Const('Aha')], [], None, None)])], [])])])
++                            nodes.Const('Aha')], [], None, None)])], [], [])])])
+ 
+     for_loop = nodes.For(
+         nodes.Name('item', 'store'),
+@@ -155,7 +155,7 @@ def test_if_branching_stores():
+     tmpl = nodes.Template([
+         nodes.If(nodes.Name('expression', 'load'), [
+             nodes.Assign(nodes.Name('variable', 'store'),
+-                         nodes.Const(42))], [])])
++                         nodes.Const(42))], [], [])])
+ 
+     sym = symbols_for_node(tmpl)
+     assert sym.refs == {
+@@ -177,7 +177,7 @@ def test_if_branching_stores_undefined():
+         nodes.Assign(nodes.Name('variable', 'store'), nodes.Const(23)),
+         nodes.If(nodes.Name('expression', 'load'), [
+             nodes.Assign(nodes.Name('variable', 'store'),
+-                         nodes.Const(42))], [])])
++                         nodes.Const(42))], [], [])])
+ 
+     sym = symbols_for_node(tmpl)
+     assert sym.refs == {
+@@ -197,7 +197,7 @@ def test_if_branching_stores_undefined():
+ def test_if_branching_multi_scope():
+     for_loop = nodes.For(nodes.Name('item', 'store'), nodes.Name('seq', 'load'), [
+         nodes.If(nodes.Name('expression', 'load'), [
+-            nodes.Assign(nodes.Name('x', 'store'), nodes.Const(42))], []),
++            nodes.Assign(nodes.Name('x', 'store'), nodes.Const(42))], [], []),
+         nodes.Include(nodes.Const('helper.html'), True, False)
+     ], [], None, False)
+ 
+
+diff --git a/tests/test_imports.py b/tests/test_imports.py
+index a6d5161..65aae43 100644
+--- a/tests/test_imports.py
++++ b/tests/test_imports.py
+@@ -11,7 +11,8 @@
+ import pytest
+ 
+ from jinja2 import Environment, DictLoader
+-from jinja2.exceptions import TemplateNotFound, TemplatesNotFound
++from jinja2.exceptions import TemplateNotFound, TemplatesNotFound, \
++    TemplateSyntaxError
+ 
+ 
+ @pytest.fixture
+@@ -50,13 +51,36 @@ class TestImports(object):
+         )
+         assert t.render(foo=42) == '[42|23]'
+ 
+-    def test_trailing_comma(self, test_env):
++    def test_import_needs_name(self, test_env):
++        test_env.from_string('{% from "foo" import bar %}')
++        test_env.from_string('{% from "foo" import bar, baz %}')
++
++        with pytest.raises(TemplateSyntaxError):
++            test_env.from_string('{% from "foo" import %}')
++
++    def test_no_trailing_comma(self, test_env):
++        with pytest.raises(TemplateSyntaxError):
++            test_env.from_string('{% from "foo" import bar, %}')
++
++        with pytest.raises(TemplateSyntaxError):
++            test_env.from_string('{% from "foo" import bar,, %}')
++
++        with pytest.raises(TemplateSyntaxError):
++            test_env.from_string('{% from "foo" import, %}')
++
++    def test_trailing_comma_with_context(self, test_env):
+         test_env.from_string('{% from "foo" import bar, baz with context %}')
+         test_env.from_string('{% from "foo" import bar, baz, with context %}')
+         test_env.from_string('{% from "foo" import bar, with context %}')
+         test_env.from_string('{% from "foo" import bar, with, context %}')
+         test_env.from_string('{% from "foo" import bar, with with context %}')
+ 
++        with pytest.raises(TemplateSyntaxError):
++            test_env.from_string('{% from "foo" import bar,, with context %}')
++
++        with pytest.raises(TemplateSyntaxError):
++            test_env.from_string('{% from "foo" import bar with context, %}')
++
+     def test_exports(self, test_env):
+         m = test_env.from_string('''
+             {% macro toplevel() %}...{% endmacro %}
+
+diff --git a/tests/test_lexnparse.py b/tests/test_lexnparse.py
+index 20d2c6d..7da72c0 100644
+--- a/tests/test_lexnparse.py
++++ b/tests/test_lexnparse.py
+@@ -126,6 +126,33 @@ class TestLexer(object):
+                 result = tmpl.render()
+                 assert result == expect, (keep, template, result, expect)
+ 
++    @pytest.mark.parametrize('name,valid2,valid3', (
++        (u'foo', True, True),
++        (u'föö', False, True),
++        (u'き', False, True),
++        (u'_', True, True),
++        (u'1a', False, False),  # invalid ascii start
++        (u'a-', False, False),  # invalid ascii continue
++        (u'🐍', False, False),  # invalid unicode start
++        (u'a🐍', False, False),  # invalid unicode continue
++        # start characters not matched by \w
++        (u'\u1885', False, True),
++        (u'\u1886', False, True),
++        (u'\u2118', False, True),
++        (u'\u212e', False, True),
++        # continue character not matched by \w
++        (u'\xb7', False, False),
++        (u'a\xb7', False, True),
++    ))
++    def test_name(self, env, name, valid2, valid3):
++        t = u'{{ ' + name + u' }}'
++
++        if (valid2 and PY2) or (valid3 and not PY2):
++            # valid for version being tested, shouldn't raise
++            env.from_string(t)
++        else:
++            pytest.raises(TemplateSyntaxError, env.from_string, t)
++
+ 
+ @pytest.mark.lexnparse
+ @pytest.mark.parser
+
+diff --git a/tests/test_nativetypes.py b/tests/test_nativetypes.py
+new file mode 100644
+index 0000000..aec1a3b
+--- /dev/null
++++ b/tests/test_nativetypes.py
+@@ -0,0 +1,110 @@
++import pytest
++
++from jinja2._compat import text_type
++from jinja2.exceptions import UndefinedError
++from jinja2.nativetypes import NativeEnvironment
++from jinja2.runtime import Undefined
++
++
++@pytest.fixture
++def env():
++    return NativeEnvironment()
++
++
++class TestNativeEnvironment(object):
++    def test_is_defined_native_return(self, env):
++        t = env.from_string('{{ missing is defined }}')
++        assert not t.render()
++
++    def test_undefined_native_return(self, env):
++        t = env.from_string('{{ missing }}')
++        assert isinstance(t.render(), Undefined)
++
++    def test_adding_undefined_native_return(self, env):
++        t = env.from_string('{{ 3 + missing }}')
++
++        with pytest.raises(UndefinedError):
++            t.render()
++
++    def test_cast_int(self, env):
++        t = env.from_string("{{ anumber|int }}")
++        result = t.render(anumber='3')
++        assert isinstance(result, int)
++        assert result == 3
++
++    def test_list_add(self, env):
++        t = env.from_string("{{ listone + listtwo }}")
++        result = t.render(listone=['a', 'b'], listtwo=['c', 'd'])
++        assert isinstance(result, list)
++        assert result == ['a', 'b', 'c', 'd']
++
++    def test_multi_expression_add(self, env):
++        t = env.from_string("{{ listone }} + {{ listtwo }}")
++        result = t.render(listone=['a', 'b'], listtwo=['c', 'd'])
++        assert not isinstance(result, list)
++        assert result == "['a', 'b'] + ['c', 'd']"
++
++    def test_loops(self, env):
++        t = env.from_string("{% for x in listone %}{{ x }}{% endfor %}")
++        result = t.render(listone=['a', 'b', 'c', 'd'])
++        assert isinstance(result, text_type)
++        assert result == 'abcd'
++
++    def test_loops_with_ints(self, env):
++        t = env.from_string("{% for x in listone %}{{ x }}{% endfor %}")
++        result = t.render(listone=[1, 2, 3, 4])
++        assert isinstance(result, int)
++        assert result == 1234
++
++    def test_loop_look_alike(self, env):
++        t = env.from_string("{% for x in listone %}{{ x }}{% endfor %}")
++        result = t.render(listone=[1])
++        assert isinstance(result, int)
++        assert result == 1
++
++    def test_booleans(self, env):
++        t = env.from_string("{{ boolval }}")
++        result = t.render(boolval=True)
++        assert isinstance(result, bool)
++        assert result is True
++
++        t = env.from_string("{{ boolval }}")
++        result = t.render(boolval=False)
++        assert isinstance(result, bool)
++        assert result is False
++
++        t = env.from_string("{{ 1 == 1 }}")
++        result = t.render()
++        assert isinstance(result, bool)
++        assert result is True
++
++        t = env.from_string("{{ 2 + 2 == 5 }}")
++        result = t.render()
++        assert isinstance(result, bool)
++        assert result is False
++
++        t = env.from_string("{{ None == None }}")
++        result = t.render()
++        assert isinstance(result, bool)
++        assert result is True
++
++        t = env.from_string("{{ '' == None }}")
++        result = t.render()
++        assert isinstance(result, bool)
++        assert result is False
++
++    def test_variable_dunder(self, env):
++        t = env.from_string("{{ x.__class__ }}")
++        result = t.render(x=True)
++        assert isinstance(result, type)
++
++    def test_constant_dunder(self, env):
++        t = env.from_string("{{ true.__class__ }}")
++        result = t.render()
++        assert isinstance(result, type)
++
++    def test_constant_dunder_to_string(self, env):
++        t = env.from_string("{{ true.__class__|string }}")
++        result = t.render()
++        assert not isinstance(result, type)
++        assert result in ["<type 'bool'>", "<class 'bool'>"]
+
+diff --git a/tests/test_regression.py b/tests/test_regression.py
+index 8bd2678..876b41c 100644
+--- a/tests/test_regression.py
++++ b/tests/test_regression.py
+@@ -471,7 +471,6 @@ class TestBug(object):
+             ]
+         }})
+         lines = [x.strip() for x in sm.splitlines() if x.strip()]
+-        print(lines)
+         assert lines == [
+             '<?xml version="1.0" encoding="UTF-8"?>',
+             '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+
+diff --git a/tests/test_tests.py b/tests/test_tests.py
+index 0dead3b..84df5ea 100644
+--- a/tests/test_tests.py
++++ b/tests/test_tests.py
+@@ -78,17 +78,37 @@ class TestTestsCase(object):
+         assert tmpl.render() == 'True|False'
+ 
+     def test_equalto(self, env):
+-        tmpl = env.from_string('{{ foo is equalto 12 }}|'
+-                               '{{ foo is equalto 0 }}|'
+-                               '{{ foo is equalto (3 * 4) }}|'
+-                               '{{ bar is equalto "baz" }}|'
+-                               '{{ bar is equalto "zab" }}|'
+-                               '{{ bar is equalto ("ba" + "z") }}|'
+-                               '{{ bar is equalto bar }}|'
+-                               '{{ bar is equalto foo }}')
++        tmpl = env.from_string(
++            '{{ foo is eq 12 }}|'
++            '{{ foo is eq 0 }}|'
++            '{{ foo is eq (3 * 4) }}|'
++            '{{ bar is eq "baz" }}|'
++            '{{ bar is eq "zab" }}|'
++            '{{ bar is eq ("ba" + "z") }}|'
++            '{{ bar is eq bar }}|'
++            '{{ bar is eq foo }}'
++        )
+         assert tmpl.render(foo=12, bar="baz") \
+             == 'True|False|True|True|False|True|True|False'
+ 
++    @pytest.mark.parametrize('op,expect', (
++        ('eq 2', True),
++        ('eq 3', False),
++        ('ne 3', True),
++        ('ne 2', False),
++        ('lt 3', True),
++        ('lt 2', False),
++        ('le 2', True),
++        ('le 1', False),
++        ('gt 1', True),
++        ('gt 2', False),
++        ('ge 2', True),
++        ('ge 3', False),
++    ))
++    def test_compare_aliases(self, env, op, expect):
++        t = env.from_string('{{{{ 2 is {op} }}}}'.format(op=op))
++        assert t.render() == str(expect)
++
+     def test_sameas(self, env):
+         tmpl = env.from_string('{{ foo is sameas false }}|'
+                                '{{ 0 is sameas false }}')
+@@ -126,3 +146,16 @@ class TestTestsCase(object):
+         assert tmpl.render() == 'False'
+         assert items == [('us-west-1', '(us-east-1|ap-northeast-1)'),
+                          ('stage', '(dev|stage)')]
++
++    def test_in(self, env):
++        tmpl = env.from_string('{{ "o" is in "foo" }}|'
++                               '{{ "foo" is in "foo" }}|'
++                               '{{ "b" is in "foo" }}|'
++                               '{{ 1 is in ((1, 2)) }}|'
++                               '{{ 3 is in ((1, 2)) }}|'
++                               '{{ 1 is in [1, 2] }}|'
++                               '{{ 3 is in [1, 2] }}|'
++                               '{{ "foo" is in {"foo": 1}}}|'
++                               '{{ "baz" is in {"bar": 1}}}')
++        assert tmpl.render() \
++            == 'True|True|False|True|False|True|False|True|False'
+
+diff --git a/tests/test_utils.py b/tests/test_utils.py
+index 2400fb8..f71c608 100644
+--- a/tests/test_utils.py
++++ b/tests/test_utils.py
+@@ -75,24 +75,6 @@ class TestHelpers(object):
+         assert func('FOO.TXT') == False
+ 
+ 
+-@pytest.mark.utils
+-@pytest.mark.markupleak
+-@pytest.mark.skipif(hasattr(escape, 'func_code'),
+-                    reason='this test only tests the c extension')
+-class TestMarkupLeak(object):
+-
+-    def test_markup_leaks(self):
+-        counts = set()
+-        for count in range(20):
+-            for item in range(1000):
+-                escape("foo")
+-                escape("<foo>")
+-                escape(u"foo")
+-                escape(u"<foo>")
+-            counts.add(len(gc.get_objects()))
+-        assert len(counts) == 1, 'ouch, c extension seems to leak objects'
+-
+-
+ @pytest.mark.utils
+ @pytest.mark.escapeUrlizeTarget
+ class TestEscapeUrlizeTarget(object):

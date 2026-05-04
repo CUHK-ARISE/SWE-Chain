@@ -1,0 +1,1520 @@
+{
+  "old_dir": ".packages/poetry/1.6.0",
+  "new_dir": ".packages/poetry/1.7.0",
+  "extracted_at": "2026-04-24T01:19:31.892198",
+  "diff_file": "confirmed/poetry_1.5.0_to_1.8.5/1.7.0/differences/code_diff_v1.6.0_to_v1.7.0_py.diff",
+  "diff_content": "diff --git a/src/poetry/config/config.py b/src/poetry/config/config.py\nindex 6d76586..cbd89eb 100644\n--- a/src/poetry/config/config.py\n+++ b/src/poetry/config/config.py\n@@ -133,6 +133,9 @@ class Config:\n             \"max-workers\": None,\n             \"no-binary\": None,\n         },\n+        \"warnings\": {\n+            \"export\": True,\n+        },\n     }\n \n     def __init__(\n@@ -223,6 +226,22 @@ class Config:\n             path = Path(self.get(\"cache-dir\")) / \"virtualenvs\"\n         return Path(path).expanduser()\n \n+    @property\n+    def installer_max_workers(self) -> int:\n+        # This should be directly handled by ThreadPoolExecutor\n+        # however, on some systems the number of CPUs cannot be determined\n+        # (it raises a NotImplementedError), so, in this case, we assume\n+        # that the system only has one CPU.\n+        try:\n+            default_max_workers = (os.cpu_count() or 1) + 4\n+        except NotImplementedError:\n+            default_max_workers = 5\n+\n+        desired_max_workers = self.get(\"installer.max-workers\")\n+        if desired_max_workers is None:\n+            return default_max_workers\n+        return min(default_max_workers, int(desired_max_workers))\n+\n     def get(self, setting_name: str, default: Any = None) -> Any:\n         \"\"\"\n         Retrieve a setting value.\n@@ -279,6 +298,7 @@ class Config:\n             \"experimental.system-git-client\",\n             \"installer.modern-installation\",\n             \"installer.parallel\",\n+            \"warnings.export\",\n         }:\n             return boolean_normalizer\n \n\ndiff --git a/src/poetry/console/application.py b/src/poetry/console/application.py\nindex 8d325ef..3286c73 100644\n--- a/src/poetry/console/application.py\n+++ b/src/poetry/console/application.py\n@@ -354,6 +354,12 @@ class Application(BaseApplication):\n             manager.load_plugins()\n             manager.activate(self)\n \n+            # We have to override the command from poetry-plugin-export\n+            # with the wrapper.\n+            if self.command_loader.has(\"export\"):\n+                del self.command_loader._factories[\"export\"]\n+            self.command_loader._factories[\"export\"] = load_command(\"export\")\n+\n         self._plugins_loaded = True\n \n     @property\n@@ -391,7 +397,7 @@ class Application(BaseApplication):\n             SolutionProviderRepository,\n         )\n \n-        from poetry.mixology.solutions.providers.python_requirement_solution_provider import (  # noqa: E501\n+        from poetry.mixology.solutions.providers.python_requirement_solution_provider import (\n             PythonRequirementSolutionProvider,\n         )\n \n\ndiff --git a/src/poetry/console/commands/config.py b/src/poetry/console/commands/config.py\nindex eed7cad..3b460fb 100644\n--- a/src/poetry/console/commands/config.py\n+++ b/src/poetry/console/commands/config.py\n@@ -77,6 +77,7 @@ To remove a repository (repo is a short alias for repositories):\n                 PackageFilterPolicy.validator,\n                 PackageFilterPolicy.normalize,\n             ),\n+            \"warnings.export\": (boolean_validator, boolean_normalizer),\n         }\n \n         return unique_config_values\n@@ -122,6 +123,9 @@ To remove a repository (repo is a short alias for repositories):\n \n         # show the value if no value is provided\n         if not self.argument(\"value\") and not self.option(\"unset\"):\n+            if setting_key.split(\".\")[0] in self.LIST_PROHIBITED_SETTINGS:\n+                raise ValueError(f\"Expected a value for {setting_key} setting.\")\n+\n             m = re.match(r\"^repos?(?:itories)?(?:\\.(.+))?\", self.argument(\"key\"))\n             value: str | dict[str, Any]\n             if m:\n\ndiff --git a/src/poetry/console/commands/export.py b/src/poetry/console/commands/export.py\nnew file mode 100644\nindex 0000000..cf18e27\n--- /dev/null\n+++ b/src/poetry/console/commands/export.py\n@@ -0,0 +1,21 @@\n+from __future__ import annotations\n+\n+from poetry_plugin_export.command import (  # type: ignore[import-untyped]\n+    ExportCommand as BaseExportCommand,\n+)\n+\n+\n+class ExportCommand(BaseExportCommand):  # type: ignore[misc]\n+    def handle(self) -> int:\n+        if self.poetry.config.get(\"warnings.export\"):\n+            self.line_error(\n+                \"Warning: poetry-plugin-export will not be installed by default in a\"\n+                \" future version of Poetry.\\n\"\n+                \"In order to avoid a breaking change and make your automation\"\n+                \" forward-compatible, please install poetry-plugin-export explicitly.\"\n+                \" See https://python-poetry.org/docs/plugins/#using-plugins for details\"\n+                \" on how to install a plugin.\\n\"\n+                \"To disable this warning run 'poetry config warnings.export false'.\",\n+                style=\"warning\",\n+            )\n+        return super().handle()  # type: ignore[no-any-return]\n\ndiff --git a/src/poetry/console/commands/init.py b/src/poetry/console/commands/init.py\nindex d7dc3bb..cf59517 100644\n--- a/src/poetry/console/commands/init.py\n+++ b/src/poetry/console/commands/init.py\n@@ -489,6 +489,7 @@ You can specify a package in the following forms:\n \n         if self._pool is None:\n             self._pool = RepositoryPool()\n-            self._pool.add_repository(PyPiRepository())\n+            pool_size = self.poetry.config.installer_max_workers\n+            self._pool.add_repository(PyPiRepository(pool_size=pool_size))\n \n         return self._pool\n\ndiff --git a/src/poetry/console/commands/install.py b/src/poetry/console/commands/install.py\nindex cc6e22e..8e716ca 100644\n--- a/src/poetry/console/commands/install.py\n+++ b/src/poetry/console/commands/install.py\n@@ -155,14 +155,6 @@ dependencies and not including the current project, run the command with the\n         if self.option(\"no-root\"):\n             return 0\n \n-        try:\n-            builder = EditableBuilder(self.poetry, self.env, self.io)\n-        except ModuleOrPackageNotFound:\n-            # This is likely due to the fact that the project is an application\n-            # not following the structure expected by Poetry\n-            # If this is a true error it will be picked up later by build anyway.\n-            return 0\n-\n         log_install = (\n             \"<b>Installing</> the current project:\"\n             f\" <c1>{self.poetry.package.pretty_name}</c1>\"\n@@ -178,7 +170,26 @@ dependencies and not including the current project, run the command with the\n             self.line(\"\")\n             return 0\n \n-        builder.build()\n+        # Prior to https://github.com/python-poetry/poetry-core/pull/629\n+        # the existence of a module/package was checked when creating the\n+        # EditableBuilder. Afterwards, the existence is checked after\n+        # executing the build script (if there is one),\n+        # i.e. during EditableBuilder.build().\n+        try:\n+            builder = EditableBuilder(self.poetry, self.env, self.io)\n+            builder.build()\n+        except (ModuleOrPackageNotFound, FileNotFoundError) as e:\n+            # This is likely due to the fact that the project is an application\n+            # not following the structure expected by Poetry.\n+            # No need for an editable install in this case.\n+            self.line(\"\")\n+            self.line_error(\n+                f\"The current project could not be installed: <error>{e}</error>\\n\"\n+                \"If you do not want to install the current project\"\n+                \" use <c1>--no-root</c1>\",\n+                style=\"warning\",\n+            )\n+            return 0\n \n         if overwrite:\n             self.overwrite(log_install.format(tag=\"success\"))\n\ndiff --git a/src/poetry/console/commands/version.py b/src/poetry/console/commands/version.py\nindex b6953c9..0af2a00 100644\n--- a/src/poetry/console/commands/version.py\n+++ b/src/poetry/console/commands/version.py\n@@ -27,7 +27,7 @@ class VersionCommand(Command):\n             \"version\",\n             \"The version number or the rule to update the version.\",\n             optional=True,\n-        )\n+        ),\n     ]\n     options = [\n         option(\"short\", \"s\", \"Output the version number only\"),\n@@ -36,6 +36,7 @@ class VersionCommand(Command):\n             None,\n             \"Do not update pyproject.toml file\",\n         ),\n+        option(\"next-phase\", None, \"Increment the phase of the current version\"),\n     ]\n \n     help = \"\"\"\\\n@@ -62,7 +63,7 @@ patch, minor, major, prepatch, preminor, premajor, prerelease.\n \n         if version:\n             version = self.increment_version(\n-                self.poetry.package.pretty_version, version\n+                self.poetry.package.pretty_version, version, self.option(\"next-phase\")\n             )\n \n             if self.option(\"short\"):\n@@ -91,7 +92,9 @@ patch, minor, major, prepatch, preminor, premajor, prerelease.\n \n         return 0\n \n-    def increment_version(self, version: str, rule: str) -> Version:\n+    def increment_version(\n+        self, version: str, rule: str, next_phase: bool = False\n+    ) -> Version:\n         from poetry.core.constraints.version import Version\n \n         try:\n@@ -115,7 +118,8 @@ patch, minor, major, prepatch, preminor, premajor, prerelease.\n             if parsed.is_unstable():\n                 pre = parsed.pre\n                 assert pre is not None\n-                new = Version(parsed.epoch, parsed.release, pre.next())\n+                pre = pre.next_phase() if next_phase else pre.next()\n+                new = Version(parsed.epoch, parsed.release, pre)\n             else:\n                 new = parsed.next_patch().first_prerelease()\n         else:\n\ndiff --git a/src/poetry/factory.py b/src/poetry/factory.py\nindex 828ce26..15bd004 100644\n--- a/src/poetry/factory.py\n+++ b/src/poetry/factory.py\n@@ -224,12 +224,14 @@ class Factory(BaseFactory):\n         except KeyError:\n             raise InvalidSourceError(\"Missing [name] in source.\")\n \n+        pool_size = config.installer_max_workers\n+\n         if name.lower() == \"pypi\":\n             if \"url\" in source:\n                 raise InvalidSourceError(\n                     \"The PyPI repository cannot be configured with a custom url.\"\n                 )\n-            return PyPiRepository(disable_cache=disable_cache)\n+            return PyPiRepository(disable_cache=disable_cache, pool_size=pool_size)\n \n         try:\n             url = source[\"url\"]\n@@ -246,6 +248,7 @@ class Factory(BaseFactory):\n             url,\n             config=config,\n             disable_cache=disable_cache,\n+            pool_size=pool_size,\n         )\n \n     @classmethod\n\ndiff --git a/src/poetry/inspection/info.py b/src/poetry/inspection/info.py\nindex d1461d4..545eed2 100644\n--- a/src/poetry/inspection/info.py\n+++ b/src/poetry/inspection/info.py\n@@ -5,8 +5,6 @@ import functools\n import glob\n import logging\n import os\n-import tarfile\n-import zipfile\n \n from pathlib import Path\n from typing import TYPE_CHECKING\n@@ -25,13 +23,12 @@ from poetry.core.version.requirements import InvalidRequirement\n from poetry.pyproject.toml import PyProjectTOML\n from poetry.utils.env import EnvCommandError\n from poetry.utils.env import ephemeral_environment\n+from poetry.utils.helpers import extractall\n from poetry.utils.setup_reader import SetupReader\n \n \n if TYPE_CHECKING:\n-    from collections.abc import Callable\n     from collections.abc import Iterator\n-    from contextlib import AbstractContextManager\n \n     from poetry.core.packages.project_package import ProjectPackage\n \n@@ -46,11 +43,10 @@ import pyproject_hooks\n source = '{source}'\n dest = '{dest}'\n \n-with build.env.IsolatedEnvBuilder() as env:\n+with build.env.DefaultIsolatedEnv() as env:\n     builder = build.ProjectBuilder(\n-        srcdir=source,\n-        scripts_dir=env.scripts_dir,\n-        python_executable=env.executable,\n+        source_dir=source,\n+        python_executable=env.python_executable,\n         runner=pyproject_hooks.quiet_subprocess_runner,\n     )\n     env.install(builder.build_system_requires)\n@@ -58,7 +54,7 @@ with build.env.IsolatedEnvBuilder() as env:\n     builder.metadata_path(dest)\n \"\"\"\n \n-PEP517_META_BUILD_DEPS = [\"build==0.10.0\", \"pyproject_hooks==1.0.0\"]\n+PEP517_META_BUILD_DEPS = [\"build==1.0.3\", \"pyproject_hooks==1.0.0\"]\n \n \n class PackageInfoError(ValueError):\n@@ -292,26 +288,18 @@ class PackageInfo:\n         # Still not dependencies found\n         # So, we unpack and introspect\n         suffix = path.suffix\n+        zip = suffix == \".zip\"\n \n-        context: Callable[\n-            [str], AbstractContextManager[zipfile.ZipFile | tarfile.TarFile]\n-        ]\n-        if suffix == \".zip\":\n-            context = zipfile.ZipFile\n-        else:\n-            if suffix == \".bz2\":\n-                suffixes = path.suffixes\n-                if len(suffixes) > 1 and suffixes[-2] == \".tar\":\n-                    suffix = \".tar.bz2\"\n-            else:\n-                suffix = \".tar.gz\"\n-\n-            context = tarfile.open\n+        if suffix == \".bz2\":\n+            suffixes = path.suffixes\n+            if len(suffixes) > 1 and suffixes[-2] == \".tar\":\n+                suffix = \".tar.bz2\"\n+        elif not zip:\n+            suffix = \".tar.gz\"\n \n         with temporary_directory() as tmp_str:\n             tmp = Path(tmp_str)\n-            with context(path.as_posix()) as archive:\n-                archive.extractall(tmp.as_posix())\n+            extractall(source=path, dest=tmp, zip=zip)\n \n             # a little bit of guess work to determine the directory we care about\n             elements = list(tmp.glob(\"*\"))\n@@ -580,7 +568,7 @@ def get_pep517_metadata(path: Path) -> PackageInfo:\n             return info\n \n     with ephemeral_environment(\n-        flags={\"no-pip\": False, \"no-setuptools\": False, \"no-wheel\": False}\n+        flags={\"no-pip\": False, \"setuptools\": \"bundle\", \"wheel\": \"bundle\"}\n     ) as venv:\n         # TODO: cache PEP 517 build environment corresponding to each project venv\n         dest_dir = venv.path.parent / \"dist\"\n@@ -598,11 +586,7 @@ def get_pep517_metadata(path: Path) -> PackageInfo:\n                 \"--no-input\",\n                 *PEP517_META_BUILD_DEPS,\n             )\n-            venv.run(\n-                \"python\",\n-                \"-\",\n-                input_=pep517_meta_build_script,\n-            )\n+            venv.run_python_script(pep517_meta_build_script)\n             info = PackageInfo.from_metadata(dest_dir)\n         except EnvCommandError as e:\n             # something went wrong while attempting pep517 metadata build\n\ndiff --git a/src/poetry/installation/chef.py b/src/poetry/installation/chef.py\nindex da8679d..d801fb6 100644\n--- a/src/poetry/installation/chef.py\n+++ b/src/poetry/installation/chef.py\n@@ -1,8 +1,7 @@\n from __future__ import annotations\n \n-import tarfile\n+import os\n import tempfile\n-import zipfile\n \n from contextlib import redirect_stdout\n from io import StringIO\n@@ -13,28 +12,42 @@ from build import BuildBackendException\n from build import ProjectBuilder\n from build.env import IsolatedEnv as BaseIsolatedEnv\n from poetry.core.utils.helpers import temporary_directory\n-from pyproject_hooks import quiet_subprocess_runner  # type: ignore[import]\n+from pyproject_hooks import quiet_subprocess_runner  # type: ignore[import-untyped]\n \n from poetry.utils._compat import decode\n from poetry.utils.env import ephemeral_environment\n+from poetry.utils.helpers import extractall\n \n \n if TYPE_CHECKING:\n-    from collections.abc import Callable\n     from collections.abc import Collection\n-    from contextlib import AbstractContextManager\n \n     from poetry.repositories import RepositoryPool\n     from poetry.utils.cache import ArtifactCache\n     from poetry.utils.env import Env\n \n \n-class ChefError(Exception):\n-    ...\n+class ChefError(Exception): ...\n \n \n-class ChefBuildError(ChefError):\n-    ...\n+class ChefBuildError(ChefError): ...\n+\n+\n+class ChefInstallError(ChefError):\n+    def __init__(self, requirements: Collection[str], output: str, error: str) -> None:\n+        message = \"\\n\\n\".join(\n+            (\n+                f\"Failed to install {', '.join(requirements)}.\",\n+                f\"Output:\\n{output}\",\n+                f\"Error:\\n{error}\",\n+            )\n+        )\n+        super().__init__(message)\n+        self._requirements = requirements\n+\n+    @property\n+    def requirements(self) -> Collection[str]:\n+        return self._requirements\n \n \n class IsolatedEnv(BaseIsolatedEnv):\n@@ -43,15 +56,22 @@ class IsolatedEnv(BaseIsolatedEnv):\n         self._pool = pool\n \n     @property\n-    def executable(self) -> str:\n+    def python_executable(self) -> str:\n         return str(self._env.python)\n \n-    @property\n-    def scripts_dir(self) -> str:\n-        return str(self._env._bin_dir)\n+    def make_extra_environ(self) -> dict[str, str]:\n+        path = os.environ.get(\"PATH\")\n+        scripts_dir = str(self._env._bin_dir)\n+        return {\n+            \"PATH\": (\n+                os.pathsep.join([scripts_dir, path])\n+                if path is not None\n+                else scripts_dir\n+            )\n+        }\n \n     def install(self, requirements: Collection[str]) -> None:\n-        from cleo.io.null_io import NullIO\n+        from cleo.io.buffered_io import BufferedIO\n         from poetry.core.packages.dependency import Dependency\n         from poetry.core.packages.project_package import ProjectPackage\n \n@@ -67,8 +87,9 @@ class IsolatedEnv(BaseIsolatedEnv):\n             dependency = Dependency.create_from_pep_508(requirement)\n             package.add_dependency(dependency)\n \n+        io = BufferedIO()\n         installer = Installer(\n-            NullIO(),\n+            io,\n             self._env,\n             package,\n             Locker(self._env.path.joinpath(\"poetry.lock\"), {}),\n@@ -77,7 +98,8 @@ class IsolatedEnv(BaseIsolatedEnv):\n             InstalledRepository.load(self._env),\n         )\n         installer.update(True)\n-        installer.run()\n+        if installer.run() != 0:\n+            raise ChefInstallError(requirements, io.fetch_output(), io.fetch_error())\n \n \n class Chef:\n@@ -109,8 +131,7 @@ class Chef:\n             env = IsolatedEnv(venv, self._pool)\n             builder = ProjectBuilder(\n                 directory,\n-                python_executable=env.executable,\n-                scripts_dir=env.scripts_dir,\n+                python_executable=env.python_executable,\n                 runner=quiet_subprocess_runner,\n             )\n             env.install(builder.build_system_requires)\n@@ -132,14 +153,12 @@ class Chef:\n                     )\n             except BuildBackendException as e:\n                 message_parts = [str(e)]\n-                if isinstance(e.exception, CalledProcessError) and (\n-                    e.exception.stdout is not None or e.exception.stderr is not None\n-                ):\n-                    message_parts.append(\n-                        decode(e.exception.stderr)\n-                        if e.exception.stderr is not None\n-                        else decode(e.exception.stdout)\n-                    )\n+                if isinstance(e.exception, CalledProcessError):\n+                    text = e.exception.stderr or e.exception.stdout\n+                    if text is not None:\n+                        message_parts.append(decode(text))\n+                else:\n+                    message_parts.append(str(e.exception))\n \n                 error = ChefBuildError(\"\\n\\n\".join(message_parts))\n \n@@ -152,19 +171,11 @@ class Chef:\n         from poetry.core.packages.utils.link import Link\n \n         suffix = archive.suffix\n-        context: Callable[\n-            [str], AbstractContextManager[zipfile.ZipFile | tarfile.TarFile]\n-        ]\n-        if suffix == \".zip\":  # noqa: SIM108\n-            context = zipfile.ZipFile\n-        else:\n-            context = tarfile.open\n+        zip = suffix == \".zip\"\n \n         with temporary_directory() as tmp_dir:\n-            with context(archive.as_posix()) as archive_archive:\n-                archive_archive.extractall(tmp_dir)\n-\n             archive_dir = Path(tmp_dir)\n+            extractall(source=archive, dest=archive_dir, zip=zip)\n \n             elements = list(archive_dir.glob(\"*\"))\n \n\ndiff --git a/src/poetry/installation/executor.py b/src/poetry/installation/executor.py\nindex 4103da2..0d4ca05 100644\n--- a/src/poetry/installation/executor.py\n+++ b/src/poetry/installation/executor.py\n@@ -2,9 +2,9 @@ from __future__ import annotations\n \n import contextlib\n import csv\n+import functools\n import itertools\n import json\n-import os\n import threading\n \n from concurrent.futures import ThreadPoolExecutor\n@@ -16,10 +16,10 @@ from typing import Any\n \n from cleo.io.null_io import NullIO\n from poetry.core.packages.utils.link import Link\n-from requests.utils import atomic_open\n \n from poetry.installation.chef import Chef\n from poetry.installation.chef import ChefBuildError\n+from poetry.installation.chef import ChefInstallError\n from poetry.installation.chooser import Chooser\n from poetry.installation.operations import Install\n from poetry.installation.operations import Uninstall\n@@ -28,8 +28,8 @@ from poetry.installation.wheel_installer import WheelInstaller\n from poetry.puzzle.exceptions import SolverProblemError\n from poetry.utils._compat import decode\n from poetry.utils.authenticator import Authenticator\n-from poetry.utils.cache import ArtifactCache\n from poetry.utils.env import EnvCommandError\n+from poetry.utils.helpers import Downloader\n from poetry.utils.helpers import get_file_hash\n from poetry.utils.helpers import pluralize\n from poetry.utils.helpers import remove_directory\n@@ -72,13 +72,11 @@ class Executor:\n             parallel = config.get(\"installer.parallel\", True)\n \n         if parallel:\n-            self._max_workers = self._get_max_workers(\n-                desired_max_workers=config.get(\"installer.max-workers\")\n-            )\n+            self._max_workers = config.installer_max_workers\n         else:\n             self._max_workers = 1\n \n-        self._artifact_cache = ArtifactCache(cache_dir=config.artifacts_cache_directory)\n+        self._artifact_cache = pool.artifact_cache\n         self._authenticator = Authenticator(\n             config, self._io, disable_cache=disable_cache, pool_size=self._max_workers\n         )\n@@ -222,21 +220,6 @@ class Executor:\n \n         return 1 if self._shutdown else 0\n \n-    @staticmethod\n-    def _get_max_workers(desired_max_workers: int | None = None) -> int:\n-        # This should be directly handled by ThreadPoolExecutor\n-        # however, on some systems the number of CPUs cannot be determined\n-        # (it raises a NotImplementedError), so, in this case, we assume\n-        # that the system only has one CPU.\n-        try:\n-            default_max_workers = (os.cpu_count() or 1) + 4\n-        except NotImplementedError:\n-            default_max_workers = 5\n-\n-        if desired_max_workers is None:\n-            return default_max_workers\n-        return min(default_max_workers, desired_max_workers)\n-\n     def _write(self, operation: Operation, line: str) -> None:\n         if not self.supports_fancy_output() or not self._should_write_operation(\n             operation\n@@ -314,9 +297,9 @@ class Executor:\n                 with self._lock:\n                     trace = ExceptionTrace(e)\n                     trace.render(io)\n+                    pkg = operation.package\n                     if isinstance(e, ChefBuildError):\n-                        pkg = operation.package\n-                        pip_command = \"pip wheel --use-pep517\"\n+                        pip_command = \"pip wheel --no-cache-dir --use-pep517\"\n                         if pkg.develop:\n                             requirement = pkg.source_url\n                             pip_command += \" --editable\"\n@@ -324,8 +307,7 @@ class Executor:\n                             requirement = (\n                                 pkg.to_dependency().to_pep_508().split(\";\")[0].strip()\n                             )\n-                        io.write_line(\"\")\n-                        io.write_line(\n+                        message = (\n                             \"<info>\"\n                             \"Note: This error originates from the build backend,\"\n                             \" and is likely not a problem with poetry\"\n@@ -334,19 +316,30 @@ class Executor:\n                             f\" running '{pip_command} \\\"{requirement}\\\"'.\"\n                             \"</info>\"\n                         )\n+                    elif isinstance(e, ChefInstallError):\n+                        message = (\n+                            \"<error>\"\n+                            \"Cannot install build-system.requires\"\n+                            f\" for {pkg.pretty_name}.\"\n+                            \"</error>\"\n+                        )\n                     elif isinstance(e, SolverProblemError):\n-                        pkg = operation.package\n-                        io.write_line(\"\")\n-                        io.write_line(\n+                        message = (\n                             \"<error>\"\n                             \"Cannot resolve build-system.requires\"\n                             f\" for {pkg.pretty_name}.\"\n                             \"</error>\"\n                         )\n+                    else:\n+                        message = f\"<error>Cannot install {pkg.pretty_name}.</error>\"\n+\n+                    io.write_line(\"\")\n+                    io.write_line(message)\n                     io.write_line(\"\")\n             finally:\n                 with self._lock:\n                     self._shutdown = True\n+\n         except KeyboardInterrupt:\n             try:\n                 message = (\n@@ -755,23 +748,11 @@ class Executor:\n     def _download_link(self, operation: Install | Update, link: Link) -> Path:\n         package = operation.package\n \n-        output_dir = self._artifact_cache.get_cache_directory_for_link(link)\n-        # Try to get cached original package for the link provided\n+        # Get original package for the link provided\n+        download_func = functools.partial(self._download_archive, operation)\n         original_archive = self._artifact_cache.get_cached_archive_for_link(\n-            link, strict=True\n+            link, strict=True, download_func=download_func\n         )\n-        if original_archive is None:\n-            # No cached original distributions was found, so we download and prepare it\n-            try:\n-                original_archive = self._download_archive(operation, link)\n-            except BaseException:\n-                cache_directory = self._artifact_cache.get_cache_directory_for_link(\n-                    link\n-                )\n-                cached_file = cache_directory.joinpath(link.filename)\n-                cached_file.unlink(missing_ok=True)\n-\n-                raise\n \n         # Get potential higher prioritized cached archive, otherwise it will fall back\n         # to the original archive.\n@@ -797,7 +778,7 @@ class Executor:\n             )\n             self._write(operation, message)\n \n-            archive = self._chef.prepare(archive, output_dir=output_dir)\n+            archive = self._chef.prepare(archive, output_dir=original_archive.parent)\n \n         # Use the original archive to provide the correct hash.\n         self._populate_hashes_dict(original_archive, package)\n@@ -822,11 +803,15 @@ class Executor:\n \n         return archive_hash\n \n-    def _download_archive(self, operation: Install | Update, link: Link) -> Path:\n-        response = self._authenticator.request(\n-            \"get\", link.url, stream=True, io=self._sections.get(id(operation), self._io)\n-        )\n-        wheel_size = response.headers.get(\"content-length\")\n+    def _download_archive(\n+        self,\n+        operation: Install | Update,\n+        url: str,\n+        dest: Path,\n+    ) -> None:\n+        downloader = Downloader(url, dest, self._authenticator)\n+        wheel_size = downloader.total_size\n+\n         operation_message = self.get_operation_message(operation)\n         message = (\n             f\"  <fg=blue;options=bold>•</> {operation_message}: <info>Downloading...</>\"\n@@ -848,30 +833,15 @@ class Executor:\n                 self._sections[id(operation)].clear()\n                 progress.start()\n \n-        done = 0\n-        archive = (\n-            self._artifact_cache.get_cache_directory_for_link(link) / link.filename\n-        )\n-        archive.parent.mkdir(parents=True, exist_ok=True)\n-        with atomic_open(archive) as f:\n-            for chunk in response.iter_content(chunk_size=4096):\n-                if not chunk:\n-                    break\n-\n-                done += len(chunk)\n-\n-                if progress:\n-                    with self._lock:\n-                        progress.set_progress(done)\n-\n-                f.write(chunk)\n+        for fetched_size in downloader.download_with_progress(chunk_size=4096):\n+            if progress:\n+                with self._lock:\n+                    progress.set_progress(fetched_size)\n \n         if progress:\n             with self._lock:\n                 progress.finish()\n \n-        return archive\n-\n     def _should_write_operation(self, operation: Operation) -> bool:\n         return (\n             not operation.skipped or self._dry_run or self._verbose or not self._enabled\n\ndiff --git a/src/poetry/installation/wheel_installer.py b/src/poetry/installation/wheel_installer.py\nindex d25811f..27a867f 100644\n--- a/src/poetry/installation/wheel_installer.py\n+++ b/src/poetry/installation/wheel_installer.py\n@@ -1,5 +1,6 @@\n from __future__ import annotations\n \n+import logging\n import platform\n import sys\n \n@@ -15,7 +16,10 @@ from poetry.__version__ import __version__\n from poetry.utils._compat import WINDOWS\n \n \n+logger = logging.getLogger(__name__)\n+\n if TYPE_CHECKING:\n+    from collections.abc import Collection\n     from typing import BinaryIO\n \n     from installer.records import RecordEntry\n@@ -42,9 +46,9 @@ class WheelDestination(SchemeDictionaryDestination):\n \n         target_path = Path(self.scheme_dict[scheme]) / path\n         if target_path.exists():\n-            # Contrary to the base library we don't raise an error\n-            # here since it can break namespace packages (like Poetry's)\n-            pass\n+            # Contrary to the base library we don't raise an error here since it can\n+            # break pkgutil-style and pkg_resource-style namespace packages.\n+            logger.warning(f\"Installing {target_path} over existing file\")\n \n         parent_folder = target_path.parent\n         if not parent_folder.exists():\n@@ -60,18 +64,6 @@ class WheelDestination(SchemeDictionaryDestination):\n \n         return RecordEntry(path, Hash(self.hash_algorithm, hash_), size)\n \n-    def for_source(self, source: WheelFile) -> WheelDestination:\n-        scheme_dict = self.scheme_dict.copy()\n-\n-        scheme_dict[\"headers\"] = str(Path(scheme_dict[\"headers\"]) / source.distribution)\n-\n-        return self.__class__(\n-            scheme_dict,\n-            interpreter=self.interpreter,\n-            script_kind=self.script_kind,\n-            bytecode_optimization_levels=self.bytecode_optimization_levels,\n-        )\n-\n \n class WheelInstaller:\n     def __init__(self, env: Env) -> None:\n@@ -85,18 +77,13 @@ class WheelInstaller:\n                 script_kind = \"win-arm64\" if sys.maxsize > 2**32 else \"win-arm\"\n             else:\n                 script_kind = \"win-amd64\" if sys.maxsize > 2**32 else \"win-ia32\"\n+        self._script_kind = script_kind\n \n-        schemes = self._env.paths\n-        schemes[\"headers\"] = schemes[\"include\"]\n-\n-        self._destination = WheelDestination(\n-            schemes, interpreter=str(self._env.python), script_kind=script_kind\n-        )\n-\n+        self._bytecode_optimization_levels: Collection[int] = ()\n         self.invalid_wheels: dict[Path, list[str]] = {}\n \n     def enable_bytecode_compilation(self, enable: bool = True) -> None:\n-        self._destination.bytecode_optimization_levels = (-1,) if enable else ()\n+        self._bytecode_optimization_levels = (-1,) if enable else ()\n \n     def install(self, wheel: Path) -> None:\n         with WheelFile.open(wheel) as source:\n@@ -107,9 +94,21 @@ class WheelInstaller:\n                 source.validate_record(validate_contents=False)\n             except _WheelFileValidationError as e:\n                 self.invalid_wheels[wheel] = e.issues\n+\n+            scheme_dict = self._env.paths.copy()\n+            scheme_dict[\"headers\"] = str(\n+                Path(scheme_dict[\"include\"]) / source.distribution\n+            )\n+            destination = WheelDestination(\n+                scheme_dict,\n+                interpreter=str(self._env.python),\n+                script_kind=self._script_kind,\n+                bytecode_optimization_levels=self._bytecode_optimization_levels,\n+            )\n+\n             install(\n                 source=source,\n-                destination=self._destination.for_source(source),\n+                destination=destination,\n                 # Additional metadata that is generated by the installation tool.\n                 additional_metadata={\n                     \"INSTALLER\": f\"Poetry {__version__}\".encode(),\n\ndiff --git a/src/poetry/json/__init__.py b/src/poetry/json/__init__.py\nindex 06ee010..de4f178 100644\n--- a/src/poetry/json/__init__.py\n+++ b/src/poetry/json/__init__.py\n@@ -5,8 +5,9 @@ import json\n from pathlib import Path\n from typing import Any\n \n-import jsonschema\n+import fastjsonschema\n \n+from fastjsonschema.exceptions import JsonSchemaException\n from poetry.core.json import SCHEMA_DIR as CORE_SCHEMA_DIR\n \n \n@@ -21,18 +22,13 @@ def validate_object(obj: dict[str, Any]) -> list[str]:\n     schema_file = Path(SCHEMA_DIR, \"poetry.json\")\n     schema = json.loads(schema_file.read_text(encoding=\"utf-8\"))\n \n-    validator = jsonschema.Draft7Validator(schema)\n-    validation_errors = sorted(validator.iter_errors(obj), key=lambda e: e.path)\n+    validate = fastjsonschema.compile(schema)\n \n     errors = []\n-\n-    for error in validation_errors:\n-        message = error.message\n-        if error.path:\n-            path = \".\".join(str(x) for x in error.absolute_path)\n-            message = f\"[{path}] {message}\"\n-\n-        errors.append(message)\n+    try:\n+        validate(obj)\n+    except JsonSchemaException as e:\n+        errors = [e.message]\n \n     core_schema = json.loads(\n         (CORE_SCHEMA_DIR / \"poetry-schema.json\").read_text(encoding=\"utf-8\")\n\ndiff --git a/src/poetry/mixology/failure.py b/src/poetry/mixology/failure.py\nindex da14d15..8c7cebb 100644\n--- a/src/poetry/mixology/failure.py\n+++ b/src/poetry/mixology/failure.py\n@@ -41,7 +41,7 @@ class _Writer:\n             if isinstance(incompatibility.cause, PythonCause):\n                 if not required_python_version_notification:\n                     buffer.append(\n-                        \"The current project's Python requirement\"\n+                        \"The current project's supported Python range\"\n                         f\" ({incompatibility.cause.root_python_version}) is not\"\n                         \" compatible with some of the required packages Python\"\n                         \" requirement:\"\n\ndiff --git a/src/poetry/mixology/solutions/providers/python_requirement_solution_provider.py b/src/poetry/mixology/solutions/providers/python_requirement_solution_provider.py\nindex b7d6e83..040e325 100644\n--- a/src/poetry/mixology/solutions/providers/python_requirement_solution_provider.py\n+++ b/src/poetry/mixology/solutions/providers/python_requirement_solution_provider.py\n@@ -19,7 +19,7 @@ class PythonRequirementSolutionProvider(HasSolutionsForException):\n             return False\n \n         m = re.match(\n-            \"^The current project's Python requirement (.+) is not compatible \"\n+            \"^The current project's supported Python range (.+) is not compatible \"\n             \"with some of the required packages Python requirement\",\n             str(exception),\n         )\n\ndiff --git a/src/poetry/mixology/solutions/solutions/python_requirement_solution.py b/src/poetry/mixology/solutions/solutions/python_requirement_solution.py\nindex b625e12..9856ca3 100644\n--- a/src/poetry/mixology/solutions/solutions/python_requirement_solution.py\n+++ b/src/poetry/mixology/solutions/solutions/python_requirement_solution.py\n@@ -58,6 +58,6 @@ class PythonRequirementSolution(Solution):\n     @property\n     def documentation_links(self) -> list[str]:\n         return [\n-            \"https://python-poetry.org/docs/dependency-specification/#python-restricted-dependencies\",  # noqa: E501\n-            \"https://python-poetry.org/docs/dependency-specification/#using-environment-markers\",  # noqa: E501\n+            \"https://python-poetry.org/docs/dependency-specification/#python-restricted-dependencies\",\n+            \"https://python-poetry.org/docs/dependency-specification/#using-environment-markers\",\n         ]\n\ndiff --git a/src/poetry/mixology/version_solver.py b/src/poetry/mixology/version_solver.py\nindex 5c613a7..55e76a5 100644\n--- a/src/poetry/mixology/version_solver.py\n+++ b/src/poetry/mixology/version_solver.py\n@@ -394,7 +394,7 @@ class VersionSolver:\n             # details.\n             #\n             # .. _algorithm documentation:\n-            # https://github.com/dart-lang/pub/tree/master/doc/solver.md#conflict-resolution  # noqa: E501\n+            # https://github.com/dart-lang/pub/tree/master/doc/solver.md#conflict-resolution\n             if difference is not None:\n                 inverse = difference.inverse\n                 if inverse.dependency != most_recent_satisfier.dependency:\n\ndiff --git a/src/poetry/packages/direct_origin.py b/src/poetry/packages/direct_origin.py\nindex f8e6095..9451e38 100644\n--- a/src/poetry/packages/direct_origin.py\n+++ b/src/poetry/packages/direct_origin.py\n@@ -76,14 +76,9 @@ class DirectOrigin:\n \n     def get_package_from_url(self, url: str) -> Package:\n         link = Link(url)\n-        artifact = self._artifact_cache.get_cached_archive_for_link(link, strict=True)\n-\n-        if not artifact:\n-            artifact = (\n-                self._artifact_cache.get_cache_directory_for_link(link) / link.filename\n-            )\n-            artifact.parent.mkdir(parents=True, exist_ok=True)\n-            download_file(url, artifact)\n+        artifact = self._artifact_cache.get_cached_archive_for_link(\n+            link, strict=True, download_func=download_file\n+        )\n \n         package = self.get_package_from_file(artifact)\n         package.files = [\n\ndiff --git a/src/poetry/packages/locker.py b/src/poetry/packages/locker.py\nindex 2031194..822e0a5 100644\n--- a/src/poetry/packages/locker.py\n+++ b/src/poetry/packages/locker.py\n@@ -323,6 +323,14 @@ class Locker:\n             except tomllib.TOMLDecodeError as e:\n                 raise RuntimeError(f\"Unable to read the lock file ({e}).\")\n \n+        # if the lockfile doesn't contain a metadata section at all,\n+        # it probably needs to be rebuilt completely\n+        if \"metadata\" not in lock_data:\n+            raise RuntimeError(\n+                \"The lock file does not have a metadata entry.\\n\"\n+                \"Regenerate the lock file with the `poetry lock` command.\"\n+            )\n+\n         metadata = lock_data[\"metadata\"]\n         lock_version = Version.parse(metadata.get(\"lock-version\", \"1.0\"))\n         current_version = Version.parse(self._VERSION)\n\ndiff --git a/src/poetry/publishing/uploader.py b/src/poetry/publishing/uploader.py\nindex e4d5088..ab415db 100644\n--- a/src/poetry/publishing/uploader.py\n+++ b/src/poetry/publishing/uploader.py\n@@ -31,17 +31,20 @@ if TYPE_CHECKING:\n class UploadError(Exception):\n     def __init__(self, error: ConnectionError | HTTPError | str) -> None:\n         if isinstance(error, HTTPError):\n-            message = (\n-                f\"HTTP Error {error.response.status_code}: {error.response.reason} |\"\n-                f\" {error.response.content!r}\"\n-            )\n+            if error.response is None:\n+                message = \"HTTP Error connecting to the repository\"\n+            else:\n+                message = (\n+                    f\"HTTP Error {error.response.status_code}: \"\n+                    f\"{error.response.reason} | {error.response.content!r}\"\n+                )\n         elif isinstance(error, ConnectionError):\n             message = (\n                 \"Connection Error: We were unable to connect to the repository, \"\n                 \"ensure the url is correct and can be reached.\"\n             )\n         else:\n-            message = str(error)\n+            message = error\n         super().__init__(message)\n \n \n@@ -74,7 +77,7 @@ class Uploader:\n         self._password = password\n \n     def make_session(self) -> requests.Session:\n-        session = requests.session()\n+        session = requests.Session()\n         auth = self.get_auth()\n         if auth is not None:\n             session.auth = auth\n@@ -103,10 +106,8 @@ class Uploader:\n         if client_cert:\n             session.cert = str(client_cert)\n \n-        try:\n+        with session:\n             self._upload(session, url, dry_run, skip_existing)\n-        finally:\n-            session.close()\n \n     def post_data(self, file: Path) -> dict[str, Any]:\n         meta = Metadata.from_package(self._package)\n@@ -321,7 +322,7 @@ class Uploader:\n         raise ValueError(\"Unknown distribution format \" + \"\".join(exts))\n \n     def _is_file_exists_error(self, response: requests.Response) -> bool:\n-        # based on https://github.com/pypa/twine/blob/a6dd69c79f7b5abfb79022092a5d3776a499e31b/twine/commands/upload.py#L32  # noqa: E501\n+        # based on https://github.com/pypa/twine/blob/a6dd69c79f7b5abfb79022092a5d3776a499e31b/twine/commands/upload.py#L32\n         status = response.status_code\n         reason = response.reason.lower()\n         text = response.text.lower()\n\ndiff --git a/src/poetry/puzzle/provider.py b/src/poetry/puzzle/provider.py\nindex a7ef7a0..09fbe86 100644\n--- a/src/poetry/puzzle/provider.py\n+++ b/src/poetry/puzzle/provider.py\n@@ -606,10 +606,11 @@ class Provider:\n \n             # For dependency resolution, markers of duplicate dependencies must be\n             # mutually exclusive.\n-            deps = self._resolve_overlapping_markers(package, deps)\n+            active_extras = None if package.is_root() else dependency.extras\n+            deps = self._resolve_overlapping_markers(package, deps, active_extras)\n \n             if len(deps) == 1:\n-                self.debug(f\"<debug>Merging requirements for {deps[0]!s}</debug>\")\n+                self.debug(f\"<debug>Merging requirements for {dep_name}</debug>\")\n                 dependencies.append(deps[0])\n                 continue\n \n@@ -682,7 +683,6 @@ class Provider:\n                 if python_constraint_intersection.is_empty():\n                     # This dependency is not needed under current python constraint.\n                     continue\n-                dep.transitive_python_versions = str(python_constraint_intersection)\n \n             clean_dependencies.append(dep)\n \n@@ -839,11 +839,14 @@ class Provider:\n \n         return merged_dependencies\n \n-    def _is_relevant_marker(self, marker: BaseMarker) -> bool:\n+    def _is_relevant_marker(\n+        self, marker: BaseMarker, active_extras: Collection[NormalizedName] | None\n+    ) -> bool:\n         \"\"\"\n         A marker is relevant if\n         - it is not empty\n         - allowed by the project's python constraint\n+        - allowed by active extras of the dependency (not relevant for root package)\n         - allowed by the environment (only during installation)\n         \"\"\"\n         return (\n@@ -851,11 +854,15 @@ class Provider:\n             and self._python_constraint.allows_any(\n                 get_python_constraint_from_marker(marker)\n             )\n+            and (active_extras is None or marker.validate({\"extra\": active_extras}))\n             and (not self._env or marker.validate(self._env.marker_env))\n         )\n \n     def _resolve_overlapping_markers(\n-        self, package: Package, dependencies: list[Dependency]\n+        self,\n+        package: Package,\n+        dependencies: list[Dependency],\n+        active_extras: Collection[NormalizedName] | None,\n     ) -> list[Dependency]:\n         \"\"\"\n         Convert duplicate dependencies with potentially overlapping markers\n@@ -888,7 +895,7 @@ class Provider:\n             used_marker_intersection: BaseMarker = AnyMarker()\n             for m in markers:\n                 used_marker_intersection = used_marker_intersection.intersect(m)\n-            if not self._is_relevant_marker(used_marker_intersection):\n+            if not self._is_relevant_marker(used_marker_intersection, active_extras):\n                 continue\n \n             # intersection of constraints\n\ndiff --git a/src/poetry/puzzle/transaction.py b/src/poetry/puzzle/transaction.py\nindex 6650934..7a5f8bc 100644\n--- a/src/poetry/puzzle/transaction.py\n+++ b/src/poetry/puzzle/transaction.py\n@@ -98,14 +98,9 @@ class Transaction:\n                 result_package_names = {\n                     result_package.name for result_package, _ in self._result_packages\n                 }\n-                # We preserve pip/setuptools/wheel when not managed by poetry, this is\n-                # done to avoid externally managed virtual environments causing\n-                # unnecessary removals.\n-                preserved_package_names = {\n-                    \"pip\",\n-                    \"setuptools\",\n-                    \"wheel\",\n-                } - result_package_names\n+                # We preserve pip when not managed by poetry, this is done to avoid\n+                # externally managed virtual environments causing unnecessary removals.\n+                preserved_package_names = {\"pip\"} - result_package_names\n \n                 for installed_package in self._installed_packages:\n                     if installed_package.name in uninstalls:\n\ndiff --git a/src/poetry/repositories/abstract_repository.py b/src/poetry/repositories/abstract_repository.py\nindex dbbc6a9..a40b970 100644\n--- a/src/poetry/repositories/abstract_repository.py\n+++ b/src/poetry/repositories/abstract_repository.py\n@@ -20,12 +20,10 @@ class AbstractRepository(ABC):\n         return self._name\n \n     @abstractmethod\n-    def find_packages(self, dependency: Dependency) -> list[Package]:\n-        ...\n+    def find_packages(self, dependency: Dependency) -> list[Package]: ...\n \n     @abstractmethod\n-    def search(self, query: str) -> list[Package]:\n-        ...\n+    def search(self, query: str) -> list[Package]: ...\n \n     @abstractmethod\n     def package(\n@@ -33,5 +31,4 @@ class AbstractRepository(ABC):\n         name: str,\n         version: Version,\n         extras: list[str] | None = None,\n-    ) -> Package:\n-        ...\n+    ) -> Package: ...\n\ndiff --git a/src/poetry/repositories/cached_repository.py b/src/poetry/repositories/cached_repository.py\nindex a04fb4d..1a24477 100644\n--- a/src/poetry/repositories/cached_repository.py\n+++ b/src/poetry/repositories/cached_repository.py\n@@ -35,8 +35,7 @@ class CachedRepository(Repository, ABC):\n     @abstractmethod\n     def _get_release_info(\n         self, name: NormalizedName, version: Version\n-    ) -> dict[str, Any]:\n-        ...\n+    ) -> dict[str, Any]: ...\n \n     def get_release_info(self, name: NormalizedName, version: Version) -> PackageInfo:\n         \"\"\"\n\ndiff --git a/src/poetry/repositories/http_repository.py b/src/poetry/repositories/http_repository.py\nindex ebf8b1a..826703a 100644\n--- a/src/poetry/repositories/http_repository.py\n+++ b/src/poetry/repositories/http_repository.py\n@@ -11,6 +11,7 @@ from typing import Any\n from typing import Iterator\n \n import requests\n+import requests.adapters\n \n from poetry.core.constraints.version import parse_constraint\n from poetry.core.packages.dependency import Dependency\n@@ -44,6 +45,7 @@ class HTTPRepository(CachedRepository):\n         url: str,\n         config: Config | None = None,\n         disable_cache: bool = False,\n+        pool_size: int = requests.adapters.DEFAULT_POOLSIZE,\n     ) -> None:\n         super().__init__(name, disable_cache, config)\n         self._url = url\n@@ -51,6 +53,7 @@ class HTTPRepository(CachedRepository):\n             config=config,\n             cache_id=name,\n             disable_cache=disable_cache,\n+            pool_size=pool_size,\n         )\n         self._authenticator.add_repository(name, url)\n         self.get_page = functools.lru_cache(maxsize=None)(self._get_page)\n\ndiff --git a/src/poetry/repositories/legacy_repository.py b/src/poetry/repositories/legacy_repository.py\nindex 2c23a9e..a6557ee 100644\n--- a/src/poetry/repositories/legacy_repository.py\n+++ b/src/poetry/repositories/legacy_repository.py\n@@ -3,6 +3,8 @@ from __future__ import annotations\n from typing import TYPE_CHECKING\n from typing import Any\n \n+import requests.adapters\n+\n from poetry.core.packages.package import Package\n \n from poetry.inspection.info import PackageInfo\n@@ -27,11 +29,12 @@ class LegacyRepository(HTTPRepository):\n         url: str,\n         config: Config | None = None,\n         disable_cache: bool = False,\n+        pool_size: int = requests.adapters.DEFAULT_POOLSIZE,\n     ) -> None:\n         if name == \"pypi\":\n             raise ValueError(\"The name [pypi] is reserved for repositories\")\n \n-        super().__init__(name, url.rstrip(\"/\"), config, disable_cache)\n+        super().__init__(name, url.rstrip(\"/\"), config, disable_cache, pool_size)\n \n     @property\n     def packages(self) -> list[Package]:\n\ndiff --git a/src/poetry/repositories/pypi_repository.py b/src/poetry/repositories/pypi_repository.py\nindex cf63e3c..66f6fb6 100644\n--- a/src/poetry/repositories/pypi_repository.py\n+++ b/src/poetry/repositories/pypi_repository.py\n@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING\n from typing import Any\n \n import requests\n+import requests.adapters\n \n from cachecontrol.controller import logger as cache_control_logger\n from poetry.core.packages.package import Package\n@@ -38,9 +39,13 @@ class PyPiRepository(HTTPRepository):\n         url: str = \"https://pypi.org/\",\n         disable_cache: bool = False,\n         fallback: bool = True,\n+        pool_size: int = requests.adapters.DEFAULT_POOLSIZE,\n     ) -> None:\n         super().__init__(\n-            \"PyPI\", url.rstrip(\"/\") + \"/simple/\", disable_cache=disable_cache\n+            \"PyPI\",\n+            url.rstrip(\"/\") + \"/simple/\",\n+            disable_cache=disable_cache,\n+            pool_size=pool_size,\n         )\n \n         self._base_url = url\n@@ -49,7 +54,7 @@ class PyPiRepository(HTTPRepository):\n     def search(self, query: str) -> list[Package]:\n         results = []\n \n-        response = requests.session().get(\n+        response = requests.get(\n             self._base_url + \"search\", params={\"q\": query}, timeout=REQUESTS_TIMEOUT\n         )\n         parser = SearchResultParser()\n\ndiff --git a/src/poetry/utils/authenticator.py b/src/poetry/utils/authenticator.py\nindex dd432e9..2628e5b 100644\n--- a/src/poetry/utils/authenticator.py\n+++ b/src/poetry/utils/authenticator.py\n@@ -13,12 +13,15 @@ from typing import TYPE_CHECKING\n from typing import Any\n \n import requests\n+import requests.adapters\n import requests.auth\n import requests.exceptions\n \n from cachecontrol import CacheControlAdapter\n from cachecontrol.caches import FileCache\n+from requests_toolbelt import user_agent\n \n+from poetry.__version__ import __version__\n from poetry.config.config import Config\n from poetry.exceptions import PoetryException\n from poetry.utils.constants import REQUESTS_TIMEOUT\n@@ -108,16 +111,16 @@ class Authenticator:\n         io: IO | None = None,\n         cache_id: str | None = None,\n         disable_cache: bool = False,\n-        pool_size: int = 10,\n+        pool_size: int = requests.adapters.DEFAULT_POOLSIZE,\n     ) -> None:\n         self._config = config or Config.create()\n         self._io = io\n         self._sessions_for_netloc: dict[str, requests.Session] = {}\n         self._credentials: dict[str, HTTPAuthCredential] = {}\n         self._certs: dict[str, RepositoryCertificateConfig] = {}\n-        self._configured_repositories: dict[\n-            str, AuthenticatorRepositoryConfig\n-        ] | None = None\n+        self._configured_repositories: (\n+            dict[str, AuthenticatorRepositoryConfig] | None\n+        ) = None\n         self._password_manager = PasswordManager(self._config)\n         self._cache_control = (\n             FileCache(\n@@ -134,9 +137,11 @@ class Authenticator:\n             self._get_repository_config_for_url\n         )\n         self._pool_size = pool_size\n+        self._user_agent = user_agent(\"poetry\", __version__)\n \n     def create_session(self) -> requests.Session:\n         session = requests.Session()\n+        session.headers[\"User-Agent\"] = self._user_agent\n \n         if self._cache_control is None:\n             return session\n\ndiff --git a/src/poetry/utils/cache.py b/src/poetry/utils/cache.py\nindex 79e6739..99955e4 100644\n--- a/src/poetry/utils/cache.py\n+++ b/src/poetry/utils/cache.py\n@@ -5,13 +5,16 @@ import hashlib\n import json\n import logging\n import shutil\n+import threading\n import time\n \n+from collections import defaultdict\n from pathlib import Path\n from typing import TYPE_CHECKING\n from typing import Any\n from typing import Generic\n from typing import TypeVar\n+from typing import overload\n \n from poetry.utils._compat import decode\n from poetry.utils._compat import encode\n@@ -187,6 +190,9 @@ class FileCache(Generic[T]):\n class ArtifactCache:\n     def __init__(self, *, cache_dir: Path) -> None:\n         self._cache_dir = cache_dir\n+        self._archive_locks: defaultdict[Path, threading.Lock] = defaultdict(\n+            threading.Lock\n+        )\n \n     def get_cache_directory_for_link(self, link: Link) -> Path:\n         key_parts = {\"url\": link.url_without_fragment}\n@@ -218,18 +224,54 @@ class ArtifactCache:\n \n         return self._get_directory_from_hash(key_parts)\n \n+    @overload\n+    def get_cached_archive_for_link(\n+        self,\n+        link: Link,\n+        *,\n+        strict: bool,\n+        env: Env | None = ...,\n+        download_func: Callable[[str, Path], None],\n+    ) -> Path: ...\n+\n+    @overload\n+    def get_cached_archive_for_link(\n+        self,\n+        link: Link,\n+        *,\n+        strict: bool,\n+        env: Env | None = ...,\n+        download_func: None = ...,\n+    ) -> Path | None: ...\n+\n     def get_cached_archive_for_link(\n         self,\n         link: Link,\n         *,\n         strict: bool,\n         env: Env | None = None,\n+        download_func: Callable[[str, Path], None] | None = None,\n     ) -> Path | None:\n         cache_dir = self.get_cache_directory_for_link(link)\n \n-        return self._get_cached_archive(\n+        cached_archive = self._get_cached_archive(\n             cache_dir, strict=strict, filename=link.filename, env=env\n         )\n+        if cached_archive is None and strict and download_func is not None:\n+            cached_archive = cache_dir / link.filename\n+            with self._archive_locks[cached_archive]:\n+                # Check again if the archive exists (under the lock) to avoid\n+                # duplicate downloads because it may have already been downloaded\n+                # by another thread in the meantime\n+                if not cached_archive.exists():\n+                    cache_dir.mkdir(parents=True, exist_ok=True)\n+                    try:\n+                        download_func(link.url, cached_archive)\n+                    except BaseException:\n+                        cached_archive.unlink(missing_ok=True)\n+                        raise\n+\n+        return cached_archive\n \n     def get_cached_archive_for_git(\n         self, url: str, reference: str, subdirectory: str | None, env: Env\n@@ -246,8 +288,9 @@ class ArtifactCache:\n         filename: str | None = None,\n         env: Env | None = None,\n     ) -> Path | None:\n+        # implication \"not strict -> env must not be None\"\n         assert strict or env is not None\n-        # implication \"strict -> filename should not be None\"\n+        # implication \"strict -> filename must not be None\"\n         assert not strict or filename is not None\n \n         archives = self._get_cached_archives(cache_dir)\n\ndiff --git a/src/poetry/utils/env/__init__.py b/src/poetry/utils/env/__init__.py\nindex dc5bc36..ed22bb3 100644\n--- a/src/poetry/utils/env/__init__.py\n+++ b/src/poetry/utils/env/__init__.py\n@@ -41,7 +41,7 @@ if TYPE_CHECKING:\n @contextmanager\n def ephemeral_environment(\n     executable: Path | None = None,\n-    flags: dict[str, bool] | None = None,\n+    flags: dict[str, str | bool] | None = None,\n ) -> Iterator[VirtualEnv]:\n     with temporary_directory() as tmp_dir:\n         # TODO: cache PEP 517 build environment corresponding to each project venv\n\ndiff --git a/src/poetry/utils/env/base_env.py b/src/poetry/utils/env/base_env.py\nindex 487a0aa..0880502 100644\n--- a/src/poetry/utils/env/base_env.py\n+++ b/src/poetry/utils/env/base_env.py\n@@ -219,8 +219,11 @@ class Env:\n \n         return self._platlib\n \n+    def _get_lib_dirs(self) -> list[Path]:\n+        return [self.purelib, self.platlib]\n+\n     def is_path_relative_to_lib(self, path: Path) -> bool:\n-        for lib_path in [self.purelib, self.platlib]:\n+        for lib_path in self._get_lib_dirs():\n             with contextlib.suppress(ValueError):\n                 path.relative_to(lib_path)\n                 return True\n@@ -324,8 +327,8 @@ class Env:\n             \"-I\",\n             \"-W\",\n             \"ignore\",\n-            \"-\",\n-            input_=content,\n+            \"-c\",\n+            content,\n             stderr=subprocess.PIPE,\n             **kwargs,\n         )\n@@ -335,23 +338,11 @@ class Env:\n         Run a command inside the Python environment.\n         \"\"\"\n         call = kwargs.pop(\"call\", False)\n-        input_ = kwargs.pop(\"input_\", None)\n         env = kwargs.pop(\"env\", dict(os.environ))\n         stderr = kwargs.pop(\"stderr\", subprocess.STDOUT)\n \n         try:\n-            if input_:\n-                output: str = subprocess.run(\n-                    cmd,\n-                    stdout=subprocess.PIPE,\n-                    stderr=stderr,\n-                    input=input_,\n-                    check=True,\n-                    env=env,\n-                    text=True,\n-                    **kwargs,\n-                ).stdout\n-            elif call:\n+            if call:\n                 assert stderr != subprocess.PIPE\n                 subprocess.check_call(cmd, stderr=stderr, env=env, **kwargs)\n                 output = \"\"\n@@ -360,7 +351,7 @@ class Env:\n                     cmd, stderr=stderr, env=env, text=True, **kwargs\n                 )\n         except CalledProcessError as e:\n-            raise EnvCommandError(e, input=input_)\n+            raise EnvCommandError(e)\n \n         return output\n \n\ndiff --git a/src/poetry/utils/env/env_manager.py b/src/poetry/utils/env/env_manager.py\nindex 1fa70af..e7b0cc7 100644\n--- a/src/poetry/utils/env/env_manager.py\n+++ b/src/poetry/utils/env/env_manager.py\n@@ -612,35 +612,40 @@ class EnvManager:\n         cls,\n         path: Path,\n         executable: Path | None = None,\n-        flags: dict[str, bool] | None = None,\n+        flags: dict[str, str | bool] | None = None,\n         with_pip: bool | None = None,\n         with_wheel: bool | None = None,\n         with_setuptools: bool | None = None,\n         prompt: str | None = None,\n     ) -> virtualenv.run.session.Session:\n-        if WINDOWS:\n-            path = get_real_windows_path(path)\n-            executable = get_real_windows_path(executable) if executable else None\n-\n         flags = flags or {}\n \n-        flags[\"no-pip\"] = (\n-            not with_pip if with_pip is not None else flags.pop(\"no-pip\", True)\n-        )\n+        if with_pip is not None:\n+            flags[\"no-pip\"] = not with_pip\n \n-        flags[\"no-setuptools\"] = (\n-            not with_setuptools\n-            if with_setuptools is not None\n-            else flags.pop(\"no-setuptools\", True)\n-        )\n+        if with_wheel is not None:\n+            wheel_flags: dict[str, str | bool] = (\n+                {\"wheel\": \"bundle\"} if with_wheel else {\"no-wheel\": True}\n+            )\n+            flags.update(wheel_flags)\n \n-        # we want wheels to be enabled when pip is required and it has not been\n-        # explicitly disabled\n-        flags[\"no-wheel\"] = (\n-            not with_wheel\n-            if with_wheel is not None\n-            else flags.pop(\"no-wheel\", flags[\"no-pip\"])\n-        )\n+        if with_setuptools is not None:\n+            setuptools_flags: dict[str, str | bool] = (\n+                {\"setuptools\": \"bundle\"} if with_setuptools else {\"no-setuptools\": True}\n+            )\n+            flags.update(setuptools_flags)\n+\n+        flags.setdefault(\"no-pip\", True)\n+\n+        if \"setuptools\" not in flags and \"no-setuptools\" not in flags:\n+            flags[\"no-setuptools\"] = True\n+\n+        if \"wheel\" not in flags and \"no-wheel\" not in flags:\n+            flags[\"no-wheel\"] = True\n+\n+        if WINDOWS:\n+            path = get_real_windows_path(path)\n+            executable = get_real_windows_path(executable) if executable else None\n \n         executable_str = None if executable is None else executable.resolve().as_posix()\n \n@@ -658,6 +663,9 @@ class EnvManager:\n             if value is True:\n                 args.append(f\"--{flag}\")\n \n+            elif value is not False:\n+                args.append(f\"--{flag}={value}\")\n+\n         args.append(str(path))\n \n         cli_result = virtualenv.cli_run(args)\n\ndiff --git a/src/poetry/utils/env/exceptions.py b/src/poetry/utils/env/exceptions.py\nindex 13c4311..ece3b39 100644\n--- a/src/poetry/utils/env/exceptions.py\n+++ b/src/poetry/utils/env/exceptions.py\n@@ -20,7 +20,7 @@ class IncorrectEnvError(EnvError):\n \n \n class EnvCommandError(EnvError):\n-    def __init__(self, e: CalledProcessError, input: str | None = None) -> None:\n+    def __init__(self, e: CalledProcessError) -> None:\n         self.e = e\n \n         message_parts = [\n@@ -30,8 +30,6 @@ class EnvCommandError(EnvError):\n             message_parts.append(f\"Output:\\n{decode(e.output)}\")\n         if e.stderr:\n             message_parts.append(f\"Error output:\\n{decode(e.stderr)}\")\n-        if input:\n-            message_parts.append(f\"Input:\\n{input}\")\n         super().__init__(\"\\n\\n\".join(message_parts))\n \n \n\ndiff --git a/src/poetry/utils/env/system_env.py b/src/poetry/utils/env/system_env.py\nindex 81ec740..e088e68 100644\n--- a/src/poetry/utils/env/system_env.py\n+++ b/src/poetry/utils/env/system_env.py\n@@ -2,6 +2,7 @@ from __future__ import annotations\n \n import os\n import platform\n+import site\n import sys\n import sysconfig\n \n@@ -87,3 +88,6 @@ class SystemEnv(Env):\n \n     def is_venv(self) -> bool:\n         return self._path != self._base\n+\n+    def _get_lib_dirs(self) -> list[Path]:\n+        return super()._get_lib_dirs() + [Path(d) for d in site.getsitepackages()]\n\ndiff --git a/src/poetry/utils/env/virtual_env.py b/src/poetry/utils/env/virtual_env.py\nindex 4487683..c8a8115 100644\n--- a/src/poetry/utils/env/virtual_env.py\n+++ b/src/poetry/utils/env/virtual_env.py\n@@ -3,9 +3,11 @@ from __future__ import annotations\n import json\n import os\n import re\n+import sys\n \n from contextlib import contextmanager\n from copy import deepcopy\n+from functools import cached_property\n from pathlib import Path\n from typing import TYPE_CHECKING\n from typing import Any\n@@ -20,6 +22,7 @@ from poetry.utils.env.script_strings import GET_PATHS\n from poetry.utils.env.script_strings import GET_PYTHON_VERSION\n from poetry.utils.env.script_strings import GET_SYS_PATH\n from poetry.utils.env.script_strings import GET_SYS_TAGS\n+from poetry.utils.env.system_env import SystemEnv\n \n \n if TYPE_CHECKING:\n@@ -133,3 +136,21 @@ class VirtualEnv(Env):\n \n     def _updated_path(self) -> str:\n         return os.pathsep.join([str(self._bin_dir), os.environ.get(\"PATH\", \"\")])\n+\n+    @cached_property\n+    def includes_system_site_packages(self) -> bool:\n+        pyvenv_cfg = self._path / \"pyvenv.cfg\"\n+        return (\n+            re.search(\n+                r\"^\\s*include-system-site-packages\\s*=\\s*true\\s*$\",\n+                pyvenv_cfg.read_text(),\n+                re.IGNORECASE | re.MULTILINE,\n+            )\n+            is not None\n+        )\n+\n+    def is_path_relative_to_lib(self, path: Path) -> bool:\n+        return super().is_path_relative_to_lib(path) or (\n+            self.includes_system_site_packages\n+            and SystemEnv(Path(sys.prefix)).is_path_relative_to_lib(path)\n+        )\n\ndiff --git a/src/poetry/utils/helpers.py b/src/poetry/utils/helpers.py\nindex fb14e81..ad74353 100644\n--- a/src/poetry/utils/helpers.py\n+++ b/src/poetry/utils/helpers.py\n@@ -6,13 +6,20 @@ import os\n import shutil\n import stat\n import sys\n+import tarfile\n import tempfile\n+import zipfile\n \n from collections.abc import Mapping\n from contextlib import contextmanager\n+from contextlib import suppress\n+from functools import cached_property\n from pathlib import Path\n from typing import TYPE_CHECKING\n from typing import Any\n+from typing import overload\n+\n+import requests\n \n from requests.utils import atomic_open\n \n@@ -22,6 +29,7 @@ from poetry.utils.constants import REQUESTS_TIMEOUT\n if TYPE_CHECKING:\n     from collections.abc import Callable\n     from collections.abc import Iterator\n+    from types import TracebackType\n \n     from poetry.core.packages.package import Package\n     from requests import Session\n@@ -39,7 +47,23 @@ def directory(path: Path) -> Iterator[Path]:\n         os.chdir(cwd)\n \n \n-def _on_rm_error(func: Callable[[str], None], path: str, exc_info: Exception) -> None:\n+# Correct type signature when used as `shutil.rmtree(..., onexc=_on_rm_error)`.\n+@overload\n+def _on_rm_error(\n+    func: Callable[[str], None], path: str, exc_info: Exception\n+) -> None: ...\n+\n+\n+# Correct type signature when used as `shutil.rmtree(..., onerror=_on_rm_error)`.\n+@overload\n+def _on_rm_error(\n+    func: Callable[[str], None],\n+    path: str,\n+    exc_info: tuple[type[BaseException], BaseException, TracebackType],\n+) -> None: ...\n+\n+\n+def _on_rm_error(func: Callable[[str], None], path: str, exc_info: Any) -> None:\n     if not os.path.exists(path):\n         return\n \n@@ -47,9 +71,7 @@ def _on_rm_error(func: Callable[[str], None], path: str, exc_info: Exception) ->\n     func(path)\n \n \n-def remove_directory(\n-    path: Path, *args: Any, force: bool = False, **kwargs: Any\n-) -> None:\n+def remove_directory(path: Path, force: bool = False) -> None:\n     \"\"\"\n     Helper function handle safe removal, and optionally forces stubborn file removal.\n     This is particularly useful when dist files are read-only or git writes read-only\n@@ -60,8 +82,12 @@ def remove_directory(\n     if path.is_symlink():\n         return os.unlink(path)\n \n-    kwargs[\"onerror\"] = kwargs.pop(\"onerror\", _on_rm_error if force else None)\n-    shutil.rmtree(path, *args, **kwargs)\n+    kwargs: dict[str, Any] = {}\n+    if force:\n+        onexc = \"onexc\" if sys.version_info >= (3, 12) else \"onerror\"\n+        kwargs[onexc] = _on_rm_error\n+\n+    shutil.rmtree(path, **kwargs)\n \n \n def merge_dicts(d1: dict[str, Any], d2: dict[str, Any]) -> None:\n@@ -78,25 +104,16 @@ def download_file(\n     session: Authenticator | Session | None = None,\n     chunk_size: int = 1024,\n ) -> None:\n-    import requests\n-\n     from poetry.puzzle.provider import Indicator\n \n-    get = requests.get if not session else session.get\n-\n-    response = get(url, stream=True, timeout=REQUESTS_TIMEOUT)\n-    response.raise_for_status()\n+    downloader = Downloader(url, dest, session)\n \n     set_indicator = False\n     with Indicator.context() as update_context:\n         update_context(f\"Downloading {url}\")\n \n-        if \"Content-Length\" in response.headers:\n-            try:\n-                total_size = int(response.headers[\"Content-Length\"])\n-            except ValueError:\n-                total_size = 0\n-\n+        total_size = downloader.total_size\n+        if total_size > 0:\n             fetched_size = 0\n             last_percent = 0\n \n@@ -104,17 +121,44 @@ def download_file(\n             # but skip the updating\n             set_indicator = total_size > 1024 * 1024\n \n-        with atomic_open(dest) as f:\n-            for chunk in response.iter_content(chunk_size=chunk_size):\n+        for fetched_size in downloader.download_with_progress(chunk_size):\n+            if set_indicator:\n+                percent = (fetched_size * 100) // total_size\n+                if percent > last_percent:\n+                    last_percent = percent\n+                    update_context(f\"Downloading {url} {percent:3}%\")\n+\n+\n+class Downloader:\n+    def __init__(\n+        self,\n+        url: str,\n+        dest: Path,\n+        session: Authenticator | Session | None = None,\n+    ):\n+        self._dest = dest\n+\n+        get = requests.get if not session else session.get\n+\n+        self._response = get(url, stream=True, timeout=REQUESTS_TIMEOUT)\n+        self._response.raise_for_status()\n+\n+    @cached_property\n+    def total_size(self) -> int:\n+        total_size = 0\n+        if \"Content-Length\" in self._response.headers:\n+            with suppress(ValueError):\n+                total_size = int(self._response.headers[\"Content-Length\"])\n+        return total_size\n+\n+    def download_with_progress(self, chunk_size: int = 1024) -> Iterator[int]:\n+        fetched_size = 0\n+        with atomic_open(self._dest) as f:\n+            for chunk in self._response.iter_content(chunk_size=chunk_size):\n                 if chunk:\n                     f.write(chunk)\n-\n-                    if set_indicator:\n-                        fetched_size += len(chunk)\n-                        percent = (fetched_size * 100) // total_size\n-                        if percent > last_percent:\n-                            last_percent = percent\n-                            update_context(f\"Downloading {url} {percent:3}%\")\n+                    fetched_size += len(chunk)\n+                    yield fetched_size\n \n \n def get_package_version_display_string(\n@@ -246,3 +290,16 @@ def get_file_hash(path: Path, hash_name: str = \"sha256\") -> str:\n             h.update(content)\n \n     return h.hexdigest()\n+\n+\n+def extractall(source: Path, dest: Path, zip: bool) -> None:\n+    \"\"\"Extract all members from either a zip or tar archive.\"\"\"\n+    if zip:\n+        with zipfile.ZipFile(source) as archive:\n+            archive.extractall(dest)\n+    else:\n+        with tarfile.open(source) as archive:\n+            if hasattr(tarfile, \"data_filter\"):\n+                archive.extractall(dest, filter=\"data\")\n+            else:\n+                archive.extractall(dest)\n\ndiff --git a/src/poetry/utils/password_manager.py b/src/poetry/utils/password_manager.py\nindex 6205560..166386f 100644\n--- a/src/poetry/utils/password_manager.py\n+++ b/src/poetry/utils/password_manager.py\n@@ -47,8 +47,18 @@ class PoetryKeyring:\n \n         import keyring\n \n+        from keyring.errors import KeyringError\n+        from keyring.errors import KeyringLocked\n+\n         for name in names:\n-            credential = keyring.get_credential(name, username)\n+            credential = None\n+            try:\n+                credential = keyring.get_credential(name, username)\n+            except KeyringLocked:\n+                logger.debug(\"Keyring %s is locked\", name)\n+            except (KeyringError, RuntimeError):\n+                logger.debug(\"Accessing keyring %s failed\", name, exc_info=True)\n+\n             if credential:\n                 return HTTPAuthCredential(\n                     username=credential.username, password=credential.password\n\ndiff --git a/src/poetry/utils/setup_reader.py b/src/poetry/utils/setup_reader.py\nindex 9217687..ffc10a1 100644\n--- a/src/poetry/utils/setup_reader.py\n+++ b/src/poetry/utils/setup_reader.py\n@@ -22,6 +22,7 @@ class SetupReader:\n     DEFAULT: ClassVar[dict[str, Any]] = {\n         \"name\": None,\n         \"version\": None,\n+        \"description\": None,\n         \"install_requires\": [],\n         \"extras_require\": {},\n         \"python_requires\": None,\n@@ -62,6 +63,7 @@ class SetupReader:\n         call, body = setup_call\n         result[\"name\"] = self._find_single_string(call, body, \"name\")\n         result[\"version\"] = self._find_single_string(call, body, \"version\")\n+        result[\"description\"] = self._find_single_string(call, body, \"description\")\n         result[\"install_requires\"] = self._find_install_requires(call, body)\n         result[\"extras_require\"] = self._find_extras_require(call, body)\n         result[\"python_requires\"] = self._find_single_string(\n@@ -77,12 +79,16 @@ class SetupReader:\n \n         name = None\n         version = None\n+        description = None\n         if parser.has_option(\"metadata\", \"name\"):\n             name = parser.get(\"metadata\", \"name\")\n \n         if parser.has_option(\"metadata\", \"version\"):\n             version = Version.parse(parser.get(\"metadata\", \"version\")).text\n \n+        if parser.has_option(\"metadata\", \"description\"):\n+            description = parser.get(\"metadata\", \"description\")\n+\n         install_requires = []\n         extras_require: dict[str, list[str]] = {}\n         python_requires = None\n@@ -112,6 +118,7 @@ class SetupReader:\n         return {\n             \"name\": name,\n             \"version\": version,\n+            \"description\": description,\n             \"install_requires\": install_requires,\n             \"extras_require\": extras_require,\n             \"python_requires\": python_requires,\n\ndiff --git a/src/poetry/utils/shell.py b/src/poetry/utils/shell.py\nindex 290a62c..f8c413a 100644\n--- a/src/poetry/utils/shell.py\n+++ b/src/poetry/utils/shell.py\n@@ -97,12 +97,16 @@ class Shell:\n         import shlex\n \n         terminal = shutil.get_terminal_size()\n+        cmd = f\"{self._get_source_command()} {shlex.quote(str(activate_path))}\"\n+\n         with env.temp_environ():\n+            args = [\"-e\", cmd] if self._name == \"nu\" else [\"-i\"]\n+\n             c = pexpect.spawn(\n-                self._path, [\"-i\"], dimensions=(terminal.lines, terminal.columns)\n+                self._path, args, dimensions=(terminal.lines, terminal.columns)\n             )\n \n-        if self._name in [\"zsh\", \"nu\"]:\n+        if self._name in [\"zsh\"]:\n             c.setecho(False)\n \n         if self._name == \"zsh\":\n@@ -110,10 +114,13 @@ class Shell:\n             c.sendline(f\"emulate bash -c '. {shlex.quote(str(activate_path))}'\")\n         elif self._name == \"xonsh\":\n             c.sendline(f\"vox activate {shlex.quote(str(env.path))}\")\n+        elif self._name == \"nu\":\n+            # If this is nu, we don't want to send the activation command to the\n+            # command line since we already ran it via the shell's invocation.\n+            pass\n         else:\n-            cmd = f\"{self._get_source_command()} {shlex.quote(str(activate_path))}\"\n-            if self._name in [\"fish\", \"nu\"]:\n-                # Under fish and nu \"\\r\" should be sent explicitly\n+            if self._name in [\"fish\"]:\n+                # Under fish, \"\\r\" should be sent explicitly\n                 cmd += \"\\r\"\n             c.sendline(cmd)\n \n\ndiff --git a/src/poetry/vcs/git/backend.py b/src/poetry/vcs/git/backend.py\nindex fcafc43..484eae4 100644\n--- a/src/poetry/vcs/git/backend.py\n+++ b/src/poetry/vcs/git/backend.py\n@@ -8,6 +8,8 @@ from pathlib import Path\n from subprocess import CalledProcessError\n from typing import TYPE_CHECKING\n from urllib.parse import urljoin\n+from urllib.parse import urlparse\n+from urllib.parse import urlunparse\n \n from dulwich import porcelain\n from dulwich.client import HTTPUnauthorized\n@@ -15,6 +17,7 @@ from dulwich.client import get_transport_and_path\n from dulwich.config import ConfigFile\n from dulwich.config import parse_submodules\n from dulwich.errors import NotGitRepository\n+from dulwich.index import IndexEntry\n from dulwich.refs import ANNOTATED_TAG_SUFFIX\n from dulwich.repo import Repo\n \n@@ -30,6 +33,9 @@ if TYPE_CHECKING:\n \n logger = logging.getLogger(__name__)\n \n+# A relative URL by definition starts with ../ or ./\n+RELATIVE_SUBMODULE_REGEX = re.compile(r\"^\\.{1,2}/\")\n+\n \n def is_revision_sha(revision: str | None) -> bool:\n     return re.match(r\"^\\b[0-9a-f]{5,40}\\b$\", revision or \"\") is not None\n@@ -326,49 +332,64 @@ class Git:\n         Helper method to identify configured submodules and clone them recursively.\n         \"\"\"\n         repo_root = Path(repo.path)\n-        modules_config = repo_root.joinpath(\".gitmodules\")\n-\n-        # A relative URL by definition starts with ../ or ./\n-        relative_submodule_regex = re.compile(r\"^\\.{1,2}/\")\n-\n-        if modules_config.exists():\n-            config = ConfigFile.from_path(str(modules_config))\n-\n-            url: bytes\n-            path: bytes\n-            submodules = parse_submodules(config)\n-\n-            for path, url, name in submodules:\n-                path_relative = Path(path.decode(\"utf-8\"))\n-                path_absolute = repo_root.joinpath(path_relative)\n-\n-                url_string = url.decode(\"utf-8\")\n-                if relative_submodule_regex.search(url_string):\n-                    url_string = urljoin(f\"{Git.get_remote_url(repo)}/\", url_string)\n-\n-                source_root = path_absolute.parent\n-                source_root.mkdir(parents=True, exist_ok=True)\n-\n-                with repo:\n-                    try:\n-                        revision = repo.open_index()[path].sha.decode(\"utf-8\")\n-                    except KeyError:\n-                        logger.debug(\n-                            \"Skip submodule %s in %s, path %s not found\",\n-                            name,\n-                            repo.path,\n-                            path,\n-                        )\n-                        continue\n-\n-                cls.clone(\n-                    url=url_string,\n-                    source_root=source_root,\n-                    name=path_relative.name,\n+        for submodule in cls._get_submodules(repo):\n+            path_absolute = repo_root / submodule.path\n+            source_root = path_absolute.parent\n+            source_root.mkdir(parents=True, exist_ok=True)\n+            cls.clone(\n+                url=submodule.url,\n+                source_root=source_root,\n+                name=path_absolute.name,\n+                revision=submodule.revision,\n+                clean=path_absolute.exists()\n+                and not path_absolute.joinpath(\".git\").is_dir(),\n+            )\n+\n+    @classmethod\n+    def _get_submodules(cls, repo: Repo) -> list[SubmoduleInfo]:\n+        modules_config = Path(repo.path, \".gitmodules\")\n+\n+        if not modules_config.exists():\n+            return []\n+\n+        config = ConfigFile.from_path(str(modules_config))\n+\n+        submodules: list[SubmoduleInfo] = []\n+        for path, url, name in parse_submodules(config):\n+            url_str = url.decode(\"utf-8\")\n+            path_str = path.decode(\"utf-8\")\n+            name_str = name.decode(\"utf-8\")\n+\n+            if RELATIVE_SUBMODULE_REGEX.search(url_str):\n+                url_str = urlpathjoin(f\"{cls.get_remote_url(repo)}/\", url_str)\n+\n+            with repo:\n+                index = repo.open_index()\n+\n+                try:\n+                    entry = index[path]\n+                except KeyError:\n+                    logger.debug(\n+                        \"Skip submodule %s in %s, path %s not found\",\n+                        name,\n+                        repo.path,\n+                        path,\n+                    )\n+                    continue\n+\n+                assert isinstance(entry, IndexEntry)\n+                revision = entry.sha.decode(\"utf-8\")\n+\n+            submodules.append(\n+                SubmoduleInfo(\n+                    path=path_str,\n+                    url=url_str,\n+                    name=name_str,\n                     revision=revision,\n-                    clean=path_absolute.exists()\n-                    and not path_absolute.joinpath(\".git\").is_dir(),\n                 )\n+            )\n+\n+        return submodules\n \n     @staticmethod\n     def is_using_legacy_client() -> bool:\n@@ -450,3 +471,31 @@ class Git:\n \n         # fallback to legacy git client\n         return cls._clone_legacy(url=url, refspec=refspec, target=target)\n+\n+\n+def urlpathjoin(base: str, path: str) -> str:\n+    \"\"\"\n+    Allow any URL to be joined with a path\n+\n+    This works around an issue with urllib.parse.urljoin where it only handles\n+    relative URLs for protocols contained in urllib.parse.uses_relative. As it\n+    happens common protocols used with git, like ssh or git+ssh are not in that\n+    list.\n+\n+    Thus we need to implement our own version of urljoin that handles all URLs\n+    protocols. This is accomplished by using urlparse and urlunparse to split\n+    the URL into its components, join the path, and then reassemble the URL.\n+\n+    See: https://github.com/python-poetry/poetry/issues/6499#issuecomment-1564712609\n+    \"\"\"\n+    parsed_base = urlparse(base)\n+    new = parsed_base._replace(path=urljoin(parsed_base.path, path))\n+    return urlunparse(new)\n+\n+\n+@dataclasses.dataclass\n+class SubmoduleInfo:\n+    path: str\n+    url: str\n+    name: str\n+    revision: str\n\ndiff --git a/src/poetry/vcs/git/system.py b/src/poetry/vcs/git/system.py\nindex 935fc73..ae4f9a0 100644\n--- a/src/poetry/vcs/git/system.py\n+++ b/src/poetry/vcs/git/system.py\n@@ -22,21 +22,8 @@ class SystemGit:\n \n     @classmethod\n     def checkout(cls, rev: str, target: Path | None = None) -> str:\n-        args = []\n-\n-        if target:\n-            args += [\n-                \"--git-dir\",\n-                (target / \".git\").as_posix(),\n-                \"--work-tree\",\n-                target.as_posix(),\n-            ]\n-\n         cls._check_parameter(rev)\n-\n-        args += [\"checkout\", rev]\n-\n-        return cls.run(*args)\n+        return cls.run(\"checkout\", rev, folder=target)\n \n     @staticmethod\n     def run(*args: Any, **kwargs: Any) -> str:\n",
+  "structured_diff": {
+    "src/poetry/config/config.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -133,6 +133,9 @@",
+          "snippet": " class Config:\n             \"max-workers\": None,\n             \"no-binary\": None,\n         },\n+        \"warnings\": {\n+            \"export\": True,\n+        },\n     }\n \n     def __init__(",
+          "affect": [
+            {
+              "kind": "attribute",
+              "node": "src/poetry/config/config.py::Config::default_config"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -223,6 +226,22 @@",
+          "snippet": " class Config:\n             path = Path(self.get(\"cache-dir\")) / \"virtualenvs\"\n         return Path(path).expanduser()\n \n+    @property\n+    def installer_max_workers(self) -> int:\n+        # This should be directly handled by ThreadPoolExecutor\n+        # however, on some systems the number of CPUs cannot be determined\n+        # (it raises a NotImplementedError), so, in this case, we assume\n+        # that the system only has one CPU.\n+        try:\n+            default_max_workers = (os.cpu_count() or 1) + 4\n+        except NotImplementedError:\n+            default_max_workers = 5\n+\n+        desired_max_workers = self.get(\"installer.max-workers\")\n+        if desired_max_workers is None:\n+            return default_max_workers\n+        return min(default_max_workers, int(desired_max_workers))\n+\n     def get(self, setting_name: str, default: Any = None) -> Any:\n         \"\"\"\n         Retrieve a setting value.",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "src/poetry/config/config.py::Config"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/config/config.py::Config::installer_max_workers"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -279,6 +298,7 @@",
+          "snippet": " class Config:\n             \"experimental.system-git-client\",\n             \"installer.modern-installation\",\n             \"installer.parallel\",\n+            \"warnings.export\",\n         }:\n             return boolean_normalizer\n \n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/config/config.py::Config::_get_normalizer"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/console/application.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -354,6 +354,12 @@",
+          "snippet": " class Application(BaseApplication):\n             manager.load_plugins()\n             manager.activate(self)\n \n+            # We have to override the command from poetry-plugin-export\n+            # with the wrapper.\n+            if self.command_loader.has(\"export\"):\n+                del self.command_loader._factories[\"export\"]\n+            self.command_loader._factories[\"export\"] = load_command(\"export\")\n+\n         self._plugins_loaded = True\n \n     @property",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/console/application.py::Application::_load_plugins"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -391,7 +397,7 @@",
+          "snippet": " class Application(BaseApplication):\n             SolutionProviderRepository,\n         )\n \n-        from poetry.mixology.solutions.providers.python_requirement_solution_provider import (  # noqa: E501\n+        from poetry.mixology.solutions.providers.python_requirement_solution_provider import (\n             PythonRequirementSolutionProvider,\n         )\n \n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/console/application.py::Application::_get_solution_provider_repository"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/console/commands/config.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -77,6 +77,7 @@",
+          "snippet": " To remove a repository (repo is a short alias for repositories):\n                 PackageFilterPolicy.validator,\n                 PackageFilterPolicy.normalize,\n             ),\n+            \"warnings.export\": (boolean_validator, boolean_normalizer),\n         }\n \n         return unique_config_values",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/console/commands/config.py::ConfigCommand::unique_config_values"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -122,6 +123,9 @@",
+          "snippet": " To remove a repository (repo is a short alias for repositories):\n \n         # show the value if no value is provided\n         if not self.argument(\"value\") and not self.option(\"unset\"):\n+            if setting_key.split(\".\")[0] in self.LIST_PROHIBITED_SETTINGS:\n+                raise ValueError(f\"Expected a value for {setting_key} setting.\")\n+\n             m = re.match(r\"^repos?(?:itories)?(?:\\.(.+))?\", self.argument(\"key\"))\n             value: str | dict[str, Any]\n             if m:\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/console/commands/config.py::ConfigCommand::handle"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/console/commands/export.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -0,0 +1,21 @@",
+          "snippet": "+from __future__ import annotations\n+\n+from poetry_plugin_export.command import (  # type: ignore[import-untyped]\n+    ExportCommand as BaseExportCommand,\n+)\n+\n+\n+class ExportCommand(BaseExportCommand):  # type: ignore[misc]\n+    def handle(self) -> int:\n+        if self.poetry.config.get(\"warnings.export\"):\n+            self.line_error(\n+                \"Warning: poetry-plugin-export will not be installed by default in a\"\n+                \" future version of Poetry.\\n\"\n+                \"In order to avoid a breaking change and make your automation\"\n+                \" forward-compatible, please install poetry-plugin-export explicitly.\"\n+                \" See https://python-poetry.org/docs/plugins/#using-plugins for details\"\n+                \" on how to install a plugin.\\n\"\n+                \"To disable this warning run 'poetry config warnings.export false'.\",\n+                style=\"warning\",\n+            )\n+        return super().handle()  # type: ignore[no-any-return]\n",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "src/poetry/console/commands/export.py::ExportCommand"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/console/commands/export.py::ExportCommand::handle"
+            }
+          ]
+        }
+      ],
+      "messages": [
+        "new file mode 100644"
+      ]
+    },
+    "src/poetry/console/commands/init.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -489,6 +489,7 @@",
+          "snippet": " You can specify a package in the following forms:\n \n         if self._pool is None:\n             self._pool = RepositoryPool()\n-            self._pool.add_repository(PyPiRepository())\n+            pool_size = self.poetry.config.installer_max_workers\n+            self._pool.add_repository(PyPiRepository(pool_size=pool_size))\n \n         return self._pool\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/console/commands/init.py::InitCommand::_get_pool"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/console/commands/install.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -155,14 +155,6 @@",
+          "snippet": " dependencies and not including the current project, run the command with the\n         if self.option(\"no-root\"):\n             return 0\n \n-        try:\n-            builder = EditableBuilder(self.poetry, self.env, self.io)\n-        except ModuleOrPackageNotFound:\n-            # This is likely due to the fact that the project is an application\n-            # not following the structure expected by Poetry\n-            # If this is a true error it will be picked up later by build anyway.\n-            return 0\n-\n         log_install = (\n             \"<b>Installing</> the current project:\"\n             f\" <c1>{self.poetry.package.pretty_name}</c1>\"",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/console/commands/install.py::InstallCommand::handle"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -178,7 +170,26 @@",
+          "snippet": " dependencies and not including the current project, run the command with the\n             self.line(\"\")\n             return 0\n \n-        builder.build()\n+        # Prior to https://github.com/python-poetry/poetry-core/pull/629\n+        # the existence of a module/package was checked when creating the\n+        # EditableBuilder. Afterwards, the existence is checked after\n+        # executing the build script (if there is one),\n+        # i.e. during EditableBuilder.build().\n+        try:\n+            builder = EditableBuilder(self.poetry, self.env, self.io)\n+            builder.build()\n+        except (ModuleOrPackageNotFound, FileNotFoundError) as e:\n+            # This is likely due to the fact that the project is an application\n+            # not following the structure expected by Poetry.\n+            # No need for an editable install in this case.\n+            self.line(\"\")\n+            self.line_error(\n+                f\"The current project could not be installed: <error>{e}</error>\\n\"\n+                \"If you do not want to install the current project\"\n+                \" use <c1>--no-root</c1>\",\n+                style=\"warning\",\n+            )\n+            return 0\n \n         if overwrite:\n             self.overwrite(log_install.format(tag=\"success\"))\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/console/commands/install.py::InstallCommand::handle"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/console/commands/version.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -27,7 +27,7 @@",
+          "snippet": " class VersionCommand(Command):\n             \"version\",\n             \"The version number or the rule to update the version.\",\n             optional=True,\n-        )\n+        ),\n     ]\n     options = [\n         option(\"short\", \"s\", \"Output the version number only\"),",
+          "affect": [
+            {
+              "kind": "attribute",
+              "node": "src/poetry/console/commands/version.py::VersionCommand::arguments"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -36,6 +36,7 @@",
+          "snippet": " class VersionCommand(Command):\n             None,\n             \"Do not update pyproject.toml file\",\n         ),\n+        option(\"next-phase\", None, \"Increment the phase of the current version\"),\n     ]\n \n     help = \"\"\"\\",
+          "affect": [
+            {
+              "kind": "attribute",
+              "node": "src/poetry/console/commands/version.py::VersionCommand::options"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -62,7 +63,7 @@",
+          "snippet": " patch, minor, major, prepatch, preminor, premajor, prerelease.\n \n         if version:\n             version = self.increment_version(\n-                self.poetry.package.pretty_version, version\n+                self.poetry.package.pretty_version, version, self.option(\"next-phase\")\n             )\n \n             if self.option(\"short\"):",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/console/commands/version.py::VersionCommand::handle"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -91,7 +92,9 @@",
+          "snippet": " patch, minor, major, prepatch, preminor, premajor, prerelease.\n \n         return 0\n \n-    def increment_version(self, version: str, rule: str) -> Version:\n+    def increment_version(\n+        self, version: str, rule: str, next_phase: bool = False\n+    ) -> Version:\n         from poetry.core.constraints.version import Version\n \n         try:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/console/commands/version.py::VersionCommand::increment_version"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -115,7 +118,8 @@",
+          "snippet": " patch, minor, major, prepatch, preminor, premajor, prerelease.\n             if parsed.is_unstable():\n                 pre = parsed.pre\n                 assert pre is not None\n-                new = Version(parsed.epoch, parsed.release, pre.next())\n+                pre = pre.next_phase() if next_phase else pre.next()\n+                new = Version(parsed.epoch, parsed.release, pre)\n             else:\n                 new = parsed.next_patch().first_prerelease()\n         else:\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/console/commands/version.py::VersionCommand::increment_version"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/factory.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -224,12 +224,14 @@",
+          "snippet": " class Factory(BaseFactory):\n         except KeyError:\n             raise InvalidSourceError(\"Missing [name] in source.\")\n \n+        pool_size = config.installer_max_workers\n+\n         if name.lower() == \"pypi\":\n             if \"url\" in source:\n                 raise InvalidSourceError(\n                     \"The PyPI repository cannot be configured with a custom url.\"\n                 )\n-            return PyPiRepository(disable_cache=disable_cache)\n+            return PyPiRepository(disable_cache=disable_cache, pool_size=pool_size)\n \n         try:\n             url = source[\"url\"]",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/factory.py::Factory::create_package_source"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -246,6 +248,7 @@",
+          "snippet": " class Factory(BaseFactory):\n             url,\n             config=config,\n             disable_cache=disable_cache,\n+            pool_size=pool_size,\n         )\n \n     @classmethod\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/factory.py::Factory::create_package_source"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/inspection/info.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -5,8 +5,6 @@",
+          "snippet": " import functools\n import glob\n import logging\n import os\n-import tarfile\n-import zipfile\n \n from pathlib import Path\n from typing import TYPE_CHECKING",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/inspection/info.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -25,13 +23,12 @@",
+          "snippet": " from poetry.core.version.requirements import InvalidRequirement\n from poetry.pyproject.toml import PyProjectTOML\n from poetry.utils.env import EnvCommandError\n from poetry.utils.env import ephemeral_environment\n+from poetry.utils.helpers import extractall\n from poetry.utils.setup_reader import SetupReader\n \n \n if TYPE_CHECKING:\n-    from collections.abc import Callable\n     from collections.abc import Iterator\n-    from contextlib import AbstractContextManager\n \n     from poetry.core.packages.project_package import ProjectPackage\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/inspection/info.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -46,11 +43,10 @@",
+          "snippet": " import pyproject_hooks\n source = '{source}'\n dest = '{dest}'\n \n-with build.env.IsolatedEnvBuilder() as env:\n+with build.env.DefaultIsolatedEnv() as env:\n     builder = build.ProjectBuilder(\n-        srcdir=source,\n-        scripts_dir=env.scripts_dir,\n-        python_executable=env.executable,\n+        source_dir=source,\n+        python_executable=env.python_executable,\n         runner=pyproject_hooks.quiet_subprocess_runner,\n     )\n     env.install(builder.build_system_requires)",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "src/poetry/inspection/info.py::PEP517_META_BUILD"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -58,7 +54,7 @@",
+          "snippet": " with build.env.IsolatedEnvBuilder() as env:\n     builder.metadata_path(dest)\n \"\"\"\n \n-PEP517_META_BUILD_DEPS = [\"build==0.10.0\", \"pyproject_hooks==1.0.0\"]\n+PEP517_META_BUILD_DEPS = [\"build==1.0.3\", \"pyproject_hooks==1.0.0\"]\n \n \n class PackageInfoError(ValueError):",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "src/poetry/inspection/info.py::PEP517_META_BUILD_DEPS"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -292,26 +288,18 @@",
+          "snippet": " class PackageInfo:\n         # Still not dependencies found\n         # So, we unpack and introspect\n         suffix = path.suffix\n+        zip = suffix == \".zip\"\n \n-        context: Callable[\n-            [str], AbstractContextManager[zipfile.ZipFile | tarfile.TarFile]\n-        ]\n-        if suffix == \".zip\":\n-            context = zipfile.ZipFile\n-        else:\n-            if suffix == \".bz2\":\n-                suffixes = path.suffixes\n-                if len(suffixes) > 1 and suffixes[-2] == \".tar\":\n-                    suffix = \".tar.bz2\"\n-            else:\n-                suffix = \".tar.gz\"\n-\n-            context = tarfile.open\n+        if suffix == \".bz2\":\n+            suffixes = path.suffixes\n+            if len(suffixes) > 1 and suffixes[-2] == \".tar\":\n+                suffix = \".tar.bz2\"\n+        elif not zip:\n+            suffix = \".tar.gz\"\n \n         with temporary_directory() as tmp_str:\n             tmp = Path(tmp_str)\n-            with context(path.as_posix()) as archive:\n-                archive.extractall(tmp.as_posix())\n+            extractall(source=path, dest=tmp, zip=zip)\n \n             # a little bit of guess work to determine the directory we care about\n             elements = list(tmp.glob(\"*\"))",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/inspection/info.py::PackageInfo::_from_sdist_file"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -580,7 +568,7 @@",
+          "snippet": " def get_pep517_metadata(path: Path) -> PackageInfo:\n             return info\n \n     with ephemeral_environment(\n-        flags={\"no-pip\": False, \"no-setuptools\": False, \"no-wheel\": False}\n+        flags={\"no-pip\": False, \"setuptools\": \"bundle\", \"wheel\": \"bundle\"}\n     ) as venv:\n         # TODO: cache PEP 517 build environment corresponding to each project venv\n         dest_dir = venv.path.parent / \"dist\"",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/poetry/inspection/info.py::get_pep517_metadata"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -598,11 +586,7 @@",
+          "snippet": " def get_pep517_metadata(path: Path) -> PackageInfo:\n                 \"--no-input\",\n                 *PEP517_META_BUILD_DEPS,\n             )\n-            venv.run(\n-                \"python\",\n-                \"-\",\n-                input_=pep517_meta_build_script,\n-            )\n+            venv.run_python_script(pep517_meta_build_script)\n             info = PackageInfo.from_metadata(dest_dir)\n         except EnvCommandError as e:\n             # something went wrong while attempting pep517 metadata build\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/poetry/inspection/info.py::get_pep517_metadata"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/installation/chef.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,8 +1,7 @@",
+          "snippet": " from __future__ import annotations\n \n-import tarfile\n+import os\n import tempfile\n-import zipfile\n \n from contextlib import redirect_stdout\n from io import StringIO",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/installation/chef.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -13,28 +12,42 @@",
+          "snippet": " from build import BuildBackendException\n from build import ProjectBuilder\n from build.env import IsolatedEnv as BaseIsolatedEnv\n from poetry.core.utils.helpers import temporary_directory\n-from pyproject_hooks import quiet_subprocess_runner  # type: ignore[import]\n+from pyproject_hooks import quiet_subprocess_runner  # type: ignore[import-untyped]\n \n from poetry.utils._compat import decode\n from poetry.utils.env import ephemeral_environment\n+from poetry.utils.helpers import extractall\n \n \n if TYPE_CHECKING:\n-    from collections.abc import Callable\n     from collections.abc import Collection\n-    from contextlib import AbstractContextManager\n \n     from poetry.repositories import RepositoryPool\n     from poetry.utils.cache import ArtifactCache\n     from poetry.utils.env import Env\n \n \n-class ChefError(Exception):\n-    ...\n+class ChefError(Exception): ...\n \n \n-class ChefBuildError(ChefError):\n-    ...\n+class ChefBuildError(ChefError): ...\n+\n+\n+class ChefInstallError(ChefError):\n+    def __init__(self, requirements: Collection[str], output: str, error: str) -> None:\n+        message = \"\\n\\n\".join(\n+            (\n+                f\"Failed to install {', '.join(requirements)}.\",\n+                f\"Output:\\n{output}\",\n+                f\"Error:\\n{error}\",\n+            )\n+        )\n+        super().__init__(message)\n+        self._requirements = requirements\n+\n+    @property\n+    def requirements(self) -> Collection[str]:\n+        return self._requirements\n \n \n class IsolatedEnv(BaseIsolatedEnv):",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "src/poetry/installation/chef.py::ChefError"
+            },
+            {
+              "kind": "class",
+              "node": "src/poetry/installation/chef.py::ChefBuildError"
+            },
+            {
+              "kind": "class",
+              "node": "src/poetry/installation/chef.py::ChefInstallError"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/chef.py::ChefInstallError::__init__"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/chef.py::ChefInstallError::requirements"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -43,15 +56,22 @@",
+          "snippet": " class IsolatedEnv(BaseIsolatedEnv):\n         self._pool = pool\n \n     @property\n-    def executable(self) -> str:\n+    def python_executable(self) -> str:\n         return str(self._env.python)\n \n-    @property\n-    def scripts_dir(self) -> str:\n-        return str(self._env._bin_dir)\n+    def make_extra_environ(self) -> dict[str, str]:\n+        path = os.environ.get(\"PATH\")\n+        scripts_dir = str(self._env._bin_dir)\n+        return {\n+            \"PATH\": (\n+                os.pathsep.join([scripts_dir, path])\n+                if path is not None\n+                else scripts_dir\n+            )\n+        }\n \n     def install(self, requirements: Collection[str]) -> None:\n-        from cleo.io.null_io import NullIO\n+        from cleo.io.buffered_io import BufferedIO\n         from poetry.core.packages.dependency import Dependency\n         from poetry.core.packages.project_package import ProjectPackage\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/chef.py::IsolatedEnv::python_executable"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/chef.py::IsolatedEnv::make_extra_environ"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/chef.py::IsolatedEnv::install"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -67,8 +87,9 @@",
+          "snippet": " class IsolatedEnv(BaseIsolatedEnv):\n             dependency = Dependency.create_from_pep_508(requirement)\n             package.add_dependency(dependency)\n \n+        io = BufferedIO()\n         installer = Installer(\n-            NullIO(),\n+            io,\n             self._env,\n             package,\n             Locker(self._env.path.joinpath(\"poetry.lock\"), {}),",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/chef.py::IsolatedEnv::install"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -77,7 +98,8 @@",
+          "snippet": " class IsolatedEnv(BaseIsolatedEnv):\n             InstalledRepository.load(self._env),\n         )\n         installer.update(True)\n-        installer.run()\n+        if installer.run() != 0:\n+            raise ChefInstallError(requirements, io.fetch_output(), io.fetch_error())\n \n \n class Chef:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/chef.py::IsolatedEnv::install"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -109,8 +131,7 @@",
+          "snippet": " class Chef:\n             env = IsolatedEnv(venv, self._pool)\n             builder = ProjectBuilder(\n                 directory,\n-                python_executable=env.executable,\n-                scripts_dir=env.scripts_dir,\n+                python_executable=env.python_executable,\n                 runner=quiet_subprocess_runner,\n             )\n             env.install(builder.build_system_requires)",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/chef.py::Chef::_prepare"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -132,14 +153,12 @@",
+          "snippet": " class Chef:\n                     )\n             except BuildBackendException as e:\n                 message_parts = [str(e)]\n-                if isinstance(e.exception, CalledProcessError) and (\n-                    e.exception.stdout is not None or e.exception.stderr is not None\n-                ):\n-                    message_parts.append(\n-                        decode(e.exception.stderr)\n-                        if e.exception.stderr is not None\n-                        else decode(e.exception.stdout)\n-                    )\n+                if isinstance(e.exception, CalledProcessError):\n+                    text = e.exception.stderr or e.exception.stdout\n+                    if text is not None:\n+                        message_parts.append(decode(text))\n+                else:\n+                    message_parts.append(str(e.exception))\n \n                 error = ChefBuildError(\"\\n\\n\".join(message_parts))\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/chef.py::Chef::_prepare"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -152,19 +171,11 @@",
+          "snippet": " class Chef:\n         from poetry.core.packages.utils.link import Link\n \n         suffix = archive.suffix\n-        context: Callable[\n-            [str], AbstractContextManager[zipfile.ZipFile | tarfile.TarFile]\n-        ]\n-        if suffix == \".zip\":  # noqa: SIM108\n-            context = zipfile.ZipFile\n-        else:\n-            context = tarfile.open\n+        zip = suffix == \".zip\"\n \n         with temporary_directory() as tmp_dir:\n-            with context(archive.as_posix()) as archive_archive:\n-                archive_archive.extractall(tmp_dir)\n-\n             archive_dir = Path(tmp_dir)\n+            extractall(source=archive, dest=archive_dir, zip=zip)\n \n             elements = list(archive_dir.glob(\"*\"))\n \n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/chef.py::Chef::_prepare_sdist"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/installation/executor.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -2,9 +2,9 @@",
+          "snippet": " from __future__ import annotations\n \n import contextlib\n import csv\n+import functools\n import itertools\n import json\n-import os\n import threading\n \n from concurrent.futures import ThreadPoolExecutor",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/installation/executor.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -16,10 +16,10 @@",
+          "snippet": " from typing import Any\n \n from cleo.io.null_io import NullIO\n from poetry.core.packages.utils.link import Link\n-from requests.utils import atomic_open\n \n from poetry.installation.chef import Chef\n from poetry.installation.chef import ChefBuildError\n+from poetry.installation.chef import ChefInstallError\n from poetry.installation.chooser import Chooser\n from poetry.installation.operations import Install\n from poetry.installation.operations import Uninstall",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/installation/executor.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -28,8 +28,8 @@",
+          "snippet": " from poetry.installation.wheel_installer import WheelInstaller\n from poetry.puzzle.exceptions import SolverProblemError\n from poetry.utils._compat import decode\n from poetry.utils.authenticator import Authenticator\n-from poetry.utils.cache import ArtifactCache\n from poetry.utils.env import EnvCommandError\n+from poetry.utils.helpers import Downloader\n from poetry.utils.helpers import get_file_hash\n from poetry.utils.helpers import pluralize\n from poetry.utils.helpers import remove_directory",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/installation/executor.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -72,13 +72,11 @@",
+          "snippet": " class Executor:\n             parallel = config.get(\"installer.parallel\", True)\n \n         if parallel:\n-            self._max_workers = self._get_max_workers(\n-                desired_max_workers=config.get(\"installer.max-workers\")\n-            )\n+            self._max_workers = config.installer_max_workers\n         else:\n             self._max_workers = 1\n \n-        self._artifact_cache = ArtifactCache(cache_dir=config.artifacts_cache_directory)\n+        self._artifact_cache = pool.artifact_cache\n         self._authenticator = Authenticator(\n             config, self._io, disable_cache=disable_cache, pool_size=self._max_workers\n         )",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/executor.py::Executor::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -222,21 +220,6 @@",
+          "snippet": " class Executor:\n \n         return 1 if self._shutdown else 0\n \n-    @staticmethod\n-    def _get_max_workers(desired_max_workers: int | None = None) -> int:\n-        # This should be directly handled by ThreadPoolExecutor\n-        # however, on some systems the number of CPUs cannot be determined\n-        # (it raises a NotImplementedError), so, in this case, we assume\n-        # that the system only has one CPU.\n-        try:\n-            default_max_workers = (os.cpu_count() or 1) + 4\n-        except NotImplementedError:\n-            default_max_workers = 5\n-\n-        if desired_max_workers is None:\n-            return default_max_workers\n-        return min(default_max_workers, desired_max_workers)\n-\n     def _write(self, operation: Operation, line: str) -> None:\n         if not self.supports_fancy_output() or not self._should_write_operation(\n             operation",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/executor.py::Executor::_write"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -314,9 +297,9 @@",
+          "snippet": " class Executor:\n                 with self._lock:\n                     trace = ExceptionTrace(e)\n                     trace.render(io)\n+                    pkg = operation.package\n                     if isinstance(e, ChefBuildError):\n-                        pkg = operation.package\n-                        pip_command = \"pip wheel --use-pep517\"\n+                        pip_command = \"pip wheel --no-cache-dir --use-pep517\"\n                         if pkg.develop:\n                             requirement = pkg.source_url\n                             pip_command += \" --editable\"",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/executor.py::Executor::_execute_operation"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -324,8 +307,7 @@",
+          "snippet": " class Executor:\n                             requirement = (\n                                 pkg.to_dependency().to_pep_508().split(\";\")[0].strip()\n                             )\n-                        io.write_line(\"\")\n-                        io.write_line(\n+                        message = (\n                             \"<info>\"\n                             \"Note: This error originates from the build backend,\"\n                             \" and is likely not a problem with poetry\"",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/executor.py::Executor::_execute_operation"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -334,19 +316,30 @@",
+          "snippet": " class Executor:\n                             f\" running '{pip_command} \\\"{requirement}\\\"'.\"\n                             \"</info>\"\n                         )\n+                    elif isinstance(e, ChefInstallError):\n+                        message = (\n+                            \"<error>\"\n+                            \"Cannot install build-system.requires\"\n+                            f\" for {pkg.pretty_name}.\"\n+                            \"</error>\"\n+                        )\n                     elif isinstance(e, SolverProblemError):\n-                        pkg = operation.package\n-                        io.write_line(\"\")\n-                        io.write_line(\n+                        message = (\n                             \"<error>\"\n                             \"Cannot resolve build-system.requires\"\n                             f\" for {pkg.pretty_name}.\"\n                             \"</error>\"\n                         )\n+                    else:\n+                        message = f\"<error>Cannot install {pkg.pretty_name}.</error>\"\n+\n+                    io.write_line(\"\")\n+                    io.write_line(message)\n                     io.write_line(\"\")\n             finally:\n                 with self._lock:\n                     self._shutdown = True\n+\n         except KeyboardInterrupt:\n             try:\n                 message = (",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/executor.py::Executor::_execute_operation"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -755,23 +748,11 @@",
+          "snippet": " class Executor:\n     def _download_link(self, operation: Install | Update, link: Link) -> Path:\n         package = operation.package\n \n-        output_dir = self._artifact_cache.get_cache_directory_for_link(link)\n-        # Try to get cached original package for the link provided\n+        # Get original package for the link provided\n+        download_func = functools.partial(self._download_archive, operation)\n         original_archive = self._artifact_cache.get_cached_archive_for_link(\n-            link, strict=True\n+            link, strict=True, download_func=download_func\n         )\n-        if original_archive is None:\n-            # No cached original distributions was found, so we download and prepare it\n-            try:\n-                original_archive = self._download_archive(operation, link)\n-            except BaseException:\n-                cache_directory = self._artifact_cache.get_cache_directory_for_link(\n-                    link\n-                )\n-                cached_file = cache_directory.joinpath(link.filename)\n-                cached_file.unlink(missing_ok=True)\n-\n-                raise\n \n         # Get potential higher prioritized cached archive, otherwise it will fall back\n         # to the original archive.",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/executor.py::Executor::_download_link"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -797,7 +778,7 @@",
+          "snippet": " class Executor:\n             )\n             self._write(operation, message)\n \n-            archive = self._chef.prepare(archive, output_dir=output_dir)\n+            archive = self._chef.prepare(archive, output_dir=original_archive.parent)\n \n         # Use the original archive to provide the correct hash.\n         self._populate_hashes_dict(original_archive, package)",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/executor.py::Executor::_download_link"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -822,11 +803,15 @@",
+          "snippet": " class Executor:\n \n         return archive_hash\n \n-    def _download_archive(self, operation: Install | Update, link: Link) -> Path:\n-        response = self._authenticator.request(\n-            \"get\", link.url, stream=True, io=self._sections.get(id(operation), self._io)\n-        )\n-        wheel_size = response.headers.get(\"content-length\")\n+    def _download_archive(\n+        self,\n+        operation: Install | Update,\n+        url: str,\n+        dest: Path,\n+    ) -> None:\n+        downloader = Downloader(url, dest, self._authenticator)\n+        wheel_size = downloader.total_size\n+\n         operation_message = self.get_operation_message(operation)\n         message = (\n             f\"  <fg=blue;options=bold>•</> {operation_message}: <info>Downloading...</>\"",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/executor.py::Executor::_download_archive"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -848,30 +833,15 @@",
+          "snippet": " class Executor:\n                 self._sections[id(operation)].clear()\n                 progress.start()\n \n-        done = 0\n-        archive = (\n-            self._artifact_cache.get_cache_directory_for_link(link) / link.filename\n-        )\n-        archive.parent.mkdir(parents=True, exist_ok=True)\n-        with atomic_open(archive) as f:\n-            for chunk in response.iter_content(chunk_size=4096):\n-                if not chunk:\n-                    break\n-\n-                done += len(chunk)\n-\n-                if progress:\n-                    with self._lock:\n-                        progress.set_progress(done)\n-\n-                f.write(chunk)\n+        for fetched_size in downloader.download_with_progress(chunk_size=4096):\n+            if progress:\n+                with self._lock:\n+                    progress.set_progress(fetched_size)\n \n         if progress:\n             with self._lock:\n                 progress.finish()\n \n-        return archive\n-\n     def _should_write_operation(self, operation: Operation) -> bool:\n         return (\n             not operation.skipped or self._dry_run or self._verbose or not self._enabled\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/executor.py::Executor::_download_archive"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/executor.py::Executor::_should_write_operation"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/installation/wheel_installer.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,5 +1,6 @@",
+          "snippet": " from __future__ import annotations\n \n+import logging\n import platform\n import sys\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/installation/wheel_installer.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -15,7 +16,10 @@",
+          "snippet": " from poetry.__version__ import __version__\n from poetry.utils._compat import WINDOWS\n \n \n+logger = logging.getLogger(__name__)\n+\n if TYPE_CHECKING:\n+    from collections.abc import Collection\n     from typing import BinaryIO\n \n     from installer.records import RecordEntry",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "src/poetry/installation/wheel_installer.py::logger"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -42,9 +46,9 @@",
+          "snippet": " class WheelDestination(SchemeDictionaryDestination):\n \n         target_path = Path(self.scheme_dict[scheme]) / path\n         if target_path.exists():\n-            # Contrary to the base library we don't raise an error\n-            # here since it can break namespace packages (like Poetry's)\n-            pass\n+            # Contrary to the base library we don't raise an error here since it can\n+            # break pkgutil-style and pkg_resource-style namespace packages.\n+            logger.warning(f\"Installing {target_path} over existing file\")\n \n         parent_folder = target_path.parent\n         if not parent_folder.exists():",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/wheel_installer.py::WheelDestination::write_to_fs"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -60,18 +64,6 @@",
+          "snippet": " class WheelDestination(SchemeDictionaryDestination):\n \n         return RecordEntry(path, Hash(self.hash_algorithm, hash_), size)\n \n-    def for_source(self, source: WheelFile) -> WheelDestination:\n-        scheme_dict = self.scheme_dict.copy()\n-\n-        scheme_dict[\"headers\"] = str(Path(scheme_dict[\"headers\"]) / source.distribution)\n-\n-        return self.__class__(\n-            scheme_dict,\n-            interpreter=self.interpreter,\n-            script_kind=self.script_kind,\n-            bytecode_optimization_levels=self.bytecode_optimization_levels,\n-        )\n-\n \n class WheelInstaller:\n     def __init__(self, env: Env) -> None:",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/installation/wheel_installer.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -85,18 +77,13 @@",
+          "snippet": " class WheelInstaller:\n                 script_kind = \"win-arm64\" if sys.maxsize > 2**32 else \"win-arm\"\n             else:\n                 script_kind = \"win-amd64\" if sys.maxsize > 2**32 else \"win-ia32\"\n+        self._script_kind = script_kind\n \n-        schemes = self._env.paths\n-        schemes[\"headers\"] = schemes[\"include\"]\n-\n-        self._destination = WheelDestination(\n-            schemes, interpreter=str(self._env.python), script_kind=script_kind\n-        )\n-\n+        self._bytecode_optimization_levels: Collection[int] = ()\n         self.invalid_wheels: dict[Path, list[str]] = {}\n \n     def enable_bytecode_compilation(self, enable: bool = True) -> None:\n-        self._destination.bytecode_optimization_levels = (-1,) if enable else ()\n+        self._bytecode_optimization_levels = (-1,) if enable else ()\n \n     def install(self, wheel: Path) -> None:\n         with WheelFile.open(wheel) as source:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/wheel_installer.py::WheelInstaller::__init__"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/wheel_installer.py::WheelInstaller::enable_bytecode_compilation"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -107,9 +94,21 @@",
+          "snippet": " class WheelInstaller:\n                 source.validate_record(validate_contents=False)\n             except _WheelFileValidationError as e:\n                 self.invalid_wheels[wheel] = e.issues\n+\n+            scheme_dict = self._env.paths.copy()\n+            scheme_dict[\"headers\"] = str(\n+                Path(scheme_dict[\"include\"]) / source.distribution\n+            )\n+            destination = WheelDestination(\n+                scheme_dict,\n+                interpreter=str(self._env.python),\n+                script_kind=self._script_kind,\n+                bytecode_optimization_levels=self._bytecode_optimization_levels,\n+            )\n+\n             install(\n                 source=source,\n-                destination=self._destination.for_source(source),\n+                destination=destination,\n                 # Additional metadata that is generated by the installation tool.\n                 additional_metadata={\n                     \"INSTALLER\": f\"Poetry {__version__}\".encode(),\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/wheel_installer.py::WheelInstaller::install"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/json/__init__.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -5,8 +5,9 @@",
+          "snippet": " import json\n from pathlib import Path\n from typing import Any\n \n-import jsonschema\n+import fastjsonschema\n \n+from fastjsonschema.exceptions import JsonSchemaException\n from poetry.core.json import SCHEMA_DIR as CORE_SCHEMA_DIR\n \n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/json/__init__.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -21,18 +22,13 @@",
+          "snippet": " def validate_object(obj: dict[str, Any]) -> list[str]:\n     schema_file = Path(SCHEMA_DIR, \"poetry.json\")\n     schema = json.loads(schema_file.read_text(encoding=\"utf-8\"))\n \n-    validator = jsonschema.Draft7Validator(schema)\n-    validation_errors = sorted(validator.iter_errors(obj), key=lambda e: e.path)\n+    validate = fastjsonschema.compile(schema)\n \n     errors = []\n-\n-    for error in validation_errors:\n-        message = error.message\n-        if error.path:\n-            path = \".\".join(str(x) for x in error.absolute_path)\n-            message = f\"[{path}] {message}\"\n-\n-        errors.append(message)\n+    try:\n+        validate(obj)\n+    except JsonSchemaException as e:\n+        errors = [e.message]\n \n     core_schema = json.loads(\n         (CORE_SCHEMA_DIR / \"poetry-schema.json\").read_text(encoding=\"utf-8\")\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/poetry/json/__init__.py::validate_object"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/mixology/failure.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -41,7 +41,7 @@",
+          "snippet": " class _Writer:\n             if isinstance(incompatibility.cause, PythonCause):\n                 if not required_python_version_notification:\n                     buffer.append(\n-                        \"The current project's Python requirement\"\n+                        \"The current project's supported Python range\"\n                         f\" ({incompatibility.cause.root_python_version}) is not\"\n                         \" compatible with some of the required packages Python\"\n                         \" requirement:\"\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/mixology/failure.py::_Writer::write"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/mixology/solutions/providers/python_requirement_solution_provider.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -19,7 +19,7 @@",
+          "snippet": " class PythonRequirementSolutionProvider(HasSolutionsForException):\n             return False\n \n         m = re.match(\n-            \"^The current project's Python requirement (.+) is not compatible \"\n+            \"^The current project's supported Python range (.+) is not compatible \"\n             \"with some of the required packages Python requirement\",\n             str(exception),\n         )\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/mixology/solutions/providers/python_requirement_solution_provider.py::PythonRequirementSolutionProvider::can_solve"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/mixology/solutions/solutions/python_requirement_solution.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -58,6 +58,6 @@",
+          "snippet": " class PythonRequirementSolution(Solution):\n     @property\n     def documentation_links(self) -> list[str]:\n         return [\n-            \"https://python-poetry.org/docs/dependency-specification/#python-restricted-dependencies\",  # noqa: E501\n-            \"https://python-poetry.org/docs/dependency-specification/#using-environment-markers\",  # noqa: E501\n+            \"https://python-poetry.org/docs/dependency-specification/#python-restricted-dependencies\",\n+            \"https://python-poetry.org/docs/dependency-specification/#using-environment-markers\",\n         ]\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/mixology/solutions/solutions/python_requirement_solution.py::PythonRequirementSolution::documentation_links"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/mixology/version_solver.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -394,7 +394,7 @@",
+          "snippet": " class VersionSolver:\n             # details.\n             #\n             # .. _algorithm documentation:\n-            # https://github.com/dart-lang/pub/tree/master/doc/solver.md#conflict-resolution  # noqa: E501\n+            # https://github.com/dart-lang/pub/tree/master/doc/solver.md#conflict-resolution\n             if difference is not None:\n                 inverse = difference.inverse\n                 if inverse.dependency != most_recent_satisfier.dependency:\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/mixology/version_solver.py::VersionSolver::_resolve_conflict"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/packages/direct_origin.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -76,14 +76,9 @@",
+          "snippet": " class DirectOrigin:\n \n     def get_package_from_url(self, url: str) -> Package:\n         link = Link(url)\n-        artifact = self._artifact_cache.get_cached_archive_for_link(link, strict=True)\n-\n-        if not artifact:\n-            artifact = (\n-                self._artifact_cache.get_cache_directory_for_link(link) / link.filename\n-            )\n-            artifact.parent.mkdir(parents=True, exist_ok=True)\n-            download_file(url, artifact)\n+        artifact = self._artifact_cache.get_cached_archive_for_link(\n+            link, strict=True, download_func=download_file\n+        )\n \n         package = self.get_package_from_file(artifact)\n         package.files = [\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/packages/direct_origin.py::DirectOrigin::get_package_from_url"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/packages/locker.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -323,6 +323,14 @@",
+          "snippet": " class Locker:\n             except tomllib.TOMLDecodeError as e:\n                 raise RuntimeError(f\"Unable to read the lock file ({e}).\")\n \n+        # if the lockfile doesn't contain a metadata section at all,\n+        # it probably needs to be rebuilt completely\n+        if \"metadata\" not in lock_data:\n+            raise RuntimeError(\n+                \"The lock file does not have a metadata entry.\\n\"\n+                \"Regenerate the lock file with the `poetry lock` command.\"\n+            )\n+\n         metadata = lock_data[\"metadata\"]\n         lock_version = Version.parse(metadata.get(\"lock-version\", \"1.0\"))\n         current_version = Version.parse(self._VERSION)\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/packages/locker.py::Locker::_get_lock_data"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/publishing/uploader.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -31,17 +31,20 @@",
+          "snippet": " if TYPE_CHECKING:\n class UploadError(Exception):\n     def __init__(self, error: ConnectionError | HTTPError | str) -> None:\n         if isinstance(error, HTTPError):\n-            message = (\n-                f\"HTTP Error {error.response.status_code}: {error.response.reason} |\"\n-                f\" {error.response.content!r}\"\n-            )\n+            if error.response is None:\n+                message = \"HTTP Error connecting to the repository\"\n+            else:\n+                message = (\n+                    f\"HTTP Error {error.response.status_code}: \"\n+                    f\"{error.response.reason} | {error.response.content!r}\"\n+                )\n         elif isinstance(error, ConnectionError):\n             message = (\n                 \"Connection Error: We were unable to connect to the repository, \"\n                 \"ensure the url is correct and can be reached.\"\n             )\n         else:\n-            message = str(error)\n+            message = error\n         super().__init__(message)\n \n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/publishing/uploader.py::UploadError::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -74,7 +77,7 @@",
+          "snippet": " class Uploader:\n         self._password = password\n \n     def make_session(self) -> requests.Session:\n-        session = requests.session()\n+        session = requests.Session()\n         auth = self.get_auth()\n         if auth is not None:\n             session.auth = auth",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/publishing/uploader.py::Uploader::make_session"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -103,10 +106,8 @@",
+          "snippet": " class Uploader:\n         if client_cert:\n             session.cert = str(client_cert)\n \n-        try:\n+        with session:\n             self._upload(session, url, dry_run, skip_existing)\n-        finally:\n-            session.close()\n \n     def post_data(self, file: Path) -> dict[str, Any]:\n         meta = Metadata.from_package(self._package)",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/publishing/uploader.py::Uploader::upload"
+            },
+            {
+              "kind": "class",
+              "node": "src/poetry/publishing/uploader.py::Uploader"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -321,7 +322,7 @@",
+          "snippet": " class Uploader:\n         raise ValueError(\"Unknown distribution format \" + \"\".join(exts))\n \n     def _is_file_exists_error(self, response: requests.Response) -> bool:\n-        # based on https://github.com/pypa/twine/blob/a6dd69c79f7b5abfb79022092a5d3776a499e31b/twine/commands/upload.py#L32  # noqa: E501\n+        # based on https://github.com/pypa/twine/blob/a6dd69c79f7b5abfb79022092a5d3776a499e31b/twine/commands/upload.py#L32\n         status = response.status_code\n         reason = response.reason.lower()\n         text = response.text.lower()\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/publishing/uploader.py::Uploader::_is_file_exists_error"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/puzzle/provider.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -606,10 +606,11 @@",
+          "snippet": " class Provider:\n \n             # For dependency resolution, markers of duplicate dependencies must be\n             # mutually exclusive.\n-            deps = self._resolve_overlapping_markers(package, deps)\n+            active_extras = None if package.is_root() else dependency.extras\n+            deps = self._resolve_overlapping_markers(package, deps, active_extras)\n \n             if len(deps) == 1:\n-                self.debug(f\"<debug>Merging requirements for {deps[0]!s}</debug>\")\n+                self.debug(f\"<debug>Merging requirements for {dep_name}</debug>\")\n                 dependencies.append(deps[0])\n                 continue\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/puzzle/provider.py::Provider::complete_package"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -682,7 +683,6 @@",
+          "snippet": " class Provider:\n                 if python_constraint_intersection.is_empty():\n                     # This dependency is not needed under current python constraint.\n                     continue\n-                dep.transitive_python_versions = str(python_constraint_intersection)\n \n             clean_dependencies.append(dep)\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/puzzle/provider.py::Provider::complete_package"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -839,11 +839,14 @@",
+          "snippet": " class Provider:\n \n         return merged_dependencies\n \n-    def _is_relevant_marker(self, marker: BaseMarker) -> bool:\n+    def _is_relevant_marker(\n+        self, marker: BaseMarker, active_extras: Collection[NormalizedName] | None\n+    ) -> bool:\n         \"\"\"\n         A marker is relevant if\n         - it is not empty\n         - allowed by the project's python constraint\n+        - allowed by active extras of the dependency (not relevant for root package)\n         - allowed by the environment (only during installation)\n         \"\"\"\n         return (",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/puzzle/provider.py::Provider::_is_relevant_marker"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -851,11 +854,15 @@",
+          "snippet": " class Provider:\n             and self._python_constraint.allows_any(\n                 get_python_constraint_from_marker(marker)\n             )\n+            and (active_extras is None or marker.validate({\"extra\": active_extras}))\n             and (not self._env or marker.validate(self._env.marker_env))\n         )\n \n     def _resolve_overlapping_markers(\n-        self, package: Package, dependencies: list[Dependency]\n+        self,\n+        package: Package,\n+        dependencies: list[Dependency],\n+        active_extras: Collection[NormalizedName] | None,\n     ) -> list[Dependency]:\n         \"\"\"\n         Convert duplicate dependencies with potentially overlapping markers",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/puzzle/provider.py::Provider::_is_relevant_marker"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/puzzle/provider.py::Provider::_resolve_overlapping_markers"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -888,7 +895,7 @@",
+          "snippet": " class Provider:\n             used_marker_intersection: BaseMarker = AnyMarker()\n             for m in markers:\n                 used_marker_intersection = used_marker_intersection.intersect(m)\n-            if not self._is_relevant_marker(used_marker_intersection):\n+            if not self._is_relevant_marker(used_marker_intersection, active_extras):\n                 continue\n \n             # intersection of constraints\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/puzzle/provider.py::Provider::_resolve_overlapping_markers"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/puzzle/transaction.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -98,14 +98,9 @@",
+          "snippet": " class Transaction:\n                 result_package_names = {\n                     result_package.name for result_package, _ in self._result_packages\n                 }\n-                # We preserve pip/setuptools/wheel when not managed by poetry, this is\n-                # done to avoid externally managed virtual environments causing\n-                # unnecessary removals.\n-                preserved_package_names = {\n-                    \"pip\",\n-                    \"setuptools\",\n-                    \"wheel\",\n-                } - result_package_names\n+                # We preserve pip when not managed by poetry, this is done to avoid\n+                # externally managed virtual environments causing unnecessary removals.\n+                preserved_package_names = {\"pip\"} - result_package_names\n \n                 for installed_package in self._installed_packages:\n                     if installed_package.name in uninstalls:\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/puzzle/transaction.py::Transaction::calculate_operations"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/repositories/abstract_repository.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -20,12 +20,10 @@",
+          "snippet": " class AbstractRepository(ABC):\n         return self._name\n \n     @abstractmethod\n-    def find_packages(self, dependency: Dependency) -> list[Package]:\n-        ...\n+    def find_packages(self, dependency: Dependency) -> list[Package]: ...\n \n     @abstractmethod\n-    def search(self, query: str) -> list[Package]:\n-        ...\n+    def search(self, query: str) -> list[Package]: ...\n \n     @abstractmethod\n     def package(",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/repositories/abstract_repository.py::AbstractRepository::find_packages"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/repositories/abstract_repository.py::AbstractRepository::search"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -33,5 +31,4 @@",
+          "snippet": " class AbstractRepository(ABC):\n         name: str,\n         version: Version,\n         extras: list[str] | None = None,\n-    ) -> Package:\n-        ...\n+    ) -> Package: ...\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/repositories/abstract_repository.py::AbstractRepository::package"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/repositories/cached_repository.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -35,8 +35,7 @@",
+          "snippet": " class CachedRepository(Repository, ABC):\n     @abstractmethod\n     def _get_release_info(\n         self, name: NormalizedName, version: Version\n-    ) -> dict[str, Any]:\n-        ...\n+    ) -> dict[str, Any]: ...\n \n     def get_release_info(self, name: NormalizedName, version: Version) -> PackageInfo:\n         \"\"\"\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/repositories/cached_repository.py::CachedRepository::_get_release_info"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/repositories/http_repository.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -11,6 +11,7 @@",
+          "snippet": " from typing import Any\n from typing import Iterator\n \n import requests\n+import requests.adapters\n \n from poetry.core.constraints.version import parse_constraint\n from poetry.core.packages.dependency import Dependency",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/repositories/http_repository.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -44,6 +45,7 @@",
+          "snippet": " class HTTPRepository(CachedRepository):\n         url: str,\n         config: Config | None = None,\n         disable_cache: bool = False,\n+        pool_size: int = requests.adapters.DEFAULT_POOLSIZE,\n     ) -> None:\n         super().__init__(name, disable_cache, config)\n         self._url = url",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/repositories/http_repository.py::HTTPRepository::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -51,6 +53,7 @@",
+          "snippet": " class HTTPRepository(CachedRepository):\n             config=config,\n             cache_id=name,\n             disable_cache=disable_cache,\n+            pool_size=pool_size,\n         )\n         self._authenticator.add_repository(name, url)\n         self.get_page = functools.lru_cache(maxsize=None)(self._get_page)\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/repositories/http_repository.py::HTTPRepository::__init__"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/repositories/legacy_repository.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -3,6 +3,8 @@",
+          "snippet": " from __future__ import annotations\n from typing import TYPE_CHECKING\n from typing import Any\n \n+import requests.adapters\n+\n from poetry.core.packages.package import Package\n \n from poetry.inspection.info import PackageInfo",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/repositories/legacy_repository.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -27,11 +29,12 @@",
+          "snippet": " class LegacyRepository(HTTPRepository):\n         url: str,\n         config: Config | None = None,\n         disable_cache: bool = False,\n+        pool_size: int = requests.adapters.DEFAULT_POOLSIZE,\n     ) -> None:\n         if name == \"pypi\":\n             raise ValueError(\"The name [pypi] is reserved for repositories\")\n \n-        super().__init__(name, url.rstrip(\"/\"), config, disable_cache)\n+        super().__init__(name, url.rstrip(\"/\"), config, disable_cache, pool_size)\n \n     @property\n     def packages(self) -> list[Package]:\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/repositories/legacy_repository.py::LegacyRepository::__init__"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/repositories/pypi_repository.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -7,6 +7,7 @@",
+          "snippet": " from typing import TYPE_CHECKING\n from typing import Any\n \n import requests\n+import requests.adapters\n \n from cachecontrol.controller import logger as cache_control_logger\n from poetry.core.packages.package import Package",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/repositories/pypi_repository.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -38,9 +39,13 @@",
+          "snippet": " class PyPiRepository(HTTPRepository):\n         url: str = \"https://pypi.org/\",\n         disable_cache: bool = False,\n         fallback: bool = True,\n+        pool_size: int = requests.adapters.DEFAULT_POOLSIZE,\n     ) -> None:\n         super().__init__(\n-            \"PyPI\", url.rstrip(\"/\") + \"/simple/\", disable_cache=disable_cache\n+            \"PyPI\",\n+            url.rstrip(\"/\") + \"/simple/\",\n+            disable_cache=disable_cache,\n+            pool_size=pool_size,\n         )\n \n         self._base_url = url",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/repositories/pypi_repository.py::PyPiRepository::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -49,7 +54,7 @@",
+          "snippet": " class PyPiRepository(HTTPRepository):\n     def search(self, query: str) -> list[Package]:\n         results = []\n \n-        response = requests.session().get(\n+        response = requests.get(\n             self._base_url + \"search\", params={\"q\": query}, timeout=REQUESTS_TIMEOUT\n         )\n         parser = SearchResultParser()\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/repositories/pypi_repository.py::PyPiRepository::search"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/utils/authenticator.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -13,12 +13,15 @@",
+          "snippet": " from typing import TYPE_CHECKING\n from typing import Any\n \n import requests\n+import requests.adapters\n import requests.auth\n import requests.exceptions\n \n from cachecontrol import CacheControlAdapter\n from cachecontrol.caches import FileCache\n+from requests_toolbelt import user_agent\n \n+from poetry.__version__ import __version__\n from poetry.config.config import Config\n from poetry.exceptions import PoetryException\n from poetry.utils.constants import REQUESTS_TIMEOUT",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/utils/authenticator.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -108,16 +111,16 @@",
+          "snippet": " class Authenticator:\n         io: IO | None = None,\n         cache_id: str | None = None,\n         disable_cache: bool = False,\n-        pool_size: int = 10,\n+        pool_size: int = requests.adapters.DEFAULT_POOLSIZE,\n     ) -> None:\n         self._config = config or Config.create()\n         self._io = io\n         self._sessions_for_netloc: dict[str, requests.Session] = {}\n         self._credentials: dict[str, HTTPAuthCredential] = {}\n         self._certs: dict[str, RepositoryCertificateConfig] = {}\n-        self._configured_repositories: dict[\n-            str, AuthenticatorRepositoryConfig\n-        ] | None = None\n+        self._configured_repositories: (\n+            dict[str, AuthenticatorRepositoryConfig] | None\n+        ) = None\n         self._password_manager = PasswordManager(self._config)\n         self._cache_control = (\n             FileCache(",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/authenticator.py::Authenticator::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -134,9 +137,11 @@",
+          "snippet": " class Authenticator:\n             self._get_repository_config_for_url\n         )\n         self._pool_size = pool_size\n+        self._user_agent = user_agent(\"poetry\", __version__)\n \n     def create_session(self) -> requests.Session:\n         session = requests.Session()\n+        session.headers[\"User-Agent\"] = self._user_agent\n \n         if self._cache_control is None:\n             return session\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/authenticator.py::Authenticator::__init__"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/authenticator.py::Authenticator::create_session"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/utils/cache.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -5,13 +5,16 @@",
+          "snippet": " import hashlib\n import json\n import logging\n import shutil\n+import threading\n import time\n \n+from collections import defaultdict\n from pathlib import Path\n from typing import TYPE_CHECKING\n from typing import Any\n from typing import Generic\n from typing import TypeVar\n+from typing import overload\n \n from poetry.utils._compat import decode\n from poetry.utils._compat import encode",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/utils/cache.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -187,6 +190,9 @@",
+          "snippet": " class FileCache(Generic[T]):\n class ArtifactCache:\n     def __init__(self, *, cache_dir: Path) -> None:\n         self._cache_dir = cache_dir\n+        self._archive_locks: defaultdict[Path, threading.Lock] = defaultdict(\n+            threading.Lock\n+        )\n \n     def get_cache_directory_for_link(self, link: Link) -> Path:\n         key_parts = {\"url\": link.url_without_fragment}",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/cache.py::ArtifactCache::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -218,18 +224,54 @@",
+          "snippet": " class ArtifactCache:\n \n         return self._get_directory_from_hash(key_parts)\n \n+    @overload\n+    def get_cached_archive_for_link(\n+        self,\n+        link: Link,\n+        *,\n+        strict: bool,\n+        env: Env | None = ...,\n+        download_func: Callable[[str, Path], None],\n+    ) -> Path: ...\n+\n+    @overload\n+    def get_cached_archive_for_link(\n+        self,\n+        link: Link,\n+        *,\n+        strict: bool,\n+        env: Env | None = ...,\n+        download_func: None = ...,\n+    ) -> Path | None: ...\n+\n     def get_cached_archive_for_link(\n         self,\n         link: Link,\n         *,\n         strict: bool,\n         env: Env | None = None,\n+        download_func: Callable[[str, Path], None] | None = None,\n     ) -> Path | None:\n         cache_dir = self.get_cache_directory_for_link(link)\n \n-        return self._get_cached_archive(\n+        cached_archive = self._get_cached_archive(\n             cache_dir, strict=strict, filename=link.filename, env=env\n         )\n+        if cached_archive is None and strict and download_func is not None:\n+            cached_archive = cache_dir / link.filename\n+            with self._archive_locks[cached_archive]:\n+                # Check again if the archive exists (under the lock) to avoid\n+                # duplicate downloads because it may have already been downloaded\n+                # by another thread in the meantime\n+                if not cached_archive.exists():\n+                    cache_dir.mkdir(parents=True, exist_ok=True)\n+                    try:\n+                        download_func(link.url, cached_archive)\n+                    except BaseException:\n+                        cached_archive.unlink(missing_ok=True)\n+                        raise\n+\n+        return cached_archive\n \n     def get_cached_archive_for_git(\n         self, url: str, reference: str, subdirectory: str | None, env: Env",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "src/poetry/utils/cache.py::ArtifactCache"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/cache.py::ArtifactCache::get_cached_archive_for_link"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -246,8 +288,9 @@",
+          "snippet": " class ArtifactCache:\n         filename: str | None = None,\n         env: Env | None = None,\n     ) -> Path | None:\n+        # implication \"not strict -> env must not be None\"\n         assert strict or env is not None\n-        # implication \"strict -> filename should not be None\"\n+        # implication \"strict -> filename must not be None\"\n         assert not strict or filename is not None\n \n         archives = self._get_cached_archives(cache_dir)\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/cache.py::ArtifactCache::_get_cached_archive"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/utils/env/__init__.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -41,7 +41,7 @@",
+          "snippet": " if TYPE_CHECKING:\n @contextmanager\n def ephemeral_environment(\n     executable: Path | None = None,\n-    flags: dict[str, bool] | None = None,\n+    flags: dict[str, str | bool] | None = None,\n ) -> Iterator[VirtualEnv]:\n     with temporary_directory() as tmp_dir:\n         # TODO: cache PEP 517 build environment corresponding to each project venv\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/poetry/utils/env/__init__.py::ephemeral_environment"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/utils/env/base_env.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -219,8 +219,11 @@",
+          "snippet": " class Env:\n \n         return self._platlib\n \n+    def _get_lib_dirs(self) -> list[Path]:\n+        return [self.purelib, self.platlib]\n+\n     def is_path_relative_to_lib(self, path: Path) -> bool:\n-        for lib_path in [self.purelib, self.platlib]:\n+        for lib_path in self._get_lib_dirs():\n             with contextlib.suppress(ValueError):\n                 path.relative_to(lib_path)\n                 return True",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env/base_env.py::Env::_get_lib_dirs"
+            },
+            {
+              "kind": "class",
+              "node": "src/poetry/utils/env/base_env.py::Env"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env/base_env.py::Env::is_path_relative_to_lib"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -324,8 +327,8 @@",
+          "snippet": " class Env:\n             \"-I\",\n             \"-W\",\n             \"ignore\",\n-            \"-\",\n-            input_=content,\n+            \"-c\",\n+            content,\n             stderr=subprocess.PIPE,\n             **kwargs,\n         )",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env/base_env.py::Env::run_python_script"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -335,23 +338,11 @@",
+          "snippet": " class Env:\n         Run a command inside the Python environment.\n         \"\"\"\n         call = kwargs.pop(\"call\", False)\n-        input_ = kwargs.pop(\"input_\", None)\n         env = kwargs.pop(\"env\", dict(os.environ))\n         stderr = kwargs.pop(\"stderr\", subprocess.STDOUT)\n \n         try:\n-            if input_:\n-                output: str = subprocess.run(\n-                    cmd,\n-                    stdout=subprocess.PIPE,\n-                    stderr=stderr,\n-                    input=input_,\n-                    check=True,\n-                    env=env,\n-                    text=True,\n-                    **kwargs,\n-                ).stdout\n-            elif call:\n+            if call:\n                 assert stderr != subprocess.PIPE\n                 subprocess.check_call(cmd, stderr=stderr, env=env, **kwargs)\n                 output = \"\"",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env/base_env.py::Env::_run"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -360,7 +351,7 @@",
+          "snippet": " class Env:\n                     cmd, stderr=stderr, env=env, text=True, **kwargs\n                 )\n         except CalledProcessError as e:\n-            raise EnvCommandError(e, input=input_)\n+            raise EnvCommandError(e)\n \n         return output\n \n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env/base_env.py::Env::_run"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/utils/env/env_manager.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -612,35 +612,40 @@",
+          "snippet": " class EnvManager:\n         cls,\n         path: Path,\n         executable: Path | None = None,\n-        flags: dict[str, bool] | None = None,\n+        flags: dict[str, str | bool] | None = None,\n         with_pip: bool | None = None,\n         with_wheel: bool | None = None,\n         with_setuptools: bool | None = None,\n         prompt: str | None = None,\n     ) -> virtualenv.run.session.Session:\n-        if WINDOWS:\n-            path = get_real_windows_path(path)\n-            executable = get_real_windows_path(executable) if executable else None\n-\n         flags = flags or {}\n \n-        flags[\"no-pip\"] = (\n-            not with_pip if with_pip is not None else flags.pop(\"no-pip\", True)\n-        )\n+        if with_pip is not None:\n+            flags[\"no-pip\"] = not with_pip\n \n-        flags[\"no-setuptools\"] = (\n-            not with_setuptools\n-            if with_setuptools is not None\n-            else flags.pop(\"no-setuptools\", True)\n-        )\n+        if with_wheel is not None:\n+            wheel_flags: dict[str, str | bool] = (\n+                {\"wheel\": \"bundle\"} if with_wheel else {\"no-wheel\": True}\n+            )\n+            flags.update(wheel_flags)\n \n-        # we want wheels to be enabled when pip is required and it has not been\n-        # explicitly disabled\n-        flags[\"no-wheel\"] = (\n-            not with_wheel\n-            if with_wheel is not None\n-            else flags.pop(\"no-wheel\", flags[\"no-pip\"])\n-        )\n+        if with_setuptools is not None:\n+            setuptools_flags: dict[str, str | bool] = (\n+                {\"setuptools\": \"bundle\"} if with_setuptools else {\"no-setuptools\": True}\n+            )\n+            flags.update(setuptools_flags)\n+\n+        flags.setdefault(\"no-pip\", True)\n+\n+        if \"setuptools\" not in flags and \"no-setuptools\" not in flags:\n+            flags[\"no-setuptools\"] = True\n+\n+        if \"wheel\" not in flags and \"no-wheel\" not in flags:\n+            flags[\"no-wheel\"] = True\n+\n+        if WINDOWS:\n+            path = get_real_windows_path(path)\n+            executable = get_real_windows_path(executable) if executable else None\n \n         executable_str = None if executable is None else executable.resolve().as_posix()\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env/env_manager.py::EnvManager::build_venv"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -658,6 +663,9 @@",
+          "snippet": " class EnvManager:\n             if value is True:\n                 args.append(f\"--{flag}\")\n \n+            elif value is not False:\n+                args.append(f\"--{flag}={value}\")\n+\n         args.append(str(path))\n \n         cli_result = virtualenv.cli_run(args)\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env/env_manager.py::EnvManager::build_venv"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/utils/env/exceptions.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -20,7 +20,7 @@",
+          "snippet": " class IncorrectEnvError(EnvError):\n \n \n class EnvCommandError(EnvError):\n-    def __init__(self, e: CalledProcessError, input: str | None = None) -> None:\n+    def __init__(self, e: CalledProcessError) -> None:\n         self.e = e\n \n         message_parts = [",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env/exceptions.py::EnvCommandError::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -30,8 +30,6 @@",
+          "snippet": " class EnvCommandError(EnvError):\n             message_parts.append(f\"Output:\\n{decode(e.output)}\")\n         if e.stderr:\n             message_parts.append(f\"Error output:\\n{decode(e.stderr)}\")\n-        if input:\n-            message_parts.append(f\"Input:\\n{input}\")\n         super().__init__(\"\\n\\n\".join(message_parts))\n \n \n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env/exceptions.py::EnvCommandError::__init__"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/utils/env/system_env.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -2,6 +2,7 @@",
+          "snippet": " from __future__ import annotations\n \n import os\n import platform\n+import site\n import sys\n import sysconfig\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/utils/env/system_env.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -87,3 +88,6 @@",
+          "snippet": " class SystemEnv(Env):\n \n     def is_venv(self) -> bool:\n         return self._path != self._base\n+\n+    def _get_lib_dirs(self) -> list[Path]:\n+        return super()._get_lib_dirs() + [Path(d) for d in site.getsitepackages()]\n",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "src/poetry/utils/env/system_env.py::SystemEnv"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env/system_env.py::SystemEnv::_get_lib_dirs"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/utils/env/virtual_env.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -3,9 +3,11 @@",
+          "snippet": " from __future__ import annotations\n import json\n import os\n import re\n+import sys\n \n from contextlib import contextmanager\n from copy import deepcopy\n+from functools import cached_property\n from pathlib import Path\n from typing import TYPE_CHECKING\n from typing import Any",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/utils/env/virtual_env.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -20,6 +22,7 @@",
+          "snippet": " from poetry.utils.env.script_strings import GET_PATHS\n from poetry.utils.env.script_strings import GET_PYTHON_VERSION\n from poetry.utils.env.script_strings import GET_SYS_PATH\n from poetry.utils.env.script_strings import GET_SYS_TAGS\n+from poetry.utils.env.system_env import SystemEnv\n \n \n if TYPE_CHECKING:",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/utils/env/virtual_env.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -133,3 +136,21 @@",
+          "snippet": " class VirtualEnv(Env):\n \n     def _updated_path(self) -> str:\n         return os.pathsep.join([str(self._bin_dir), os.environ.get(\"PATH\", \"\")])\n+\n+    @cached_property\n+    def includes_system_site_packages(self) -> bool:\n+        pyvenv_cfg = self._path / \"pyvenv.cfg\"\n+        return (\n+            re.search(\n+                r\"^\\s*include-system-site-packages\\s*=\\s*true\\s*$\",\n+                pyvenv_cfg.read_text(),\n+                re.IGNORECASE | re.MULTILINE,\n+            )\n+            is not None\n+        )\n+\n+    def is_path_relative_to_lib(self, path: Path) -> bool:\n+        return super().is_path_relative_to_lib(path) or (\n+            self.includes_system_site_packages\n+            and SystemEnv(Path(sys.prefix)).is_path_relative_to_lib(path)\n+        )\n",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "src/poetry/utils/env/virtual_env.py::VirtualEnv"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env/virtual_env.py::VirtualEnv::includes_system_site_packages"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env/virtual_env.py::VirtualEnv::is_path_relative_to_lib"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/utils/helpers.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -6,13 +6,20 @@",
+          "snippet": " import os\n import shutil\n import stat\n import sys\n+import tarfile\n import tempfile\n+import zipfile\n \n from collections.abc import Mapping\n from contextlib import contextmanager\n+from contextlib import suppress\n+from functools import cached_property\n from pathlib import Path\n from typing import TYPE_CHECKING\n from typing import Any\n+from typing import overload\n+\n+import requests\n \n from requests.utils import atomic_open\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/utils/helpers.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -22,6 +29,7 @@",
+          "snippet": " from poetry.utils.constants import REQUESTS_TIMEOUT\n if TYPE_CHECKING:\n     from collections.abc import Callable\n     from collections.abc import Iterator\n+    from types import TracebackType\n \n     from poetry.core.packages.package import Package\n     from requests import Session",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/utils/helpers.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -39,7 +47,23 @@",
+          "snippet": " def directory(path: Path) -> Iterator[Path]:\n         os.chdir(cwd)\n \n \n-def _on_rm_error(func: Callable[[str], None], path: str, exc_info: Exception) -> None:\n+# Correct type signature when used as `shutil.rmtree(..., onexc=_on_rm_error)`.\n+@overload\n+def _on_rm_error(\n+    func: Callable[[str], None], path: str, exc_info: Exception\n+) -> None: ...\n+\n+\n+# Correct type signature when used as `shutil.rmtree(..., onerror=_on_rm_error)`.\n+@overload\n+def _on_rm_error(\n+    func: Callable[[str], None],\n+    path: str,\n+    exc_info: tuple[type[BaseException], BaseException, TracebackType],\n+) -> None: ...\n+\n+\n+def _on_rm_error(func: Callable[[str], None], path: str, exc_info: Any) -> None:\n     if not os.path.exists(path):\n         return\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/poetry/utils/helpers.py::_on_rm_error"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -47,9 +71,7 @@",
+          "snippet": " def _on_rm_error(func: Callable[[str], None], path: str, exc_info: Exception) ->\n     func(path)\n \n \n-def remove_directory(\n-    path: Path, *args: Any, force: bool = False, **kwargs: Any\n-) -> None:\n+def remove_directory(path: Path, force: bool = False) -> None:\n     \"\"\"\n     Helper function handle safe removal, and optionally forces stubborn file removal.\n     This is particularly useful when dist files are read-only or git writes read-only",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/poetry/utils/helpers.py::remove_directory"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -60,8 +82,12 @@",
+          "snippet": " def remove_directory(\n     if path.is_symlink():\n         return os.unlink(path)\n \n-    kwargs[\"onerror\"] = kwargs.pop(\"onerror\", _on_rm_error if force else None)\n-    shutil.rmtree(path, *args, **kwargs)\n+    kwargs: dict[str, Any] = {}\n+    if force:\n+        onexc = \"onexc\" if sys.version_info >= (3, 12) else \"onerror\"\n+        kwargs[onexc] = _on_rm_error\n+\n+    shutil.rmtree(path, **kwargs)\n \n \n def merge_dicts(d1: dict[str, Any], d2: dict[str, Any]) -> None:",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/poetry/utils/helpers.py::remove_directory"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -78,25 +104,16 @@",
+          "snippet": " def download_file(\n     session: Authenticator | Session | None = None,\n     chunk_size: int = 1024,\n ) -> None:\n-    import requests\n-\n     from poetry.puzzle.provider import Indicator\n \n-    get = requests.get if not session else session.get\n-\n-    response = get(url, stream=True, timeout=REQUESTS_TIMEOUT)\n-    response.raise_for_status()\n+    downloader = Downloader(url, dest, session)\n \n     set_indicator = False\n     with Indicator.context() as update_context:\n         update_context(f\"Downloading {url}\")\n \n-        if \"Content-Length\" in response.headers:\n-            try:\n-                total_size = int(response.headers[\"Content-Length\"])\n-            except ValueError:\n-                total_size = 0\n-\n+        total_size = downloader.total_size\n+        if total_size > 0:\n             fetched_size = 0\n             last_percent = 0\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/poetry/utils/helpers.py::download_file"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -104,17 +121,44 @@",
+          "snippet": " def download_file(\n             # but skip the updating\n             set_indicator = total_size > 1024 * 1024\n \n-        with atomic_open(dest) as f:\n-            for chunk in response.iter_content(chunk_size=chunk_size):\n+        for fetched_size in downloader.download_with_progress(chunk_size):\n+            if set_indicator:\n+                percent = (fetched_size * 100) // total_size\n+                if percent > last_percent:\n+                    last_percent = percent\n+                    update_context(f\"Downloading {url} {percent:3}%\")\n+\n+\n+class Downloader:\n+    def __init__(\n+        self,\n+        url: str,\n+        dest: Path,\n+        session: Authenticator | Session | None = None,\n+    ):\n+        self._dest = dest\n+\n+        get = requests.get if not session else session.get\n+\n+        self._response = get(url, stream=True, timeout=REQUESTS_TIMEOUT)\n+        self._response.raise_for_status()\n+\n+    @cached_property\n+    def total_size(self) -> int:\n+        total_size = 0\n+        if \"Content-Length\" in self._response.headers:\n+            with suppress(ValueError):\n+                total_size = int(self._response.headers[\"Content-Length\"])\n+        return total_size\n+\n+    def download_with_progress(self, chunk_size: int = 1024) -> Iterator[int]:\n+        fetched_size = 0\n+        with atomic_open(self._dest) as f:\n+            for chunk in self._response.iter_content(chunk_size=chunk_size):\n                 if chunk:\n                     f.write(chunk)\n-\n-                    if set_indicator:\n-                        fetched_size += len(chunk)\n-                        percent = (fetched_size * 100) // total_size\n-                        if percent > last_percent:\n-                            last_percent = percent\n-                            update_context(f\"Downloading {url} {percent:3}%\")\n+                    fetched_size += len(chunk)\n+                    yield fetched_size\n \n \n def get_package_version_display_string(",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/poetry/utils/helpers.py::download_file"
+            },
+            {
+              "kind": "class",
+              "node": "src/poetry/utils/helpers.py::Downloader"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/helpers.py::Downloader::__init__"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/helpers.py::Downloader::total_size"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/helpers.py::Downloader::download_with_progress"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -246,3 +290,16 @@",
+          "snippet": " def get_file_hash(path: Path, hash_name: str = \"sha256\") -> str:\n             h.update(content)\n \n     return h.hexdigest()\n+\n+\n+def extractall(source: Path, dest: Path, zip: bool) -> None:\n+    \"\"\"Extract all members from either a zip or tar archive.\"\"\"\n+    if zip:\n+        with zipfile.ZipFile(source) as archive:\n+            archive.extractall(dest)\n+    else:\n+        with tarfile.open(source) as archive:\n+            if hasattr(tarfile, \"data_filter\"):\n+                archive.extractall(dest, filter=\"data\")\n+            else:\n+                archive.extractall(dest)\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/poetry/utils/helpers.py::extractall"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/utils/password_manager.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -47,8 +47,18 @@",
+          "snippet": " class PoetryKeyring:\n \n         import keyring\n \n+        from keyring.errors import KeyringError\n+        from keyring.errors import KeyringLocked\n+\n         for name in names:\n-            credential = keyring.get_credential(name, username)\n+            credential = None\n+            try:\n+                credential = keyring.get_credential(name, username)\n+            except KeyringLocked:\n+                logger.debug(\"Keyring %s is locked\", name)\n+            except (KeyringError, RuntimeError):\n+                logger.debug(\"Accessing keyring %s failed\", name, exc_info=True)\n+\n             if credential:\n                 return HTTPAuthCredential(\n                     username=credential.username, password=credential.password\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/password_manager.py::PoetryKeyring::get_credential"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/utils/setup_reader.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -22,6 +22,7 @@",
+          "snippet": " class SetupReader:\n     DEFAULT: ClassVar[dict[str, Any]] = {\n         \"name\": None,\n         \"version\": None,\n+        \"description\": None,\n         \"install_requires\": [],\n         \"extras_require\": {},\n         \"python_requires\": None,",
+          "affect": [
+            {
+              "kind": "attribute",
+              "node": "src/poetry/utils/setup_reader.py::SetupReader::DEFAULT"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -62,6 +63,7 @@",
+          "snippet": " class SetupReader:\n         call, body = setup_call\n         result[\"name\"] = self._find_single_string(call, body, \"name\")\n         result[\"version\"] = self._find_single_string(call, body, \"version\")\n+        result[\"description\"] = self._find_single_string(call, body, \"description\")\n         result[\"install_requires\"] = self._find_install_requires(call, body)\n         result[\"extras_require\"] = self._find_extras_require(call, body)\n         result[\"python_requires\"] = self._find_single_string(",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/setup_reader.py::SetupReader::read_setup_py"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -77,12 +79,16 @@",
+          "snippet": " class SetupReader:\n \n         name = None\n         version = None\n+        description = None\n         if parser.has_option(\"metadata\", \"name\"):\n             name = parser.get(\"metadata\", \"name\")\n \n         if parser.has_option(\"metadata\", \"version\"):\n             version = Version.parse(parser.get(\"metadata\", \"version\")).text\n \n+        if parser.has_option(\"metadata\", \"description\"):\n+            description = parser.get(\"metadata\", \"description\")\n+\n         install_requires = []\n         extras_require: dict[str, list[str]] = {}\n         python_requires = None",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/setup_reader.py::SetupReader::read_setup_cfg"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -112,6 +118,7 @@",
+          "snippet": " class SetupReader:\n         return {\n             \"name\": name,\n             \"version\": version,\n+            \"description\": description,\n             \"install_requires\": install_requires,\n             \"extras_require\": extras_require,\n             \"python_requires\": python_requires,\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/setup_reader.py::SetupReader::read_setup_cfg"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/utils/shell.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -97,12 +97,16 @@",
+          "snippet": " class Shell:\n         import shlex\n \n         terminal = shutil.get_terminal_size()\n+        cmd = f\"{self._get_source_command()} {shlex.quote(str(activate_path))}\"\n+\n         with env.temp_environ():\n+            args = [\"-e\", cmd] if self._name == \"nu\" else [\"-i\"]\n+\n             c = pexpect.spawn(\n-                self._path, [\"-i\"], dimensions=(terminal.lines, terminal.columns)\n+                self._path, args, dimensions=(terminal.lines, terminal.columns)\n             )\n \n-        if self._name in [\"zsh\", \"nu\"]:\n+        if self._name in [\"zsh\"]:\n             c.setecho(False)\n \n         if self._name == \"zsh\":",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/shell.py::Shell::activate"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -110,10 +114,13 @@",
+          "snippet": " class Shell:\n             c.sendline(f\"emulate bash -c '. {shlex.quote(str(activate_path))}'\")\n         elif self._name == \"xonsh\":\n             c.sendline(f\"vox activate {shlex.quote(str(env.path))}\")\n+        elif self._name == \"nu\":\n+            # If this is nu, we don't want to send the activation command to the\n+            # command line since we already ran it via the shell's invocation.\n+            pass\n         else:\n-            cmd = f\"{self._get_source_command()} {shlex.quote(str(activate_path))}\"\n-            if self._name in [\"fish\", \"nu\"]:\n-                # Under fish and nu \"\\r\" should be sent explicitly\n+            if self._name in [\"fish\"]:\n+                # Under fish, \"\\r\" should be sent explicitly\n                 cmd += \"\\r\"\n             c.sendline(cmd)\n \n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/shell.py::Shell::activate"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/vcs/git/backend.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -8,6 +8,8 @@",
+          "snippet": " from pathlib import Path\n from subprocess import CalledProcessError\n from typing import TYPE_CHECKING\n from urllib.parse import urljoin\n+from urllib.parse import urlparse\n+from urllib.parse import urlunparse\n \n from dulwich import porcelain\n from dulwich.client import HTTPUnauthorized",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/vcs/git/backend.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -15,6 +17,7 @@",
+          "snippet": " from dulwich.client import get_transport_and_path\n from dulwich.config import ConfigFile\n from dulwich.config import parse_submodules\n from dulwich.errors import NotGitRepository\n+from dulwich.index import IndexEntry\n from dulwich.refs import ANNOTATED_TAG_SUFFIX\n from dulwich.repo import Repo\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/vcs/git/backend.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -30,6 +33,9 @@",
+          "snippet": " if TYPE_CHECKING:\n \n logger = logging.getLogger(__name__)\n \n+# A relative URL by definition starts with ../ or ./\n+RELATIVE_SUBMODULE_REGEX = re.compile(r\"^\\.{1,2}/\")\n+\n \n def is_revision_sha(revision: str | None) -> bool:\n     return re.match(r\"^\\b[0-9a-f]{5,40}\\b$\", revision or \"\") is not None",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "src/poetry/vcs/git/backend.py::RELATIVE_SUBMODULE_REGEX"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -326,49 +332,64 @@",
+          "snippet": " class Git:\n         Helper method to identify configured submodules and clone them recursively.\n         \"\"\"\n         repo_root = Path(repo.path)\n-        modules_config = repo_root.joinpath(\".gitmodules\")\n-\n-        # A relative URL by definition starts with ../ or ./\n-        relative_submodule_regex = re.compile(r\"^\\.{1,2}/\")\n-\n-        if modules_config.exists():\n-            config = ConfigFile.from_path(str(modules_config))\n-\n-            url: bytes\n-            path: bytes\n-            submodules = parse_submodules(config)\n-\n-            for path, url, name in submodules:\n-                path_relative = Path(path.decode(\"utf-8\"))\n-                path_absolute = repo_root.joinpath(path_relative)\n-\n-                url_string = url.decode(\"utf-8\")\n-                if relative_submodule_regex.search(url_string):\n-                    url_string = urljoin(f\"{Git.get_remote_url(repo)}/\", url_string)\n-\n-                source_root = path_absolute.parent\n-                source_root.mkdir(parents=True, exist_ok=True)\n-\n-                with repo:\n-                    try:\n-                        revision = repo.open_index()[path].sha.decode(\"utf-8\")\n-                    except KeyError:\n-                        logger.debug(\n-                            \"Skip submodule %s in %s, path %s not found\",\n-                            name,\n-                            repo.path,\n-                            path,\n-                        )\n-                        continue\n-\n-                cls.clone(\n-                    url=url_string,\n-                    source_root=source_root,\n-                    name=path_relative.name,\n+        for submodule in cls._get_submodules(repo):\n+            path_absolute = repo_root / submodule.path\n+            source_root = path_absolute.parent\n+            source_root.mkdir(parents=True, exist_ok=True)\n+            cls.clone(\n+                url=submodule.url,\n+                source_root=source_root,\n+                name=path_absolute.name,\n+                revision=submodule.revision,\n+                clean=path_absolute.exists()\n+                and not path_absolute.joinpath(\".git\").is_dir(),\n+            )\n+\n+    @classmethod\n+    def _get_submodules(cls, repo: Repo) -> list[SubmoduleInfo]:\n+        modules_config = Path(repo.path, \".gitmodules\")\n+\n+        if not modules_config.exists():\n+            return []\n+\n+        config = ConfigFile.from_path(str(modules_config))\n+\n+        submodules: list[SubmoduleInfo] = []\n+        for path, url, name in parse_submodules(config):\n+            url_str = url.decode(\"utf-8\")\n+            path_str = path.decode(\"utf-8\")\n+            name_str = name.decode(\"utf-8\")\n+\n+            if RELATIVE_SUBMODULE_REGEX.search(url_str):\n+                url_str = urlpathjoin(f\"{cls.get_remote_url(repo)}/\", url_str)\n+\n+            with repo:\n+                index = repo.open_index()\n+\n+                try:\n+                    entry = index[path]\n+                except KeyError:\n+                    logger.debug(\n+                        \"Skip submodule %s in %s, path %s not found\",\n+                        name,\n+                        repo.path,\n+                        path,\n+                    )\n+                    continue\n+\n+                assert isinstance(entry, IndexEntry)\n+                revision = entry.sha.decode(\"utf-8\")\n+\n+            submodules.append(\n+                SubmoduleInfo(\n+                    path=path_str,\n+                    url=url_str,\n+                    name=name_str,\n                     revision=revision,\n-                    clean=path_absolute.exists()\n-                    and not path_absolute.joinpath(\".git\").is_dir(),\n                 )\n+            )\n+\n+        return submodules\n \n     @staticmethod\n     def is_using_legacy_client() -> bool:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/vcs/git/backend.py::Git::_clone_submodules"
+            },
+            {
+              "kind": "class",
+              "node": "src/poetry/vcs/git/backend.py::Git"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/vcs/git/backend.py::Git::_get_submodules"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -450,3 +471,31 @@",
+          "snippet": " class Git:\n \n         # fallback to legacy git client\n         return cls._clone_legacy(url=url, refspec=refspec, target=target)\n+\n+\n+def urlpathjoin(base: str, path: str) -> str:\n+    \"\"\"\n+    Allow any URL to be joined with a path\n+\n+    This works around an issue with urllib.parse.urljoin where it only handles\n+    relative URLs for protocols contained in urllib.parse.uses_relative. As it\n+    happens common protocols used with git, like ssh or git+ssh are not in that\n+    list.\n+\n+    Thus we need to implement our own version of urljoin that handles all URLs\n+    protocols. This is accomplished by using urlparse and urlunparse to split\n+    the URL into its components, join the path, and then reassemble the URL.\n+\n+    See: https://github.com/python-poetry/poetry/issues/6499#issuecomment-1564712609\n+    \"\"\"\n+    parsed_base = urlparse(base)\n+    new = parsed_base._replace(path=urljoin(parsed_base.path, path))\n+    return urlunparse(new)\n+\n+\n+@dataclasses.dataclass\n+class SubmoduleInfo:\n+    path: str\n+    url: str\n+    name: str\n+    revision: str\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/poetry/vcs/git/backend.py::urlpathjoin"
+            },
+            {
+              "kind": "class",
+              "node": "src/poetry/vcs/git/backend.py::SubmoduleInfo"
+            },
+            {
+              "kind": "attribute",
+              "node": "src/poetry/vcs/git/backend.py::SubmoduleInfo::path"
+            },
+            {
+              "kind": "attribute",
+              "node": "src/poetry/vcs/git/backend.py::SubmoduleInfo::url"
+            },
+            {
+              "kind": "attribute",
+              "node": "src/poetry/vcs/git/backend.py::SubmoduleInfo::name"
+            },
+            {
+              "kind": "attribute",
+              "node": "src/poetry/vcs/git/backend.py::SubmoduleInfo::revision"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/vcs/git/system.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -22,21 +22,8 @@",
+          "snippet": " class SystemGit:\n \n     @classmethod\n     def checkout(cls, rev: str, target: Path | None = None) -> str:\n-        args = []\n-\n-        if target:\n-            args += [\n-                \"--git-dir\",\n-                (target / \".git\").as_posix(),\n-                \"--work-tree\",\n-                target.as_posix(),\n-            ]\n-\n         cls._check_parameter(rev)\n-\n-        args += [\"checkout\", rev]\n-\n-        return cls.run(*args)\n+        return cls.run(\"checkout\", rev, folder=target)\n \n     @staticmethod\n     def run(*args: Any, **kwargs: Any) -> str:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/vcs/git/system.py::SystemGit::checkout"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

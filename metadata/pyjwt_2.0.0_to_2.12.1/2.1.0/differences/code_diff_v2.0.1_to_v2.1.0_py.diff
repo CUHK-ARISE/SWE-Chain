@@ -1,0 +1,285 @@
+diff --git a/jwt/__init__.py b/jwt/__init__.py
+index b7b3367..9fb8e31 100644
+--- a/jwt/__init__.py
++++ b/jwt/__init__.py
+@@ -1,3 +1,4 @@
++from .api_jwk import PyJWK, PyJWKSet
+ from .api_jws import (
+     PyJWS,
+     get_unverified_header,
+@@ -13,6 +14,7 @@ from .exceptions import (
+     InvalidAudienceError,
+     InvalidIssuedAtError,
+     InvalidIssuerError,
++    InvalidKeyError,
+     InvalidSignatureError,
+     InvalidTokenError,
+     MissingRequiredClaimError,
+@@ -23,7 +25,7 @@ from .exceptions import (
+ )
+ from .jwks_client import PyJWKClient
+ 
+-__version__ = "2.0.1"
++__version__ = "2.1.0"
+ 
+ __title__ = "PyJWT"
+ __description__ = "JSON Web Token implementation in Python"
+@@ -42,6 +44,8 @@ __all__ = [
+     "PyJWS",
+     "PyJWT",
+     "PyJWKClient",
++    "PyJWK",
++    "PyJWKSet",
+     "decode",
+     "encode",
+     "get_unverified_header",
+@@ -55,6 +59,7 @@ __all__ = [
+     "InvalidAudienceError",
+     "InvalidIssuedAtError",
+     "InvalidIssuerError",
++    "InvalidKeyError",
+     "InvalidSignatureError",
+     "InvalidTokenError",
+     "MissingRequiredClaimError",
+
+diff --git a/jwt/algorithms.py b/jwt/algorithms.py
+index 0d54382..cee66a4 100644
+--- a/jwt/algorithms.py
++++ b/jwt/algorithms.py
+@@ -37,6 +37,10 @@ try:
+         rsa_recover_prime_factors,
+     )
+     from cryptography.hazmat.primitives.serialization import (
++        Encoding,
++        NoEncryption,
++        PrivateFormat,
++        PublicFormat,
+         load_pem_private_key,
+         load_pem_public_key,
+         load_ssh_public_key,
+@@ -51,6 +55,7 @@ requires_cryptography = {
+     "RS384",
+     "RS512",
+     "ES256",
++    "ES256K",
+     "ES384",
+     "ES521",
+     "ES512",
+@@ -79,6 +84,7 @@ def get_default_algorithms():
+                 "RS384": RSAAlgorithm(RSAAlgorithm.SHA384),
+                 "RS512": RSAAlgorithm(RSAAlgorithm.SHA512),
+                 "ES256": ECAlgorithm(ECAlgorithm.SHA256),
++                "ES256K": ECAlgorithm(ECAlgorithm.SHA256),
+                 "ES384": ECAlgorithm(ECAlgorithm.SHA384),
+                 "ES521": ECAlgorithm(ECAlgorithm.SHA512),
+                 "ES512": ECAlgorithm(
+@@ -425,6 +431,8 @@ if has_crypto:
+                 return False
+ 
+             try:
++                if isinstance(key, EllipticCurvePrivateKey):
++                    key = key.public_key()
+                 key.verify(der_sig, msg, ec.ECDSA(self.hash_alg()))
+                 return True
+             except InvalidSignature:
+@@ -467,6 +475,13 @@ if has_crypto:
+                     curve_obj = ec.SECP521R1()
+                 else:
+                     raise InvalidKeyError("Coords should be 66 bytes for curve P-521")
++            elif curve == "secp256k1":
++                if len(x) == len(y) == 32:
++                    curve_obj = ec.SECP256K1()
++                else:
++                    raise InvalidKeyError(
++                        "Coords should be 32 bytes for curve secp256k1"
++                    )
+             else:
+                 raise InvalidKeyError(f"Invalid curve: {curve}")
+ 
+@@ -577,3 +592,73 @@ if has_crypto:
+                 return True  # If no exception was raised, the signature is valid.
+             except cryptography.exceptions.InvalidSignature:
+                 return False
++
++        @staticmethod
++        def to_jwk(key):
++            if isinstance(key, Ed25519PublicKey):
++                x = key.public_bytes(
++                    encoding=Encoding.Raw,
++                    format=PublicFormat.Raw,
++                )
++
++                return json.dumps(
++                    {
++                        "x": base64url_encode(force_bytes(x)).decode(),
++                        "kty": "OKP",
++                        "crv": "Ed25519",
++                    }
++                )
++
++            if isinstance(key, Ed25519PrivateKey):
++                d = key.private_bytes(
++                    encoding=Encoding.Raw,
++                    format=PrivateFormat.Raw,
++                    encryption_algorithm=NoEncryption(),
++                )
++
++                x = key.public_key().public_bytes(
++                    encoding=Encoding.Raw,
++                    format=PublicFormat.Raw,
++                )
++
++                return json.dumps(
++                    {
++                        "x": base64url_encode(force_bytes(x)).decode(),
++                        "d": base64url_encode(force_bytes(d)).decode(),
++                        "kty": "OKP",
++                        "crv": "Ed25519",
++                    }
++                )
++
++            raise InvalidKeyError("Not a public or private key")
++
++        @staticmethod
++        def from_jwk(jwk):
++            try:
++                if isinstance(jwk, str):
++                    obj = json.loads(jwk)
++                elif isinstance(jwk, dict):
++                    obj = jwk
++                else:
++                    raise ValueError
++            except ValueError:
++                raise InvalidKeyError("Key is not valid JSON")
++
++            if obj.get("kty") != "OKP":
++                raise InvalidKeyError("Not an Octet Key Pair")
++
++            curve = obj.get("crv")
++            if curve != "Ed25519":
++                raise InvalidKeyError(f"Invalid curve: {curve}")
++
++            if "x" not in obj:
++                raise InvalidKeyError('OKP should have "x" parameter')
++            x = base64url_decode(obj.get("x"))
++
++            try:
++                if "d" not in obj:
++                    return Ed25519PublicKey.from_public_bytes(x)
++                d = base64url_decode(obj.get("d"))
++                return Ed25519PrivateKey.from_private_bytes(d)
++            except ValueError as err:
++                raise InvalidKeyError("Invalid key parameter") from err
+
+diff --git a/jwt/api_jwk.py b/jwt/api_jwk.py
+index 3c10e07..a0f6364 100644
+--- a/jwt/api_jwk.py
++++ b/jwt/api_jwk.py
+@@ -1,7 +1,7 @@
+ import json
+ 
+ from .algorithms import get_default_algorithms
+-from .exceptions import PyJWKError, PyJWKSetError
++from .exceptions import InvalidKeyError, PyJWKError, PyJWKSetError
+ 
+ 
+ class PyJWK:
+@@ -9,11 +9,40 @@ class PyJWK:
+         self._algorithms = get_default_algorithms()
+         self._jwk_data = jwk_data
+ 
++        kty = self._jwk_data.get("kty", None)
++        if not kty:
++            raise InvalidKeyError("kty is not found: %s" % self._jwk_data)
++
+         if not algorithm and isinstance(self._jwk_data, dict):
+             algorithm = self._jwk_data.get("alg", None)
+ 
+         if not algorithm:
+-            raise PyJWKError("Unable to find a algorithm for key: %s" % self._jwk_data)
++            # Determine alg with kty (and crv).
++            crv = self._jwk_data.get("crv", None)
++            if kty == "EC":
++                if crv == "P-256" or not crv:
++                    algorithm = "ES256"
++                elif crv == "P-384":
++                    algorithm = "ES384"
++                elif crv == "P-521":
++                    algorithm = "ES512"
++                elif crv == "secp256k1":
++                    algorithm = "ES256K"
++                else:
++                    raise InvalidKeyError("Unsupported crv: %s" % crv)
++            elif kty == "RSA":
++                algorithm = "RS256"
++            elif kty == "oct":
++                algorithm = "HS256"
++            elif kty == "OKP":
++                if not crv:
++                    raise InvalidKeyError("crv is not found: %s" % self._jwk_data)
++                if crv == "Ed25519":
++                    algorithm = "EdDSA"
++                else:
++                    raise InvalidKeyError("Unsupported crv: %s" % crv)
++            else:
++                raise InvalidKeyError("Unsupported kty: %s" % kty)
+ 
+         self.Algorithm = self._algorithms.get(algorithm)
+ 
+
+diff --git a/jwt/api_jwt.py b/jwt/api_jwt.py
+index 80b33bf..70a5e53 100644
+--- a/jwt/api_jwt.py
++++ b/jwt/api_jwt.py
+@@ -75,6 +75,13 @@ class PyJWT:
+         else:
+             options.setdefault("verify_signature", True)
+ 
++        if not options["verify_signature"]:
++            options.setdefault("verify_exp", False)
++            options.setdefault("verify_nbf", False)
++            options.setdefault("verify_iat", False)
++            options.setdefault("verify_aud", False)
++            options.setdefault("verify_iss", False)
++
+         if options["verify_signature"] and not algorithms:
+             raise DecodeError(
+                 'It is required that you pass in a value for the "algorithms" argument when calling decode().'
+@@ -95,9 +102,8 @@ class PyJWT:
+         if not isinstance(payload, dict):
+             raise DecodeError("Invalid payload string: must be a json object")
+ 
+-        if options["verify_signature"]:
+-            merged_options = {**self.options, **options}
+-            self._validate_claims(payload, merged_options, **kwargs)
++        merged_options = {**self.options, **options}
++        self._validate_claims(payload, merged_options, **kwargs)
+ 
+         decoded["payload"] = payload
+         return decoded
+
+diff --git a/jwt/jwks_client.py b/jwt/jwks_client.py
+index a6c0d9f..dc86c3b 100644
+--- a/jwt/jwks_client.py
++++ b/jwt/jwks_client.py
+@@ -1,5 +1,6 @@
+ import json
+ import urllib.request
++from functools import lru_cache
+ from typing import Any, List
+ 
+ from .api_jwk import PyJWK, PyJWKSet
+@@ -8,8 +9,12 @@ from .exceptions import PyJWKClientError
+ 
+ 
+ class PyJWKClient:
+-    def __init__(self, uri: str):
++    def __init__(self, uri: str, cache_keys: bool = True, max_cached_keys: int = 16):
+         self.uri = uri
++        if cache_keys:
++            # Cache signing keys
++            # Ignore mypy (https://github.com/python/mypy/issues/2427)
++            self.get_signing_key = lru_cache(maxsize=max_cached_keys)(self.get_signing_key)  # type: ignore
+ 
+     def fetch_data(self) -> Any:
+         with urllib.request.urlopen(self.uri) as response:

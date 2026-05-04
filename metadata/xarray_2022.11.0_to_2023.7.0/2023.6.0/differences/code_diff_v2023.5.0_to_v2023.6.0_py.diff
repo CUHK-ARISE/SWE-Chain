@@ -1,0 +1,1399 @@
+diff --git a/.github/workflows/parse_logs.py b/.github/workflows/parse_logs.py
+deleted file mode 100644
+index c0674ae..0000000
+--- a/.github/workflows/parse_logs.py
++++ /dev/null
+@@ -1,102 +0,0 @@
+-# type: ignore
+-import argparse
+-import functools
+-import json
+-import pathlib
+-import textwrap
+-from dataclasses import dataclass
+-
+-from pytest import CollectReport, TestReport
+-
+-
+-@dataclass
+-class SessionStart:
+-    pytest_version: str
+-    outcome: str = "status"
+-
+-    @classmethod
+-    def _from_json(cls, json):
+-        json_ = json.copy()
+-        json_.pop("$report_type")
+-        return cls(**json_)
+-
+-
+-@dataclass
+-class SessionFinish:
+-    exitstatus: str
+-    outcome: str = "status"
+-
+-    @classmethod
+-    def _from_json(cls, json):
+-        json_ = json.copy()
+-        json_.pop("$report_type")
+-        return cls(**json_)
+-
+-
+-def parse_record(record):
+-    report_types = {
+-        "TestReport": TestReport,
+-        "CollectReport": CollectReport,
+-        "SessionStart": SessionStart,
+-        "SessionFinish": SessionFinish,
+-    }
+-    cls = report_types.get(record["$report_type"])
+-    if cls is None:
+-        raise ValueError(f"unknown report type: {record['$report_type']}")
+-
+-    return cls._from_json(record)
+-
+-
+-@functools.singledispatch
+-def format_summary(report):
+-    return f"{report.nodeid}: {report}"
+-
+-
+-@format_summary.register
+-def _(report: TestReport):
+-    message = report.longrepr.chain[0][1].message
+-    return f"{report.nodeid}: {message}"
+-
+-
+-@format_summary.register
+-def _(report: CollectReport):
+-    message = report.longrepr.split("\n")[-1].removeprefix("E").lstrip()
+-    return f"{report.nodeid}: {message}"
+-
+-
+-def format_report(reports, py_version):
+-    newline = "\n"
+-    summaries = newline.join(format_summary(r) for r in reports)
+-    message = textwrap.dedent(
+-        """\
+-        <details><summary>Python {py_version} Test Summary</summary>
+-
+-        ```
+-        {summaries}
+-        ```
+-
+-        </details>
+-        """
+-    ).format(summaries=summaries, py_version=py_version)
+-    return message
+-
+-
+-if __name__ == "__main__":
+-    parser = argparse.ArgumentParser()
+-    parser.add_argument("filepath", type=pathlib.Path)
+-    args = parser.parse_args()
+-
+-    py_version = args.filepath.stem.split("-")[1]
+-
+-    print("Parsing logs ...")
+-
+-    lines = args.filepath.read_text().splitlines()
+-    reports = [parse_record(json.loads(line)) for line in lines]
+-
+-    failed = [report for report in reports if report.outcome == "failed"]
+-
+-    message = format_report(failed, py_version=py_version)
+-
+-    output_file = pathlib.Path("pytest-logs.txt")
+-    print(f"Writing output file to: {output_file.absolute()}")
+-    output_file.write_text(message)
+
+diff --git a/asv_bench/benchmarks/combine.py b/asv_bench/benchmarks/combine.py
+index a4f8db2..772d888 100644
+--- a/asv_bench/benchmarks/combine.py
++++ b/asv_bench/benchmarks/combine.py
+@@ -2,8 +2,49 @@ import numpy as np
+ 
+ import xarray as xr
+ 
++from . import requires_dask
+ 
+-class Combine:
++
++class Combine1d:
++    """Benchmark concatenating and merging large datasets"""
++
++    def setup(self) -> None:
++        """Create 2 datasets with two different variables"""
++
++        t_size = 8000
++        t = np.arange(t_size)
++        data = np.random.randn(t_size)
++
++        self.dsA0 = xr.Dataset({"A": xr.DataArray(data, coords={"T": t}, dims=("T"))})
++        self.dsA1 = xr.Dataset(
++            {"A": xr.DataArray(data, coords={"T": t + t_size}, dims=("T"))}
++        )
++
++    def time_combine_by_coords(self) -> None:
++        """Also has to load and arrange t coordinate"""
++        datasets = [self.dsA0, self.dsA1]
++
++        xr.combine_by_coords(datasets)
++
++
++class Combine1dDask(Combine1d):
++    """Benchmark concatenating and merging large datasets"""
++
++    def setup(self) -> None:
++        """Create 2 datasets with two different variables"""
++        requires_dask()
++
++        t_size = 8000
++        t = np.arange(t_size)
++        var = xr.Variable(dims=("T",), data=np.random.randn(t_size)).chunk()
++
++        data_vars = {f"long_name_{v}": ("T", var) for v in range(500)}
++
++        self.dsA0 = xr.Dataset(data_vars, coords={"T": t})
++        self.dsA1 = xr.Dataset(data_vars, coords={"T": t + t_size})
++
++
++class Combine3d:
+     """Benchmark concatenating and merging large datasets"""
+ 
+     def setup(self):
+
+diff --git a/asv_bench/benchmarks/pandas.py b/asv_bench/benchmarks/pandas.py
+index 2a296ec..9bda597 100644
+--- a/asv_bench/benchmarks/pandas.py
++++ b/asv_bench/benchmarks/pandas.py
+@@ -29,19 +29,20 @@ class MultiIndexSeries:
+ class ToDataFrame:
+     def setup(self, *args, **kwargs):
+         xp = kwargs.get("xp", np)
++        nvars = kwargs.get("nvars", 1)
+         random_kws = kwargs.get("random_kws", {})
+         method = kwargs.get("method", "to_dataframe")
+ 
+         dim1 = 10_000
+         dim2 = 10_000
++
++        var = xr.Variable(
++            dims=("dim1", "dim2"), data=xp.random.random((dim1, dim2), **random_kws)
++        )
++        data_vars = {f"long_name_{v}": (("dim1", "dim2"), var) for v in range(nvars)}
++
+         ds = xr.Dataset(
+-            {
+-                "x": xr.DataArray(
+-                    data=xp.random.random((dim1, dim2), **random_kws),
+-                    dims=["dim1", "dim2"],
+-                    coords={"dim1": np.arange(0, dim1), "dim2": np.arange(0, dim2)},
+-                )
+-            }
++            data_vars, coords={"dim1": np.arange(0, dim1), "dim2": np.arange(0, dim2)}
+         )
+         self.to_frame = getattr(ds, method)
+ 
+@@ -58,4 +59,6 @@ class ToDataFrameDask(ToDataFrame):
+ 
+         import dask.array as da
+ 
+-        super().setup(xp=da, random_kws=dict(chunks=5000), method="to_dask_dataframe")
++        super().setup(
++            xp=da, random_kws=dict(chunks=5000), method="to_dask_dataframe", nvars=500
++        )
+
+diff --git a/doc/conf.py b/doc/conf.py
+index e8ef13f..f201af8 100644
+--- a/doc/conf.py
++++ b/doc/conf.py
+@@ -58,7 +58,7 @@ except ImportError:
+         ]
+     )
+ 
+-nbsphinx_allow_errors = True
++nbsphinx_allow_errors = False
+ 
+ # -- General configuration ------------------------------------------------
+ 
+
+diff --git a/xarray/backends/file_manager.py b/xarray/backends/file_manager.py
+index 91fd15f..df901f9 100644
+--- a/xarray/backends/file_manager.py
++++ b/xarray/backends/file_manager.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import atexit
+ import contextlib
+ import io
+ import threading
+@@ -289,6 +290,13 @@ class CachingFileManager(FileManager):
+         )
+ 
+ 
++@atexit.register
++def _remove_del_method():
++    # We don't need to close unclosed files at program exit, and may not be able
++    # to, because Python is cleaning up imports / globals.
++    del CachingFileManager.__del__
++
++
+ class _RefCounter:
+     """Class for keeping track of reference counts."""
+ 
+
+diff --git a/xarray/backends/netCDF4_.py b/xarray/backends/netCDF4_.py
+index d3866e9..8a5d48c 100644
+--- a/xarray/backends/netCDF4_.py
++++ b/xarray/backends/netCDF4_.py
+@@ -65,10 +65,12 @@ class BaseNetCDF4Array(BackendArray):
+ 
+         dtype = array.dtype
+         if dtype is str:
+-            # use object dtype because that's the only way in numpy to
+-            # represent variable length strings; it also prevents automatic
+-            # string concatenation via conventions.decode_cf_variable
+-            dtype = np.dtype("O")
++            # use object dtype (with additional vlen string metadata) because that's
++            # the only way in numpy to represent variable length strings and to
++            # check vlen string dtype in further steps
++            # it also prevents automatic string concatenation via
++            # conventions.decode_cf_variable
++            dtype = coding.strings.create_vlen_dtype(str)
+         self.dtype = dtype
+ 
+     def __setitem__(self, key, value):
+
+diff --git a/xarray/backends/zarr.py b/xarray/backends/zarr.py
+index a4012a8..5ff1cf5 100644
+--- a/xarray/backends/zarr.py
++++ b/xarray/backends/zarr.py
+@@ -70,7 +70,14 @@ class ZarrArrayWrapper(BackendArray):
+         array = self.get_array()
+         self.shape = array.shape
+ 
+-        dtype = array.dtype
++        # preserve vlen string object dtype (GH 7328)
++        if array.filters is not None and any(
++            [filt.codec_id == "vlen-utf8" for filt in array.filters]
++        ):
++            dtype = coding.strings.create_vlen_dtype(str)
++        else:
++            dtype = array.dtype
++
+         self.dtype = dtype
+ 
+     def get_array(self):
+@@ -410,7 +417,7 @@ class ZarrStore(AbstractWritableDataStore):
+             if consolidated is None:
+                 consolidated = False
+ 
+-        if chunk_store:
++        if chunk_store is not None:
+             open_kwargs["chunk_store"] = chunk_store
+             if consolidated is None:
+                 consolidated = False
+
+diff --git a/xarray/coding/strings.py b/xarray/coding/strings.py
+index ffe1b1a..d0bfb1a 100644
+--- a/xarray/coding/strings.py
++++ b/xarray/coding/strings.py
+@@ -29,7 +29,8 @@ def check_vlen_dtype(dtype):
+     if dtype.kind != "O" or dtype.metadata is None:
+         return None
+     else:
+-        return dtype.metadata.get("element_type")
++        # check xarray (element_type) as well as h5py (vlen)
++        return dtype.metadata.get("element_type", dtype.metadata.get("vlen"))
+ 
+ 
+ def is_unicode_dtype(dtype):
+
+diff --git a/xarray/conventions.py b/xarray/conventions.py
+index 1506efc..053863a 100644
+--- a/xarray/conventions.py
++++ b/xarray/conventions.py
+@@ -108,6 +108,10 @@ def ensure_dtype_not_object(var: Variable, name: T_Name = None) -> Variable:
+     if var.dtype.kind == "O":
+         dims, data, attrs, encoding = _var_as_tuple(var)
+ 
++        # leave vlen dtypes unchanged
++        if strings.check_vlen_dtype(data.dtype) is not None:
++            return var
++
+         if is_duck_dask_array(data):
+             warnings.warn(
+                 "variable {} has data in the form of a dask array with "
+
+diff --git a/xarray/core/accessor_str.py b/xarray/core/accessor_str.py
+index c6c4af8..31028f1 100644
+--- a/xarray/core/accessor_str.py
++++ b/xarray/core/accessor_str.py
+@@ -51,6 +51,7 @@ from unicodedata import normalize
+ 
+ import numpy as np
+ 
++from xarray.core import duck_array_ops
+ from xarray.core.computation import apply_ufunc
+ from xarray.core.types import T_DataArray
+ 
+@@ -2085,13 +2086,16 @@ class StringAccessor(Generic[T_DataArray]):
+         else:
+             # dtype MUST be object or strings can be truncated
+             # See: https://github.com/numpy/numpy/issues/8352
+-            return self._apply(
+-                func=_get_res_multi,
+-                func_args=(pat,),
+-                dtype=np.object_,
+-                output_core_dims=[[dim]],
+-                output_sizes={dim: maxgroups},
+-            ).astype(self._obj.dtype.kind)
++            return duck_array_ops.astype(
++                self._apply(
++                    func=_get_res_multi,
++                    func_args=(pat,),
++                    dtype=np.object_,
++                    output_core_dims=[[dim]],
++                    output_sizes={dim: maxgroups},
++                ),
++                self._obj.dtype.kind,
++            )
+ 
+     def extractall(
+         self,
+@@ -2258,15 +2262,18 @@ class StringAccessor(Generic[T_DataArray]):
+ 
+             return res
+ 
+-        return self._apply(
+-            # dtype MUST be object or strings can be truncated
+-            # See: https://github.com/numpy/numpy/issues/8352
+-            func=_get_res,
+-            func_args=(pat,),
+-            dtype=np.object_,
+-            output_core_dims=[[group_dim, match_dim]],
+-            output_sizes={group_dim: maxgroups, match_dim: maxcount},
+-        ).astype(self._obj.dtype.kind)
++        return duck_array_ops.astype(
++            self._apply(
++                # dtype MUST be object or strings can be truncated
++                # See: https://github.com/numpy/numpy/issues/8352
++                func=_get_res,
++                func_args=(pat,),
++                dtype=np.object_,
++                output_core_dims=[[group_dim, match_dim]],
++                output_sizes={group_dim: maxgroups, match_dim: maxcount},
++            ),
++            self._obj.dtype.kind,
++        )
+ 
+     def findall(
+         self,
+@@ -2385,13 +2392,16 @@ class StringAccessor(Generic[T_DataArray]):
+ 
+         # dtype MUST be object or strings can be truncated
+         # See: https://github.com/numpy/numpy/issues/8352
+-        return self._apply(
+-            func=arrfunc,
+-            func_args=(sep,),
+-            dtype=np.object_,
+-            output_core_dims=[[dim]],
+-            output_sizes={dim: 3},
+-        ).astype(self._obj.dtype.kind)
++        return duck_array_ops.astype(
++            self._apply(
++                func=arrfunc,
++                func_args=(sep,),
++                dtype=np.object_,
++                output_core_dims=[[dim]],
++                output_sizes={dim: 3},
++            ),
++            self._obj.dtype.kind,
++        )
+ 
+     def partition(
+         self,
+@@ -2510,13 +2520,16 @@ class StringAccessor(Generic[T_DataArray]):
+ 
+         # dtype MUST be object or strings can be truncated
+         # See: https://github.com/numpy/numpy/issues/8352
+-        return self._apply(
+-            func=_dosplit,
+-            func_args=(sep,),
+-            dtype=np.object_,
+-            output_core_dims=[[dim]],
+-            output_sizes={dim: maxsplit},
+-        ).astype(self._obj.dtype.kind)
++        return duck_array_ops.astype(
++            self._apply(
++                func=_dosplit,
++                func_args=(sep,),
++                dtype=np.object_,
++                output_core_dims=[[dim]],
++                output_sizes={dim: maxsplit},
++            ),
++            self._obj.dtype.kind,
++        )
+ 
+     def split(
+         self,
+
+diff --git a/xarray/core/combine.py b/xarray/core/combine.py
+index 8106c29..cee2730 100644
+--- a/xarray/core/combine.py
++++ b/xarray/core/combine.py
+@@ -970,10 +970,9 @@ def combine_by_coords(
+ 
+         # Perform the multidimensional combine on each group of data variables
+         # before merging back together
+-        concatenated_grouped_by_data_vars = []
+-        for vars, datasets_with_same_vars in grouped_by_vars:
+-            concatenated = _combine_single_variable_hypercube(
+-                list(datasets_with_same_vars),
++        concatenated_grouped_by_data_vars = tuple(
++            _combine_single_variable_hypercube(
++                tuple(datasets_with_same_vars),
+                 fill_value=fill_value,
+                 data_vars=data_vars,
+                 coords=coords,
+@@ -981,7 +980,8 @@ def combine_by_coords(
+                 join=join,
+                 combine_attrs=combine_attrs,
+             )
+-            concatenated_grouped_by_data_vars.append(concatenated)
++            for vars, datasets_with_same_vars in grouped_by_vars
++        )
+ 
+     return merge(
+         concatenated_grouped_by_data_vars,
+
+diff --git a/xarray/core/common.py b/xarray/core/common.py
+index 397d6de..5dd4c4d 100644
+--- a/xarray/core/common.py
++++ b/xarray/core/common.py
+@@ -211,7 +211,7 @@ class AbstractArray:
+         int or tuple of int
+             Axis number or numbers corresponding to the given dimensions.
+         """
+-        if isinstance(dim, Iterable) and not isinstance(dim, str):
++        if not isinstance(dim, str) and isinstance(dim, Iterable):
+             return tuple(self._get_axis_num(d) for d in dim)
+         else:
+             return self._get_axis_num(dim)
+
+diff --git a/xarray/core/concat.py b/xarray/core/concat.py
+index dcf2a23..d7aad8c 100644
+--- a/xarray/core/concat.py
++++ b/xarray/core/concat.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ from collections.abc import Hashable, Iterable
+ from typing import TYPE_CHECKING, Any, Union, cast, overload
+ 
++import numpy as np
+ import pandas as pd
+ 
+ from xarray.core import dtypes, utils
+@@ -517,7 +518,7 @@ def _dataset_concat(
+     if variables_to_merge:
+         grouped = {
+             k: v
+-            for k, v in collect_variables_and_indexes(list(datasets)).items()
++            for k, v in collect_variables_and_indexes(datasets).items()
+             if k in variables_to_merge
+         }
+         merged_vars, merged_indexes = merge_collected(
+@@ -543,7 +544,7 @@ def _dataset_concat(
+         # ensure each variable with the given name shares the same
+         # dimensions and the same shape for all of them except along the
+         # concat dimension
+-        common_dims = tuple(pd.unique([d for v in vars for d in v.dims]))
++        common_dims = tuple(utils.OrderedSet(d for v in vars for d in v.dims))
+         if dim not in common_dims:
+             common_dims = (dim,) + common_dims
+         for var, dim_len in zip(vars, concat_dim_lengths):
+@@ -568,38 +569,45 @@ def _dataset_concat(
+                     yield PandasIndex(data, dim, coord_dtype=var.dtype)
+ 
+     # create concatenation index, needed for later reindexing
+-    concat_index = list(range(sum(concat_dim_lengths)))
++    file_start_indexes = np.append(0, np.cumsum(concat_dim_lengths))
++    concat_index = np.arange(file_start_indexes[-1])
++    concat_index_size = concat_index.size
++    variable_index_mask = np.ones(concat_index_size, dtype=bool)
+ 
+     # stack up each variable and/or index to fill-out the dataset (in order)
+     # n.b. this loop preserves variable order, needed for groupby.
++    ndatasets = len(datasets)
+     for name in vars_order:
+         if name in concat_over and name not in result_indexes:
+             variables = []
+-            variable_index = []
++            # Initialize the mask to all True then set False if any name is missing in
++            # the datasets:
++            variable_index_mask.fill(True)
+             var_concat_dim_length = []
+             for i, ds in enumerate(datasets):
+                 if name in ds.variables:
+                     variables.append(ds[name].variable)
+-                    # add to variable index, needed for reindexing
+-                    var_idx = [
+-                        sum(concat_dim_lengths[:i]) + k
+-                        for k in range(concat_dim_lengths[i])
+-                    ]
+-                    variable_index.extend(var_idx)
+-                    var_concat_dim_length.append(len(var_idx))
++                    var_concat_dim_length.append(concat_dim_lengths[i])
+                 else:
+                     # raise if coordinate not in all datasets
+                     if name in coord_names:
+                         raise ValueError(
+                             f"coordinate {name!r} not present in all datasets."
+                         )
++
++                    # Mask out the indexes without the name:
++                    start = file_start_indexes[i]
++                    end = file_start_indexes[i + 1]
++                    variable_index_mask[slice(start, end)] = False
++
++            variable_index = concat_index[variable_index_mask]
+             vars = ensure_common_dims(variables, var_concat_dim_length)
+ 
+             # Try to concatenate the indexes, concatenate the variables when no index
+             # is found on all datasets.
+             indexes: list[Index] = list(get_indexes(name))
+             if indexes:
+-                if len(indexes) < len(datasets):
++                if len(indexes) < ndatasets:
+                     raise ValueError(
+                         f"{name!r} must have either an index or no index in all datasets, "
+                         f"found {len(indexes)}/{len(datasets)} datasets with an index."
+@@ -623,7 +631,7 @@ def _dataset_concat(
+                     vars, dim, positions, combine_attrs=combine_attrs
+                 )
+                 # reindex if variable is not present in all datasets
+-                if len(variable_index) < len(concat_index):
++                if len(variable_index) < concat_index_size:
+                     combined_var = reindex_variables(
+                         variables={name: combined_var},
+                         dim_pos_indexers={
+
+diff --git a/xarray/core/dataarray.py b/xarray/core/dataarray.py
+index bc2450a..9635d67 100644
+--- a/xarray/core/dataarray.py
++++ b/xarray/core/dataarray.py
+@@ -42,6 +42,7 @@ from xarray.core.utils import (
+     ReprObject,
+     _default,
+     either_dict_or_kwargs,
++    emit_user_level_warning,
+ )
+ from xarray.core.variable import (
+     IndexVariable,
+@@ -4331,16 +4332,44 @@ class DataArray(
+         return result
+ 
+     def to_cdms2(self) -> cdms2_Variable:
+-        """Convert this array into a cdms2.Variable"""
++        """Convert this array into a cdms2.Variable
++
++        .. deprecated:: 2023.06.0
++            The `cdms2`_ library has been deprecated. Please consider using the
++            `xcdat`_ library instead.
++
++        .. _cdms2: https://github.com/CDAT/cdms
++        .. _xcdat: https://github.com/xCDAT/xcdat
++        """
+         from xarray.convert import to_cdms2
+ 
++        emit_user_level_warning(
++            "The cdms2 library has been deprecated."
++            " Please consider using the xcdat library instead.",
++            DeprecationWarning,
++        )
++
+         return to_cdms2(self)
+ 
+     @classmethod
+     def from_cdms2(cls, variable: cdms2_Variable) -> DataArray:
+-        """Convert a cdms2.Variable into an xarray.DataArray"""
++        """Convert a cdms2.Variable into an xarray.DataArray
++
++        .. deprecated:: 2023.06.0
++            The `cdms2`_ library has been deprecated. Please consider using the
++            `xcdat`_ library instead.
++
++        .. _cdms2: https://github.com/CDAT/cdms
++        .. _xcdat: https://github.com/xCDAT/xcdat
++        """
+         from xarray.convert import from_cdms2
+ 
++        emit_user_level_warning(
++            "The cdms2 library has been deprecated."
++            " Please consider using the xcdat library instead.",
++            DeprecationWarning,
++        )
++
+         return from_cdms2(variable)
+ 
+     def to_iris(self) -> iris_Cube:
+@@ -5475,6 +5504,7 @@ class DataArray(
+         numpy.polyfit
+         numpy.polyval
+         xarray.polyval
++        DataArray.curvefit
+         """
+         return self._to_temp_dataset().polyfit(
+             dim, deg, skipna=skipna, rcond=rcond, w=w, full=full, cov=cov
+@@ -6129,9 +6159,10 @@ class DataArray(
+         func: Callable[..., Any],
+         reduce_dims: Dims = None,
+         skipna: bool = True,
+-        p0: dict[str, Any] | None = None,
+-        bounds: dict[str, Any] | None = None,
++        p0: dict[str, float | DataArray] | None = None,
++        bounds: dict[str, tuple[float | DataArray, float | DataArray]] | None = None,
+         param_names: Sequence[str] | None = None,
++        errors: ErrorOptions = "raise",
+         kwargs: dict[str, Any] | None = None,
+     ) -> Dataset:
+         """
+@@ -6161,17 +6192,25 @@ class DataArray(
+             Whether to skip missing values when fitting. Default is True.
+         p0 : dict-like or None, optional
+             Optional dictionary of parameter names to initial guesses passed to the
+-            `curve_fit` `p0` arg. If none or only some parameters are passed, the rest will
+-            be assigned initial values following the default scipy behavior.
+-        bounds : dict-like or None, optional
+-            Optional dictionary of parameter names to bounding values passed to the
+-            `curve_fit` `bounds` arg. If none or only some parameters are passed, the rest
+-            will be unbounded following the default scipy behavior.
++            `curve_fit` `p0` arg. If the values are DataArrays, they will be appropriately
++            broadcast to the coordinates of the array. If none or only some parameters are
++            passed, the rest will be assigned initial values following the default scipy
++            behavior.
++        bounds : dict-like, optional
++            Optional dictionary of parameter names to tuples of bounding values passed to the
++            `curve_fit` `bounds` arg. If any of the bounds are DataArrays, they will be
++            appropriately broadcast to the coordinates of the array. If none or only some
++            parameters are passed, the rest will be unbounded following the default scipy
++            behavior.
+         param_names : sequence of Hashable or None, optional
+             Sequence of names for the fittable parameters of `func`. If not supplied,
+             this will be automatically determined by arguments of `func`. `param_names`
+             should be manually supplied when fitting a function that takes a variable
+             number of parameters.
++        errors : {"raise", "ignore"}, default: "raise"
++            If 'raise', any errors from the `scipy.optimize_curve_fit` optimization will
++            raise an exception. If 'ignore', the coefficients and covariances for the
++            coordinates where the fitting failed will be NaN.
+         **kwargs : optional
+             Additional keyword arguments to passed to scipy curve_fit.
+ 
+@@ -6185,6 +6224,86 @@ class DataArray(
+             [var]_curvefit_covariance
+                 The covariance matrix of the coefficient estimates.
+ 
++        Examples
++        --------
++        Generate some exponentially decaying data, where the decay constant and amplitude are
++        different for different values of the coordinate ``x``:
++
++        >>> rng = np.random.default_rng(seed=0)
++        >>> def exp_decay(t, time_constant, amplitude):
++        ...     return np.exp(-t / time_constant) * amplitude
++        ...
++        >>> t = np.linspace(0, 10, 11)
++        >>> da = xr.DataArray(
++        ...     np.stack(
++        ...         [
++        ...             exp_decay(t, 1, 0.1),
++        ...             exp_decay(t, 2, 0.2),
++        ...             exp_decay(t, 3, 0.3),
++        ...         ]
++        ...     )
++        ...     + rng.normal(size=(3, t.size)) * 0.01,
++        ...     coords={"x": [0, 1, 2], "time": t},
++        ... )
++        >>> da
++        <xarray.DataArray (x: 3, time: 11)>
++        array([[ 0.1012573 ,  0.0354669 ,  0.01993775,  0.00602771, -0.00352513,
++                 0.00428975,  0.01328788,  0.009562  , -0.00700381, -0.01264187,
++                -0.0062282 ],
++               [ 0.20041326,  0.09805582,  0.07138797,  0.03216692,  0.01974438,
++                 0.01097441,  0.00679441,  0.01015578,  0.01408826,  0.00093645,
++                 0.01501222],
++               [ 0.29334805,  0.21847449,  0.16305984,  0.11130396,  0.07164415,
++                 0.04744543,  0.03602333,  0.03129354,  0.01074885,  0.01284436,
++                 0.00910995]])
++        Coordinates:
++          * x        (x) int64 0 1 2
++          * time     (time) float64 0.0 1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 9.0 10.0
++
++        Fit the exponential decay function to the data along the ``time`` dimension:
++
++        >>> fit_result = da.curvefit("time", exp_decay)
++        >>> fit_result["curvefit_coefficients"].sel(
++        ...     param="time_constant"
++        ... )  # doctest: +NUMBER
++        <xarray.DataArray 'curvefit_coefficients' (x: 3)>
++        array([1.0569203, 1.7354963, 2.9421577])
++        Coordinates:
++          * x        (x) int64 0 1 2
++            param    <U13 'time_constant'
++        >>> fit_result["curvefit_coefficients"].sel(param="amplitude")
++        <xarray.DataArray 'curvefit_coefficients' (x: 3)>
++        array([0.1005489 , 0.19631423, 0.30003579])
++        Coordinates:
++          * x        (x) int64 0 1 2
++            param    <U13 'amplitude'
++
++        An initial guess can also be given with the ``p0`` arg (although it does not make much
++        of a difference in this simple example). To have a different guess for different
++        coordinate points, the guess can be a DataArray. Here we use the same initial guess
++        for the amplitude but different guesses for the time constant:
++
++        >>> fit_result = da.curvefit(
++        ...     "time",
++        ...     exp_decay,
++        ...     p0={
++        ...         "amplitude": 0.2,
++        ...         "time_constant": xr.DataArray([1, 2, 3], coords=[da.x]),
++        ...     },
++        ... )
++        >>> fit_result["curvefit_coefficients"].sel(param="time_constant")
++        <xarray.DataArray 'curvefit_coefficients' (x: 3)>
++        array([1.0569213 , 1.73550052, 2.94215733])
++        Coordinates:
++          * x        (x) int64 0 1 2
++            param    <U13 'time_constant'
++        >>> fit_result["curvefit_coefficients"].sel(param="amplitude")
++        <xarray.DataArray 'curvefit_coefficients' (x: 3)>
++        array([0.10054889, 0.1963141 , 0.3000358 ])
++        Coordinates:
++          * x        (x) int64 0 1 2
++            param    <U13 'amplitude'
++
+         See Also
+         --------
+         DataArray.polyfit
+@@ -6198,6 +6317,7 @@ class DataArray(
+             p0=p0,
+             bounds=bounds,
+             param_names=param_names,
++            errors=errors,
+             kwargs=kwargs,
+         )
+ 
+
+diff --git a/xarray/core/dataset.py b/xarray/core/dataset.py
+index d2ecd65..f4ba9d4 100644
+--- a/xarray/core/dataset.py
++++ b/xarray/core/dataset.py
+@@ -361,17 +361,24 @@ def _initialize_curvefit_params(params, p0, bounds, func_args):
+     """Set initial guess and bounds for curvefit.
+     Priority: 1) passed args 2) func signature 3) scipy defaults
+     """
++    from xarray.core.computation import where
+ 
+     def _initialize_feasible(lb, ub):
+         # Mimics functionality of scipy.optimize.minpack._initialize_feasible
+         lb_finite = np.isfinite(lb)
+         ub_finite = np.isfinite(ub)
+-        p0 = np.nansum(
+-            [
+-                0.5 * (lb + ub) * int(lb_finite & ub_finite),
+-                (lb + 1) * int(lb_finite & ~ub_finite),
+-                (ub - 1) * int(~lb_finite & ub_finite),
+-            ]
++        p0 = where(
++            lb_finite,
++            where(
++                ub_finite,
++                0.5 * (lb + ub),  # both bounds finite
++                lb + 1,  # lower bound finite, upper infinite
++            ),
++            where(
++                ub_finite,
++                ub - 1,  # lower bound infinite, upper finite
++                0,  # both bounds infinite
++            ),
+         )
+         return p0
+ 
+@@ -381,9 +388,13 @@ def _initialize_curvefit_params(params, p0, bounds, func_args):
+         if p in func_args and func_args[p].default is not func_args[p].empty:
+             param_defaults[p] = func_args[p].default
+         if p in bounds:
+-            bounds_defaults[p] = tuple(bounds[p])
+-            if param_defaults[p] < bounds[p][0] or param_defaults[p] > bounds[p][1]:
+-                param_defaults[p] = _initialize_feasible(bounds[p][0], bounds[p][1])
++            lb, ub = bounds[p]
++            bounds_defaults[p] = (lb, ub)
++            param_defaults[p] = where(
++                (param_defaults[p] < lb) | (param_defaults[p] > ub),
++                _initialize_feasible(lb, ub),
++                param_defaults[p],
++            )
+         if p in p0:
+             param_defaults[p] = p0[p]
+     return param_defaults, bounds_defaults
+@@ -636,7 +647,7 @@ class Dataset(
+             )
+ 
+         if isinstance(coords, Dataset):
+-            coords = coords.variables
++            coords = coords._variables
+ 
+         variables, coord_names, dims, indexes, _ = merge_data_and_coords(
+             data_vars, coords, compat="broadcast_equals"
+@@ -1388,8 +1399,8 @@ class Dataset(
+         coords: dict[Hashable, Variable] = {}
+         # preserve ordering
+         for k in self._variables:
+-            if k in self._coord_names and set(self.variables[k].dims) <= needed_dims:
+-                coords[k] = self.variables[k]
++            if k in self._coord_names and set(self._variables[k].dims) <= needed_dims:
++                coords[k] = self._variables[k]
+ 
+         indexes = filter_indexes_from_coords(self._indexes, set(coords))
+ 
+@@ -6465,7 +6476,10 @@ class Dataset(
+         columns.extend(k for k in self.coords if k not in self.dims)
+         columns.extend(self.data_vars)
+ 
++        ds_chunks = self.chunks
++
+         series_list = []
++        df_meta = pd.DataFrame()
+         for name in columns:
+             try:
+                 var = self.variables[name]
+@@ -6484,8 +6498,11 @@ class Dataset(
+             if not is_duck_dask_array(var._data):
+                 var = var.chunk()
+ 
+-            dask_array = var.set_dims(ordered_dims).chunk(self.chunks).data
+-            series = dd.from_array(dask_array.reshape(-1), columns=[name])
++            # Broadcast then flatten the array:
++            var_new_dims = var.set_dims(ordered_dims).chunk(ds_chunks)
++            dask_array = var_new_dims._data.reshape(-1)
++
++            series = dd.from_dask_array(dask_array, columns=name, meta=df_meta)
+             series_list.append(series)
+ 
+         df = dd.concat(series_list, axis=1)
+@@ -7955,7 +7972,7 @@ class Dataset(
+                 scale_da = scale
+ 
+             if w is not None:
+-                rhs *= w[:, np.newaxis]
++                rhs = rhs * w[:, np.newaxis]
+ 
+             with warnings.catch_warnings():
+                 if full:  # Copy np.polyfit behavior
+@@ -8611,9 +8628,10 @@ class Dataset(
+         func: Callable[..., Any],
+         reduce_dims: Dims = None,
+         skipna: bool = True,
+-        p0: dict[str, Any] | None = None,
+-        bounds: dict[str, Any] | None = None,
++        p0: dict[str, float | DataArray] | None = None,
++        bounds: dict[str, tuple[float | DataArray, float | DataArray]] | None = None,
+         param_names: Sequence[str] | None = None,
++        errors: ErrorOptions = "raise",
+         kwargs: dict[str, Any] | None = None,
+     ) -> T_Dataset:
+         """
+@@ -8643,17 +8661,25 @@ class Dataset(
+             Whether to skip missing values when fitting. Default is True.
+         p0 : dict-like, optional
+             Optional dictionary of parameter names to initial guesses passed to the
+-            `curve_fit` `p0` arg. If none or only some parameters are passed, the rest will
+-            be assigned initial values following the default scipy behavior.
++            `curve_fit` `p0` arg. If the values are DataArrays, they will be appropriately
++            broadcast to the coordinates of the array. If none or only some parameters are
++            passed, the rest will be assigned initial values following the default scipy
++            behavior.
+         bounds : dict-like, optional
+-            Optional dictionary of parameter names to bounding values passed to the
+-            `curve_fit` `bounds` arg. If none or only some parameters are passed, the rest
+-            will be unbounded following the default scipy behavior.
++            Optional dictionary of parameter names to tuples of bounding values passed to the
++            `curve_fit` `bounds` arg. If any of the bounds are DataArrays, they will be
++            appropriately broadcast to the coordinates of the array. If none or only some
++            parameters are passed, the rest will be unbounded following the default scipy
++            behavior.
+         param_names : sequence of hashable, optional
+             Sequence of names for the fittable parameters of `func`. If not supplied,
+             this will be automatically determined by arguments of `func`. `param_names`
+             should be manually supplied when fitting a function that takes a variable
+             number of parameters.
++        errors : {"raise", "ignore"}, default: "raise"
++            If 'raise', any errors from the `scipy.optimize_curve_fit` optimization will
++            raise an exception. If 'ignore', the coefficients and covariances for the
++            coordinates where the fitting failed will be NaN.
+         **kwargs : optional
+             Additional keyword arguments to passed to scipy curve_fit.
+ 
+@@ -8715,29 +8741,56 @@ class Dataset(
+                 "in fitting on scalar data."
+             )
+ 
++        # Check that initial guess and bounds only contain coordinates that are in preserved_dims
++        for param, guess in p0.items():
++            if isinstance(guess, DataArray):
++                unexpected = set(guess.dims) - set(preserved_dims)
++                if unexpected:
++                    raise ValueError(
++                        f"Initial guess for '{param}' has unexpected dimensions "
++                        f"{tuple(unexpected)}. It should only have dimensions that are in data "
++                        f"dimensions {preserved_dims}."
++                    )
++        for param, (lb, ub) in bounds.items():
++            for label, bound in zip(("Lower", "Upper"), (lb, ub)):
++                if isinstance(bound, DataArray):
++                    unexpected = set(bound.dims) - set(preserved_dims)
++                    if unexpected:
++                        raise ValueError(
++                            f"{label} bound for '{param}' has unexpected dimensions "
++                            f"{tuple(unexpected)}. It should only have dimensions that are in data "
++                            f"dimensions {preserved_dims}."
++                        )
++
++        if errors not in ["raise", "ignore"]:
++            raise ValueError('errors must be either "raise" or "ignore"')
++
+         # Broadcast all coords with each other
+         coords_ = broadcast(*coords_)
+         coords_ = [
+             coord.broadcast_like(self, exclude=preserved_dims) for coord in coords_
+         ]
++        n_coords = len(coords_)
+ 
+         params, func_args = _get_func_args(func, param_names)
+         param_defaults, bounds_defaults = _initialize_curvefit_params(
+             params, p0, bounds, func_args
+         )
+         n_params = len(params)
+-        kwargs.setdefault("p0", [param_defaults[p] for p in params])
+-        kwargs.setdefault(
+-            "bounds",
+-            [
+-                [bounds_defaults[p][0] for p in params],
+-                [bounds_defaults[p][1] for p in params],
+-            ],
+-        )
+ 
+-        def _wrapper(Y, *coords_, **kwargs):
++        def _wrapper(Y, *args, **kwargs):
+             # Wrap curve_fit with raveled coordinates and pointwise NaN handling
+-            x = np.vstack([c.ravel() for c in coords_])
++            # *args contains:
++            #   - the coordinates
++            #   - initial guess
++            #   - lower bounds
++            #   - upper bounds
++            coords__ = args[:n_coords]
++            p0_ = args[n_coords + 0 * n_params : n_coords + 1 * n_params]
++            lb = args[n_coords + 1 * n_params : n_coords + 2 * n_params]
++            ub = args[n_coords + 2 * n_params :]
++
++            x = np.vstack([c.ravel() for c in coords__])
+             y = Y.ravel()
+             if skipna:
+                 mask = np.all([np.any(~np.isnan(x), axis=0), ~np.isnan(y)], axis=0)
+@@ -8748,7 +8801,15 @@ class Dataset(
+                     pcov = np.full([n_params, n_params], np.nan)
+                     return popt, pcov
+             x = np.squeeze(x)
+-            popt, pcov = curve_fit(func, x, y, **kwargs)
++
++            try:
++                popt, pcov = curve_fit(func, x, y, p0=p0_, bounds=(lb, ub), **kwargs)
++            except RuntimeError:
++                if errors == "raise":
++                    raise
++                popt = np.full([n_params], np.nan)
++                pcov = np.full([n_params, n_params], np.nan)
++
+             return popt, pcov
+ 
+         result = type(self)()
+@@ -8758,13 +8819,21 @@ class Dataset(
+             else:
+                 name = f"{str(name)}_"
+ 
++            input_core_dims = [reduce_dims_ for _ in range(n_coords + 1)]
++            input_core_dims.extend(
++                [[] for _ in range(3 * n_params)]
++            )  # core_dims for p0 and bounds
++
+             popt, pcov = apply_ufunc(
+                 _wrapper,
+                 da,
+                 *coords_,
++                *param_defaults.values(),
++                *[b[0] for b in bounds_defaults.values()],
++                *[b[1] for b in bounds_defaults.values()],
+                 vectorize=True,
+                 dask="parallelized",
+-                input_core_dims=[reduce_dims_ for d in range(len(coords_) + 1)],
++                input_core_dims=input_core_dims,
+                 output_core_dims=[["param"], ["cov_i", "cov_j"]],
+                 dask_gufunc_kwargs={
+                     "output_sizes": {
+
+diff --git a/xarray/core/dtypes.py b/xarray/core/dtypes.py
+index 4d8583c..7ac342e 100644
+--- a/xarray/core/dtypes.py
++++ b/xarray/core/dtypes.py
+@@ -37,11 +37,11 @@ NINF = AlwaysLessThan()
+ # instead of following NumPy's own type-promotion rules. These type promotion
+ # rules match pandas instead. For reference, see the NumPy type hierarchy:
+ # https://numpy.org/doc/stable/reference/arrays.scalars.html
+-PROMOTE_TO_OBJECT = [
+-    {np.number, np.character},  # numpy promotes to character
+-    {np.bool_, np.character},  # numpy promotes to character
+-    {np.bytes_, np.unicode_},  # numpy promotes to unicode
+-]
++PROMOTE_TO_OBJECT: tuple[tuple[type[np.generic], type[np.generic]], ...] = (
++    (np.number, np.character),  # numpy promotes to character
++    (np.bool_, np.character),  # numpy promotes to character
++    (np.bytes_, np.unicode_),  # numpy promotes to unicode
++)
+ 
+ 
+ def maybe_promote(dtype):
+@@ -74,7 +74,10 @@ def maybe_promote(dtype):
+     else:
+         dtype = object
+         fill_value = np.nan
+-    return np.dtype(dtype), fill_value
++
++    dtype = np.dtype(dtype)
++    fill_value = dtype.type(fill_value)
++    return dtype, fill_value
+ 
+ 
+ NAT_TYPES = {np.datetime64("NaT").dtype, np.timedelta64("NaT").dtype}
+@@ -156,7 +159,9 @@ def is_datetime_like(dtype):
+     return np.issubdtype(dtype, np.datetime64) or np.issubdtype(dtype, np.timedelta64)
+ 
+ 
+-def result_type(*arrays_and_dtypes):
++def result_type(
++    *arrays_and_dtypes: np.typing.ArrayLike | np.typing.DTypeLike,
++) -> np.dtype:
+     """Like np.result_type, but with type promotion rules matching pandas.
+ 
+     Examples of changed behavior:
+
+diff --git a/xarray/core/duck_array_ops.py b/xarray/core/duck_array_ops.py
+index 4d7998e..4f245e5 100644
+--- a/xarray/core/duck_array_ops.py
++++ b/xarray/core/duck_array_ops.py
+@@ -194,7 +194,10 @@ def asarray(data, xp=np):
+ 
+ def as_shared_dtype(scalars_or_arrays, xp=np):
+     """Cast a arrays to a shared dtype using xarray's type promotion rules."""
+-    if any(isinstance(x, array_type("cupy")) for x in scalars_or_arrays):
++    array_type_cupy = array_type("cupy")
++    if array_type_cupy and any(
++        isinstance(x, array_type_cupy) for x in scalars_or_arrays
++    ):
+         import cupy as cp
+ 
+         arrays = [asarray(x, xp=cp) for x in scalars_or_arrays]
+
+diff --git a/xarray/core/groupby.py b/xarray/core/groupby.py
+index 85ea0b5..2a4465d 100644
+--- a/xarray/core/groupby.py
++++ b/xarray/core/groupby.py
+@@ -236,6 +236,10 @@ class _DummyGroup(Generic[T_Xarray]):
+             key = key[0]
+         return self.values[key]
+ 
++    def to_index(self) -> pd.Index:
++        # could be pd.RangeIndex?
++        return pd.Index(np.arange(self.size))
++
+     def copy(self, deep: bool = True, data: Any = None):
+         raise NotImplementedError
+ 
+@@ -381,7 +385,7 @@ class ResolvedGrouper(ABC, Generic[T_Xarray]):
+     @property
+     def group_as_index(self) -> pd.Index:
+         if self._group_as_index is None:
+-            self._group_as_index = safe_cast_to_index(self.group1d)
++            self._group_as_index = self.group1d.to_index()
+         return self._group_as_index
+ 
+ 
+@@ -622,6 +626,7 @@ def _resolve_group(obj: T_Xarray, group: T_Group | Hashable) -> T_Group:
+         (group_dim,) = group.dims
+         if len(group) != obj.sizes[group_dim]:
+             raise ValueError(error_msg)
++        newgroup = DataArray(group)
+ 
+     else:
+         if not hashable(group):
+
+diff --git a/xarray/core/indexes.py b/xarray/core/indexes.py
+index 93e9e53..9ee9bc3 100644
+--- a/xarray/core/indexes.py
++++ b/xarray/core/indexes.py
+@@ -1495,7 +1495,7 @@ def filter_indexes_from_coords(
+     of coordinate names.
+ 
+     """
+-    filtered_indexes: dict[Any, Index] = dict(**indexes)
++    filtered_indexes: dict[Any, Index] = dict(indexes)
+ 
+     index_coord_names: dict[Hashable, set[Hashable]] = defaultdict(set)
+     for name, idx in indexes.items():
+
+diff --git a/xarray/core/merge.py b/xarray/core/merge.py
+index bf7288a..56e5125 100644
+--- a/xarray/core/merge.py
++++ b/xarray/core/merge.py
+@@ -195,11 +195,11 @@ def _assert_prioritized_valid(
+ 
+ 
+ def merge_collected(
+-    grouped: dict[Hashable, list[MergeElement]],
++    grouped: dict[Any, list[MergeElement]],
+     prioritized: Mapping[Any, MergeElement] | None = None,
+     compat: CompatOptions = "minimal",
+     combine_attrs: CombineAttrsOptions = "override",
+-    equals: dict[Hashable, bool] | None = None,
++    equals: dict[Any, bool] | None = None,
+ ) -> tuple[dict[Hashable, Variable], dict[Hashable, Index]]:
+     """Merge dicts of variables, while resolving conflicts appropriately.
+ 
+@@ -306,7 +306,7 @@ def merge_collected(
+ 
+ 
+ def collect_variables_and_indexes(
+-    list_of_mappings: list[DatasetLike],
++    list_of_mappings: Iterable[DatasetLike],
+     indexes: Mapping[Any, Any] | None = None,
+ ) -> dict[Hashable, list[MergeElement]]:
+     """Collect variables and indexes from list of mappings of xarray objects.
+@@ -556,7 +556,12 @@ def merge_coords(
+     return variables, out_indexes
+ 
+ 
+-def merge_data_and_coords(data_vars, coords, compat="broadcast_equals", join="outer"):
++def merge_data_and_coords(
++    data_vars: Mapping[Any, Any],
++    coords: Mapping[Any, Any],
++    compat: CompatOptions = "broadcast_equals",
++    join: JoinOptions = "outer",
++) -> _MergeResult:
+     """Used in Dataset.__init__."""
+     indexes, coords = _create_indexes_from_coords(coords, data_vars)
+     objects = [data_vars, coords]
+@@ -570,7 +575,9 @@ def merge_data_and_coords(data_vars, coords, compat="broadcast_equals", join="ou
+     )
+ 
+ 
+-def _create_indexes_from_coords(coords, data_vars=None):
++def _create_indexes_from_coords(
++    coords: Mapping[Any, Any], data_vars: Mapping[Any, Any] | None = None
++) -> tuple[dict, dict]:
+     """Maybe create default indexes from a mapping of coordinates.
+ 
+     Return those indexes and updated coordinates.
+@@ -605,7 +612,11 @@ def _create_indexes_from_coords(coords, data_vars=None):
+     return indexes, updated_coords
+ 
+ 
+-def assert_valid_explicit_coords(variables, dims, explicit_coords):
++def assert_valid_explicit_coords(
++    variables: Mapping[Any, Any],
++    dims: Mapping[Any, int],
++    explicit_coords: Iterable[Hashable],
++) -> None:
+     """Validate explicit coordinate names/dims.
+ 
+     Raise a MergeError if an explicit coord shares a name with a dimension
+@@ -688,7 +699,7 @@ def merge_core(
+     join: JoinOptions = "outer",
+     combine_attrs: CombineAttrsOptions = "override",
+     priority_arg: int | None = None,
+-    explicit_coords: Sequence | None = None,
++    explicit_coords: Iterable[Hashable] | None = None,
+     indexes: Mapping[Any, Any] | None = None,
+     fill_value: object = dtypes.NA,
+ ) -> _MergeResult:
+@@ -1035,7 +1046,7 @@ def dataset_merge_method(
+     # method due for backwards compatibility
+     # TODO: consider deprecating it?
+ 
+-    if isinstance(overwrite_vars, Iterable) and not isinstance(overwrite_vars, str):
++    if not isinstance(overwrite_vars, str) and isinstance(overwrite_vars, Iterable):
+         overwrite_vars = set(overwrite_vars)
+     else:
+         overwrite_vars = {overwrite_vars}
+
+diff --git a/xarray/core/pycompat.py b/xarray/core/pycompat.py
+index db77ef5..9af5d69 100644
+--- a/xarray/core/pycompat.py
++++ b/xarray/core/pycompat.py
+@@ -50,7 +50,7 @@ class DuckArrayModule:
+             else:
+                 raise NotImplementedError
+ 
+-        except ImportError:  # pragma: no cover
++        except (ImportError, AttributeError):  # pragma: no cover
+             duck_array_module = None
+             duck_array_version = Version("0.0.0")
+             duck_array_type = ()
+@@ -61,14 +61,26 @@ class DuckArrayModule:
+         self.available = duck_array_module is not None
+ 
+ 
++_cached_duck_array_modules: dict[ModType, DuckArrayModule] = {}
++
++
++def _get_cached_duck_array_module(mod: ModType) -> DuckArrayModule:
++    if mod not in _cached_duck_array_modules:
++        duckmod = DuckArrayModule(mod)
++        _cached_duck_array_modules[mod] = duckmod
++        return duckmod
++    else:
++        return _cached_duck_array_modules[mod]
++
++
+ def array_type(mod: ModType) -> DuckArrayTypes:
+     """Quick wrapper to get the array class of the module."""
+-    return DuckArrayModule(mod).type
++    return _get_cached_duck_array_module(mod).type
+ 
+ 
+ def mod_version(mod: ModType) -> Version:
+     """Quick wrapper to get the version of the module."""
+-    return DuckArrayModule(mod).version
++    return _get_cached_duck_array_module(mod).version
+ 
+ 
+ def is_dask_collection(x):
+
+diff --git a/xarray/core/utils.py b/xarray/core/utils.py
+index 6ed0b2c..7270a8f 100644
+--- a/xarray/core/utils.py
++++ b/xarray/core/utils.py
+@@ -536,8 +536,7 @@ class OrderedSet(MutableSet[T]):
+     # Additional methods
+ 
+     def update(self, values: Iterable[T]) -> None:
+-        for v in values:
+-            self._d[v] = None
++        self._d.update(dict.fromkeys(values))
+ 
+     def __repr__(self) -> str:
+         return f"{type(self).__name__}({list(self)!r})"
+
+diff --git a/xarray/core/variable.py b/xarray/core/variable.py
+index 27a5399..9271d0c 100644
+--- a/xarray/core/variable.py
++++ b/xarray/core/variable.py
+@@ -238,7 +238,7 @@ def _possibly_convert_datetime_or_timedelta_index(data):
+         return data
+ 
+ 
+-def as_compatible_data(data, fastpath=False):
++def as_compatible_data(data, fastpath: bool = False):
+     """Prepare and wrap data to put in a Variable.
+ 
+     - If data does not have the necessary attributes, convert it to ndarray.
+@@ -677,7 +677,8 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+     def _parse_dimensions(self, dims: str | Iterable[Hashable]) -> tuple[Hashable, ...]:
+         if isinstance(dims, str):
+             dims = (dims,)
+-        dims = tuple(dims)
++        else:
++            dims = tuple(dims)
+         if len(dims) != self.ndim:
+             raise ValueError(
+                 f"dimensions {dims} must have the same length as the "
+@@ -1421,7 +1422,7 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+         pads = [(0, 0) if d != dim else dim_pad for d in self.dims]
+ 
+         data = np.pad(
+-            trimmed_data.astype(dtype),
++            duck_array_ops.astype(trimmed_data, dtype),
+             pads,
+             mode="constant",
+             constant_values=fill_value,
+@@ -1570,7 +1571,7 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+             pad_option_kwargs["reflect_type"] = reflect_type
+ 
+         array = np.pad(
+-            self.data.astype(dtype, copy=False),
++            duck_array_ops.astype(self.data, dtype, copy=False),
+             pad_width_by_index,
+             mode=mode,
+             **pad_option_kwargs,
+@@ -2102,12 +2103,13 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+         # twice
+         variables = list(variables)
+         first_var = variables[0]
++        first_var_dims = first_var.dims
+ 
+-        arrays = [v.data for v in variables]
++        arrays = [v._data for v in variables]
+ 
+-        if dim in first_var.dims:
++        if dim in first_var_dims:
+             axis = first_var.get_axis_num(dim)
+-            dims = first_var.dims
++            dims = first_var_dims
+             data = duck_array_ops.concatenate(arrays, axis=axis)
+             if positions is not None:
+                 # TODO: deprecate this option -- we don't need it for groupby
+@@ -2116,7 +2118,7 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+                 data = duck_array_ops.take(data, indices, axis=axis)
+         else:
+             axis = 0
+-            dims = (dim,) + first_var.dims
++            dims = (dim,) + first_var_dims
+             data = duck_array_ops.stack(arrays, axis=axis)
+ 
+         attrs = merge_attrs(
+@@ -2125,12 +2127,12 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+         encoding = dict(first_var.encoding)
+         if not shortcut:
+             for var in variables:
+-                if var.dims != first_var.dims:
++                if var.dims != first_var_dims:
+                     raise ValueError(
+-                        f"Variable has dimensions {list(var.dims)} but first Variable has dimensions {list(first_var.dims)}"
++                        f"Variable has dimensions {list(var.dims)} but first Variable has dimensions {list(first_var_dims)}"
+                     )
+ 
+-        return cls(dims, data, attrs, encoding)
++        return cls(dims, data, attrs, encoding, fastpath=True)
+ 
+     def equals(self, other, equiv=duck_array_ops.array_equiv):
+         """True if two Variables have the same dimensions and values;
+@@ -2438,7 +2440,7 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+         """
+         if fill_value is dtypes.NA:  # np.nan is passed
+             dtype, fill_value = dtypes.maybe_promote(self.dtype)
+-            var = self.astype(dtype, copy=False)
++            var = duck_array_ops.astype(self, dtype, copy=False)
+         else:
+             dtype = self.dtype
+             var = self
+@@ -2482,7 +2484,7 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+                 pads[d] = (win - 1, 0)
+ 
+         padded = var.pad(pads, mode="constant", constant_values=fill_value)
+-        axis = [self.get_axis_num(d) for d in dim]
++        axis = tuple(self.get_axis_num(d) for d in dim)
+         new_dims = self.dims + tuple(window_dim)
+         return Variable(
+             new_dims,

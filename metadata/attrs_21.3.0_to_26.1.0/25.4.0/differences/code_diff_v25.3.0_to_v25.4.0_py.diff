@@ -1,0 +1,1452 @@
+diff --git a/bench/test_benchmarks.py b/bench/test_benchmarks.py
+index 17916ca..a3ea8a0 100644
+--- a/bench/test_benchmarks.py
++++ b/bench/test_benchmarks.py
+@@ -119,3 +119,56 @@ def test_hash():
+ 
+     for _ in range(ROUNDS):
+         hash(c)
++
++
++def test_asdict_complicated():
++    """
++    Benchmark instances with non-shortcut fields.
++    """
++    c = C()
++    ad = attrs.asdict
++
++    for _ in range(ROUNDS):
++        ad(c)
++
++
++def test_astuple_complicated():
++    """
++    Benchmark instances with non-shortcut fields.
++    """
++    c = C()
++    at = attrs.astuple
++
++    for _ in range(ROUNDS):
++        at(c)
++
++
++@attrs.define
++class AtomicFields:
++    a: int = 0
++    b: Ellipsis = ...
++    c: str = "foo"
++    d: tuple[str] = "bar"
++    e: complex = complex()
++
++
++def test_asdict_atomic():
++    """
++    Benchmark atomic-only instances.
++    """
++    c = AtomicFields()
++    ad = attrs.asdict
++
++    for _ in range(ROUNDS):
++        ad(c)
++
++
++def test_astuple_atomic():
++    """
++    Benchmark atomic-only instances.
++    """
++    c = AtomicFields()
++    at = attrs.astuple
++
++    for _ in range(ROUNDS):
++        at(c)
+
+diff --git a/src/attr/_compat.py b/src/attr/_compat.py
+index 22fcd78..bc68ed9 100644
+--- a/src/attr/_compat.py
++++ b/src/attr/_compat.py
+@@ -10,7 +10,6 @@ from typing import _GenericAlias
+ 
+ 
+ PYPY = platform.python_implementation() == "PyPy"
+-PY_3_9_PLUS = sys.version_info[:2] >= (3, 9)
+ PY_3_10_PLUS = sys.version_info[:2] >= (3, 10)
+ PY_3_11_PLUS = sys.version_info[:2] >= (3, 11)
+ PY_3_12_PLUS = sys.version_info[:2] >= (3, 12)
+@@ -18,10 +17,16 @@ PY_3_13_PLUS = sys.version_info[:2] >= (3, 13)
+ PY_3_14_PLUS = sys.version_info[:2] >= (3, 14)
+ 
+ 
+-if PY_3_14_PLUS:  # pragma: no cover
++if PY_3_14_PLUS:
+     import annotationlib
+ 
+-    _get_annotations = annotationlib.get_annotations
++    # We request forward-ref annotations to not break in the presence of
++    # forward references.
++
++    def _get_annotations(cls):
++        return annotationlib.get_annotations(
++            cls, format=annotationlib.Format.FORWARDREF
++        )
+ 
+ else:
+ 
+
+diff --git a/src/attr/_funcs.py b/src/attr/_funcs.py
+index c39fb8a..1adb500 100644
+--- a/src/attr/_funcs.py
++++ b/src/attr/_funcs.py
+@@ -3,11 +3,28 @@
+ 
+ import copy
+ 
+-from ._compat import PY_3_9_PLUS, get_generic_base
++from ._compat import get_generic_base
+ from ._make import _OBJ_SETATTR, NOTHING, fields
+ from .exceptions import AttrsAttributeNotFoundError
+ 
+ 
++_ATOMIC_TYPES = frozenset(
++    {
++        type(None),
++        bool,
++        int,
++        float,
++        str,
++        complex,
++        bytes,
++        type(...),
++        type,
++        range,
++        property,
++    }
++)
++
++
+ def asdict(
+     inst,
+     recurse=True,
+@@ -71,7 +88,10 @@ def asdict(
+             v = value_serializer(inst, a, v)
+ 
+         if recurse is True:
+-            if has(v.__class__):
++            value_type = type(v)
++            if value_type in _ATOMIC_TYPES:
++                rv[a.name] = v
++            elif has(value_type):
+                 rv[a.name] = asdict(
+                     v,
+                     recurse=True,
+@@ -80,8 +100,8 @@ def asdict(
+                     retain_collection_types=retain_collection_types,
+                     value_serializer=value_serializer,
+                 )
+-            elif isinstance(v, (tuple, list, set, frozenset)):
+-                cf = v.__class__ if retain_collection_types is True else list
++            elif issubclass(value_type, (tuple, list, set, frozenset)):
++                cf = value_type if retain_collection_types is True else list
+                 items = [
+                     _asdict_anything(
+                         i,
+@@ -101,7 +121,7 @@ def asdict(
+                     # Workaround for TypeError: cf.__new__() missing 1 required
+                     # positional argument (which appears, for a namedturle)
+                     rv[a.name] = cf(*items)
+-            elif isinstance(v, dict):
++            elif issubclass(value_type, dict):
+                 df = dict_factory
+                 rv[a.name] = df(
+                     (
+@@ -142,7 +162,12 @@ def _asdict_anything(
+     """
+     ``asdict`` only works on attrs instances, this works on anything.
+     """
+-    if getattr(val.__class__, "__attrs_attrs__", None) is not None:
++    val_type = type(val)
++    if val_type in _ATOMIC_TYPES:
++        rv = val
++        if value_serializer is not None:
++            rv = value_serializer(None, None, rv)
++    elif getattr(val_type, "__attrs_attrs__", None) is not None:
+         # Attrs class.
+         rv = asdict(
+             val,
+@@ -152,7 +177,7 @@ def _asdict_anything(
+             retain_collection_types=retain_collection_types,
+             value_serializer=value_serializer,
+         )
+-    elif isinstance(val, (tuple, list, set, frozenset)):
++    elif issubclass(val_type, (tuple, list, set, frozenset)):
+         if retain_collection_types is True:
+             cf = val.__class__
+         elif is_key:
+@@ -173,7 +198,7 @@ def _asdict_anything(
+                 for i in val
+             ]
+         )
+-    elif isinstance(val, dict):
++    elif issubclass(val_type, dict):
+         df = dict_factory
+         rv = df(
+             (
+@@ -253,8 +278,11 @@ def astuple(
+         v = getattr(inst, a.name)
+         if filter is not None and not filter(a, v):
+             continue
++        value_type = type(v)
+         if recurse is True:
+-            if has(v.__class__):
++            if value_type in _ATOMIC_TYPES:
++                rv.append(v)
++            elif has(value_type):
+                 rv.append(
+                     astuple(
+                         v,
+@@ -264,7 +292,7 @@ def astuple(
+                         retain_collection_types=retain,
+                     )
+                 )
+-            elif isinstance(v, (tuple, list, set, frozenset)):
++            elif issubclass(value_type, (tuple, list, set, frozenset)):
+                 cf = v.__class__ if retain is True else list
+                 items = [
+                     (
+@@ -288,8 +316,8 @@ def astuple(
+                     # Workaround for TypeError: cf.__new__() missing 1 required
+                     # positional argument (which appears, for a namedturle)
+                     rv.append(cf(*items))
+-            elif isinstance(v, dict):
+-                df = v.__class__ if retain is True else dict
++            elif issubclass(value_type, dict):
++                df = value_type if retain is True else dict
+                 rv.append(
+                     df(
+                         (
+@@ -450,10 +478,11 @@ def resolve_types(
+     if getattr(cls, "__attrs_types_resolved__", None) != cls:
+         import typing
+ 
+-        kwargs = {"globalns": globalns, "localns": localns}
+-
+-        if PY_3_9_PLUS:
+-            kwargs["include_extras"] = include_extras
++        kwargs = {
++            "globalns": globalns,
++            "localns": localns,
++            "include_extras": include_extras,
++        }
+ 
+         hints = typing.get_type_hints(cls, **kwargs)
+         for field in fields(cls) if attribs is None else attribs:
+
+diff --git a/src/attr/_make.py b/src/attr/_make.py
+index e84d979..d24d9ba 100644
+--- a/src/attr/_make.py
++++ b/src/attr/_make.py
+@@ -12,6 +12,7 @@ import linecache
+ import sys
+ import types
+ import unicodedata
++import weakref
+ 
+ from collections.abc import Callable, Mapping
+ from functools import cached_property
+@@ -113,7 +114,7 @@ def attrib(
+     type=None,
+     converter=None,
+     factory=None,
+-    kw_only=False,
++    kw_only=None,
+     eq=None,
+     order=None,
+     on_setattr=None,
+@@ -156,6 +157,9 @@ def attrib(
+        *eq*, *order*, and *cmp* also accept a custom callable
+     .. versionchanged:: 21.1.0 *cmp* undeprecated
+     .. versionadded:: 22.2.0 *alias*
++    .. versionchanged:: 25.4.0
++       *kw_only* can now be None, and its default is also changed from False to
++       None.
+     """
+     eq, eq_key, order, order_key = _determine_attrib_eq_order(
+         cmp, eq, order, True
+@@ -373,7 +377,12 @@ def _collect_base_attrs_broken(cls, taken_attr_names):
+ 
+ 
+ def _transform_attrs(
+-    cls, these, auto_attribs, kw_only, collect_by_mro, field_transformer
++    cls,
++    these,
++    auto_attribs,
++    kw_only,
++    collect_by_mro,
++    field_transformer,
+ ) -> _Attributes:
+     """
+     Transform all `_CountingAttr`s on a class into `Attribute`s.
+@@ -428,8 +437,15 @@ def _transform_attrs(
+         )
+ 
+     fca = Attribute.from_counting_attr
++    no = ClassProps.KeywordOnly.NO
+     own_attrs = [
+-        fca(attr_name, ca, anns.get(attr_name)) for attr_name, ca in ca_list
++        fca(
++            attr_name,
++            ca,
++            kw_only is not no,
++            anns.get(attr_name),
++        )
++        for attr_name, ca in ca_list
+     ]
+ 
+     if collect_by_mro:
+@@ -441,7 +457,7 @@ def _transform_attrs(
+             cls, {a.name for a in own_attrs}
+         )
+ 
+-    if kw_only:
++    if kw_only is ClassProps.KeywordOnly.FORCE:
+         own_attrs = [a.evolve(kw_only=True) for a in own_attrs]
+         base_attrs = [a.evolve(kw_only=True) for a in base_attrs]
+ 
+@@ -651,38 +667,31 @@ class _ClassBuilder:
+         self,
+         cls: type,
+         these,
+-        slots,
+-        frozen,
+-        weakref_slot,
+-        getstate_setstate,
+-        auto_attribs,
+-        kw_only,
+-        cache_hash,
+-        is_exc,
+-        collect_by_mro,
+-        on_setattr,
+-        has_custom_setattr,
+-        field_transformer,
++        auto_attribs: bool,
++        props: ClassProps,
++        has_custom_setattr: bool,
+     ):
+         attrs, base_attrs, base_map = _transform_attrs(
+             cls,
+             these,
+             auto_attribs,
+-            kw_only,
+-            collect_by_mro,
+-            field_transformer,
++            props.kw_only,
++            props.collected_fields_by_mro,
++            props.field_transformer,
+         )
+ 
+         self._cls = cls
+-        self._cls_dict = dict(cls.__dict__) if slots else {}
++        self._cls_dict = dict(cls.__dict__) if props.is_slotted else {}
+         self._attrs = attrs
+         self._base_names = {a.name for a in base_attrs}
+         self._base_attr_map = base_map
+         self._attr_names = tuple(a.name for a in attrs)
+-        self._slots = slots
+-        self._frozen = frozen
+-        self._weakref_slot = weakref_slot
+-        self._cache_hash = cache_hash
++        self._slots = props.is_slotted
++        self._frozen = props.is_frozen
++        self._weakref_slot = props.has_weakref_slot
++        self._cache_hash = (
++            props.hashability is ClassProps.Hashability.HASHABLE_CACHED
++        )
+         self._has_pre_init = bool(getattr(cls, "__attrs_pre_init__", False))
+         self._pre_init_has_args = False
+         if self._has_pre_init:
+@@ -693,20 +702,21 @@ class _ClassBuilder:
+             self._pre_init_has_args = len(pre_init_signature.parameters) > 1
+         self._has_post_init = bool(getattr(cls, "__attrs_post_init__", False))
+         self._delete_attribs = not bool(these)
+-        self._is_exc = is_exc
+-        self._on_setattr = on_setattr
++        self._is_exc = props.is_exception
++        self._on_setattr = props.on_setattr_hook
+ 
+         self._has_custom_setattr = has_custom_setattr
+         self._wrote_own_setattr = False
+ 
+         self._cls_dict["__attrs_attrs__"] = self._attrs
++        self._cls_dict["__attrs_props__"] = props
+ 
+-        if frozen:
++        if props.is_frozen:
+             self._cls_dict["__setattr__"] = _frozen_setattrs
+             self._cls_dict["__delattr__"] = _frozen_delattrs
+ 
+             self._wrote_own_setattr = True
+-        elif on_setattr in (
++        elif self._on_setattr in (
+             _DEFAULT_ON_SETATTR,
+             setters.validate,
+             setters.convert,
+@@ -722,18 +732,18 @@ class _ClassBuilder:
+                     break
+             if (
+                 (
+-                    on_setattr == _DEFAULT_ON_SETATTR
++                    self._on_setattr == _DEFAULT_ON_SETATTR
+                     and not (has_validator or has_converter)
+                 )
+-                or (on_setattr == setters.validate and not has_validator)
+-                or (on_setattr == setters.convert and not has_converter)
++                or (self._on_setattr == setters.validate and not has_validator)
++                or (self._on_setattr == setters.convert and not has_converter)
+             ):
+                 # If class-level on_setattr is set to convert + validate, but
+                 # there's no field to convert or validate, pretend like there's
+                 # no on_setattr.
+                 self._on_setattr = None
+ 
+-        if getstate_setstate:
++        if props.added_pickling:
+             (
+                 self._cls_dict["__getstate__"],
+                 self._cls_dict["__setstate__"],
+@@ -784,6 +794,7 @@ class _ClassBuilder:
+         self._eval_snippets()
+         if self._slots is True:
+             cls = self._create_slots_class()
++            self._cls.__attrs_base_of_slotted__ = weakref.ref(cls)
+         else:
+             cls = self._patch_original_class()
+             if PY_3_10_PLUS:
+@@ -845,6 +856,10 @@ class _ClassBuilder:
+             if k not in (*tuple(self._attr_names), "__dict__", "__weakref__")
+         }
+ 
++        # 3.14.0rc2+
++        if hasattr(sys, "_clear_type_descriptors"):
++            sys._clear_type_descriptors(self._cls)
++
+         # If our class doesn't have its own implementation of __setattr__
+         # (either from the user or by us), check the bases, if one of them has
+         # an attrs-made __setattr__, that needs to be reset. We don't walk the
+@@ -1326,6 +1341,7 @@ def attrs(
+     field_transformer=None,
+     match_args=True,
+     unsafe_hash=None,
++    force_kw_only=True,
+ ):
+     r"""
+     A class decorator that adds :term:`dunder methods` according to the
+@@ -1392,6 +1408,10 @@ def attrs(
+        If a class has an *inherited* classmethod called
+        ``__attrs_init_subclass__``, it is executed after the class is created.
+     .. deprecated:: 24.1.0 *hash* is deprecated in favor of *unsafe_hash*.
++    .. versionchanged:: 25.4.0
++       *kw_only* now only applies to attributes defined in the current class,
++       and respects attribute-level ``kw_only=False`` settings.
++    .. versionadded:: 25.4.0 *force_kw_only*
+     """
+     if repr_ns is not None:
+         import warnings
+@@ -1413,6 +1433,7 @@ def attrs(
+         on_setattr = setters.pipe(*on_setattr)
+ 
+     def wrap(cls):
++        nonlocal hash
+         is_frozen = frozen or _has_frozen_base_class(cls)
+         is_exc = auto_exc is True and issubclass(cls, BaseException)
+         has_own_setattr = auto_detect and _has_own_attribute(
+@@ -1423,84 +1444,112 @@ def attrs(
+             msg = "Can't freeze a class with a custom __setattr__."
+             raise ValueError(msg)
+ 
+-        builder = _ClassBuilder(
+-            cls,
+-            these,
+-            slots,
+-            is_frozen,
+-            weakref_slot,
+-            _determine_whether_to_implement(
++        eq = not is_exc and _determine_whether_to_implement(
++            cls, eq_, auto_detect, ("__eq__", "__ne__")
++        )
++
++        Hashability = ClassProps.Hashability
++
++        if is_exc:
++            hashability = Hashability.LEAVE_ALONE
++        elif hash is True:
++            hashability = (
++                Hashability.HASHABLE_CACHED
++                if cache_hash
++                else Hashability.HASHABLE
++            )
++        elif hash is False:
++            hashability = Hashability.LEAVE_ALONE
++        elif hash is None:
++            if auto_detect is True and _has_own_attribute(cls, "__hash__"):
++                hashability = Hashability.LEAVE_ALONE
++            elif eq is True and is_frozen is True:
++                hashability = (
++                    Hashability.HASHABLE_CACHED
++                    if cache_hash
++                    else Hashability.HASHABLE
++                )
++            elif eq is False:
++                hashability = Hashability.LEAVE_ALONE
++            else:
++                hashability = Hashability.UNHASHABLE
++        else:
++            msg = "Invalid value for hash.  Must be True, False, or None."
++            raise TypeError(msg)
++
++        KeywordOnly = ClassProps.KeywordOnly
++        if kw_only:
++            kwo = KeywordOnly.FORCE if force_kw_only else KeywordOnly.YES
++        else:
++            kwo = KeywordOnly.NO
++
++        props = ClassProps(
++            is_exception=is_exc,
++            is_frozen=is_frozen,
++            is_slotted=slots,
++            collected_fields_by_mro=collect_by_mro,
++            added_init=_determine_whether_to_implement(
++                cls, init, auto_detect, ("__init__",)
++            ),
++            added_repr=_determine_whether_to_implement(
++                cls, repr, auto_detect, ("__repr__",)
++            ),
++            added_eq=eq,
++            added_ordering=not is_exc
++            and _determine_whether_to_implement(
++                cls,
++                order_,
++                auto_detect,
++                ("__lt__", "__le__", "__gt__", "__ge__"),
++            ),
++            hashability=hashability,
++            added_match_args=match_args,
++            kw_only=kwo,
++            has_weakref_slot=weakref_slot,
++            added_str=str,
++            added_pickling=_determine_whether_to_implement(
+                 cls,
+                 getstate_setstate,
+                 auto_detect,
+                 ("__getstate__", "__setstate__"),
+                 default=slots,
+             ),
+-            auto_attribs,
+-            kw_only,
+-            cache_hash,
+-            is_exc,
+-            collect_by_mro,
+-            on_setattr,
+-            has_own_setattr,
+-            field_transformer,
++            on_setattr_hook=on_setattr,
++            field_transformer=field_transformer,
+         )
+ 
+-        if _determine_whether_to_implement(
+-            cls, repr, auto_detect, ("__repr__",)
+-        ):
++        if not props.is_hashable and cache_hash:
++            msg = "Invalid value for cache_hash.  To use hash caching, hashing must be either explicitly or implicitly enabled."
++            raise TypeError(msg)
++
++        builder = _ClassBuilder(
++            cls,
++            these,
++            auto_attribs=auto_attribs,
++            props=props,
++            has_custom_setattr=has_own_setattr,
++        )
++
++        if props.added_repr:
+             builder.add_repr(repr_ns)
+ 
+-        if str is True:
++        if props.added_str:
+             builder.add_str()
+ 
+-        eq = _determine_whether_to_implement(
+-            cls, eq_, auto_detect, ("__eq__", "__ne__")
+-        )
+-        if not is_exc and eq is True:
++        if props.added_eq:
+             builder.add_eq()
+-        if not is_exc and _determine_whether_to_implement(
+-            cls, order_, auto_detect, ("__lt__", "__le__", "__gt__", "__ge__")
+-        ):
++        if props.added_ordering:
+             builder.add_order()
+ 
+         if not frozen:
+             builder.add_setattr()
+ 
+-        nonlocal hash
+-        if (
+-            hash is None
+-            and auto_detect is True
+-            and _has_own_attribute(cls, "__hash__")
+-        ):
+-            hash = False
+-
+-        if hash is not True and hash is not False and hash is not None:
+-            # Can't use `hash in` because 1 == True for example.
+-            msg = "Invalid value for hash.  Must be True, False, or None."
+-            raise TypeError(msg)
+-
+-        if hash is False or (hash is None and eq is False) or is_exc:
+-            # Don't do anything. Should fall back to __object__'s __hash__
+-            # which is by id.
+-            if cache_hash:
+-                msg = "Invalid value for cache_hash.  To use hash caching, hashing must be either explicitly or implicitly enabled."
+-                raise TypeError(msg)
+-        elif hash is True or (
+-            hash is None and eq is True and is_frozen is True
+-        ):
+-            # Build a __hash__ if told so, or if it's safe.
++        if props.is_hashable:
+             builder.add_hash()
+-        else:
+-            # Raise TypeError on attempts to hash.
+-            if cache_hash:
+-                msg = "Invalid value for cache_hash.  To use hash caching, hashing must be either explicitly or implicitly enabled."
+-                raise TypeError(msg)
++        elif props.hashability is Hashability.UNHASHABLE:
+             builder.make_unhashable()
+ 
+-        if _determine_whether_to_implement(
+-            cls, init, auto_detect, ("__init__",)
+-        ):
++        if props.added_init:
+             builder.add_init()
+         else:
+             builder.add_attrs_init()
+@@ -2126,8 +2175,9 @@ def _attrs_to_init_script(
+     )
+     lines.extend(extra_lines)
+ 
+-    args = []
+-    kw_only_args = []
++    args = []  # Parameters in the definition of __init__
++    pre_init_args = []  # Parameters in the call to __attrs_pre_init__
++    kw_only_args = []  # Used for both 'args' and 'pre_init_args' above
+     attrs_to_validate = []
+ 
+     # This is a dictionary of names to validator and converter callables.
+@@ -2205,6 +2255,7 @@ def _attrs_to_init_script(
+                 kw_only_args.append(arg)
+             else:
+                 args.append(arg)
++                pre_init_args.append(arg_name)
+ 
+             if converter is not None:
+                 lines.append(
+@@ -2224,6 +2275,7 @@ def _attrs_to_init_script(
+                 kw_only_args.append(arg)
+             else:
+                 args.append(arg)
++                pre_init_args.append(arg_name)
+             lines.append(f"if {arg_name} is not NOTHING:")
+ 
+             init_factory_name = _INIT_FACTORY_PAT % (a.name,)
+@@ -2266,6 +2318,7 @@ def _attrs_to_init_script(
+                 kw_only_args.append(arg_name)
+             else:
+                 args.append(arg_name)
++                pre_init_args.append(arg_name)
+ 
+             if converter is not None:
+                 lines.append(
+@@ -2322,7 +2375,7 @@ def _attrs_to_init_script(
+         lines.append(f"BaseException.__init__(self, {vals})")
+ 
+     args = ", ".join(args)
+-    pre_init_args = args
++    pre_init_args = ", ".join(pre_init_args)
+     if kw_only_args:
+         # leading comma & kw_only args
+         args += f"{', ' if args else ''}*, {', '.join(kw_only_args)}"
+@@ -2337,7 +2390,7 @@ def _attrs_to_init_script(
+         pre_init_args += pre_init_kw_only_args
+ 
+     if call_pre_init and pre_init_has_args:
+-        # If pre init method has arguments, pass same arguments as `__init__`.
++        # If pre init method has arguments, pass the values given to __init__.
+         lines[0] = f"self.__attrs_pre_init__({pre_init_args})"
+ 
+     # Python <3.12 doesn't allow backslashes in f-strings.
+@@ -2486,7 +2539,11 @@ class Attribute:
+         raise FrozenInstanceError
+ 
+     @classmethod
+-    def from_counting_attr(cls, name: str, ca: _CountingAttr, type=None):
++    def from_counting_attr(
++        cls, name: str, ca: _CountingAttr, kw_only: bool, type=None
++    ):
++        # The 'kw_only' argument is the class-level setting, and is used if the
++        # attribute itself does not explicitly set 'kw_only'.
+         # type holds the annotated value. deal with conflicts:
+         if type is None:
+             type = ca.type
+@@ -2505,7 +2562,7 @@ class Attribute:
+             ca.metadata,
+             type,
+             ca.converter,
+-            ca.kw_only,
++            kw_only if ca.kw_only is None else ca.kw_only,
+             ca.eq,
+             ca.eq_key,
+             ca.order,
+@@ -2741,6 +2798,188 @@ class _CountingAttr:
+ _CountingAttr = _add_eq(_add_repr(_CountingAttr))
+ 
+ 
++class ClassProps:
++    """
++    Effective class properties as derived from parameters to `attr.s()` or
++    `define()` decorators.
++
++    This is the same data structure that *attrs* uses internally to decide how
++    to construct the final class.
++
++    Warning:
++
++        This feature is currently **experimental** and is not covered by our
++        strict backwards-compatibility guarantees.
++
++
++    Attributes:
++        is_exception (bool):
++            Whether the class is treated as an exception class.
++
++        is_slotted (bool):
++            Whether the class is `slotted <slotted classes>`.
++
++        has_weakref_slot (bool):
++            Whether the class has a slot for weak references.
++
++        is_frozen (bool):
++            Whether the class is frozen.
++
++        kw_only (KeywordOnly):
++            Whether / how the class enforces keyword-only arguments on the
++            ``__init__`` method.
++
++        collected_fields_by_mro (bool):
++            Whether the class fields were collected by method resolution order.
++            That is, correctly but unlike `dataclasses`.
++
++        added_init (bool):
++            Whether the class has an *attrs*-generated ``__init__`` method.
++
++        added_repr (bool):
++            Whether the class has an *attrs*-generated ``__repr__`` method.
++
++        added_eq (bool):
++            Whether the class has *attrs*-generated equality methods.
++
++        added_ordering (bool):
++            Whether the class has *attrs*-generated ordering methods.
++
++        hashability (Hashability): How `hashable <hashing>` the class is.
++
++        added_match_args (bool):
++            Whether the class supports positional `match <match>` over its
++            fields.
++
++        added_str (bool):
++            Whether the class has an *attrs*-generated ``__str__`` method.
++
++        added_pickling (bool):
++            Whether the class has *attrs*-generated ``__getstate__`` and
++            ``__setstate__`` methods for `pickle`.
++
++        on_setattr_hook (Callable[[Any, Attribute[Any], Any], Any] | None):
++            The class's ``__setattr__`` hook.
++
++        field_transformer (Callable[[Attribute[Any]], Attribute[Any]] | None):
++            The class's `field transformers <transform-fields>`.
++
++    .. versionadded:: 25.4.0
++    """
++
++    class Hashability(enum.Enum):
++        """
++        The hashability of a class.
++
++        .. versionadded:: 25.4.0
++        """
++
++        HASHABLE = "hashable"
++        """Write a ``__hash__``."""
++        HASHABLE_CACHED = "hashable_cache"
++        """Write a ``__hash__`` and cache the hash."""
++        UNHASHABLE = "unhashable"
++        """Set ``__hash__`` to ``None``."""
++        LEAVE_ALONE = "leave_alone"
++        """Don't touch ``__hash__``."""
++
++    class KeywordOnly(enum.Enum):
++        """
++        How attributes should be treated regarding keyword-only parameters.
++
++        .. versionadded:: 25.4.0
++        """
++
++        NO = "no"
++        """Attributes are not keyword-only."""
++        YES = "yes"
++        """Attributes in current class without kw_only=False are keyword-only."""
++        FORCE = "force"
++        """All attributes are keyword-only."""
++
++    __slots__ = (  # noqa: RUF023 -- order matters for __init__
++        "is_exception",
++        "is_slotted",
++        "has_weakref_slot",
++        "is_frozen",
++        "kw_only",
++        "collected_fields_by_mro",
++        "added_init",
++        "added_repr",
++        "added_eq",
++        "added_ordering",
++        "hashability",
++        "added_match_args",
++        "added_str",
++        "added_pickling",
++        "on_setattr_hook",
++        "field_transformer",
++    )
++
++    def __init__(
++        self,
++        is_exception,
++        is_slotted,
++        has_weakref_slot,
++        is_frozen,
++        kw_only,
++        collected_fields_by_mro,
++        added_init,
++        added_repr,
++        added_eq,
++        added_ordering,
++        hashability,
++        added_match_args,
++        added_str,
++        added_pickling,
++        on_setattr_hook,
++        field_transformer,
++    ):
++        self.is_exception = is_exception
++        self.is_slotted = is_slotted
++        self.has_weakref_slot = has_weakref_slot
++        self.is_frozen = is_frozen
++        self.kw_only = kw_only
++        self.collected_fields_by_mro = collected_fields_by_mro
++        self.added_init = added_init
++        self.added_repr = added_repr
++        self.added_eq = added_eq
++        self.added_ordering = added_ordering
++        self.hashability = hashability
++        self.added_match_args = added_match_args
++        self.added_str = added_str
++        self.added_pickling = added_pickling
++        self.on_setattr_hook = on_setattr_hook
++        self.field_transformer = field_transformer
++
++    @property
++    def is_hashable(self):
++        return (
++            self.hashability is ClassProps.Hashability.HASHABLE
++            or self.hashability is ClassProps.Hashability.HASHABLE_CACHED
++        )
++
++
++_cas = [
++    Attribute(
++        name=name,
++        default=NOTHING,
++        validator=None,
++        repr=True,
++        cmp=None,
++        eq=True,
++        order=False,
++        hash=True,
++        init=True,
++        inherited=False,
++        alias=_default_init_alias_for(name),
++    )
++    for name in ClassProps.__slots__
++]
++
++ClassProps = _add_eq(_add_repr(ClassProps, attrs=_cas), attrs=_cas)
++
++
+ class Factory:
+     """
+     Stores a factory callable.
+
+diff --git a/src/attr/_next_gen.py b/src/attr/_next_gen.py
+index 9290664..4ccd0da 100644
+--- a/src/attr/_next_gen.py
++++ b/src/attr/_next_gen.py
+@@ -17,7 +17,7 @@ from ._make import (
+     attrib,
+     attrs,
+ )
+-from .exceptions import UnannotatedAttributeError
++from .exceptions import NotAnAttrsClassError, UnannotatedAttributeError
+ 
+ 
+ def define(
+@@ -43,6 +43,7 @@ def define(
+     on_setattr=None,
+     field_transformer=None,
+     match_args=True,
++    force_kw_only=False,
+ ):
+     r"""
+     A class decorator that adds :term:`dunder methods` according to
+@@ -76,7 +77,7 @@ def define(
+             sensible ``__ne__`` by default, so it *should* be enough to only
+             implement ``__eq__`` in most cases).
+ 
+-            Passing True or False` to *init*, *repr*, *eq*, or *hash*
++            Passing :data:`True` or :data:`False` to *init*, *repr*, *eq*, or *hash*
+             overrides whatever *auto_detect* would determine.
+ 
+         auto_exc (bool):
+@@ -214,8 +215,12 @@ def define(
+                 5. Subclasses of a frozen class are frozen too.
+ 
+         kw_only (bool):
+-            Make all attributes keyword-only in the generated ``__init__`` (if
+-            *init* is False, this parameter is ignored).
++            Make attributes keyword-only in the generated ``__init__`` (if
++            *init* is False, this parameter is ignored).  Attributes that
++            explicitly set ``kw_only=False`` are not affected; base class
++            attributes are also not affected.
++
++            Also see *force_kw_only*.
+ 
+         weakref_slot (bool):
+             Make instances weak-referenceable.  This has no effect unless
+@@ -244,6 +249,15 @@ def define(
+             See also `issue #428
+             <https://github.com/python-attrs/attrs/issues/428>`_.
+ 
++        force_kw_only (bool):
++            A back-compat flag for restoring pre-25.4.0 behavior.  If True and
++            ``kw_only=True``, all attributes are made keyword-only, including
++            base class attributes, and those set to ``kw_only=False`` at the
++            attribute level.  Defaults to False.
++
++            See also `issue #980
++            <https://github.com/python-attrs/attrs/issues/980>`_.
++
+         getstate_setstate (bool | None):
+             .. note::
+ 
+@@ -319,6 +333,11 @@ def define(
+     .. versionadded:: 24.3.0
+        Unless already present, a ``__replace__`` method is automatically
+        created for `copy.replace` (Python 3.13+ only).
++    .. versionchanged:: 25.4.0
++       *kw_only* now only applies to attributes defined in the current class,
++       and respects attribute-level ``kw_only=False`` settings.
++    .. versionadded:: 25.4.0
++       Added *force_kw_only* to go back to the previous *kw_only* behavior.
+ 
+     .. note::
+ 
+@@ -337,6 +356,7 @@ def define(
+         - *auto_exc=True*
+         - *auto_detect=True*
+         - *order=False*
++        - *force_kw_only=False*
+         - Some options that were only relevant on Python 2 or were kept around
+           for backwards-compatibility have been removed.
+ 
+@@ -366,6 +386,7 @@ def define(
+             on_setattr=on_setattr,
+             field_transformer=field_transformer,
+             match_args=match_args,
++            force_kw_only=force_kw_only,
+         )
+ 
+     def wrap(cls):
+@@ -424,7 +445,7 @@ def field(
+     type=None,
+     converter=None,
+     factory=None,
+-    kw_only=False,
++    kw_only=None,
+     eq=None,
+     order=None,
+     on_setattr=None,
+@@ -550,9 +571,10 @@ def field(
+             itself. You can use it as part of your own code or for `static type
+             checking <types>`.
+ 
+-        kw_only (bool):
++        kw_only (bool | None):
+             Make this attribute keyword-only in the generated ``__init__`` (if
+-            ``init`` is False, this parameter is ignored).
++            *init* is False, this parameter is ignored).  If None (default),
++            mirror the setting from `attrs.define`.
+ 
+         on_setattr (~typing.Callable | list[~typing.Callable] | None | ~typing.Literal[attrs.setters.NO_OP]):
+             Allows to overwrite the *on_setattr* setting from `attr.s`. If left
+@@ -572,6 +594,9 @@ def field(
+     .. versionadded:: 23.1.0
+        The *type* parameter has been re-added; mostly for `attrs.make_class`.
+        Please note that type checkers ignore this metadata.
++    .. versionchanged:: 25.4.0
++       *kw_only* can now be None, and its default is also changed from False to
++       None.
+ 
+     .. seealso::
+ 
+@@ -621,3 +646,29 @@ def astuple(inst, *, recurse=True, filter=None):
+     return _astuple(
+         inst=inst, recurse=recurse, filter=filter, retain_collection_types=True
+     )
++
++
++def inspect(cls):
++    """
++    Inspect the class and return its effective build parameters.
++
++    Warning:
++        This feature is currently **experimental** and is not covered by our
++        strict backwards-compatibility guarantees.
++
++    Args:
++        cls: The *attrs*-decorated class to inspect.
++
++    Returns:
++        The effective build parameters of the class.
++
++    Raises:
++        NotAnAttrsClassError: If the class is not an *attrs*-decorated class.
++
++    .. versionadded:: 25.4.0
++    """
++    try:
++        return cls.__dict__["__attrs_props__"]
++    except KeyError:
++        msg = f"{cls!r} is not an attrs-decorated class."
++        raise NotAnAttrsClassError(msg) from None
+
+diff --git a/src/attr/_version_info.py b/src/attr/_version_info.py
+index 51a1312..27f1888 100644
+--- a/src/attr/_version_info.py
++++ b/src/attr/_version_info.py
+@@ -84,3 +84,6 @@ class VersionInfo:
+         # Since alphabetically "dev0" < "final" < "post1" < "post2", we don't
+         # have to do anything special with releaselevel for now.
+         return us < them
++
++    def __hash__(self):
++        return hash((self.year, self.minor, self.micro, self.releaselevel))
+
+diff --git a/src/attr/validators.py b/src/attr/validators.py
+index e7b7552..837e003 100644
+--- a/src/attr/validators.py
++++ b/src/attr/validators.py
+@@ -361,26 +361,32 @@ def deep_iterable(member_validator, iterable_validator=None):
+     A validator that performs deep validation of an iterable.
+ 
+     Args:
+-        member_validator: Validator to apply to iterable members.
++        member_validator: Validator(s) to apply to iterable members.
+ 
+         iterable_validator:
+-            Validator to apply to iterable itself (optional).
++            Validator(s) to apply to iterable itself (optional).
+ 
+     Raises
+         TypeError: if any sub-validators fail
+ 
+     .. versionadded:: 19.1.0
++
++    .. versionchanged:: 25.4.0
++       *member_validator* and *iterable_validator* can now be a list or tuple
++       of validators.
+     """
+     if isinstance(member_validator, (list, tuple)):
+         member_validator = and_(*member_validator)
++    if isinstance(iterable_validator, (list, tuple)):
++        iterable_validator = and_(*iterable_validator)
+     return _DeepIterable(member_validator, iterable_validator)
+ 
+ 
+ @attrs(repr=False, slots=True, unsafe_hash=True)
+ class _DeepMapping:
+-    key_validator = attrib(validator=is_callable())
+-    value_validator = attrib(validator=is_callable())
+-    mapping_validator = attrib(default=None, validator=optional(is_callable()))
++    key_validator = attrib(validator=optional(is_callable()))
++    value_validator = attrib(validator=optional(is_callable()))
++    mapping_validator = attrib(validator=optional(is_callable()))
+ 
+     def __call__(self, inst, attr, value):
+         """
+@@ -390,30 +396,62 @@ class _DeepMapping:
+             self.mapping_validator(inst, attr, value)
+ 
+         for key in value:
+-            self.key_validator(inst, attr, key)
+-            self.value_validator(inst, attr, value[key])
++            if self.key_validator is not None:
++                self.key_validator(inst, attr, key)
++            if self.value_validator is not None:
++                self.value_validator(inst, attr, value[key])
+ 
+     def __repr__(self):
+         return f"<deep_mapping validator for objects mapping {self.key_validator!r} to {self.value_validator!r}>"
+ 
+ 
+-def deep_mapping(key_validator, value_validator, mapping_validator=None):
++def deep_mapping(
++    key_validator=None, value_validator=None, mapping_validator=None
++):
+     """
+     A validator that performs deep validation of a dictionary.
+ 
++    All validators are optional, but at least one of *key_validator* or
++    *value_validator* must be provided.
++
+     Args:
+-        key_validator: Validator to apply to dictionary keys.
++        key_validator: Validator(s) to apply to dictionary keys.
+ 
+-        value_validator: Validator to apply to dictionary values.
++        value_validator: Validator(s) to apply to dictionary values.
+ 
+         mapping_validator:
+-            Validator to apply to top-level mapping attribute (optional).
++            Validator(s) to apply to top-level mapping attribute.
+ 
+     .. versionadded:: 19.1.0
+ 
++    .. versionchanged:: 25.4.0
++       *key_validator* and *value_validator* are now optional, but at least one
++       of them must be provided.
++
++    .. versionchanged:: 25.4.0
++       *key_validator*, *value_validator*, and *mapping_validator* can now be a
++       list or tuple of validators.
++
+     Raises:
+-        TypeError: if any sub-validators fail
++        TypeError: If any sub-validator fails on validation.
++
++        ValueError:
++            If neither *key_validator* nor *value_validator* is provided on
++            instantiation.
+     """
++    if key_validator is None and value_validator is None:
++        msg = (
++            "At least one of key_validator or value_validator must be provided"
++        )
++        raise ValueError(msg)
++
++    if isinstance(key_validator, (list, tuple)):
++        key_validator = and_(*key_validator)
++    if isinstance(value_validator, (list, tuple)):
++        value_validator = and_(*value_validator)
++    if isinstance(mapping_validator, (list, tuple)):
++        mapping_validator = and_(*mapping_validator)
++
+     return _DeepMapping(key_validator, value_validator, mapping_validator)
+ 
+ 
+@@ -485,7 +523,7 @@ def gt(val):
+     A validator that raises `ValueError` if the initializer is called with a
+     number smaller or equal to *val*.
+ 
+-    The validator uses `operator.ge` to compare the values.
++    The validator uses `operator.gt` to compare the values.
+ 
+     Args:
+        val: Exclusive lower bound for values
+
+diff --git a/src/attrs/__init__.py b/src/attrs/__init__.py
+index e8023ff..dc1ce4b 100644
+--- a/src/attrs/__init__.py
++++ b/src/attrs/__init__.py
+@@ -22,7 +22,8 @@ from attr import (
+     resolve_types,
+     validate,
+ )
+-from attr._next_gen import asdict, astuple
++from attr._make import ClassProps
++from attr._next_gen import asdict, astuple, inspect
+ 
+ from . import converters, exceptions, filters, setters, validators
+ 
+@@ -31,6 +32,7 @@ __all__ = [
+     "NOTHING",
+     "Attribute",
+     "AttrsInstance",
++    "ClassProps",
+     "Converter",
+     "Factory",
+     "NothingType",
+@@ -58,6 +60,7 @@ __all__ = [
+     "filters",
+     "frozen",
+     "has",
++    "inspect",
+     "make_class",
+     "mutable",
+     "resolve_types",
+
+diff --git a/conftest.py b/tests/conftest.py
+similarity index 79%
+rename from conftest.py
+rename to tests/conftest.py
+index e22f79d..3e48c3f 100644
+--- a/conftest.py
++++ b/tests/conftest.py
+@@ -6,7 +6,7 @@ import pytest
+ 
+ from hypothesis import HealthCheck, settings
+ 
+-from attr._compat import PY_3_10_PLUS
++from attr._compat import PY_3_10_PLUS, PY_3_14_PLUS
+ 
+ 
+ @pytest.fixture(name="slots", params=(True, False))
+@@ -33,4 +33,6 @@ def pytest_configure(config):
+ 
+ collect_ignore = []
+ if not PY_3_10_PLUS:
+-    collect_ignore.extend(["tests/test_pattern_matching.py"])
++    collect_ignore.extend(["test_pattern_matching.py"])
++if not PY_3_14_PLUS:
++    collect_ignore.extend(["test_forward_references.py"])
+
+diff --git a/typing-examples/baseline.py b/typing-examples/baseline.py
+new file mode 100644
+index 0000000..195b326
+--- /dev/null
++++ b/typing-examples/baseline.py
+@@ -0,0 +1,208 @@
++# SPDX-License-Identifier: MIT
++# pyright: strict
++
++"""
++Baseline features that should be supported by all type checkers.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++import attrs
++
++
++@attrs.define(order=True)
++class NGClass:
++    x: int = attrs.field(default=42)
++
++
++ngc = NGClass(1)
++
++
++@attrs.mutable(slots=False)
++class NGClass2:
++    x: int
++
++
++ngc2 = NGClass2(1)
++
++
++@attrs.frozen(str=True)
++class NGFrozen:
++    x: int
++
++
++ngf = NGFrozen(1)
++
++attrs.fields(NGFrozen).x.evolve(eq=False)
++a = attrs.fields(NGFrozen).x
++a.evolve(repr=False)
++
++
++@attrs.define
++class C:
++    a: int
++
++
++c = C(1)
++c.a
++
++
++@attrs.frozen
++class D:
++    a: int
++
++
++D(1).a
++
++
++@attrs.define
++class Derived(C):
++    b: int
++
++
++Derived(1, 2).a
++Derived(1, 2).b
++
++
++@attrs.define
++class Error(Exception):
++    x: int
++
++
++try:
++    raise Error(1)
++except Error as e:
++    e.x
++    e.args
++    str(e)
++
++
++@attrs.define
++class AliasExample:
++    without_alias: int
++    _with_alias: int = attrs.field(alias="_with_alias")
++
++
++attrs.fields(AliasExample).without_alias.alias
++attrs.fields(AliasExample)._with_alias.alias
++
++
++@attrs.define
++class Validated:
++    num: int = attrs.field(validator=attrs.validators.ge(0))
++
++
++@attrs.define
++class ValidatedInconsistentOr:
++    num: int | str = attrs.field(
++        validator=attrs.validators.or_(
++            # Various types of validators.
++            attrs.validators.ge(0),
++            attrs.validators.instance_of(str),
++        )
++    )
++
++
++attrs.validators.set_disabled(True)
++attrs.validators.set_disabled(False)
++
++
++with attrs.validators.disabled():
++    Validated(num=-1)
++
++
++@attrs.define
++class WithCustomRepr:
++    a: int = attrs.field(repr=True)
++    b: str = attrs.field(repr=False)
++    c: str = attrs.field(repr=lambda value: "c is for cookie")
++    d: bool = attrs.field(repr=str)
++
++
++@attrs.define(on_setattr=attrs.setters.validate)
++class ValidatedSetter2:
++    a: int
++    b: str = attrs.field(on_setattr=attrs.setters.NO_OP)
++    c: bool = attrs.field(on_setattr=attrs.setters.frozen)
++    d: int = attrs.field(
++        on_setattr=[attrs.setters.convert, attrs.setters.validate]
++    )
++    e: bool = attrs.field(
++        on_setattr=attrs.setters.pipe(
++            attrs.setters.convert, attrs.setters.validate
++        )
++    )
++
++
++@attrs.define(eq=True, order=True)
++class OrderFlags:
++    a: int = attrs.field(eq=False, order=False)
++    b: int = attrs.field(eq=True, order=True)
++
++
++# field_transformer
++def ft_hook2(
++    cls: type, attribs: list[attrs.Attribute[Any]]
++) -> list[attrs.Attribute[Any]]:
++    return attribs
++
++
++@attrs.define(field_transformer=ft_hook2)
++class TransformedAttrs2:
++    x: int
++
++
++@attrs.define
++class FactoryTest:
++    a: list[int] = attrs.field(factory=list)  # pyright:ignore[reportUnknownVariableType]
++    b: list[str] = attrs.field(  # pyright:ignore[reportUnknownVariableType]
++        default=attrs.Factory(list, takes_self=False)  # pyright:ignore[reportUnknownArgumentType]
++    )
++    c: list[int] = attrs.field(default=attrs.Factory((lambda s: s.a), True))
++    d: list[int] = attrs.Factory(list)  # pyright:ignore[reportUnknownVariableType]
++
++
++attrs.asdict(FactoryTest())
++attrs.asdict(FactoryTest(), retain_collection_types=False)
++
++
++@attrs.define(match_args=False)
++class MatchArgs2:
++    a: int
++    b: int
++
++
++# NG versions of asdict/astuple
++attrs.asdict(MatchArgs2(1, 2))
++attrs.astuple(MatchArgs2(1, 2))
++
++
++def accessing_from_attrs() -> None:
++    """
++    Use a function to keep the ns clean.
++    """
++    attrs.converters.optional
++    attrs.exceptions.FrozenError
++    attrs.filters.include
++    attrs.filters.exclude
++    attrs.setters.frozen
++    attrs.validators.and_
++    attrs.cmp_using
++
++
++@attrs.define(unsafe_hash=True)
++class Hashable:
++    pass
++
++
++cp: attrs.ClassProps = attrs.inspect(Hashable)
++cp.added_init
++if cp.hashability is attrs.ClassProps.Hashability.UNHASHABLE:
++    cp.is_slotted
++
++
++def test(cls: type) -> None:
++    if attrs.has(cls):
++        attrs.resolve_types(cls)

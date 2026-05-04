@@ -1,0 +1,321 @@
+{
+  "old_dir": ".packages/urllib3/2.3.0",
+  "new_dir": ".packages/urllib3/2.4.0",
+  "extracted_at": "2026-05-02T02:18:34.368373",
+  "diff_file": "confirmed/urllib3/2.4.0/differences/code_diff_v2.3.0_to_v2.4.0_py.diff",
+  "diff_content": "diff --git a/dummyserver/asgi_proxy.py b/dummyserver/asgi_proxy.py\nindex 107c5e0..00c0a1b 100755\n--- a/dummyserver/asgi_proxy.py\n+++ b/dummyserver/asgi_proxy.py\n@@ -1,5 +1,6 @@\n from __future__ import annotations\n \n+import ssl\n import typing\n \n import httpx\n@@ -29,7 +30,10 @@ async def _read_body(receive: ASGIReceiveCallable) -> bytes:\n \n class ProxyApp:\n     def __init__(self, upstream_ca_certs: str | None = None):\n-        self.upstream_ca_certs = upstream_ca_certs\n+        self.ssl_context = None\n+        if upstream_ca_certs:\n+            self.ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)\n+            self.ssl_context.load_verify_locations(cafile=upstream_ca_certs)\n \n     async def __call__(\n         self, scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable\n@@ -48,7 +52,7 @@ class ProxyApp:\n         receive: ASGIReceiveCallable,\n         send: ASGISendCallable,\n     ) -> None:\n-        async with httpx.AsyncClient(verify=self.upstream_ca_certs or True) as client:\n+        async with httpx.AsyncClient(verify=self.ssl_context or True) as client:\n             client_response = await client.request(\n                 method=scope[\"method\"],\n                 url=scope[\"path\"],\n\ndiff --git a/dummyserver/hypercornserver.py b/dummyserver/hypercornserver.py\nindex 5863033..f90f4e3 100644\n--- a/dummyserver/hypercornserver.py\n+++ b/dummyserver/hypercornserver.py\n@@ -1,15 +1,14 @@\n from __future__ import annotations\n \n-import concurrent.futures\n import contextlib\n import errno\n import functools\n import socket\n import sys\n-import threading\n-import traceback\n import typing\n \n+import anyio.abc\n+import anyio.to_thread\n import hypercorn\n import hypercorn.config\n import hypercorn.trio\n@@ -80,37 +79,25 @@ class Config(hypercorn.Config):\n         return sockets\n \n \n-# https://github.com/pgjones/hypercorn/blob/19dfb96411575a6a647cdea63fa581b48ebb9180/src/hypercorn/utils.py#L172-L178\n-async def graceful_shutdown(shutdown_event: threading.Event) -> None:\n-    while True:\n-        if shutdown_event.is_set():\n-            return\n-        await trio.sleep(0.1)\n-\n-\n async def _start_server(\n     config: Config,\n     app: QuartTrio,\n-    ready_event: threading.Event,\n-    shutdown_event: threading.Event,\n+    shutdown_event: trio.Event,\n+    *,\n+    task_status: anyio.abc.TaskStatus[list[str]] = anyio.TASK_STATUS_IGNORED,\n ) -> None:\n     async with trio.open_nursery() as nursery:\n-        try:\n-            config.bind = await nursery.start(\n+        with trio.fail_after(5):\n+            config_bind: list[str]\n+            config_bind = await nursery.start(\n                 functools.partial(\n                     hypercorn.trio.serve,\n                     app,\n                     config,\n-                    shutdown_trigger=functools.partial(\n-                        graceful_shutdown, shutdown_event\n-                    ),\n+                    shutdown_trigger=shutdown_event.wait,\n                 )\n             )\n-            ready_event.set()\n-        except Exception:\n-            print(\"Starting server failed\", file=sys.stderr)\n-            traceback.print_exc()\n-            raise\n+        task_status.started(config_bind)\n \n \n @contextlib.contextmanager\n@@ -129,30 +116,18 @@ def run_hypercorn_in_thread(\n             config.alpn_protocols = certs[\"alpn_protocols\"]\n     config.bind = [f\"{host}:0\"]\n \n-    ready_event = threading.Event()\n-    shutdown_event = threading.Event()\n-\n-    with concurrent.futures.ThreadPoolExecutor(\n-        1, thread_name_prefix=\"hypercorn dummyserver\"\n-    ) as executor:\n-        future = executor.submit(\n-            trio.run,\n-            _start_server,\n-            config,\n-            app,\n-            ready_event,\n-            shutdown_event,\n-        )\n-        ready_event.wait(5)\n-        if not ready_event.is_set():\n-            raise Exception(\"most likely failed to start server\")\n+    shutdown_event = trio.Event()\n \n+    with anyio.from_thread.start_blocking_portal(backend=\"trio\") as portal:\n+        future, config_bind = portal.start_task(\n+            _start_server, config, app, shutdown_event\n+        )\n         try:\n-            port = parse_url(config.bind[0]).port\n+            port = parse_url(config_bind[0]).port\n             assert port is not None\n             yield port\n         finally:\n-            shutdown_event.set()\n+            portal.call(shutdown_event.set)\n             future.result()\n \n \n@@ -162,9 +137,8 @@ def main() -> int:\n \n     config = Config()\n     config.bind = [\"localhost:0\"]\n-    ready_event = threading.Event()\n-    shutdown_event = threading.Event()\n-    trio.run(_start_server, config, hypercorn_app, ready_event, shutdown_event)\n+    shutdown_event = trio.Event()\n+    trio.run(_start_server, config, hypercorn_app, shutdown_event)\n     return 0\n \n \n\ndiff --git a/src/urllib3/_version.py b/src/urllib3/_version.py\nindex af6144b..1a3a320 100644\n--- a/src/urllib3/_version.py\n+++ b/src/urllib3/_version.py\n@@ -1,8 +1,13 @@\n-# file generated by setuptools_scm\n+# file generated by setuptools-scm\n # don't change, don't track in version control\n+\n+__all__ = [\"__version__\", \"__version_tuple__\", \"version\", \"version_tuple\"]\n+\n TYPE_CHECKING = False\n if TYPE_CHECKING:\n-    from typing import Tuple, Union\n+    from typing import Tuple\n+    from typing import Union\n+\n     VERSION_TUPLE = Tuple[Union[int, str], ...]\n else:\n     VERSION_TUPLE = object\n@@ -12,5 +17,5 @@ __version__: str\n __version_tuple__: VERSION_TUPLE\n version_tuple: VERSION_TUPLE\n \n-__version__ = version = '2.3.0'\n-__version_tuple__ = version_tuple = (2, 3, 0)\n+__version__ = version = '2.4.0'\n+__version_tuple__ = version_tuple = (2, 4, 0)\n\ndiff --git a/src/urllib3/contrib/emscripten/response.py b/src/urllib3/contrib/emscripten/response.py\nindex b32b402..cb1088a 100644\n--- a/src/urllib3/contrib/emscripten/response.py\n+++ b/src/urllib3/contrib/emscripten/response.py\n@@ -160,26 +160,18 @@ class EmscriptenHttpResponseWrapper(BaseHTTPResponse):\n                 # don't cache partial content\n                 cache_content = False\n                 data = self._response.body.read(amt)\n-                if self.length_remaining is not None:\n-                    self.length_remaining = max(self.length_remaining - len(data), 0)\n-                if (self.length_is_certain and self.length_remaining == 0) or len(\n-                    data\n-                ) < amt:\n-                    # definitely finished reading, close response stream\n-                    self._response.body.close()\n-                return typing.cast(bytes, data)\n             else:  # read all we can (and cache it)\n                 data = self._response.body.read()\n                 if cache_content:\n                     self._body = data\n-                if self.length_remaining is not None:\n-                    self.length_remaining = max(self.length_remaining - len(data), 0)\n-                if len(data) == 0 or (\n-                    self.length_is_certain and self.length_remaining == 0\n-                ):\n-                    # definitely finished reading, close response stream\n-                    self._response.body.close()\n-                return typing.cast(bytes, data)\n+            if self.length_remaining is not None:\n+                self.length_remaining = max(self.length_remaining - len(data), 0)\n+            if len(data) == 0 or (\n+                self.length_is_certain and self.length_remaining == 0\n+            ):\n+                # definitely finished reading, close response stream\n+                self._response.body.close()\n+            return typing.cast(bytes, data)\n \n     def read_chunked(\n         self,\n\ndiff --git a/src/urllib3/contrib/pyopenssl.py b/src/urllib3/contrib/pyopenssl.py\nindex ed65430..3714500 100644\n--- a/src/urllib3/contrib/pyopenssl.py\n+++ b/src/urllib3/contrib/pyopenssl.py\n@@ -424,6 +424,7 @@ class PyOpenSSLContext:\n         self.check_hostname = False\n         self._minimum_version: int = ssl.TLSVersion.MINIMUM_SUPPORTED\n         self._maximum_version: int = ssl.TLSVersion.MAXIMUM_SUPPORTED\n+        self._verify_flags: int = ssl.VERIFY_X509_TRUSTED_FIRST\n \n     @property\n     def options(self) -> int:\n@@ -434,6 +435,15 @@ class PyOpenSSLContext:\n         self._options = value\n         self._set_ctx_options()\n \n+    @property\n+    def verify_flags(self) -> int:\n+        return self._verify_flags\n+\n+    @verify_flags.setter\n+    def verify_flags(self, value: int) -> None:\n+        self._verify_flags = value\n+        self._ctx.get_cert_store().set_flags(self._verify_flags)\n+\n     @property\n     def verify_mode(self) -> int:\n         return _openssl_to_stdlib_verify[self._ctx.get_verify_mode()]\n\ndiff --git a/src/urllib3/exceptions.py b/src/urllib3/exceptions.py\nindex 0394578..a0de9d6 100644\n--- a/src/urllib3/exceptions.py\n+++ b/src/urllib3/exceptions.py\n@@ -31,11 +31,12 @@ class PoolError(HTTPError):\n \n     def __init__(self, pool: ConnectionPool, message: str) -> None:\n         self.pool = pool\n+        self._message = message\n         super().__init__(f\"{pool}: {message}\")\n \n     def __reduce__(self) -> _TYPE_REDUCE_RESULT:\n         # For pickling purposes.\n-        return self.__class__, (None, None)\n+        return self.__class__, (None, self._message)\n \n \n class RequestError(PoolError):\n@@ -47,7 +48,7 @@ class RequestError(PoolError):\n \n     def __reduce__(self) -> _TYPE_REDUCE_RESULT:\n         # For pickling purposes.\n-        return self.__class__, (None, self.url, None)\n+        return self.__class__, (None, self.url, self._message)\n \n \n class SSLError(HTTPError):\n@@ -100,6 +101,10 @@ class MaxRetryError(RequestError):\n \n         super().__init__(pool, url, message)\n \n+    def __reduce__(self) -> _TYPE_REDUCE_RESULT:\n+        # For pickling purposes.\n+        return self.__class__, (None, self.url, self.reason)\n+\n \n class HostChangedError(RequestError):\n     \"\"\"Raised when an existing pool gets a request for a foreign host.\"\"\"\n@@ -139,11 +144,12 @@ class NewConnectionError(ConnectTimeoutError, HTTPError):\n \n     def __init__(self, conn: HTTPConnection, message: str) -> None:\n         self.conn = conn\n+        self._message = message\n         super().__init__(f\"{conn}: {message}\")\n \n     def __reduce__(self) -> _TYPE_REDUCE_RESULT:\n         # For pickling purposes.\n-        return self.__class__, (None, None)\n+        return self.__class__, (None, self._message)\n \n     @property\n     def pool(self) -> HTTPConnection:\n@@ -162,11 +168,13 @@ class NameResolutionError(NewConnectionError):\n \n     def __init__(self, host: str, conn: HTTPConnection, reason: socket.gaierror):\n         message = f\"Failed to resolve '{host}' ({reason})\"\n+        self._host = host\n+        self._reason = reason\n         super().__init__(conn, message)\n \n     def __reduce__(self) -> _TYPE_REDUCE_RESULT:\n         # For pickling purposes.\n-        return self.__class__, (None, None, None)\n+        return self.__class__, (self._host, None, self._reason)\n \n \n class EmptyPoolError(PoolError):\n\ndiff --git a/src/urllib3/http2/connection.py b/src/urllib3/http2/connection.py\nindex f486145..d082239 100644\n--- a/src/urllib3/http2/connection.py\n+++ b/src/urllib3/http2/connection.py\n@@ -140,7 +140,7 @@ class HTTP2Connection(HTTPSConnection):\n         with self._h2_conn as conn:\n             self._h2_stream = conn.get_next_available_stream_id()\n \n-    def putheader(self, header: str | bytes, *values: str | bytes) -> None:\n+    def putheader(self, header: str | bytes, *values: str | bytes) -> None:  # type: ignore[override]\n         # TODO SKIPPABLE_HEADERS from urllib3 are ignored.\n         header = header.encode() if isinstance(header, str) else header\n         header = header.lower()  # A lot of upstream code uses capitalized headers.\n\ndiff --git a/src/urllib3/util/ssl_.py b/src/urllib3/util/ssl_.py\nindex 278128e..e43bd8f 100644\n--- a/src/urllib3/util/ssl_.py\n+++ b/src/urllib3/util/ssl_.py\n@@ -101,6 +101,7 @@ try:  # Do we have ssl at all?\n         OPENSSL_VERSION_NUMBER,\n         PROTOCOL_TLS,\n         PROTOCOL_TLS_CLIENT,\n+        VERIFY_X509_STRICT,\n         OP_NO_SSLv2,\n         OP_NO_SSLv3,\n         SSLContext,\n@@ -109,6 +110,9 @@ try:  # Do we have ssl at all?\n \n     PROTOCOL_SSLv23 = PROTOCOL_TLS\n \n+    # Needed for Python 3.9 which does not define this\n+    VERIFY_X509_PARTIAL_CHAIN = getattr(ssl, \"VERIFY_X509_PARTIAL_CHAIN\", 0x80000)\n+\n     # Setting SSLContext.hostname_checks_common_name = False didn't work before CPython\n     # 3.9.3, and 3.10 (but OK on PyPy) or OpenSSL 1.1.1l+\n     if HAS_NEVER_CHECK_COMMON_NAME and not _is_has_never_check_common_name_reliable(\n@@ -117,7 +121,7 @@ try:  # Do we have ssl at all?\n         sys.implementation.name,\n         sys.version_info,\n         sys.pypy_version_info if sys.implementation.name == \"pypy\" else None,  # type: ignore[attr-defined]\n-    ):\n+    ):  # Defensive: for Python < 3.9.3\n         HAS_NEVER_CHECK_COMMON_NAME = False\n \n     # Need to be careful here in case old TLS versions get\n@@ -138,6 +142,8 @@ except ImportError:\n     OP_NO_SSLv3 = 0x2000000  # type: ignore[assignment]\n     PROTOCOL_SSLv23 = PROTOCOL_TLS = 2  # type: ignore[assignment]\n     PROTOCOL_TLS_CLIENT = 16  # type: ignore[assignment]\n+    VERIFY_X509_PARTIAL_CHAIN = 0x80000\n+    VERIFY_X509_STRICT = 0x20  # type: ignore[assignment]\n \n \n _TYPE_PEER_CERT_RET = typing.Union[\"_TYPE_PEER_CERT_RET_DICT\", bytes, None]\n@@ -223,6 +229,7 @@ def create_urllib3_context(\n     ciphers: str | None = None,\n     ssl_minimum_version: int | None = None,\n     ssl_maximum_version: int | None = None,\n+    verify_flags: int | None = None,\n ) -> ssl.SSLContext:\n     \"\"\"Creates and configures an :class:`ssl.SSLContext` instance for use with urllib3.\n \n@@ -247,6 +254,9 @@ def create_urllib3_context(\n     :param ciphers:\n         Which cipher suites to allow the server to select. Defaults to either system configured\n         ciphers if OpenSSL 1.1.1+, otherwise uses a secure default set of ciphers.\n+    :param verify_flags:\n+        The flags for certificate verification operations. These default to\n+        ``ssl.VERIFY_X509_PARTIAL_CHAIN`` and ``ssl.VERIFY_X509_STRICT`` for Python 3.13+.\n     :returns:\n         Constructed SSLContext object with specified options\n     :rtype: SSLContext\n@@ -320,6 +330,16 @@ def create_urllib3_context(\n \n     context.options |= options\n \n+    if verify_flags is None:\n+        verify_flags = 0\n+        # In Python 3.13+ ssl.create_default_context() sets VERIFY_X509_PARTIAL_CHAIN\n+        # and VERIFY_X509_STRICT so we do the same\n+        if sys.version_info >= (3, 13):\n+            verify_flags |= VERIFY_X509_PARTIAL_CHAIN\n+            verify_flags |= VERIFY_X509_STRICT\n+\n+    context.verify_flags |= verify_flags\n+\n     # Enable post-handshake authentication for TLS 1.3, see GH #1634. PHA is\n     # necessary for conditional client cert authentication with TLS 1.3.\n     # The attribute is None for OpenSSL <= 1.1.0 or does not exist when using\n\ndiff --git a/src/urllib3/util/ssl_match_hostname.py b/src/urllib3/util/ssl_match_hostname.py\nindex 453cfd4..25d9100 100644\n--- a/src/urllib3/util/ssl_match_hostname.py\n+++ b/src/urllib3/util/ssl_match_hostname.py\n@@ -146,7 +146,7 @@ def match_hostname(\n                 if key == \"commonName\":\n                     if _dnsname_match(value, hostname):\n                         return\n-                    dnsnames.append(value)\n+                    dnsnames.append(value)  # Defensive: for Python < 3.9.3\n \n     if len(dnsnames) > 1:\n         raise CertificateError(\n",
+  "structured_diff": {
+    "dummyserver/asgi_proxy.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,5 +1,6 @@",
+          "snippet": " from __future__ import annotations\n \n+import ssl\n import typing\n \n import httpx",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "dummyserver/asgi_proxy.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -29,7 +30,10 @@",
+          "snippet": " async def _read_body(receive: ASGIReceiveCallable) -> bytes:\n \n class ProxyApp:\n     def __init__(self, upstream_ca_certs: str | None = None):\n-        self.upstream_ca_certs = upstream_ca_certs\n+        self.ssl_context = None\n+        if upstream_ca_certs:\n+            self.ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)\n+            self.ssl_context.load_verify_locations(cafile=upstream_ca_certs)\n \n     async def __call__(\n         self, scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "dummyserver/asgi_proxy.py::ProxyApp::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -48,7 +52,7 @@",
+          "snippet": " class ProxyApp:\n         receive: ASGIReceiveCallable,\n         send: ASGISendCallable,\n     ) -> None:\n-        async with httpx.AsyncClient(verify=self.upstream_ca_certs or True) as client:\n+        async with httpx.AsyncClient(verify=self.ssl_context or True) as client:\n             client_response = await client.request(\n                 method=scope[\"method\"],\n                 url=scope[\"path\"],\n",
+          "affect": [
+            {
+              "kind": "async_method",
+              "node": "dummyserver/asgi_proxy.py::ProxyApp::absolute_uri"
+            }
+          ]
+        }
+      ]
+    },
+    "dummyserver/hypercornserver.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,15 +1,14 @@",
+          "snippet": " from __future__ import annotations\n \n-import concurrent.futures\n import contextlib\n import errno\n import functools\n import socket\n import sys\n-import threading\n-import traceback\n import typing\n \n+import anyio.abc\n+import anyio.to_thread\n import hypercorn\n import hypercorn.config\n import hypercorn.trio",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "dummyserver/hypercornserver.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -80,37 +79,25 @@",
+          "snippet": " class Config(hypercorn.Config):\n         return sockets\n \n \n-# https://github.com/pgjones/hypercorn/blob/19dfb96411575a6a647cdea63fa581b48ebb9180/src/hypercorn/utils.py#L172-L178\n-async def graceful_shutdown(shutdown_event: threading.Event) -> None:\n-    while True:\n-        if shutdown_event.is_set():\n-            return\n-        await trio.sleep(0.1)\n-\n-\n async def _start_server(\n     config: Config,\n     app: QuartTrio,\n-    ready_event: threading.Event,\n-    shutdown_event: threading.Event,\n+    shutdown_event: trio.Event,\n+    *,\n+    task_status: anyio.abc.TaskStatus[list[str]] = anyio.TASK_STATUS_IGNORED,\n ) -> None:\n     async with trio.open_nursery() as nursery:\n-        try:\n-            config.bind = await nursery.start(\n+        with trio.fail_after(5):\n+            config_bind: list[str]\n+            config_bind = await nursery.start(\n                 functools.partial(\n                     hypercorn.trio.serve,\n                     app,\n                     config,\n-                    shutdown_trigger=functools.partial(\n-                        graceful_shutdown, shutdown_event\n-                    ),\n+                    shutdown_trigger=shutdown_event.wait,\n                 )\n             )\n-            ready_event.set()\n-        except Exception:\n-            print(\"Starting server failed\", file=sys.stderr)\n-            traceback.print_exc()\n-            raise\n+        task_status.started(config_bind)\n \n \n @contextlib.contextmanager",
+          "affect": [
+            {
+              "kind": "async_function",
+              "node": "dummyserver/hypercornserver.py::_start_server"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -129,30 +116,18 @@",
+          "snippet": " def run_hypercorn_in_thread(\n             config.alpn_protocols = certs[\"alpn_protocols\"]\n     config.bind = [f\"{host}:0\"]\n \n-    ready_event = threading.Event()\n-    shutdown_event = threading.Event()\n-\n-    with concurrent.futures.ThreadPoolExecutor(\n-        1, thread_name_prefix=\"hypercorn dummyserver\"\n-    ) as executor:\n-        future = executor.submit(\n-            trio.run,\n-            _start_server,\n-            config,\n-            app,\n-            ready_event,\n-            shutdown_event,\n-        )\n-        ready_event.wait(5)\n-        if not ready_event.is_set():\n-            raise Exception(\"most likely failed to start server\")\n+    shutdown_event = trio.Event()\n \n+    with anyio.from_thread.start_blocking_portal(backend=\"trio\") as portal:\n+        future, config_bind = portal.start_task(\n+            _start_server, config, app, shutdown_event\n+        )\n         try:\n-            port = parse_url(config.bind[0]).port\n+            port = parse_url(config_bind[0]).port\n             assert port is not None\n             yield port\n         finally:\n-            shutdown_event.set()\n+            portal.call(shutdown_event.set)\n             future.result()\n \n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "dummyserver/hypercornserver.py::run_hypercorn_in_thread"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -162,9 +137,8 @@",
+          "snippet": " def main() -> int:\n \n     config = Config()\n     config.bind = [\"localhost:0\"]\n-    ready_event = threading.Event()\n-    shutdown_event = threading.Event()\n-    trio.run(_start_server, config, hypercorn_app, ready_event, shutdown_event)\n+    shutdown_event = trio.Event()\n+    trio.run(_start_server, config, hypercorn_app, shutdown_event)\n     return 0\n \n \n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "dummyserver/hypercornserver.py::main"
+            }
+          ]
+        }
+      ]
+    },
+    "src/urllib3/_version.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,8 +1,13 @@",
+          "snippet": "-# file generated by setuptools_scm\n+# file generated by setuptools-scm\n # don't change, don't track in version control\n+\n+__all__ = [\"__version__\", \"__version_tuple__\", \"version\", \"version_tuple\"]\n+\n TYPE_CHECKING = False\n if TYPE_CHECKING:\n-    from typing import Tuple, Union\n+    from typing import Tuple\n+    from typing import Union\n+\n     VERSION_TUPLE = Tuple[Union[int, str], ...]\n else:\n     VERSION_TUPLE = object",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "src/urllib3/_version.py::__all__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -12,5 +17,5 @@",
+          "snippet": " __version__: str\n __version_tuple__: VERSION_TUPLE\n version_tuple: VERSION_TUPLE\n \n-__version__ = version = '2.3.0'\n-__version_tuple__ = version_tuple = (2, 3, 0)\n+__version__ = version = '2.4.0'\n+__version_tuple__ = version_tuple = (2, 4, 0)\n",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/urllib3/_version.py::<module>"
+            }
+          ]
+        }
+      ]
+    },
+    "src/urllib3/contrib/emscripten/response.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -160,26 +160,18 @@",
+          "snippet": " class EmscriptenHttpResponseWrapper(BaseHTTPResponse):\n                 # don't cache partial content\n                 cache_content = False\n                 data = self._response.body.read(amt)\n-                if self.length_remaining is not None:\n-                    self.length_remaining = max(self.length_remaining - len(data), 0)\n-                if (self.length_is_certain and self.length_remaining == 0) or len(\n-                    data\n-                ) < amt:\n-                    # definitely finished reading, close response stream\n-                    self._response.body.close()\n-                return typing.cast(bytes, data)\n             else:  # read all we can (and cache it)\n                 data = self._response.body.read()\n                 if cache_content:\n                     self._body = data\n-                if self.length_remaining is not None:\n-                    self.length_remaining = max(self.length_remaining - len(data), 0)\n-                if len(data) == 0 or (\n-                    self.length_is_certain and self.length_remaining == 0\n-                ):\n-                    # definitely finished reading, close response stream\n-                    self._response.body.close()\n-                return typing.cast(bytes, data)\n+            if self.length_remaining is not None:\n+                self.length_remaining = max(self.length_remaining - len(data), 0)\n+            if len(data) == 0 or (\n+                self.length_is_certain and self.length_remaining == 0\n+            ):\n+                # definitely finished reading, close response stream\n+                self._response.body.close()\n+            return typing.cast(bytes, data)\n \n     def read_chunked(\n         self,\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/urllib3/contrib/emscripten/response.py::EmscriptenHttpResponseWrapper::read"
+            }
+          ]
+        }
+      ]
+    },
+    "src/urllib3/contrib/pyopenssl.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -424,6 +424,7 @@",
+          "snippet": " class PyOpenSSLContext:\n         self.check_hostname = False\n         self._minimum_version: int = ssl.TLSVersion.MINIMUM_SUPPORTED\n         self._maximum_version: int = ssl.TLSVersion.MAXIMUM_SUPPORTED\n+        self._verify_flags: int = ssl.VERIFY_X509_TRUSTED_FIRST\n \n     @property\n     def options(self) -> int:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/urllib3/contrib/pyopenssl.py::PyOpenSSLContext::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -434,6 +435,15 @@",
+          "snippet": " class PyOpenSSLContext:\n         self._options = value\n         self._set_ctx_options()\n \n+    @property\n+    def verify_flags(self) -> int:\n+        return self._verify_flags\n+\n+    @verify_flags.setter\n+    def verify_flags(self, value: int) -> None:\n+        self._verify_flags = value\n+        self._ctx.get_cert_store().set_flags(self._verify_flags)\n+\n     @property\n     def verify_mode(self) -> int:\n         return _openssl_to_stdlib_verify[self._ctx.get_verify_mode()]\n",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "src/urllib3/contrib/pyopenssl.py::PyOpenSSLContext"
+            },
+            {
+              "kind": "method",
+              "node": "src/urllib3/contrib/pyopenssl.py::PyOpenSSLContext::verify_flags"
+            }
+          ]
+        }
+      ]
+    },
+    "src/urllib3/exceptions.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -31,11 +31,12 @@",
+          "snippet": " class PoolError(HTTPError):\n \n     def __init__(self, pool: ConnectionPool, message: str) -> None:\n         self.pool = pool\n+        self._message = message\n         super().__init__(f\"{pool}: {message}\")\n \n     def __reduce__(self) -> _TYPE_REDUCE_RESULT:\n         # For pickling purposes.\n-        return self.__class__, (None, None)\n+        return self.__class__, (None, self._message)\n \n \n class RequestError(PoolError):",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/urllib3/exceptions.py::PoolError::__init__"
+            },
+            {
+              "kind": "method",
+              "node": "src/urllib3/exceptions.py::PoolError::__reduce__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -47,7 +48,7 @@",
+          "snippet": " class RequestError(PoolError):\n \n     def __reduce__(self) -> _TYPE_REDUCE_RESULT:\n         # For pickling purposes.\n-        return self.__class__, (None, self.url, None)\n+        return self.__class__, (None, self.url, self._message)\n \n \n class SSLError(HTTPError):",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/urllib3/exceptions.py::RequestError::__reduce__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -100,6 +101,10 @@",
+          "snippet": " class MaxRetryError(RequestError):\n \n         super().__init__(pool, url, message)\n \n+    def __reduce__(self) -> _TYPE_REDUCE_RESULT:\n+        # For pickling purposes.\n+        return self.__class__, (None, self.url, self.reason)\n+\n \n class HostChangedError(RequestError):\n     \"\"\"Raised when an existing pool gets a request for a foreign host.\"\"\"",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/urllib3/exceptions.py::MaxRetryError::__reduce__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -139,11 +144,12 @@",
+          "snippet": " class NewConnectionError(ConnectTimeoutError, HTTPError):\n \n     def __init__(self, conn: HTTPConnection, message: str) -> None:\n         self.conn = conn\n+        self._message = message\n         super().__init__(f\"{conn}: {message}\")\n \n     def __reduce__(self) -> _TYPE_REDUCE_RESULT:\n         # For pickling purposes.\n-        return self.__class__, (None, None)\n+        return self.__class__, (None, self._message)\n \n     @property\n     def pool(self) -> HTTPConnection:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/urllib3/exceptions.py::NewConnectionError::__init__"
+            },
+            {
+              "kind": "method",
+              "node": "src/urllib3/exceptions.py::NewConnectionError::__reduce__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -162,11 +168,13 @@",
+          "snippet": " class NameResolutionError(NewConnectionError):\n \n     def __init__(self, host: str, conn: HTTPConnection, reason: socket.gaierror):\n         message = f\"Failed to resolve '{host}' ({reason})\"\n+        self._host = host\n+        self._reason = reason\n         super().__init__(conn, message)\n \n     def __reduce__(self) -> _TYPE_REDUCE_RESULT:\n         # For pickling purposes.\n-        return self.__class__, (None, None, None)\n+        return self.__class__, (self._host, None, self._reason)\n \n \n class EmptyPoolError(PoolError):\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/urllib3/exceptions.py::NameResolutionError::__init__"
+            },
+            {
+              "kind": "method",
+              "node": "src/urllib3/exceptions.py::NameResolutionError::__reduce__"
+            }
+          ]
+        }
+      ]
+    },
+    "src/urllib3/http2/connection.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -140,7 +140,7 @@",
+          "snippet": " class HTTP2Connection(HTTPSConnection):\n         with self._h2_conn as conn:\n             self._h2_stream = conn.get_next_available_stream_id()\n \n-    def putheader(self, header: str | bytes, *values: str | bytes) -> None:\n+    def putheader(self, header: str | bytes, *values: str | bytes) -> None:  # type: ignore[override]\n         # TODO SKIPPABLE_HEADERS from urllib3 are ignored.\n         header = header.encode() if isinstance(header, str) else header\n         header = header.lower()  # A lot of upstream code uses capitalized headers.\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/urllib3/http2/connection.py::HTTP2Connection::putheader"
+            }
+          ]
+        }
+      ]
+    },
+    "src/urllib3/util/ssl_.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -101,6 +101,7 @@",
+          "snippet": " try:  # Do we have ssl at all?\n         OPENSSL_VERSION_NUMBER,\n         PROTOCOL_TLS,\n         PROTOCOL_TLS_CLIENT,\n+        VERIFY_X509_STRICT,\n         OP_NO_SSLv2,\n         OP_NO_SSLv3,\n         SSLContext,",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/urllib3/util/ssl_.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -109,6 +110,9 @@",
+          "snippet": " try:  # Do we have ssl at all?\n \n     PROTOCOL_SSLv23 = PROTOCOL_TLS\n \n+    # Needed for Python 3.9 which does not define this\n+    VERIFY_X509_PARTIAL_CHAIN = getattr(ssl, \"VERIFY_X509_PARTIAL_CHAIN\", 0x80000)\n+\n     # Setting SSLContext.hostname_checks_common_name = False didn't work before CPython\n     # 3.9.3, and 3.10 (but OK on PyPy) or OpenSSL 1.1.1l+\n     if HAS_NEVER_CHECK_COMMON_NAME and not _is_has_never_check_common_name_reliable(",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/urllib3/util/ssl_.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -117,7 +121,7 @@",
+          "snippet": " try:  # Do we have ssl at all?\n         sys.implementation.name,\n         sys.version_info,\n         sys.pypy_version_info if sys.implementation.name == \"pypy\" else None,  # type: ignore[attr-defined]\n-    ):\n+    ):  # Defensive: for Python < 3.9.3\n         HAS_NEVER_CHECK_COMMON_NAME = False\n \n     # Need to be careful here in case old TLS versions get",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/urllib3/util/ssl_.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -138,6 +142,8 @@",
+          "snippet": " except ImportError:\n     OP_NO_SSLv3 = 0x2000000  # type: ignore[assignment]\n     PROTOCOL_SSLv23 = PROTOCOL_TLS = 2  # type: ignore[assignment]\n     PROTOCOL_TLS_CLIENT = 16  # type: ignore[assignment]\n+    VERIFY_X509_PARTIAL_CHAIN = 0x80000\n+    VERIFY_X509_STRICT = 0x20  # type: ignore[assignment]\n \n \n _TYPE_PEER_CERT_RET = typing.Union[\"_TYPE_PEER_CERT_RET_DICT\", bytes, None]",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/urllib3/util/ssl_.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -223,6 +229,7 @@",
+          "snippet": " def create_urllib3_context(\n     ciphers: str | None = None,\n     ssl_minimum_version: int | None = None,\n     ssl_maximum_version: int | None = None,\n+    verify_flags: int | None = None,\n ) -> ssl.SSLContext:\n     \"\"\"Creates and configures an :class:`ssl.SSLContext` instance for use with urllib3.\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/urllib3/util/ssl_.py::create_urllib3_context"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -247,6 +254,9 @@",
+          "snippet": " def create_urllib3_context(\n     :param ciphers:\n         Which cipher suites to allow the server to select. Defaults to either system configured\n         ciphers if OpenSSL 1.1.1+, otherwise uses a secure default set of ciphers.\n+    :param verify_flags:\n+        The flags for certificate verification operations. These default to\n+        ``ssl.VERIFY_X509_PARTIAL_CHAIN`` and ``ssl.VERIFY_X509_STRICT`` for Python 3.13+.\n     :returns:\n         Constructed SSLContext object with specified options\n     :rtype: SSLContext",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/urllib3/util/ssl_.py::create_urllib3_context"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -320,6 +330,16 @@",
+          "snippet": " def create_urllib3_context(\n \n     context.options |= options\n \n+    if verify_flags is None:\n+        verify_flags = 0\n+        # In Python 3.13+ ssl.create_default_context() sets VERIFY_X509_PARTIAL_CHAIN\n+        # and VERIFY_X509_STRICT so we do the same\n+        if sys.version_info >= (3, 13):\n+            verify_flags |= VERIFY_X509_PARTIAL_CHAIN\n+            verify_flags |= VERIFY_X509_STRICT\n+\n+    context.verify_flags |= verify_flags\n+\n     # Enable post-handshake authentication for TLS 1.3, see GH #1634. PHA is\n     # necessary for conditional client cert authentication with TLS 1.3.\n     # The attribute is None for OpenSSL <= 1.1.0 or does not exist when using\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/urllib3/util/ssl_.py::create_urllib3_context"
+            }
+          ]
+        }
+      ]
+    },
+    "src/urllib3/util/ssl_match_hostname.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -146,7 +146,7 @@",
+          "snippet": " def match_hostname(\n                 if key == \"commonName\":\n                     if _dnsname_match(value, hostname):\n                         return\n-                    dnsnames.append(value)\n+                    dnsnames.append(value)  # Defensive: for Python < 3.9.3\n \n     if len(dnsnames) > 1:\n         raise CertificateError(",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/urllib3/util/ssl_match_hostname.py::match_hostname"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

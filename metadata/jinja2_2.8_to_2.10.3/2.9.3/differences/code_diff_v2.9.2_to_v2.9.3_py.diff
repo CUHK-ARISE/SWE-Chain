@@ -1,0 +1,202 @@
+diff --git a/jinja2/__init__.py b/jinja2/__init__.py
+index e6581ca..06babb4 100644
+--- a/jinja2/__init__.py
++++ b/jinja2/__init__.py
+@@ -27,7 +27,7 @@
+     :license: BSD, see LICENSE for more details.
+ """
+ __docformat__ = 'restructuredtext en'
+-__version__ = '2.9.2'
++__version__ = '2.9.3'
+ 
+ # high level interface
+ from jinja2.environment import Environment, Template
+
+diff --git a/jinja2/compiler.py b/jinja2/compiler.py
+index 9051ced..cdfe38e 100644
+--- a/jinja2/compiler.py
++++ b/jinja2/compiler.py
+@@ -19,7 +19,7 @@ from jinja2.optimizer import Optimizer
+ from jinja2.exceptions import TemplateAssertionError
+ from jinja2.utils import Markup, concat, escape
+ from jinja2._compat import range_type, text_type, string_types, \
+-     iteritems, NativeStringIO, imap
++     iteritems, NativeStringIO, imap, izip
+ from jinja2.idtracking import Symbols, VAR_LOAD_PARAMETER, \
+      VAR_LOAD_RESOLVE, VAR_LOAD_ALIAS, VAR_LOAD_UNDEFINED
+ 
+@@ -796,7 +796,8 @@ class CodeGenerator(NodeVisitor):
+         context = node.scoped and (
+             'context.derived(%s)' % self.dump_local_context(frame)) or 'context'
+ 
+-        if supports_yield_from and not self.environment.is_async:
++        if supports_yield_from and not self.environment.is_async and \
++           frame.buffer is None:
+             self.writeline('yield from context.blocks[%r][0](%s)' % (
+                            node.name, context), node)
+         else:
+@@ -1164,6 +1165,18 @@ class CodeGenerator(NodeVisitor):
+         self.end_write(frame)
+         self.leave_frame(filter_frame)
+ 
++    def visit_With(self, node, frame):
++        with_frame = frame.inner()
++        with_frame.symbols.analyze_node(node)
++        self.enter_frame(with_frame)
++        for idx, (target, expr) in enumerate(izip(node.targets, node.values)):
++            self.newline()
++            self.visit(target, with_frame)
++            self.write(' = ')
++            self.visit(expr, frame)
++        self.blockvisit(node.body, with_frame)
++        self.leave_frame(with_frame)
++
+     def visit_ExprStmt(self, node, frame):
+         self.newline(node)
+         self.visit(node.node, frame)
+
+diff --git a/jinja2/idtracking.py b/jinja2/idtracking.py
+index 87ef510..433b92c 100644
+--- a/jinja2/idtracking.py
++++ b/jinja2/idtracking.py
+@@ -73,10 +73,22 @@ class Symbols(object):
+         return rv
+ 
+     def store(self, name):
+-        # We already have that name locally, so we can just bail
++        self.stores.add(name)
++
++        # If we have not see the name referenced yet, we need to figure
++        # out what to set it to.
+         if name not in self.refs:
++            # If there is a parent scope we check if the name has a
++            # reference there.  If it does it means we might have to alias
++            # to a variable there.
++            if self.parent is not None:
++                outer_ref = self.parent.find_ref(name)
++                if outer_ref is not None:
++                    self._define_ref(name, load=(VAR_LOAD_ALIAS, outer_ref))
++                    return
++
++            # Otherwise we can just set it to undefined.
+             self._define_ref(name, load=(VAR_LOAD_UNDEFINED, None))
+-        self.stores.add(name)
+ 
+     def declare_parameter(self, name):
+         self.stores.add(name)
+@@ -168,6 +180,12 @@ class RootVisitor(NodeVisitor):
+         for item in branch or ():
+             self.sym_visitor.visit(item)
+ 
++    def visit_With(self, node, **kwargs):
++        for target in node.targets:
++            self.sym_visitor.visit(target)
++        for child in node.body:
++            self.sym_visitor.visit(child)
++
+     def generic_visit(self, node, *args, **kwargs):
+         raise NotImplementedError('Cannot find symbols for %r' %
+                                   node.__class__.__name__)
+@@ -237,6 +255,10 @@ class FrameSymbolVisitor(NodeVisitor):
+     def visit_FilterBlock(self, node, **kwargs):
+         self.visit(node.filter, **kwargs)
+ 
++    def visit_With(self, node, **kwargs):
++        for target in node.values:
++            self.visit(target)
++
+     def visit_AssignBlock(self, node, **kwargs):
+         """Stop visiting at block assigns."""
+         self.visit(node.target, **kwargs)
+
+diff --git a/jinja2/nodes.py b/jinja2/nodes.py
+index d1a4c38..2c6a296 100644
+--- a/jinja2/nodes.py
++++ b/jinja2/nodes.py
+@@ -337,6 +337,15 @@ class FilterBlock(Stmt):
+     fields = ('body', 'filter')
+ 
+ 
++class With(Stmt):
++    """Specific node for with statements.  In older versions of Jinja the
++    with statement was implemented on the base of the `Scope` node instead.
++
++    .. versionadded:: 2.9.3
++    """
++    fields = ('targets', 'values', 'body')
++
++
+ class Block(Stmt):
+     """A node that represents a block."""
+     fields = ('name', 'body', 'scoped')
+
+diff --git a/jinja2/parser.py b/jinja2/parser.py
+index 9742a27..0bf74c9 100644
+--- a/jinja2/parser.py
++++ b/jinja2/parser.py
+@@ -225,19 +225,22 @@ class Parser(object):
+         return result
+ 
+     def parse_with(self):
+-        node = nodes.Scope(lineno=next(self.stream).lineno)
+-        assignments = []
++        node = nodes.With(lineno=next(self.stream).lineno)
++        targets = []
++        values = []
+         while self.stream.current.type != 'block_end':
+             lineno = self.stream.current.lineno
+-            if assignments:
++            if targets:
+                 self.stream.expect('comma')
+             target = self.parse_assign_target()
++            target.set_ctx('param')
++            targets.append(target)
+             self.stream.expect('assign')
+-            expr = self.parse_expression()
+-            assignments.append(nodes.Assign(target, expr, lineno=lineno))
+-        node.body = assignments + \
+-            list(self.parse_statements(('name:endwith',),
+-                                         drop_needle=True))
++            values.append(self.parse_expression())
++        node.targets = targets
++        node.values = values
++        node.body = self.parse_statements(('name:endwith',),
++                                          drop_needle=True)
+         return node
+ 
+     def parse_autoescape(self):
+
+diff --git a/jinja2/runtime.py b/jinja2/runtime.py
+index 958ddfd..5c2089b 100644
+--- a/jinja2/runtime.py
++++ b/jinja2/runtime.py
+@@ -214,10 +214,12 @@ class Context(object):
+                                                 'StopIteration exception')
+ 
+     def derived(self, locals=None):
+-        """Internal helper function to create a derived context."""
++        """Internal helper function to create a derived context.  This is
++        used in situations where the system needs a new context in the same
++        template that is independent.
++        """
+         context = new_context(self.environment, self.name, {},
+-                              self.parent, True, None, locals)
+-        context.vars.update(self.vars)
++                              self.get_all(), True, None, locals)
+         context.eval_ctx = self.eval_ctx
+         context.blocks.update((k, list(v)) for k, v in iteritems(self.blocks))
+         return context
+
+diff --git a/setup.py b/setup.py
+index faff1c4..3e3e7bc 100644
+--- a/setup.py
++++ b/setup.py
+@@ -40,7 +40,7 @@ from setuptools import setup
+ 
+ setup(
+     name='Jinja2',
+-    version='2.9.2',
++    version='2.9.3',
+     url='http://jinja.pocoo.org/',
+     license='BSD',
+     author='Armin Ronacher',

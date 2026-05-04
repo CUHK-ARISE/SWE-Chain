@@ -1,0 +1,1453 @@
+diff --git a/dummyserver/app.py b/dummyserver/app.py
+index 9fc9d1b..97b1b23 100644
+--- a/dummyserver/app.py
++++ b/dummyserver/app.py
+@@ -7,9 +7,9 @@ import email.utils
+ import gzip
+ import mimetypes
+ import zlib
++from collections.abc import AsyncGenerator, Iterator
+ from io import BytesIO
+ from pathlib import Path
+-from typing import Iterator
+ 
+ import trio
+ from quart import Response, make_response, request
+@@ -51,7 +51,6 @@ async def alpn_protocol() -> ResponseReturnValue:
+ @hypercorn_app.route("/certificate")
+ async def certificate() -> ResponseReturnValue:
+     """Return the requester's certificate."""
+-    print("scope", request.scope)
+     subject = request.scope["extensions"]["tls"]["client_cert_name"]
+     subject_as_dict = dict(part.split("=") for part in subject.split(", "))
+     return await make_response(subject_as_dict)
+@@ -315,6 +314,22 @@ async def slow() -> ResponseReturnValue:
+     return await make_response("TEN SECONDS LATER", 200)
+ 
+ 
++@pyodide_testing_app.route("/dripfeed")
++async def dripfeed() -> ResponseReturnValue:
++    # great big text file which streams half the file
++    # then pauses for 2 seconds and streams the rest
++    async def generate() -> AsyncGenerator[bytes]:
++        for x in range(8):
++            if x == 4:
++                await trio.sleep(2)
++            yield b"WOOO YAY BOOYAKAH" * 131072
++
++    response = await make_response(generate(), 200)
++    if hasattr(response, "timeout"):
++        response.timeout = None
++    return response
++
++
+ @pyodide_testing_app.route("/bigfile")
+ async def bigfile() -> ResponseReturnValue:
+     # great big text file, should force streaming
+@@ -353,29 +368,109 @@ async def pyodide_upload() -> ResponseReturnValue:
+     return await make_response("Uploaded file correct", 200)
+ 
+ 
++def _find_built_wheel() -> Path | None:
++    wheel_folder = Path(__file__).parent.parent / "dist"
++    wheels = list(wheel_folder.glob("*.whl"))
++    wheels = sorted(wheels, key=lambda w: w.stat().st_mtime)
++    if len(wheels) > 0:
++        return wheels[-1]  # newest wheel
++    else:
++        return None
++
++
++def _get_pyodide_template(py_file: str) -> bytes | None:
++    # serve code to run pyodide in a webworker, or html template
++    # these are included in pytest_pyodide, but
++    # we modify the webworker to automatically load our wheel
++    # before anything else
++    if py_file == "webworker_dev.js":
++        return b"""
++            importScripts("./pyodide.js");
++
++            onmessage = async function (e) {
++                try {
++                    let code = e.data.python;
++                    self.pyodide = await loadPyodide();
++                    await self.pyodide.loadPackage("/dist/urllib3.whl");
++                    await self.pyodide.loadPackagesFromImports(code);
++                    let results = await self.pyodide.runPythonAsync(code);
++                    self.postMessage({ results });
++                } catch (e) {
++                    self.postMessage({ error: e.message + "\\n" + e.stack });
++                }
++            };
++        """
++    elif py_file == "test.html":
++        return b"""
++            <!doctype html>
++            <html>
++            <head>
++                <script type="text/javascript">
++                window.logs = [];
++                console.log = function (message) {
++                    window.logs.push(message);
++                };
++                console.warn = function (message) {
++                    window.logs.push(message);
++                };
++                console.info = function (message) {
++                    window.logs.push(message);
++                };
++                console.error = function (message) {
++                    window.logs.push(message);
++                };
++                console.debug = function (message) {
++                    window.logs.push(message);
++                };
++                </script>
++                <script src="./pyodide.js"></script>
++            </head>
++            <body></body>
++            </html>
++        """
++    else:
++        return None
++
++
+ @pyodide_testing_app.route("/pyodide/<py_file>")
+ async def pyodide(py_file: str) -> ResponseReturnValue:
+-    file_path = Path(pyodide_testing_app.config["pyodide_dist_dir"], py_file)
+-    if file_path.exists():
+-        mime_type, encoding = mimetypes.guess_type(file_path)
++    template_data = _get_pyodide_template(py_file)
++    mime_type: str | None = None
++    if template_data:
++        mime_type, _encoding = mimetypes.guess_type(py_file)
+         if not mime_type:
+             mime_type = "text/plain"
+-        return await make_response(
+-            file_path.read_bytes(), 200, [("Content-Type", mime_type)]
+-        )
++        headers = [("Content-Type", mime_type)]
++        return await make_response(template_data, 200, headers)
++    file_path = Path(pyodide_testing_app.config["pyodide_dist_dir"], py_file)
++
++    if file_path is not None and file_path.exists():
++        if py_file.endswith(".whl"):
++            mime_type = "application/x-wheel"
++            headers = [
++                ("Content-Disposition", f"inline; filename='{file_path.name}'"),
++                ("Content-Type", mime_type),
++            ]
++        else:
++            mime_type, _encoding = mimetypes.guess_type(file_path)
++            if not mime_type:
++                mime_type = "text/plain"
++            headers = [("Content-Type", mime_type)]
++        return await make_response(file_path.read_bytes(), 200, headers)
+     else:
+         return await make_response("", 404)
+ 
+ 
+-@pyodide_testing_app.route("/wheel/dist.whl")
++@pyodide_testing_app.route("/dist/urllib3.whl")
+ async def wheel() -> ResponseReturnValue:
+-    # serve our wheel
+-    wheel_folder = Path(__file__).parent.parent / "dist"
+-    wheels = list(wheel_folder.glob("*.whl"))
+-    if len(wheels) > 0:
+-        wheel = wheels[0]
+-        headers = [("Content-Disposition", f"inline; filename='{wheel.name}'")]
+-        resp = await make_response(wheel.read_bytes(), 200, headers)
+-        return resp
+-    else:
+-        return await make_response(f"NO WHEEL IN {wheel_folder}", 404)
++    file_path = _find_built_wheel()
++    if not file_path:
++        print("NO BUILT WHEEL?")
++        return await make_response("", 404)
++
++    mime_type = "application/x-wheel"
++    headers = [
++        ("Content-Disposition", f"inline; filename='{file_path.name}'"),
++        ("Content-Type", mime_type),
++    ]
++    return await make_response(file_path.read_bytes(), 200, headers)
+
+diff --git a/dummyserver/hypercornserver.py b/dummyserver/hypercornserver.py
+index 888f11d..5863033 100644
+--- a/dummyserver/hypercornserver.py
++++ b/dummyserver/hypercornserver.py
+@@ -2,12 +2,16 @@ from __future__ import annotations
+ 
+ import concurrent.futures
+ import contextlib
++import errno
+ import functools
++import socket
+ import sys
+ import threading
++import traceback
+ import typing
+ 
+ import hypercorn
++import hypercorn.config
+ import hypercorn.trio
+ import hypercorn.typing
+ import trio
+@@ -16,6 +20,66 @@ from quart_trio import QuartTrio
+ from urllib3.util.url import parse_url
+ 
+ 
++class Config(hypercorn.Config):
++    def create_sockets(self) -> hypercorn.config.Sockets:
++        assert len(self.bind) == 1
++        secure_sockets, insecure_sockets = [], []
++        if self.ssl_enabled:
++            secure_sockets = self._create_urllib3_sockets(self.bind[0])
++        else:
++            insecure_sockets = self._create_urllib3_sockets(self.bind[0])
++        return hypercorn.config.Sockets(
++            secure_sockets, insecure_sockets, quic_sockets=[]
++        )
++
++    def _retry_create_urllib3_sockets(self, bind: str) -> list[socket.socket]:
++        # When we request a socket with host localhost and port zero, Hypercorn
++        # only binds to IPv4. But we want to bind to IPv6 too, otherwise we
++        # waste about 2 second for each test on Windows since urllib3 tries
++        # IPv6 first as it does not implement Happy Eyeballs.
++        # We want to use the same port for IPv4 and IPv6, so we first get a
++        # free port in IPv4 and request the same port in IPv6. But that port
++        # could easily be taken with IPv6 already, especially on crowded CI
++        # environments, which would fail the run. For this reason we retry
++        # _create_urllib3_sockets up to 10 times, which completely eliminates
++        # this failure mode.
++        for i in range(10):
++            try:
++                return self._create_urllib3_sockets(bind)
++            except OSError as e:
++                if e.errno == errno.EADDRINUSE:
++                    print(
++                        f"Retrying binding to {bind} after EADDRINUSE", file=sys.stderr
++                    )
++        raise OSError("failed to bind socket")
++
++    def _create_urllib3_sockets(self, bind: str) -> list[socket.socket]:
++        sockets = []
++
++        bind = bind.replace("[", "").replace("]", "")
++        host = bind.rsplit(":", 1)[0]
++        port = 0  # Get a random port
++        family = socket.AF_INET6 if ":" in host else socket.AF_UNSPEC
++
++        for res in socket.getaddrinfo(
++            host, port, family, socket.SOCK_STREAM, 0, socket.AI_PASSIVE
++        ):
++            af, socktype, proto, canonname, sockadddr = res
++
++            sock = socket.socket(af, socket.SOCK_STREAM, proto)
++
++            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
++            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++
++            sock.setblocking(False)
++            sock.bind((host, port))
++            port = sock.getsockname()[1]
++            sock.set_inheritable(True)
++            sockets.append(sock)
++
++        return sockets
++
++
+ # https://github.com/pgjones/hypercorn/blob/19dfb96411575a6a647cdea63fa581b48ebb9180/src/hypercorn/utils.py#L172-L178
+ async def graceful_shutdown(shutdown_event: threading.Event) -> None:
+     while True:
+@@ -25,28 +89,35 @@ async def graceful_shutdown(shutdown_event: threading.Event) -> None:
+ 
+ 
+ async def _start_server(
+-    config: hypercorn.Config,
++    config: Config,
+     app: QuartTrio,
+     ready_event: threading.Event,
+     shutdown_event: threading.Event,
+ ) -> None:
+     async with trio.open_nursery() as nursery:
+-        config.bind = await nursery.start(
+-            functools.partial(
+-                hypercorn.trio.serve,
+-                app,
+-                config,
+-                shutdown_trigger=functools.partial(graceful_shutdown, shutdown_event),
++        try:
++            config.bind = await nursery.start(
++                functools.partial(
++                    hypercorn.trio.serve,
++                    app,
++                    config,
++                    shutdown_trigger=functools.partial(
++                        graceful_shutdown, shutdown_event
++                    ),
++                )
+             )
+-        )
+-        ready_event.set()
++            ready_event.set()
++        except Exception:
++            print("Starting server failed", file=sys.stderr)
++            traceback.print_exc()
++            raise
+ 
+ 
+ @contextlib.contextmanager
+ def run_hypercorn_in_thread(
+     host: str, certs: dict[str, typing.Any] | None, app: hypercorn.typing.ASGIFramework
+ ) -> typing.Iterator[int]:
+-    config = hypercorn.Config()
++    config = Config()
+     if certs:
+         config.certfile = certs["certfile"]
+         config.keyfile = certs["keyfile"]
+@@ -89,7 +160,7 @@ def main() -> int:
+     # For debugging dummyserver itself - PYTHONPATH=src python -m dummyserver.hypercornserver
+     from .app import hypercorn_app
+ 
+-    config = hypercorn.Config()
++    config = Config()
+     config.bind = ["localhost:0"]
+     ready_event = threading.Event()
+     shutdown_event = threading.Event()
+
+diff --git a/dummyserver/testcase.py b/dummyserver/testcase.py
+index 58eac49..eb4d981 100644
+--- a/dummyserver/testcase.py
++++ b/dummyserver/testcase.py
+@@ -306,9 +306,7 @@ class ConnectionMarker:
+ 
+     @classmethod
+     @contextlib.contextmanager
+-    def mark(
+-        cls, monkeypatch: pytest.MonkeyPatch
+-    ) -> typing.Generator[None, None, None]:
++    def mark(cls, monkeypatch: pytest.MonkeyPatch) -> typing.Generator[None]:
+         """
+         Mark connections under in that context.
+         """
+
+diff --git a/src/urllib3/_base_connection.py b/src/urllib3/_base_connection.py
+index 29ca334..dc0f318 100644
+--- a/src/urllib3/_base_connection.py
++++ b/src/urllib3/_base_connection.py
+@@ -62,8 +62,7 @@ if typing.TYPE_CHECKING:
+             socket_options: _TYPE_SOCKET_OPTIONS | None = ...,
+             proxy: Url | None = None,
+             proxy_config: ProxyConfig | None = None,
+-        ) -> None:
+-            ...
++        ) -> None: ...
+ 
+         def set_tunnel(
+             self,
+@@ -71,11 +70,9 @@ if typing.TYPE_CHECKING:
+             port: int | None = None,
+             headers: typing.Mapping[str, str] | None = None,
+             scheme: str = "http",
+-        ) -> None:
+-            ...
++        ) -> None: ...
+ 
+-        def connect(self) -> None:
+-            ...
++        def connect(self) -> None: ...
+ 
+         def request(
+             self,
+@@ -91,14 +88,11 @@ if typing.TYPE_CHECKING:
+             preload_content: bool = True,
+             decode_content: bool = True,
+             enforce_content_length: bool = True,
+-        ) -> None:
+-            ...
++        ) -> None: ...
+ 
+-        def getresponse(self) -> BaseHTTPResponse:
+-            ...
++        def getresponse(self) -> BaseHTTPResponse: ...
+ 
+-        def close(self) -> None:
+-            ...
++        def close(self) -> None: ...
+ 
+         @property
+         def is_closed(self) -> bool:
+@@ -168,5 +162,4 @@ if typing.TYPE_CHECKING:
+             cert_file: str | None = None,
+             key_file: str | None = None,
+             key_password: str | None = None,
+-        ) -> None:
+-            ...
++        ) -> None: ...
+
+diff --git a/src/urllib3/_collections.py b/src/urllib3/_collections.py
+index 8a4409a..1b6c136 100644
+--- a/src/urllib3/_collections.py
++++ b/src/urllib3/_collections.py
+@@ -13,11 +13,9 @@ if typing.TYPE_CHECKING:
+     from typing_extensions import Self
+ 
+     class HasGettableStringKeys(Protocol):
+-        def keys(self) -> typing.Iterator[str]:
+-            ...
++        def keys(self) -> typing.Iterator[str]: ...
+ 
+-        def __getitem__(self, key: str) -> str:
+-            ...
++        def __getitem__(self, key: str) -> str: ...
+ 
+ 
+ __all__ = ["RecentlyUsedContainer", "HTTPHeaderDict"]
+@@ -33,7 +31,7 @@ _DT = typing.TypeVar("_DT")
+ ValidHTTPHeaderSource = typing.Union[
+     "HTTPHeaderDict",
+     typing.Mapping[str, str],
+-    typing.Iterable[typing.Tuple[str, str]],
++    typing.Iterable[tuple[str, str]],
+     "HasGettableStringKeys",
+ ]
+ 
+@@ -55,7 +53,7 @@ def ensure_can_construct_http_header_dict(
+         # Similarly to Mapping, full runtime checking of the contents of an Iterable is
+         # expensive, so for the purposes of typechecking, we assume that any Iterable
+         # is the right shape.
+-        return typing.cast(typing.Iterable[typing.Tuple[str, str]], potential)
++        return typing.cast(typing.Iterable[tuple[str, str]], potential)
+     elif hasattr(potential, "keys") and hasattr(potential, "__getitem__"):
+         return typing.cast("HasGettableStringKeys", potential)
+     else:
+@@ -155,7 +153,7 @@ class RecentlyUsedContainer(typing.Generic[_KT, _VT], typing.MutableMapping[_KT,
+             return set(self._container.keys())
+ 
+ 
+-class HTTPHeaderDictItemView(typing.Set[typing.Tuple[str, str]]):
++class HTTPHeaderDictItemView(set[tuple[str, str]]):
+     """
+     HTTPHeaderDict is unusual for a Mapping[str, str] in that it has two modes of
+     address.
+@@ -352,7 +350,7 @@ class HTTPHeaderDict(typing.MutableMapping[str, str]):
+             for key, val in other.items():
+                 self.add(key, val)
+         elif isinstance(other, typing.Iterable):
+-            other = typing.cast(typing.Iterable[typing.Tuple[str, str]], other)
++            other = typing.cast(typing.Iterable[tuple[str, str]], other)
+             for key, value in other:
+                 self.add(key, value)
+         elif hasattr(other, "keys") and hasattr(other, "__getitem__"):
+@@ -368,12 +366,10 @@ class HTTPHeaderDict(typing.MutableMapping[str, str]):
+             self.add(key, value)
+ 
+     @typing.overload
+-    def getlist(self, key: str) -> list[str]:
+-        ...
++    def getlist(self, key: str) -> list[str]: ...
+ 
+     @typing.overload
+-    def getlist(self, key: str, default: _DT) -> list[str] | _DT:
+-        ...
++    def getlist(self, key: str, default: _DT) -> list[str] | _DT: ...
+ 
+     def getlist(
+         self, key: str, default: _Sentinel | _DT = _Sentinel.not_passed
+
+diff --git a/src/urllib3/_request_methods.py b/src/urllib3/_request_methods.py
+index 03186e5..297c271 100644
+--- a/src/urllib3/_request_methods.py
++++ b/src/urllib3/_request_methods.py
+@@ -12,7 +12,7 @@ from .response import BaseHTTPResponse
+ __all__ = ["RequestMethods"]
+ 
+ _TYPE_ENCODE_URL_FIELDS = typing.Union[
+-    typing.Sequence[typing.Tuple[str, typing.Union[str, bytes]]],
++    typing.Sequence[tuple[str, typing.Union[str, bytes]]],
+     typing.Mapping[str, typing.Union[str, bytes]],
+ ]
+ 
+
+diff --git a/src/urllib3/_version.py b/src/urllib3/_version.py
+index eb8b5c2..af6144b 100644
+--- a/src/urllib3/_version.py
++++ b/src/urllib3/_version.py
+@@ -12,5 +12,5 @@ __version__: str
+ __version_tuple__: VERSION_TUPLE
+ version_tuple: VERSION_TUPLE
+ 
+-__version__ = version = '2.2.3'
+-__version_tuple__ = version_tuple = (2, 2, 3)
++__version__ = version = '2.3.0'
++__version_tuple__ = version_tuple = (2, 3, 0)
+
+diff --git a/src/urllib3/connection.py b/src/urllib3/connection.py
+index 7cbef7d..591ac40 100644
+--- a/src/urllib3/connection.py
++++ b/src/urllib3/connection.py
+@@ -78,8 +78,6 @@ RECENT_DATE = datetime.date(2023, 6, 1)
+ 
+ _CONTAINS_CONTROL_CHAR_RE = re.compile(r"[^-!#$%&'*+.^_`|~0-9a-zA-Z]")
+ 
+-_HAS_SYS_AUDIT = hasattr(sys, "audit")
+-
+ 
+ class HTTPConnection(_HTTPConnection):
+     """
+@@ -139,8 +137,9 @@ class HTTPConnection(_HTTPConnection):
+         timeout: _TYPE_TIMEOUT = _DEFAULT_TIMEOUT,
+         source_address: tuple[str, int] | None = None,
+         blocksize: int = 16384,
+-        socket_options: None
+-        | (connection._TYPE_SOCKET_OPTIONS) = default_socket_options,
++        socket_options: None | (
++            connection._TYPE_SOCKET_OPTIONS
++        ) = default_socket_options,
+         proxy: Url | None = None,
+         proxy_config: ProxyConfig | None = None,
+     ) -> None:
+@@ -215,9 +214,7 @@ class HTTPConnection(_HTTPConnection):
+                 self, f"Failed to establish a new connection: {e}"
+             ) from e
+ 
+-        # Audit hooks are only available in Python 3.8+
+-        if _HAS_SYS_AUDIT:
+-            sys.audit("http.client.connect", self, self.host, self.port)
++        sys.audit("http.client.connect", self, self.host, self.port)
+ 
+         return sock
+ 
+@@ -313,6 +310,13 @@ class HTTPConnection(_HTTPConnection):
+         """
+         return bool(self.proxy) and self._tunnel_host is None
+ 
++    @property
++    def proxy_is_tunneling(self) -> bool:
++        """
++        Return True if a tunneling proxy is configured, else return False
++        """
++        return self._tunnel_host is not None
++
+     def close(self) -> None:
+         try:
+             super().close()
+@@ -503,6 +507,11 @@ class HTTPConnection(_HTTPConnection):
+         # This is needed here to avoid circular import errors
+         from .response import HTTPResponse
+ 
++        # Save a reference to the shutdown function before ownership is passed
++        # to httplib_response
++        # TODO should we implement it everywhere?
++        _shutdown = getattr(self.sock, "shutdown", None)
++
+         # Get the response from http.client.HTTPConnection
+         httplib_response = super().getresponse()
+ 
+@@ -531,6 +540,7 @@ class HTTPConnection(_HTTPConnection):
+             enforce_content_length=resp_options.enforce_content_length,
+             request_method=resp_options.request_method,
+             request_url=resp_options.request_url,
++            sock_shutdown=_shutdown,
+         )
+         return response
+ 
+@@ -561,8 +571,9 @@ class HTTPSConnection(HTTPConnection):
+         timeout: _TYPE_TIMEOUT = _DEFAULT_TIMEOUT,
+         source_address: tuple[str, int] | None = None,
+         blocksize: int = 16384,
+-        socket_options: None
+-        | (connection._TYPE_SOCKET_OPTIONS) = HTTPConnection.default_socket_options,
++        socket_options: None | (
++            connection._TYPE_SOCKET_OPTIONS
++        ) = HTTPConnection.default_socket_options,
+         proxy: Url | None = None,
+         proxy_config: ProxyConfig | None = None,
+         cert_reqs: int | str | None = None,
+@@ -695,7 +706,7 @@ class HTTPSConnection(HTTPConnection):
+             tls_in_tls = False
+ 
+             # Do we need to establish a tunnel?
+-            if self._tunnel_host is not None:
++            if self.proxy_is_tunneling:
+                 # We're tunneling to an HTTPS origin so need to do TLS-in-TLS.
+                 if self._tunnel_scheme == "https":
+                     # _connect_tls_proxy will verify and assign proxy_is_verified
+@@ -709,7 +720,7 @@ class HTTPSConnection(HTTPConnection):
+ 
+                 self._tunnel()
+                 # Override the host with the one we're requesting data from.
+-                server_hostname = self._tunnel_host
++                server_hostname = typing.cast(str, self._tunnel_host)
+ 
+             if self.server_hostname is not None:
+                 server_hostname = self.server_hostname
+
+diff --git a/src/urllib3/connectionpool.py b/src/urllib3/connectionpool.py
+index a2c3cf6..3a0685b 100644
+--- a/src/urllib3/connectionpool.py
++++ b/src/urllib3/connectionpool.py
+@@ -170,9 +170,7 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
+     """
+ 
+     scheme = "http"
+-    ConnectionCls: (
+-        type[BaseHTTPConnection] | type[BaseHTTPSConnection]
+-    ) = HTTPConnection
++    ConnectionCls: type[BaseHTTPConnection] | type[BaseHTTPSConnection] = HTTPConnection
+ 
+     def __init__(
+         self,
+@@ -544,13 +542,13 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
+         response._pool = self  # type: ignore[attr-defined]
+ 
+         log.debug(
+-            '%s://%s:%s "%s %s HTTP/%s" %s %s',
++            '%s://%s:%s "%s %s %s" %s %s',
+             self.scheme,
+             self.host,
+             self.port,
+             method,
+             url,
+-            response.version,
++            response.version_string,
+             response.status,
+             response.length_remaining,
+         )
+@@ -1137,13 +1135,11 @@ def connection_from_url(url: str, **kw: typing.Any) -> HTTPConnectionPool:
+ 
+ 
+ @typing.overload
+-def _normalize_host(host: None, scheme: str | None) -> None:
+-    ...
++def _normalize_host(host: None, scheme: str | None) -> None: ...
+ 
+ 
+ @typing.overload
+-def _normalize_host(host: str, scheme: str | None) -> str:
+-    ...
++def _normalize_host(host: str, scheme: str | None) -> str: ...
+ 
+ 
+ def _normalize_host(host: str | None, scheme: str | None) -> str | None:
+
+diff --git a/src/urllib3/contrib/emscripten/connection.py b/src/urllib3/contrib/emscripten/connection.py
+index 2ceb457..41bfd27 100644
+--- a/src/urllib3/contrib/emscripten/connection.py
++++ b/src/urllib3/contrib/emscripten/connection.py
+@@ -182,8 +182,9 @@ class EmscriptenHTTPSConnection(EmscriptenHTTPConnection):
+         timeout: _TYPE_TIMEOUT = _DEFAULT_TIMEOUT,
+         source_address: tuple[str, int] | None = None,
+         blocksize: int = 16384,
+-        socket_options: None
+-        | _TYPE_SOCKET_OPTIONS = HTTPConnection.default_socket_options,
++        socket_options: (
++            None | _TYPE_SOCKET_OPTIONS
++        ) = HTTPConnection.default_socket_options,
+         proxy: Url | None = None,
+         proxy_config: ProxyConfig | None = None,
+         cert_reqs: int | str | None = None,
+
+diff --git a/src/urllib3/contrib/emscripten/fetch.py b/src/urllib3/contrib/emscripten/fetch.py
+index 8d197ea..a514306 100644
+--- a/src/urllib3/contrib/emscripten/fetch.py
++++ b/src/urllib3/contrib/emscripten/fetch.py
+@@ -3,6 +3,16 @@ Support for streaming http requests in emscripten.
+ 
+ A few caveats -
+ 
++If your browser (or Node.js) has WebAssembly JavaScript Promise Integration enabled
++https://github.com/WebAssembly/js-promise-integration/blob/main/proposals/js-promise-integration/Overview.md
++*and* you launch pyodide using `pyodide.runPythonAsync`, this will fetch data using the
++JavaScript asynchronous fetch api (wrapped via `pyodide.ffi.call_sync`). In this case
++timeouts and streaming should just work.
++
++Otherwise, it uses a combination of XMLHttpRequest and a web-worker for streaming.
++
++This approach has several caveats:
++
+ Firstly, you can't do streaming http in the main UI thread, because atomics.wait isn't allowed.
+ Streaming only works if you're running pyodide in a web worker.
+ 
+@@ -14,15 +24,16 @@ operation, so it requires that you have crossOriginIsolation enabled, by serving
+     Cross-Origin-Embedder-Policy: require-corp
+ 
+ You can tell if cross origin isolation is successfully enabled by looking at the global crossOriginIsolated variable in
+-javascript console. If it isn't, streaming requests will fallback to XMLHttpRequest, i.e. getting the whole
+-request into a buffer and then returning it. it shows a warning in the javascript console in this case.
++JavaScript console. If it isn't, streaming requests will fallback to XMLHttpRequest, i.e. getting the whole
++request into a buffer and then returning it. it shows a warning in the JavaScript console in this case.
+ 
+ Finally, the webworker which does the streaming fetch is created on initial import, but will only be started once
+ control is returned to javascript. Call `await wait_for_streaming_ready()` to wait for streaming fetch.
+ 
+-NB: in this code, there are a lot of javascript objects. They are named js_*
++NB: in this code, there are a lot of JavaScript objects. They are named js_*
+ to make it clear what type of object they are.
+ """
++
+ from __future__ import annotations
+ 
+ import io
+@@ -123,17 +134,18 @@ class _ReadStream(io.RawIOBase):
+         return self.is_closed()
+ 
+     def close(self) -> None:
+-        if not self.is_closed():
+-            self.read_len = 0
+-            self.read_pos = 0
+-            self.int_buffer = None
+-            self.byte_buffer = None
+-            self._is_closed = True
+-            self.request = None
+-            if self.is_live:
+-                self.worker.postMessage(_obj_from_dict({"close": self.connection_id}))
+-                self.is_live = False
+-            super().close()
++        if self.is_closed():
++            return
++        self.read_len = 0
++        self.read_pos = 0
++        self.int_buffer = None
++        self.byte_buffer = None
++        self._is_closed = True
++        self.request = None
++        if self.is_live:
++            self.worker.postMessage(_obj_from_dict({"close": self.connection_id}))
++            self.is_live = False
++        super().close()
+ 
+     def readable(self) -> bool:
+         return True
+@@ -197,7 +209,8 @@ class _StreamingFetcher:
+         self.streaming_ready = False
+ 
+         js_data_blob = js.Blob.new(
+-            [_STREAMING_WORKER_CODE], _obj_from_dict({"type": "application/javascript"})
++            to_js([_STREAMING_WORKER_CODE], create_pyproxies=False),
++            _obj_from_dict({"type": "application/javascript"}),
+         )
+ 
+         def promise_resolver(js_resolve_fn: JsProxy, js_reject_fn: JsProxy) -> None:
+@@ -288,6 +301,113 @@ class _StreamingFetcher:
+             )
+ 
+ 
++class _JSPIReadStream(io.RawIOBase):
++    """
++    A read stream that uses pyodide.ffi.run_sync to read from a JavaScript fetch
++    response. This requires support for WebAssembly JavaScript Promise Integration
++    in the containing browser, and for pyodide to be launched via runPythonAsync.
++
++    :param js_read_stream:
++        The JavaScript stream reader
++
++    :param timeout:
++        Timeout in seconds
++
++    :param request:
++        The request we're handling
++
++    :param response:
++        The response this stream relates to
++
++    :param js_abort_controller:
++        A JavaScript AbortController object, used for timeouts
++    """
++
++    def __init__(
++        self,
++        js_read_stream: Any,
++        timeout: float,
++        request: EmscriptenRequest,
++        response: EmscriptenResponse,
++        js_abort_controller: Any,  # JavaScript AbortController for timeouts
++    ):
++        self.js_read_stream = js_read_stream
++        self.timeout = timeout
++        self._is_closed = False
++        self._is_done = False
++        self.request: EmscriptenRequest | None = request
++        self.response: EmscriptenResponse | None = response
++        self.current_buffer = None
++        self.current_buffer_pos = 0
++        self.js_abort_controller = js_abort_controller
++
++    def __del__(self) -> None:
++        self.close()
++
++    # this is compatible with _base_connection
++    def is_closed(self) -> bool:
++        return self._is_closed
++
++    # for compatibility with RawIOBase
++    @property
++    def closed(self) -> bool:
++        return self.is_closed()
++
++    def close(self) -> None:
++        if self.is_closed():
++            return
++        self.read_len = 0
++        self.read_pos = 0
++        self.js_read_stream.cancel()
++        self.js_read_stream = None
++        self._is_closed = True
++        self._is_done = True
++        self.request = None
++        self.response = None
++        super().close()
++
++    def readable(self) -> bool:
++        return True
++
++    def writable(self) -> bool:
++        return False
++
++    def seekable(self) -> bool:
++        return False
++
++    def _get_next_buffer(self) -> bool:
++        result_js = _run_sync_with_timeout(
++            self.js_read_stream.read(),
++            self.timeout,
++            self.js_abort_controller,
++            request=self.request,
++            response=self.response,
++        )
++        if result_js.done:
++            self._is_done = True
++            return False
++        else:
++            self.current_buffer = result_js.value.to_py()
++            self.current_buffer_pos = 0
++            return True
++
++    def readinto(self, byte_obj: Buffer) -> int:
++        if self.current_buffer is None:
++            if not self._get_next_buffer() or self.current_buffer is None:
++                self.close()
++                return 0
++        ret_length = min(
++            len(byte_obj), len(self.current_buffer) - self.current_buffer_pos
++        )
++        byte_obj[0:ret_length] = self.current_buffer[
++            self.current_buffer_pos : self.current_buffer_pos + ret_length
++        ]
++        self.current_buffer_pos += ret_length
++        if self.current_buffer_pos == len(self.current_buffer):
++            self.current_buffer = None
++        return ret_length
++
++
+ # check if we are in a worker or not
+ def is_in_browser_main_thread() -> bool:
+     return hasattr(js, "window") and hasattr(js, "self") and js.self == js.window
+@@ -321,7 +441,23 @@ else:
+     _fetcher = None
+ 
+ 
++NODE_JSPI_ERROR = (
++    "urllib3 only works in Node.js with pyodide.runPythonAsync"
++    " and requires the flag --experimental-wasm-stack-switching in "
++    " versions of node <24."
++)
++
++
+ def send_streaming_request(request: EmscriptenRequest) -> EmscriptenResponse | None:
++    if has_jspi():
++        return send_jspi_request(request, True)
++    elif is_in_node():
++        raise _RequestError(
++            message=NODE_JSPI_ERROR,
++            request=request,
++            response=None,
++        )
++
+     if _fetcher and streaming_ready():
+         return _fetcher.send(request)
+     else:
+@@ -363,6 +499,14 @@ is working, you need to call: 'await urllib3.contrib.emscripten.fetch.wait_for_s
+ 
+ 
+ def send_request(request: EmscriptenRequest) -> EmscriptenResponse:
++    if has_jspi():
++        return send_jspi_request(request, False)
++    elif is_in_node():
++        raise _RequestError(
++            message=NODE_JSPI_ERROR,
++            request=request,
++            response=None,
++        )
+     try:
+         js_xhr = js.XMLHttpRequest.new()
+ 
+@@ -403,6 +547,152 @@ def send_request(request: EmscriptenRequest) -> EmscriptenResponse:
+             raise _RequestError(err.message, request=request)
+ 
+ 
++def send_jspi_request(
++    request: EmscriptenRequest, streaming: bool
++) -> EmscriptenResponse:
++    """
++    Send a request using WebAssembly JavaScript Promise Integration
++    to wrap the asynchronous JavaScript fetch api (experimental).
++
++    :param request:
++        Request to send
++
++    :param streaming:
++        Whether to stream the response
++
++    :return: The response object
++    :rtype: EmscriptenResponse
++    """
++    timeout = request.timeout
++    js_abort_controller = js.AbortController.new()
++    headers = {k: v for k, v in request.headers.items() if k not in HEADERS_TO_IGNORE}
++    req_body = request.body
++    fetch_data = {
++        "headers": headers,
++        "body": to_js(req_body),
++        "method": request.method,
++        "signal": js_abort_controller.signal,
++    }
++    # Call JavaScript fetch (async api, returns a promise)
++    fetcher_promise_js = js.fetch(request.url, _obj_from_dict(fetch_data))
++    # Now suspend WebAssembly until we resolve that promise
++    # or time out.
++    response_js = _run_sync_with_timeout(
++        fetcher_promise_js,
++        timeout,
++        js_abort_controller,
++        request=request,
++        response=None,
++    )
++    headers = {}
++    header_iter = response_js.headers.entries()
++    while True:
++        iter_value_js = header_iter.next()
++        if getattr(iter_value_js, "done", False):
++            break
++        else:
++            headers[str(iter_value_js.value[0])] = str(iter_value_js.value[1])
++    status_code = response_js.status
++    body: bytes | io.RawIOBase = b""
++
++    response = EmscriptenResponse(
++        status_code=status_code, headers=headers, body=b"", request=request
++    )
++    if streaming:
++        # get via inputstream
++        if response_js.body is not None:
++            # get a reader from the fetch response
++            body_stream_js = response_js.body.getReader()
++            body = _JSPIReadStream(
++                body_stream_js, timeout, request, response, js_abort_controller
++            )
++    else:
++        # get directly via arraybuffer
++        # n.b. this is another async JavaScript call.
++        body = _run_sync_with_timeout(
++            response_js.arrayBuffer(),
++            timeout,
++            js_abort_controller,
++            request=request,
++            response=response,
++        ).to_py()
++    response.body = body
++    return response
++
++
++def _run_sync_with_timeout(
++    promise: Any,
++    timeout: float,
++    js_abort_controller: Any,
++    request: EmscriptenRequest | None,
++    response: EmscriptenResponse | None,
++) -> Any:
++    """
++    Await a JavaScript promise synchronously with a timeout which is implemented
++    via the AbortController
++
++    :param promise:
++        Javascript promise to await
++
++    :param timeout:
++        Timeout in seconds
++
++    :param js_abort_controller:
++        A JavaScript AbortController object, used on timeout
++
++    :param request:
++        The request being handled
++
++    :param response:
++        The response being handled (if it exists yet)
++
++    :raises _TimeoutError: If the request times out
++    :raises _RequestError: If the request raises a JavaScript exception
++
++    :return: The result of awaiting the promise.
++    """
++    timer_id = None
++    if timeout > 0:
++        timer_id = js.setTimeout(
++            js_abort_controller.abort.bind(js_abort_controller), int(timeout * 1000)
++        )
++    try:
++        from pyodide.ffi import run_sync
++
++        # run_sync here uses WebAssembly JavaScript Promise Integration to
++        # suspend python until the JavaScript promise resolves.
++        return run_sync(promise)
++    except JsException as err:
++        if err.name == "AbortError":
++            raise _TimeoutError(
++                message="Request timed out", request=request, response=response
++            )
++        else:
++            raise _RequestError(message=err.message, request=request, response=response)
++    finally:
++        if timer_id is not None:
++            js.clearTimeout(timer_id)
++
++
++def has_jspi() -> bool:
++    """
++    Return true if jspi can be used.
++
++    This requires both browser support and also WebAssembly
++    to be in the correct state - i.e. that the javascript
++    call into python was async not sync.
++
++    :return: True if jspi can be used.
++    :rtype: bool
++    """
++    try:
++        from pyodide.ffi import can_run_sync, run_sync  # noqa: F401
++
++        return bool(can_run_sync())
++    except ImportError:
++        return False
++
++
+ def streaming_ready() -> bool | None:
+     if _fetcher:
+         return _fetcher.streaming_ready
+
+diff --git a/src/urllib3/contrib/emscripten/response.py b/src/urllib3/contrib/emscripten/response.py
+index cd3d80e..b32b402 100644
+--- a/src/urllib3/contrib/emscripten/response.py
++++ b/src/urllib3/contrib/emscripten/response.py
+@@ -75,7 +75,7 @@ class EmscriptenHttpResponseWrapper(BaseHTTPResponse):
+ 
+     def stream(
+         self, amt: int | None = 2**16, decode_content: bool | None = None
+-    ) -> typing.Generator[bytes, None, None]:
++    ) -> typing.Generator[bytes]:
+         """
+         A generator wrapper for the read() method. A call will block until
+         ``amt`` bytes have been read from the connection or until the
+@@ -185,7 +185,7 @@ class EmscriptenHttpResponseWrapper(BaseHTTPResponse):
+         self,
+         amt: int | None = None,
+         decode_content: bool | None = None,
+-    ) -> typing.Generator[bytes, None, None]:
++    ) -> typing.Generator[bytes]:
+         # chunked is handled by browser
+         while True:
+             bytes = self.read(amt, decode_content)
+@@ -241,7 +241,7 @@ class EmscriptenHttpResponseWrapper(BaseHTTPResponse):
+             self._closed = True
+ 
+     @contextmanager
+-    def _error_catcher(self) -> typing.Generator[None, None, None]:
++    def _error_catcher(self) -> typing.Generator[None]:
+         """
+         Catch Emscripten specific exceptions thrown by fetch.py,
+         instead re-raising urllib3 variants, so that low-level exceptions
+
+diff --git a/src/urllib3/contrib/pyopenssl.py b/src/urllib3/contrib/pyopenssl.py
+index c12cb31..ed65430 100644
+--- a/src/urllib3/contrib/pyopenssl.py
++++ b/src/urllib3/contrib/pyopenssl.py
+@@ -366,9 +366,11 @@ class WrappedSocket:
+             )
+             total_sent += sent
+ 
+-    def shutdown(self) -> None:
+-        # FIXME rethrow compatible exceptions should we ever use this
+-        self.connection.shutdown()
++    def shutdown(self, how: int) -> None:
++        try:
++            self.connection.shutdown()
++        except OpenSSL.SSL.Error as e:
++            raise ssl.SSLError(f"shutdown error: {e!r}") from e
+ 
+     def close(self) -> None:
+         self._closed = True
+
+diff --git a/src/urllib3/exceptions.py b/src/urllib3/exceptions.py
+index b0792f0..0394578 100644
+--- a/src/urllib3/exceptions.py
++++ b/src/urllib3/exceptions.py
+@@ -23,9 +23,7 @@ class HTTPWarning(Warning):
+     """Base warning used by this module."""
+ 
+ 
+-_TYPE_REDUCE_RESULT = typing.Tuple[
+-    typing.Callable[..., object], typing.Tuple[object, ...]
+-]
++_TYPE_REDUCE_RESULT = tuple[typing.Callable[..., object], tuple[object, ...]]
+ 
+ 
+ class PoolError(HTTPError):
+@@ -143,6 +141,10 @@ class NewConnectionError(ConnectTimeoutError, HTTPError):
+         self.conn = conn
+         super().__init__(f"{conn}: {message}")
+ 
++    def __reduce__(self) -> _TYPE_REDUCE_RESULT:
++        # For pickling purposes.
++        return self.__class__, (None, None)
++
+     @property
+     def pool(self) -> HTTPConnection:
+         warnings.warn(
+@@ -162,6 +164,10 @@ class NameResolutionError(NewConnectionError):
+         message = f"Failed to resolve '{host}' ({reason})"
+         super().__init__(conn, message)
+ 
++    def __reduce__(self) -> _TYPE_REDUCE_RESULT:
++        # For pickling purposes.
++        return self.__class__, (None, None, None)
++
+ 
+ class EmptyPoolError(PoolError):
+     """Raised when a pool runs out of connections and no more are allowed."""
+
+diff --git a/src/urllib3/fields.py b/src/urllib3/fields.py
+index 3e258a5..97c4730 100644
+--- a/src/urllib3/fields.py
++++ b/src/urllib3/fields.py
+@@ -7,8 +7,8 @@ import typing
+ _TYPE_FIELD_VALUE = typing.Union[str, bytes]
+ _TYPE_FIELD_VALUE_TUPLE = typing.Union[
+     _TYPE_FIELD_VALUE,
+-    typing.Tuple[str, _TYPE_FIELD_VALUE],
+-    typing.Tuple[str, _TYPE_FIELD_VALUE, str],
++    tuple[str, _TYPE_FIELD_VALUE],
++    tuple[str, _TYPE_FIELD_VALUE, str],
+ ]
+ 
+ 
+
+diff --git a/src/urllib3/filepost.py b/src/urllib3/filepost.py
+index 1c90a21..14f70b0 100644
+--- a/src/urllib3/filepost.py
++++ b/src/urllib3/filepost.py
+@@ -11,7 +11,7 @@ from .fields import _TYPE_FIELD_VALUE_TUPLE, RequestField
+ writer = codecs.lookup("utf-8")[3]
+ 
+ _TYPE_FIELDS_SEQUENCE = typing.Sequence[
+-    typing.Union[typing.Tuple[str, _TYPE_FIELD_VALUE_TUPLE], RequestField]
++    typing.Union[tuple[str, _TYPE_FIELD_VALUE_TUPLE], RequestField]
+ ]
+ _TYPE_FIELDS = typing.Union[
+     _TYPE_FIELDS_SEQUENCE,
+
+diff --git a/src/urllib3/response.py b/src/urllib3/response.py
+index a0273d6..66c6a68 100644
+--- a/src/urllib3/response.py
++++ b/src/urllib3/response.py
+@@ -5,6 +5,7 @@ import io
+ import json as _json
+ import logging
+ import re
++import socket
+ import sys
+ import typing
+ import warnings
+@@ -440,6 +441,9 @@ class BaseHTTPResponse(io.IOBase):
+     def drain_conn(self) -> None:
+         raise NotImplementedError()
+ 
++    def shutdown(self) -> None:
++        raise NotImplementedError()
++
+     def close(self) -> None:
+         raise NotImplementedError()
+ 
+@@ -589,6 +593,7 @@ class HTTPResponse(BaseHTTPResponse):
+         request_method: str | None = None,
+         request_url: str | None = None,
+         auto_close: bool = True,
++        sock_shutdown: typing.Callable[[int], None] | None = None,
+     ) -> None:
+         super().__init__(
+             headers=headers,
+@@ -618,6 +623,7 @@ class HTTPResponse(BaseHTTPResponse):
+ 
+         if hasattr(body, "read"):
+             self._fp = body  # type: ignore[assignment]
++        self._sock_shutdown = sock_shutdown
+ 
+         # Are we using the chunked-style of transfer encoding?
+         self.chunk_left: int | None = None
+@@ -733,7 +739,7 @@ class HTTPResponse(BaseHTTPResponse):
+         return length
+ 
+     @contextmanager
+-    def _error_catcher(self) -> typing.Generator[None, None, None]:
++    def _error_catcher(self) -> typing.Generator[None]:
+         """
+         Catch low-level python exceptions, instead re-raising urllib3
+         variants, so that low-level exceptions are not leaked in the
+@@ -812,7 +818,7 @@ class HTTPResponse(BaseHTTPResponse):
+         happen.
+ 
+         The known cases:
+-          * 3.8 <= CPython < 3.9.7 because of a bug
++          * CPython < 3.9.7 because of a bug
+             https://github.com/urllib3/urllib3/issues/2513#issuecomment-1152559900.
+           * urllib3 injected with pyOpenSSL-backed SSL-support.
+           * CPython < 3.10 only when `amt` does not fit 32-bit int.
+@@ -1037,7 +1043,7 @@ class HTTPResponse(BaseHTTPResponse):
+ 
+     def stream(
+         self, amt: int | None = 2**16, decode_content: bool | None = None
+-    ) -> typing.Generator[bytes, None, None]:
++    ) -> typing.Generator[bytes]:
+         """
+         A generator wrapper for the read() method. A call will block until
+         ``amt`` bytes have been read from the connection or until the
+@@ -1066,7 +1072,14 @@ class HTTPResponse(BaseHTTPResponse):
+     def readable(self) -> bool:
+         return True
+ 
++    def shutdown(self) -> None:
++        if not self._sock_shutdown:
++            raise ValueError("Cannot shutdown socket as self._sock_shutdown is not set")
++        self._sock_shutdown(socket.SHUT_RD)
++
+     def close(self) -> None:
++        self._sock_shutdown = None
++
+         if not self.closed and self._fp:
+             self._fp.close()
+ 
+@@ -1159,7 +1172,7 @@ class HTTPResponse(BaseHTTPResponse):
+ 
+     def read_chunked(
+         self, amt: int | None = None, decode_content: bool | None = None
+-    ) -> typing.Generator[bytes, None, None]:
++    ) -> typing.Generator[bytes]:
+         """
+         Similar to :meth:`HTTPResponse.read`, but with an additional
+         parameter: ``decode_content``.
+
+diff --git a/src/urllib3/util/connection.py b/src/urllib3/util/connection.py
+index 89bd189..f92519e 100644
+--- a/src/urllib3/util/connection.py
++++ b/src/urllib3/util/connection.py
+@@ -6,7 +6,7 @@ import typing
+ from ..exceptions import LocationParseError
+ from .timeout import _DEFAULT_TIMEOUT, _TYPE_TIMEOUT
+ 
+-_TYPE_SOCKET_OPTIONS = typing.List[typing.Tuple[int, int, typing.Union[int, bytes]]]
++_TYPE_SOCKET_OPTIONS = list[tuple[int, int, typing.Union[int, bytes]]]
+ 
+ if typing.TYPE_CHECKING:
+     from .._base_connection import BaseHTTPConnection
+
+diff --git a/src/urllib3/util/request.py b/src/urllib3/util/request.py
+index 82454a0..94392a1 100644
+--- a/src/urllib3/util/request.py
++++ b/src/urllib3/util/request.py
+@@ -68,8 +68,10 @@ def make_headers(
+ 
+     :param accept_encoding:
+         Can be a boolean, list, or string.
+-        ``True`` translates to 'gzip,deflate'.  If either the ``brotli`` or
+-        ``brotlicffi`` package is installed 'gzip,deflate,br' is used instead.
++        ``True`` translates to 'gzip,deflate'.  If the dependencies for
++        Brotli (either the ``brotli`` or ``brotlicffi`` package) and/or Zstandard
++        (the ``zstandard`` package) algorithms are installed, then their encodings are
++        included in the string ('br' and 'zstd', respectively).
+         List will get joined by comma.
+         String will be used as provided.
+ 
+@@ -116,14 +118,14 @@ def make_headers(
+         headers["connection"] = "keep-alive"
+ 
+     if basic_auth:
+-        headers[
+-            "authorization"
+-        ] = f"Basic {b64encode(basic_auth.encode('latin-1')).decode()}"
++        headers["authorization"] = (
++            f"Basic {b64encode(basic_auth.encode('latin-1')).decode()}"
++        )
+ 
+     if proxy_basic_auth:
+-        headers[
+-            "proxy-authorization"
+-        ] = f"Basic {b64encode(proxy_basic_auth.encode('latin-1')).decode()}"
++        headers["proxy-authorization"] = (
++            f"Basic {b64encode(proxy_basic_auth.encode('latin-1')).decode()}"
++        )
+ 
+     if disable_cache:
+         headers["cache-control"] = "no-cache"
+
+diff --git a/src/urllib3/util/ssl_.py b/src/urllib3/util/ssl_.py
+index 5e93be9..278128e 100644
+--- a/src/urllib3/util/ssl_.py
++++ b/src/urllib3/util/ssl_.py
+@@ -18,7 +18,7 @@ HAS_NEVER_CHECK_COMMON_NAME = False
+ IS_PYOPENSSL = False
+ ALPN_PROTOCOLS = ["http/1.1"]
+ 
+-_TYPE_VERSION_INFO = typing.Tuple[int, int, int, str, int]
++_TYPE_VERSION_INFO = tuple[int, int, int, str, int]
+ 
+ # Maps the length of a digest to a possible hash function producing this digest
+ HASHFUNC_MAP = {
+@@ -32,7 +32,7 @@ def _is_bpo_43522_fixed(
+     version_info: _TYPE_VERSION_INFO,
+     pypy_version_info: _TYPE_VERSION_INFO | None,
+ ) -> bool:
+-    """Return True for CPython 3.8.9+, 3.9.3+ or 3.10+ and PyPy 7.3.8+ where
++    """Return True for CPython 3.9.3+ or 3.10+ and PyPy 7.3.8+ where
+     setting SSLContext.hostname_checks_common_name to False works.
+ 
+     Outside of CPython and PyPy we don't know which implementations work
+@@ -48,11 +48,7 @@ def _is_bpo_43522_fixed(
+     elif implementation_name == "cpython":
+         major_minor = version_info[:2]
+         micro = version_info[2]
+-        return (
+-            (major_minor == (3, 8) and micro >= 9)
+-            or (major_minor == (3, 9) and micro >= 3)
+-            or major_minor >= (3, 10)
+-        )
++        return (major_minor == (3, 9) and micro >= 3) or major_minor >= (3, 10)
+     else:  # Defensive:
+         return False
+ 
+@@ -114,7 +110,7 @@ try:  # Do we have ssl at all?
+     PROTOCOL_SSLv23 = PROTOCOL_TLS
+ 
+     # Setting SSLContext.hostname_checks_common_name = False didn't work before CPython
+-    # 3.8.9, 3.9.3, and 3.10 (but OK on PyPy) or OpenSSL 1.1.1l+
++    # 3.9.3, and 3.10 (but OK on PyPy) or OpenSSL 1.1.1l+
+     if HAS_NEVER_CHECK_COMMON_NAME and not _is_has_never_check_common_name_reliable(
+         OPENSSL_VERSION,
+         OPENSSL_VERSION_NUMBER,
+@@ -345,15 +341,12 @@ def create_urllib3_context(
+ 
+     try:
+         context.hostname_checks_common_name = False
+-    except AttributeError:  # Defensive: for CPython < 3.8.9 and 3.9.3; for PyPy < 7.3.8
++    except AttributeError:  # Defensive: for CPython < 3.9.3; for PyPy < 7.3.8
+         pass
+ 
+-    # Enable logging of TLS session keys via defacto standard environment variable
+-    # 'SSLKEYLOGFILE', if the feature is available (Python 3.8+). Skip empty values.
+-    if hasattr(context, "keylog_filename"):
+-        sslkeylogfile = os.environ.get("SSLKEYLOGFILE")
+-        if sslkeylogfile:
+-            context.keylog_filename = sslkeylogfile
++    sslkeylogfile = os.environ.get("SSLKEYLOGFILE")
++    if sslkeylogfile:
++        context.keylog_filename = sslkeylogfile
+ 
+     return context
+ 
+@@ -373,8 +366,7 @@ def ssl_wrap_socket(
+     key_password: str | None = ...,
+     ca_cert_data: None | str | bytes = ...,
+     tls_in_tls: typing.Literal[False] = ...,
+-) -> ssl.SSLSocket:
+-    ...
++) -> ssl.SSLSocket: ...
+ 
+ 
+ @typing.overload
+@@ -392,8 +384,7 @@ def ssl_wrap_socket(
+     key_password: str | None = ...,
+     ca_cert_data: None | str | bytes = ...,
+     tls_in_tls: bool = ...,
+-) -> ssl.SSLSocket | SSLTransportType:
+-    ...
++) -> ssl.SSLSocket | SSLTransportType: ...
+ 
+ 
+ def ssl_wrap_socket(
+
+diff --git a/src/urllib3/util/ssltransport.py b/src/urllib3/util/ssltransport.py
+index d69ccb3..6d59bc3 100644
+--- a/src/urllib3/util/ssltransport.py
++++ b/src/urllib3/util/ssltransport.py
+@@ -174,12 +174,10 @@ class SSLTransport:
+     @typing.overload
+     def getpeercert(
+         self, binary_form: typing.Literal[False] = ...
+-    ) -> _TYPE_PEER_CERT_RET_DICT | None:
+-        ...
++    ) -> _TYPE_PEER_CERT_RET_DICT | None: ...
+ 
+     @typing.overload
+-    def getpeercert(self, binary_form: typing.Literal[True]) -> bytes | None:
+-        ...
++    def getpeercert(self, binary_form: typing.Literal[True]) -> bytes | None: ...
+ 
+     def getpeercert(self, binary_form: bool = False) -> _TYPE_PEER_CERT_RET:
+         return self.sslobj.getpeercert(binary_form)  # type: ignore[return-value]
+@@ -219,13 +217,11 @@ class SSLTransport:
+ 
+     # func is sslobj.do_handshake or sslobj.unwrap
+     @typing.overload
+-    def _ssl_io_loop(self, func: typing.Callable[[], None]) -> None:
+-        ...
++    def _ssl_io_loop(self, func: typing.Callable[[], None]) -> None: ...
+ 
+     # func is sslobj.write, arg1 is data
+     @typing.overload
+-    def _ssl_io_loop(self, func: typing.Callable[[bytes], int], arg1: bytes) -> int:
+-        ...
++    def _ssl_io_loop(self, func: typing.Callable[[bytes], int], arg1: bytes) -> int: ...
+ 
+     # func is sslobj.read, arg1 is len, arg2 is buffer
+     @typing.overload
+@@ -234,8 +230,7 @@ class SSLTransport:
+         func: typing.Callable[[int, bytearray | None], bytes],
+         arg1: int,
+         arg2: bytearray | None,
+-    ) -> bytes:
+-        ...
++    ) -> bytes: ...
+ 
+     def _ssl_io_loop(
+         self,
+
+diff --git a/src/urllib3/util/url.py b/src/urllib3/util/url.py
+index d53ea93..db057f1 100644
+--- a/src/urllib3/util/url.py
++++ b/src/urllib3/util/url.py
+@@ -291,13 +291,11 @@ def _remove_path_dot_segments(path: str) -> str:
+ 
+ 
+ @typing.overload
+-def _normalize_host(host: None, scheme: str | None) -> None:
+-    ...
++def _normalize_host(host: None, scheme: str | None) -> None: ...
+ 
+ 
+ @typing.overload
+-def _normalize_host(host: str, scheme: str | None) -> str:
+-    ...
++def _normalize_host(host: str, scheme: str | None) -> str: ...
+ 
+ 
+ def _normalize_host(host: str | None, scheme: str | None) -> str | None:

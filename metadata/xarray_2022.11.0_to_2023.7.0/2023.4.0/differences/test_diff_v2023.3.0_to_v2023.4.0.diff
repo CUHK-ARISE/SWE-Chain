@@ -1,0 +1,2031 @@
+diff --git a/xarray/tests/__init__.py b/xarray/tests/__init__.py
+index be81bd1..7e1b964 100644
+--- a/xarray/tests/__init__.py
++++ b/xarray/tests/__init__.py
+@@ -75,7 +75,6 @@ has_rasterio, requires_rasterio = _importorskip("rasterio")
+ has_zarr, requires_zarr = _importorskip("zarr")
+ has_fsspec, requires_fsspec = _importorskip("fsspec")
+ has_iris, requires_iris = _importorskip("iris")
+-has_cfgrib, requires_cfgrib = _importorskip("cfgrib")
+ has_numbagg, requires_numbagg = _importorskip("numbagg")
+ has_seaborn, requires_seaborn = _importorskip("seaborn")
+ has_sparse, requires_sparse = _importorskip("sparse")
+@@ -140,13 +139,18 @@ class UnexpectedDataAccess(Exception):
+ 
+ 
+ class InaccessibleArray(utils.NDArrayMixin, ExplicitlyIndexed):
++    """Disallows any loading."""
++
+     def __init__(self, array):
+         self.array = array
+ 
+-    def __getitem__(self, key):
+-        raise UnexpectedDataAccess("Tried accessing data.")
++    def get_duck_array(self):
++        raise UnexpectedDataAccess("Tried accessing data")
++
++    def __array__(self, dtype: np.typing.DTypeLike = None):
++        raise UnexpectedDataAccess("Tried accessing data")
+ 
+-    def __array__(self):
++    def __getitem__(self, key):
+         raise UnexpectedDataAccess("Tried accessing data.")
+ 
+ 
+@@ -158,6 +162,23 @@ class FirstElementAccessibleArray(InaccessibleArray):
+         return self.array[tuple_idxr]
+ 
+ 
++class DuckArrayWrapper(utils.NDArrayMixin):
++    """Array-like that prevents casting to array.
++    Modeled after cupy."""
++
++    def __init__(self, array: np.ndarray):
++        self.array = array
++
++    def __getitem__(self, key):
++        return type(self)(self.array[key])
++
++    def __array__(self, dtype: np.typing.DTypeLike = None):
++        raise UnexpectedDataAccess("Tried accessing data")
++
++    def __array_namespace__(self):
++        """Present to satisfy is_duck_array test."""
++
++
+ class ReturnItem:
+     def __getitem__(self, key):
+         return key
+
+diff --git a/xarray/tests/test_accessor_dt.py b/xarray/tests/test_accessor_dt.py
+index ef91257..64b4876 100644
+--- a/xarray/tests/test_accessor_dt.py
++++ b/xarray/tests/test_accessor_dt.py
+@@ -59,6 +59,8 @@ class TestDatetimeAccessor:
+             "quarter",
+             "date",
+             "time",
++            "daysinmonth",
++            "days_in_month",
+             "is_month_start",
+             "is_month_end",
+             "is_quarter_start",
+@@ -74,7 +76,18 @@ class TestDatetimeAccessor:
+         else:
+             data = getattr(self.times, field)
+ 
+-        expected = xr.DataArray(data, name=field, coords=[self.times], dims=["time"])
++        if data.dtype.kind != "b" and field not in ("date", "time"):
++            # pandas 2.0 returns int32 for integer fields now
++            data = data.astype("int64")
++
++        translations = {
++            "weekday": "dayofweek",
++            "daysinmonth": "days_in_month",
++            "weekofyear": "week",
++        }
++        name = translations.get(field, field)
++
++        expected = xr.DataArray(data, name=name, coords=[self.times], dims=["time"])
+ 
+         if field in ["week", "weekofyear"]:
+             with pytest.warns(
+@@ -84,7 +97,8 @@ class TestDatetimeAccessor:
+         else:
+             actual = getattr(self.data.time.dt, field)
+ 
+-        assert_equal(expected, actual)
++        assert expected.dtype == actual.dtype
++        assert_identical(expected, actual)
+ 
+     @pytest.mark.parametrize(
+         "field, pandas_field",
+
+diff --git a/xarray/tests/test_backends.py b/xarray/tests/test_backends.py
+index bc6b095..7d58c5b 100644
+--- a/xarray/tests/test_backends.py
++++ b/xarray/tests/test_backends.py
+@@ -63,7 +63,6 @@ from xarray.tests import (
+     has_scipy,
+     mock,
+     network,
+-    requires_cfgrib,
+     requires_cftime,
+     requires_dask,
+     requires_fsspec,
+@@ -73,7 +72,6 @@ from xarray.tests import (
+     requires_pseudonetcdf,
+     requires_pydap,
+     requires_pynio,
+-    requires_rasterio,
+     requires_scipy,
+     requires_scipy_or_netCDF4,
+     requires_zarr,
+@@ -632,6 +630,11 @@ class DatasetIOBase:
+         with self.roundtrip(original) as actual:
+             assert_identical(original, actual)
+             assert actual["x"].dtype == "bool"
++            # this checks for preserving dtype during second roundtrip
++            # see https://github.com/pydata/xarray/issues/7652#issuecomment-1476956975
++            with self.roundtrip(actual) as actual2:
++                assert_identical(original, actual2)
++                assert actual2["x"].dtype == "bool"
+ 
+     def test_orthogonal_indexing(self) -> None:
+         in_memory = create_test_data()
+@@ -753,6 +756,16 @@ class DatasetIOBase:
+         ]
+         multiple_indexing(indexers)
+ 
++    def test_outer_indexing_reversed(self) -> None:
++        # regression test for GH6560
++        ds = xr.Dataset(
++            {"z": (("t", "p", "y", "x"), np.ones((1, 1, 31, 40)))},
++        )
++
++        with self.roundtrip(ds) as on_disk:
++            subset = on_disk.isel(t=[0], p=0).z[:, ::10, ::10][:, ::-1, :]
++            assert subset.sizes == subset.load().sizes
++
+     def test_isel_dataarray(self) -> None:
+         # Make sure isel works lazily. GH:issue:1688
+         in_memory = create_test_data()
+@@ -3229,6 +3242,21 @@ def chunks(request):
+     return request.param
+ 
+ 
++@pytest.fixture(params=["tmp_path", "ZipStore", "Dict"])
++def tmp_store(request, tmp_path):
++    if request.param == "tmp_path":
++        return tmp_path
++    elif request.param == "ZipStore":
++        from zarr.storage import ZipStore
++
++        path = tmp_path / "store.zip"
++        return ZipStore(path)
++    elif request.param == "Dict":
++        return dict()
++    else:
++        raise ValueError("not supported")
++
++
+ # using pytest.mark.skipif does not work so this a work around
+ def skip_if_not_engine(engine):
+     if engine == "netcdf4":
+@@ -4176,51 +4204,6 @@ class TestPyNio(CFEncodedBase, NetCDF3Only):
+             assert_identical(actual, expected)
+ 
+ 
+-@requires_cfgrib
+-class TestCfGrib:
+-    def test_read(self) -> None:
+-        expected = {
+-            "number": 2,
+-            "time": 3,
+-            "isobaricInhPa": 2,
+-            "latitude": 3,
+-            "longitude": 4,
+-        }
+-        with open_example_dataset("example.grib", engine="cfgrib") as ds:
+-            assert ds.dims == expected
+-            assert list(ds.data_vars) == ["z", "t"]
+-            assert ds["z"].min() == 12660.0
+-
+-    def test_read_filter_by_keys(self) -> None:
+-        kwargs = {"filter_by_keys": {"shortName": "t"}}
+-        expected = {
+-            "number": 2,
+-            "time": 3,
+-            "isobaricInhPa": 2,
+-            "latitude": 3,
+-            "longitude": 4,
+-        }
+-        with open_example_dataset(
+-            "example.grib", engine="cfgrib", backend_kwargs=kwargs
+-        ) as ds:
+-            assert ds.dims == expected
+-            assert list(ds.data_vars) == ["t"]
+-            assert ds["t"].min() == 231.0
+-
+-    def test_read_outer(self) -> None:
+-        expected = {
+-            "number": 2,
+-            "time": 3,
+-            "isobaricInhPa": 2,
+-            "latitude": 2,
+-            "longitude": 3,
+-        }
+-        with open_example_dataset("example.grib", engine="cfgrib") as ds:
+-            res = ds.isel(latitude=[0, 2], longitude=[0, 1, 2])
+-            assert res.dims == expected
+-            assert res["t"].min() == 231.0
+-
+-
+ @requires_pseudonetcdf
+ @pytest.mark.filterwarnings("ignore:IOAPI_ISPH is assumed to be 6370000")
+ class TestPseudoNetCDFFormat:
+@@ -4441,562 +4424,6 @@ class TestPseudoNetCDFFormat:
+         pnc.pncwrite(pncf, path, **save_kwargs)
+ 
+ 
+-@requires_rasterio
+-@contextlib.contextmanager
+-def create_tmp_geotiff(
+-    nx=4,
+-    ny=3,
+-    nz=3,
+-    transform=None,
+-    transform_args=default_value,
+-    crs=default_value,
+-    open_kwargs=None,
+-    additional_attrs=None,
+-):
+-    if transform_args is default_value:
+-        transform_args = [5000, 80000, 1000, 2000.0]
+-    if crs is default_value:
+-        crs = {
+-            "units": "m",
+-            "no_defs": True,
+-            "ellps": "WGS84",
+-            "proj": "utm",
+-            "zone": 18,
+-        }
+-    # yields a temporary geotiff file and a corresponding expected DataArray
+-    import rasterio
+-    from rasterio.transform import from_origin
+-
+-    if open_kwargs is None:
+-        open_kwargs = {}
+-
+-    with create_tmp_file(suffix=".tif", allow_cleanup_failure=ON_WINDOWS) as tmp_file:
+-        # allow 2d or 3d shapes
+-        if nz == 1:
+-            data_shape = ny, nx
+-            write_kwargs = {"indexes": 1}
+-        else:
+-            data_shape = nz, ny, nx
+-            write_kwargs = {}
+-        data = np.arange(nz * ny * nx, dtype=rasterio.float32).reshape(*data_shape)
+-        if transform is None:
+-            transform = from_origin(*transform_args)
+-        if additional_attrs is None:
+-            additional_attrs = {
+-                "descriptions": tuple(f"d{n + 1}" for n in range(nz)),
+-                "units": tuple(f"u{n + 1}" for n in range(nz)),
+-            }
+-        with rasterio.open(
+-            tmp_file,
+-            "w",
+-            driver="GTiff",
+-            height=ny,
+-            width=nx,
+-            count=nz,
+-            crs=crs,
+-            transform=transform,
+-            dtype=rasterio.float32,
+-            **open_kwargs,
+-        ) as s:
+-            for attr, val in additional_attrs.items():
+-                setattr(s, attr, val)
+-            s.write(data, **write_kwargs)
+-            dx, dy = s.res[0], -s.res[1]
+-
+-        a, b, c, d = transform_args
+-        data = data[np.newaxis, ...] if nz == 1 else data
+-        expected = DataArray(
+-            data,
+-            dims=("band", "y", "x"),
+-            coords={
+-                "band": np.arange(nz) + 1,
+-                "y": -np.arange(ny) * d + b + dy / 2,
+-                "x": np.arange(nx) * c + a + dx / 2,
+-            },
+-        )
+-        yield tmp_file, expected
+-
+-
+-@requires_rasterio
+-class TestRasterio:
+-    @requires_scipy_or_netCDF4
+-    def test_serialization(self) -> None:
+-        with create_tmp_geotiff(additional_attrs={}) as (tmp_file, expected):
+-            # Write it to a netcdf and read again (roundtrip)
+-            with pytest.warns(DeprecationWarning), xr.open_rasterio(tmp_file) as rioda:
+-                with create_tmp_file(suffix=".nc") as tmp_nc_file:
+-                    rioda.to_netcdf(tmp_nc_file)
+-                    with xr.open_dataarray(tmp_nc_file) as ncds:
+-                        assert_identical(rioda, ncds)
+-
+-    def test_utm(self) -> None:
+-        with create_tmp_geotiff() as (tmp_file, expected):
+-            with pytest.warns(DeprecationWarning), xr.open_rasterio(tmp_file) as rioda:
+-                assert_allclose(rioda, expected)
+-                assert rioda.attrs["scales"] == (1.0, 1.0, 1.0)
+-                assert rioda.attrs["offsets"] == (0.0, 0.0, 0.0)
+-                assert rioda.attrs["descriptions"] == ("d1", "d2", "d3")
+-                assert rioda.attrs["units"] == ("u1", "u2", "u3")
+-                assert isinstance(rioda.attrs["crs"], str)
+-                assert isinstance(rioda.attrs["res"], tuple)
+-                assert isinstance(rioda.attrs["is_tiled"], np.uint8)
+-                assert isinstance(rioda.attrs["transform"], tuple)
+-                assert len(rioda.attrs["transform"]) == 6
+-                np.testing.assert_array_equal(
+-                    rioda.attrs["nodatavals"], [np.NaN, np.NaN, np.NaN]
+-                )
+-
+-            # Check no parse coords
+-            with pytest.warns(DeprecationWarning), xr.open_rasterio(
+-                tmp_file, parse_coordinates=False
+-            ) as rioda:
+-                assert "x" not in rioda.coords
+-                assert "y" not in rioda.coords
+-
+-    def test_non_rectilinear(self) -> None:
+-        from rasterio.transform import from_origin
+-
+-        # Create a geotiff file with 2d coordinates
+-        with create_tmp_geotiff(
+-            transform=from_origin(0, 3, 1, 1).rotation(45), crs=None
+-        ) as (tmp_file, _):
+-            # Default is to not parse coords
+-            with pytest.warns(DeprecationWarning), xr.open_rasterio(tmp_file) as rioda:
+-                assert "x" not in rioda.coords
+-                assert "y" not in rioda.coords
+-                assert "crs" not in rioda.attrs
+-                assert rioda.attrs["scales"] == (1.0, 1.0, 1.0)
+-                assert rioda.attrs["offsets"] == (0.0, 0.0, 0.0)
+-                assert rioda.attrs["descriptions"] == ("d1", "d2", "d3")
+-                assert rioda.attrs["units"] == ("u1", "u2", "u3")
+-                assert isinstance(rioda.attrs["res"], tuple)
+-                assert isinstance(rioda.attrs["is_tiled"], np.uint8)
+-                assert isinstance(rioda.attrs["transform"], tuple)
+-                assert len(rioda.attrs["transform"]) == 6
+-
+-            # See if a warning is raised if we force it
+-            with pytest.warns(Warning, match="transformation isn't rectilinear"):
+-                with xr.open_rasterio(tmp_file, parse_coordinates=True) as rioda:
+-                    assert "x" not in rioda.coords
+-                    assert "y" not in rioda.coords
+-
+-    def test_platecarree(self) -> None:
+-        with create_tmp_geotiff(
+-            8,
+-            10,
+-            1,
+-            transform_args=[1, 2, 0.5, 2.0],
+-            crs="+proj=latlong",
+-            open_kwargs={"nodata": -9765},
+-        ) as (tmp_file, expected):
+-            with pytest.warns(DeprecationWarning), xr.open_rasterio(tmp_file) as rioda:
+-                assert_allclose(rioda, expected)
+-                assert rioda.attrs["scales"] == (1.0,)
+-                assert rioda.attrs["offsets"] == (0.0,)
+-                assert isinstance(rioda.attrs["descriptions"], tuple)
+-                assert isinstance(rioda.attrs["units"], tuple)
+-                assert isinstance(rioda.attrs["crs"], str)
+-                assert isinstance(rioda.attrs["res"], tuple)
+-                assert isinstance(rioda.attrs["is_tiled"], np.uint8)
+-                assert isinstance(rioda.attrs["transform"], tuple)
+-                assert len(rioda.attrs["transform"]) == 6
+-                np.testing.assert_array_equal(rioda.attrs["nodatavals"], [-9765.0])
+-
+-    # rasterio throws a Warning, which is expected since we test rasterio's defaults
+-    @pytest.mark.filterwarnings("ignore:Dataset has no geotransform")
+-    def test_notransform(self) -> None:
+-        # regression test for https://github.com/pydata/xarray/issues/1686
+-
+-        import rasterio
+-
+-        # Create a geotiff file
+-        with create_tmp_file(suffix=".tif") as tmp_file:
+-            # data
+-            nx, ny, nz = 4, 3, 3
+-            data = np.arange(nx * ny * nz, dtype=rasterio.float32).reshape(nz, ny, nx)
+-            with rasterio.open(
+-                tmp_file,
+-                "w",
+-                driver="GTiff",
+-                height=ny,
+-                width=nx,
+-                count=nz,
+-                dtype=rasterio.float32,
+-            ) as s:
+-                s.descriptions = ("nx", "ny", "nz")
+-                s.units = ("cm", "m", "km")
+-                s.write(data)
+-
+-            # Tests
+-            expected = DataArray(
+-                data,
+-                dims=("band", "y", "x"),
+-                coords={
+-                    "band": [1, 2, 3],
+-                    "y": [0.5, 1.5, 2.5],
+-                    "x": [0.5, 1.5, 2.5, 3.5],
+-                },
+-            )
+-            with pytest.warns(DeprecationWarning), xr.open_rasterio(tmp_file) as rioda:
+-                assert_allclose(rioda, expected)
+-                assert rioda.attrs["scales"] == (1.0, 1.0, 1.0)
+-                assert rioda.attrs["offsets"] == (0.0, 0.0, 0.0)
+-                assert rioda.attrs["descriptions"] == ("nx", "ny", "nz")
+-                assert rioda.attrs["units"] == ("cm", "m", "km")
+-                assert isinstance(rioda.attrs["res"], tuple)
+-                assert isinstance(rioda.attrs["is_tiled"], np.uint8)
+-                assert isinstance(rioda.attrs["transform"], tuple)
+-                assert len(rioda.attrs["transform"]) == 6
+-
+-    def test_indexing(self) -> None:
+-        with create_tmp_geotiff(
+-            8, 10, 3, transform_args=[1, 2, 0.5, 2.0], crs="+proj=latlong"
+-        ) as (tmp_file, expected):
+-            with pytest.warns(DeprecationWarning), xr.open_rasterio(
+-                tmp_file, cache=False
+-            ) as actual:
+-                # tests
+-                # assert_allclose checks all data + coordinates
+-                assert_allclose(actual, expected)
+-                assert not actual.variable._in_memory
+-
+-                # Basic indexer
+-                ind = {"x": slice(2, 5), "y": slice(5, 7)}
+-                assert_allclose(expected.isel(**ind), actual.isel(**ind))
+-                assert not actual.variable._in_memory
+-
+-                ind2 = {"band": slice(1, 2), "x": slice(2, 5), "y": slice(5, 7)}
+-                assert_allclose(expected.isel(**ind2), actual.isel(**ind2))
+-                assert not actual.variable._in_memory
+-
+-                ind3 = {"band": slice(1, 2), "x": slice(2, 5), "y": 0}
+-                assert_allclose(expected.isel(**ind3), actual.isel(**ind3))
+-                assert not actual.variable._in_memory
+-
+-                # orthogonal indexer
+-                ind4 = {
+-                    "band": np.array([2, 1, 0]),
+-                    "x": np.array([1, 0]),
+-                    "y": np.array([0, 2]),
+-                }
+-                assert_allclose(expected.isel(**ind4), actual.isel(**ind4))
+-                assert not actual.variable._in_memory
+-
+-                ind5 = {"band": np.array([2, 1, 0]), "x": np.array([1, 0]), "y": 0}
+-                assert_allclose(expected.isel(**ind5), actual.isel(**ind5))
+-                assert not actual.variable._in_memory
+-
+-                ind6 = {"band": 0, "x": np.array([0, 0]), "y": np.array([1, 1, 1])}
+-                assert_allclose(expected.isel(**ind6), actual.isel(**ind6))
+-                assert not actual.variable._in_memory
+-
+-                # minus-stepped slice
+-                ind7 = {"band": np.array([2, 1, 0]), "x": slice(-1, None, -1), "y": 0}
+-                assert_allclose(expected.isel(**ind7), actual.isel(**ind7))
+-                assert not actual.variable._in_memory
+-
+-                ind8 = {"band": np.array([2, 1, 0]), "x": 1, "y": slice(-1, 1, -2)}
+-                assert_allclose(expected.isel(**ind8), actual.isel(**ind8))
+-                assert not actual.variable._in_memory
+-
+-                # empty selection
+-                ind9 = {"band": np.array([2, 1, 0]), "x": 1, "y": slice(2, 2, 1)}
+-                assert_allclose(expected.isel(**ind9), actual.isel(**ind9))
+-                assert not actual.variable._in_memory
+-
+-                ind10 = {"band": slice(0, 0), "x": 1, "y": 2}
+-                assert_allclose(expected.isel(**ind10), actual.isel(**ind10))
+-                assert not actual.variable._in_memory
+-
+-                # vectorized indexer
+-                ind11 = {
+-                    "band": DataArray([2, 1, 0], dims="a"),
+-                    "x": DataArray([1, 0, 0], dims="a"),
+-                    "y": np.array([0, 2]),
+-                }
+-                assert_allclose(expected.isel(**ind11), actual.isel(**ind11))
+-                assert not actual.variable._in_memory
+-
+-                ind12 = {
+-                    "band": DataArray([[2, 1, 0], [1, 0, 2]], dims=["a", "b"]),
+-                    "x": DataArray([[1, 0, 0], [0, 1, 0]], dims=["a", "b"]),
+-                    "y": 0,
+-                }
+-                assert_allclose(expected.isel(**ind12), actual.isel(**ind12))
+-                assert not actual.variable._in_memory
+-
+-                # Selecting lists of bands is fine
+-                ex = expected.isel(band=[1, 2])
+-                ac = actual.isel(band=[1, 2])
+-                assert_allclose(ac, ex)
+-                ex = expected.isel(band=[0, 2])
+-                ac = actual.isel(band=[0, 2])
+-                assert_allclose(ac, ex)
+-
+-                # Integer indexing
+-                ex = expected.isel(band=1)
+-                ac = actual.isel(band=1)
+-                assert_allclose(ac, ex)
+-
+-                ex = expected.isel(x=1, y=2)
+-                ac = actual.isel(x=1, y=2)
+-                assert_allclose(ac, ex)
+-
+-                ex = expected.isel(band=0, x=1, y=2)
+-                ac = actual.isel(band=0, x=1, y=2)
+-                assert_allclose(ac, ex)
+-
+-                # Mixed
+-                ex = actual.isel(x=slice(2), y=slice(2))
+-                ac = actual.isel(x=[0, 1], y=[0, 1])
+-                assert_allclose(ac, ex)
+-
+-                ex = expected.isel(band=0, x=1, y=slice(5, 7))
+-                ac = actual.isel(band=0, x=1, y=slice(5, 7))
+-                assert_allclose(ac, ex)
+-
+-                ex = expected.isel(band=0, x=slice(2, 5), y=2)
+-                ac = actual.isel(band=0, x=slice(2, 5), y=2)
+-                assert_allclose(ac, ex)
+-
+-                # One-element lists
+-                ex = expected.isel(band=[0], x=slice(2, 5), y=[2])
+-                ac = actual.isel(band=[0], x=slice(2, 5), y=[2])
+-                assert_allclose(ac, ex)
+-
+-    def test_caching(self) -> None:
+-        with create_tmp_geotiff(
+-            8, 10, 3, transform_args=[1, 2, 0.5, 2.0], crs="+proj=latlong"
+-        ) as (tmp_file, expected):
+-            # Cache is the default
+-            with pytest.warns(DeprecationWarning), xr.open_rasterio(tmp_file) as actual:
+-                # This should cache everything
+-                assert_allclose(actual, expected)
+-
+-                # once cached, non-windowed indexing should become possible
+-                ac = actual.isel(x=[2, 4])
+-                ex = expected.isel(x=[2, 4])
+-                assert_allclose(ac, ex)
+-
+-    @requires_dask
+-    def test_chunks(self) -> None:
+-        with create_tmp_geotiff(
+-            8, 10, 3, transform_args=[1, 2, 0.5, 2.0], crs="+proj=latlong"
+-        ) as (tmp_file, expected):
+-            # Chunk at open time
+-            with pytest.warns(DeprecationWarning), xr.open_rasterio(
+-                tmp_file, chunks=(1, 2, 2)
+-            ) as actual:
+-                import dask.array as da
+-
+-                assert isinstance(actual.data, da.Array)
+-                assert "open_rasterio" in actual.data.name
+-
+-                # do some arithmetic
+-                ac = actual.mean()
+-                ex = expected.mean()
+-                assert_allclose(ac, ex)
+-
+-                ac = actual.sel(band=1).mean(dim="x")
+-                ex = expected.sel(band=1).mean(dim="x")
+-                assert_allclose(ac, ex)
+-
+-    @pytest.mark.xfail(
+-        not has_dask, reason="without dask, a non-serializable lock is used"
+-    )
+-    def test_pickle_rasterio(self) -> None:
+-        # regression test for https://github.com/pydata/xarray/issues/2121
+-        with create_tmp_geotiff() as (tmp_file, expected):
+-            with pytest.warns(DeprecationWarning), xr.open_rasterio(tmp_file) as rioda:
+-                temp = pickle.dumps(rioda)
+-                with pickle.loads(temp) as actual:
+-                    assert_equal(actual, rioda)
+-
+-    def test_ENVI_tags(self) -> None:
+-        rasterio = pytest.importorskip("rasterio")
+-        from rasterio.transform import from_origin
+-
+-        # Create an ENVI file with some tags in the ENVI namespace
+-        # this test uses a custom driver, so we can't use create_tmp_geotiff
+-        with create_tmp_file(suffix=".dat") as tmp_file:
+-            # data
+-            nx, ny, nz = 4, 3, 3
+-            data = np.arange(nx * ny * nz, dtype=rasterio.float32).reshape(nz, ny, nx)
+-            transform = from_origin(5000, 80000, 1000, 2000.0)
+-            with rasterio.open(
+-                tmp_file,
+-                "w",
+-                driver="ENVI",
+-                height=ny,
+-                width=nx,
+-                count=nz,
+-                crs={
+-                    "units": "m",
+-                    "no_defs": True,
+-                    "ellps": "WGS84",
+-                    "proj": "utm",
+-                    "zone": 18,
+-                },
+-                transform=transform,
+-                dtype=rasterio.float32,
+-            ) as s:
+-                s.update_tags(
+-                    ns="ENVI",
+-                    description="{Tagged file}",
+-                    wavelength="{123.000000, 234.234000, 345.345678}",
+-                    fwhm="{1.000000, 0.234000, 0.000345}",
+-                )
+-                s.write(data)
+-                dx, dy = s.res[0], -s.res[1]
+-
+-            # Tests
+-            coords = {
+-                "band": [1, 2, 3],
+-                "y": -np.arange(ny) * 2000 + 80000 + dy / 2,
+-                "x": np.arange(nx) * 1000 + 5000 + dx / 2,
+-                "wavelength": ("band", np.array([123, 234.234, 345.345678])),
+-                "fwhm": ("band", np.array([1, 0.234, 0.000345])),
+-            }
+-            expected = DataArray(data, dims=("band", "y", "x"), coords=coords)
+-
+-            with pytest.warns(DeprecationWarning), xr.open_rasterio(tmp_file) as rioda:
+-                assert_allclose(rioda, expected)
+-                assert isinstance(rioda.attrs["crs"], str)
+-                assert isinstance(rioda.attrs["res"], tuple)
+-                assert isinstance(rioda.attrs["is_tiled"], np.uint8)
+-                assert isinstance(rioda.attrs["transform"], tuple)
+-                assert len(rioda.attrs["transform"]) == 6
+-                # from ENVI tags
+-                assert isinstance(rioda.attrs["description"], str)
+-                assert isinstance(rioda.attrs["map_info"], str)
+-                assert isinstance(rioda.attrs["samples"], str)
+-
+-    def test_geotiff_tags(self) -> None:
+-        # Create a geotiff file with some tags
+-        with create_tmp_geotiff() as (tmp_file, _):
+-            with pytest.warns(DeprecationWarning), xr.open_rasterio(tmp_file) as rioda:
+-                assert isinstance(rioda.attrs["AREA_OR_POINT"], str)
+-
+-    @requires_dask
+-    def test_no_mftime(self) -> None:
+-        # rasterio can accept "filename" urguments that are actually urls,
+-        # including paths to remote files.
+-        # In issue #1816, we found that these caused dask to break, because
+-        # the modification time was used to determine the dask token. This
+-        # tests ensure we can still chunk such files when reading with
+-        # rasterio.
+-        with create_tmp_geotiff(
+-            8, 10, 3, transform_args=[1, 2, 0.5, 2.0], crs="+proj=latlong"
+-        ) as (tmp_file, expected):
+-            with mock.patch("os.path.getmtime", side_effect=OSError):
+-                with pytest.warns(DeprecationWarning), xr.open_rasterio(
+-                    tmp_file, chunks=(1, 2, 2)
+-                ) as actual:
+-                    import dask.array as da
+-
+-                    assert isinstance(actual.data, da.Array)
+-                    assert_allclose(actual, expected)
+-
+-    @network
+-    def test_http_url(self) -> None:
+-        # more examples urls here
+-        # http://download.osgeo.org/geotiff/samples/
+-        url = "http://download.osgeo.org/geotiff/samples/made_up/ntf_nord.tif"
+-        with pytest.warns(DeprecationWarning), xr.open_rasterio(url) as actual:
+-            assert actual.shape == (1, 512, 512)
+-        # make sure chunking works
+-        with pytest.warns(DeprecationWarning), xr.open_rasterio(
+-            url, chunks=(1, 256, 256)
+-        ) as actual:
+-            import dask.array as da
+-
+-            assert isinstance(actual.data, da.Array)
+-
+-    def test_rasterio_environment(self) -> None:
+-        import rasterio
+-
+-        with create_tmp_geotiff() as (tmp_file, expected):
+-            # Should fail with error since suffix not allowed
+-            with pytest.raises(Exception):
+-                with rasterio.Env(GDAL_SKIP="GTiff"):
+-                    with pytest.warns(DeprecationWarning), xr.open_rasterio(
+-                        tmp_file
+-                    ) as actual:
+-                        assert_allclose(actual, expected)
+-
+-    @pytest.mark.xfail(reason="rasterio 1.1.1 is broken. GH3573")
+-    def test_rasterio_vrt(self) -> None:
+-        import rasterio
+-
+-        # tmp_file default crs is UTM: CRS({'init': 'epsg:32618'}
+-        with create_tmp_geotiff() as (tmp_file, expected):
+-            with rasterio.open(tmp_file) as src:
+-                with rasterio.vrt.WarpedVRT(src, crs="epsg:4326") as vrt:
+-                    expected_shape = (vrt.width, vrt.height)
+-                    expected_crs = vrt.crs
+-                    expected_res = vrt.res
+-                    # Value of single pixel in center of image
+-                    lon, lat = vrt.xy(vrt.width // 2, vrt.height // 2)
+-                    expected_val = next(vrt.sample([(lon, lat)]))
+-                    with pytest.warns(DeprecationWarning), xr.open_rasterio(vrt) as da:
+-                        actual_shape = (da.sizes["x"], da.sizes["y"])
+-                        actual_crs = da.crs
+-                        actual_res = da.res
+-                        actual_val = da.sel(dict(x=lon, y=lat), method="nearest").data
+-
+-                        assert actual_crs == expected_crs
+-                        assert actual_res == expected_res
+-                        assert actual_shape == expected_shape
+-                        assert expected_val.all() == actual_val.all()
+-
+-    @pytest.mark.filterwarnings(
+-        "ignore:open_rasterio is Deprecated in favor of rioxarray."
+-    )
+-    def test_rasterio_vrt_with_transform_and_size(self) -> None:
+-        # Test open_rasterio() support of WarpedVRT with transform, width and
+-        # height (issue #2864)
+-
+-        rasterio = pytest.importorskip("rasterio")
+-        from affine import Affine
+-        from rasterio.warp import calculate_default_transform
+-
+-        with create_tmp_geotiff() as (tmp_file, expected):
+-            with rasterio.open(tmp_file) as src:
+-                # Estimate the transform, width and height
+-                # for a change of resolution
+-                # tmp_file initial res is (1000,2000) (default values)
+-                trans, w, h = calculate_default_transform(
+-                    src.crs, src.crs, src.width, src.height, resolution=500, *src.bounds
+-                )
+-                with rasterio.vrt.WarpedVRT(
+-                    src, transform=trans, width=w, height=h
+-                ) as vrt:
+-                    expected_shape = (vrt.width, vrt.height)
+-                    expected_res = vrt.res
+-                    expected_transform = vrt.transform
+-                    with xr.open_rasterio(vrt) as da:
+-                        actual_shape = (da.sizes["x"], da.sizes["y"])
+-                        actual_res = da.res
+-                        actual_transform = Affine(*da.transform)
+-                        assert actual_res == expected_res
+-                        assert actual_shape == expected_shape
+-                        assert actual_transform == expected_transform
+-
+-    def test_rasterio_vrt_with_src_crs(self) -> None:
+-        # Test open_rasterio() support of WarpedVRT with specified src_crs
+-
+-        rasterio = pytest.importorskip("rasterio")
+-
+-        # create geotiff with no CRS and specify it manually
+-        with create_tmp_geotiff(crs=None) as (tmp_file, expected):
+-            src_crs = rasterio.crs.CRS({"init": "epsg:32618"})
+-            with rasterio.open(tmp_file) as src:
+-                assert src.crs is None
+-                with rasterio.vrt.WarpedVRT(src, src_crs=src_crs) as vrt:
+-                    with pytest.warns(DeprecationWarning), xr.open_rasterio(vrt) as da:
+-                        assert da.crs == src_crs
+-
+-
+ class TestEncodingInvalid:
+     def test_extract_nc4_variable_encoding(self) -> None:
+         var = xr.Variable(("x",), [1, 2, 3], {}, {"foo": "bar"})
+@@ -5184,6 +4611,56 @@ class TestDataArrayToNetCDF:
+                 assert_identical(original_da, loaded_da)
+ 
+ 
++@requires_zarr
++class TestDataArrayToZarr:
++    def test_dataarray_to_zarr_no_name(self, tmp_store) -> None:
++        original_da = DataArray(np.arange(12).reshape((3, 4)))
++
++        original_da.to_zarr(tmp_store)
++
++        with open_dataarray(tmp_store, engine="zarr") as loaded_da:
++            assert_identical(original_da, loaded_da)
++
++    def test_dataarray_to_zarr_with_name(self, tmp_store) -> None:
++        original_da = DataArray(np.arange(12).reshape((3, 4)), name="test")
++
++        original_da.to_zarr(tmp_store)
++
++        with open_dataarray(tmp_store, engine="zarr") as loaded_da:
++            assert_identical(original_da, loaded_da)
++
++    def test_dataarray_to_zarr_coord_name_clash(self, tmp_store) -> None:
++        original_da = DataArray(
++            np.arange(12).reshape((3, 4)), dims=["x", "y"], name="x"
++        )
++
++        original_da.to_zarr(tmp_store)
++
++        with open_dataarray(tmp_store, engine="zarr") as loaded_da:
++            assert_identical(original_da, loaded_da)
++
++    def test_open_dataarray_options(self, tmp_store) -> None:
++        data = DataArray(np.arange(5), coords={"y": ("x", range(5))}, dims=["x"])
++
++        data.to_zarr(tmp_store)
++
++        expected = data.drop_vars("y")
++        with open_dataarray(tmp_store, engine="zarr", drop_variables=["y"]) as loaded:
++            assert_identical(expected, loaded)
++
++    @requires_dask
++    def test_dataarray_to_zarr_compute_false(self, tmp_store) -> None:
++        from dask.delayed import Delayed
++
++        original_da = DataArray(np.arange(12).reshape((3, 4)))
++
++        output = original_da.to_zarr(tmp_store, compute=False)
++        assert isinstance(output, Delayed)
++        output.compute()
++        with open_dataarray(tmp_store, engine="zarr") as loaded_da:
++            assert_identical(original_da, loaded_da)
++
++
+ @requires_scipy_or_netCDF4
+ def test_no_warning_from_dask_effective_get() -> None:
+     with create_tmp_file() as tmpfile:
+@@ -5616,7 +5093,7 @@ def test_scipy_entrypoint(tmp_path: Path) -> None:
+     assert entrypoint.guess_can_open("something-local.nc")
+     assert entrypoint.guess_can_open("something-local.nc.gz")
+     assert not entrypoint.guess_can_open("not-found-and-no-extension")
+-    assert not entrypoint.guess_can_open(b"not-a-netcdf-file")
++    assert not entrypoint.guess_can_open(b"not-a-netcdf-file")  # type: ignore[arg-type]
+ 
+ 
+ @requires_h5netcdf
+
+diff --git a/xarray/tests/test_cftime_offsets.py b/xarray/tests/test_cftime_offsets.py
+index 6b628c1..24ffab3 100644
+--- a/xarray/tests/test_cftime_offsets.py
++++ b/xarray/tests/test_cftime_offsets.py
+@@ -1373,6 +1373,7 @@ def test_date_range_like_same_calendar():
+     assert src is out
+ 
+ 
++@pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+ def test_date_range_like_errors():
+     src = date_range("1899-02-03", periods=20, freq="D", use_cftime=False)
+     src = src[np.arange(20) != 10]  # Remove 1 day so the frequency is not inferable.
+
+diff --git a/xarray/tests/test_computation.py b/xarray/tests/test_computation.py
+index 8e45a07..3c10e3f 100644
+--- a/xarray/tests/test_computation.py
++++ b/xarray/tests/test_computation.py
+@@ -2092,6 +2092,36 @@ def test_where_attrs() -> None:
+             xr.DataArray([1000.0, 2000.0, 3000.0], dims="x"),
+             id="timedelta",
+         ),
++        pytest.param(
++            xr.DataArray([1, 2, 3], dims="x"),
++            xr.DataArray(
++                [2, 3, 4],
++                dims="degree",
++                coords={"degree": np.array([0, 1, 2], dtype=np.int64)},
++            ),
++            xr.DataArray([9, 2 + 6 + 16, 2 + 9 + 36], dims="x"),
++            id="int64-degree",
++        ),
++        pytest.param(
++            xr.DataArray([1, 2, 3], dims="x"),
++            xr.DataArray(
++                [2, 3, 4],
++                dims="degree",
++                coords={"degree": np.array([0, 1, 2], dtype=np.int32)},
++            ),
++            xr.DataArray([9, 2 + 6 + 16, 2 + 9 + 36], dims="x"),
++            id="int32-degree",
++        ),
++        pytest.param(
++            xr.DataArray([1, 2, 3], dims="x"),
++            xr.DataArray(
++                [2, 3, 4],
++                dims="degree",
++                coords={"degree": np.array([0, 1, 2], dtype=np.uint8)},
++            ),
++            xr.DataArray([9, 2 + 6 + 16, 2 + 9 + 36], dims="x"),
++            id="uint8-degree",
++        ),
+     ],
+ )
+ def test_polyval(
+
+diff --git a/xarray/tests/test_concat.py b/xarray/tests/test_concat.py
+index f60308f..9021ce2 100644
+--- a/xarray/tests/test_concat.py
++++ b/xarray/tests/test_concat.py
+@@ -297,6 +297,7 @@ def test_concat_multiple_datasets_with_multiple_missing_variables() -> None:
+     assert_identical(actual, expected)
+ 
+ 
++@pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+ def test_concat_type_of_missing_fill() -> None:
+     datasets = create_typed_datasets(2, seed=123)
+     expected1 = concat(datasets, dim="day", fill_value=dtypes.NA)
+
+diff --git a/xarray/tests/test_conventions.py b/xarray/tests/test_conventions.py
+index 9485b50..acdf9c8 100644
+--- a/xarray/tests/test_conventions.py
++++ b/xarray/tests/test_conventions.py
+@@ -32,7 +32,7 @@ from xarray.tests.test_backends import CFEncodedBase
+ class TestBoolTypeArray:
+     def test_booltype_array(self) -> None:
+         x = np.array([1, 0, 1, 1, 0], dtype="i1")
+-        bx = conventions.BoolTypeArray(x)
++        bx = coding.variables.BoolTypeArray(x)
+         assert bx.dtype == bool
+         assert_array_equal(bx, np.array([True, False, True, True, False], dtype=bool))
+ 
+@@ -41,7 +41,7 @@ class TestNativeEndiannessArray:
+     def test(self) -> None:
+         x = np.arange(5, dtype=">i8")
+         expected = np.arange(5, dtype="int64")
+-        a = conventions.NativeEndiannessArray(x)
++        a = coding.variables.NativeEndiannessArray(x)
+         assert a.dtype == expected.dtype
+         assert a.dtype == expected[:].dtype
+         assert_array_equal(a, expected)
+@@ -168,6 +168,7 @@ class TestEncodeCFVariable:
+         with pytest.raises(ValueError, match=r"'coordinates' found in both attrs"):
+             conventions.encode_dataset_coordinates(orig)
+ 
++    @pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+     def test_emit_coordinates_attribute_in_attrs(self) -> None:
+         orig = Dataset(
+             {"a": 1, "b": 1},
+@@ -185,6 +186,7 @@ class TestEncodeCFVariable:
+         assert enc["b"].attrs.get("coordinates") == "t"
+         assert "coordinates" not in enc["b"].encoding
+ 
++    @pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+     def test_emit_coordinates_attribute_in_encoding(self) -> None:
+         orig = Dataset(
+             {"a": 1, "b": 1},
+@@ -247,7 +249,7 @@ class TestDecodeCF:
+     def test_0d_int32_encoding(self) -> None:
+         original = Variable((), np.int32(0), encoding={"dtype": "int64"})
+         expected = Variable((), np.int64(0))
+-        actual = conventions.maybe_encode_nonstring_dtype(original)
++        actual = coding.variables.NonStringCoder().encode(original)
+         assert_identical(expected, actual)
+ 
+     def test_decode_cf_with_multiple_missing_values(self) -> None:
+
+diff --git a/xarray/tests/test_dask.py b/xarray/tests/test_dask.py
+index 21f0ab9..b37399d 100644
+--- a/xarray/tests/test_dask.py
++++ b/xarray/tests/test_dask.py
+@@ -1701,3 +1701,10 @@ def test_graph_manipulation():
+     # names if we were to use HighLevelGraph.cull() instead of
+     # HighLevelGraph.cull_layers() in Dataset.__dask_postpersist__().
+     assert_equal(ds2.d1 + ds2.d2, ds.d1 + ds.d2)
++
++
++def test_new_index_var_computes_once():
++    # regression test for GH1533
++    data = dask.array.from_array(np.array([100, 200]))
++    with raise_if_dask_computes(max_computes=1):
++        Dataset(coords={"z": ("z", data)})
+
+diff --git a/xarray/tests/test_dataarray.py b/xarray/tests/test_dataarray.py
+index 378d471..dcbfd42 100644
+--- a/xarray/tests/test_dataarray.py
++++ b/xarray/tests/test_dataarray.py
+@@ -278,6 +278,25 @@ class TestDataArray:
+         self.dv.encoding = expected2
+         assert expected2 is not self.dv.encoding
+ 
++    def test_reset_encoding(self) -> None:
++        array = self.mda
++        encoding = {"scale_factor": 10}
++        array.encoding = encoding
++        array["x"].encoding = encoding
++
++        assert array.encoding == encoding
++        assert array["x"].encoding == encoding
++
++        actual = array.reset_encoding()
++
++        # did not modify in place
++        assert array.encoding == encoding
++        assert array["x"].encoding == encoding
++
++        # variable and coord encoding is empty
++        assert actual.encoding == {}
++        assert actual["x"].encoding == {}
++
+     def test_constructor(self) -> None:
+         data = np.random.random((2, 3))
+ 
+@@ -1004,32 +1023,53 @@ class TestDataArray:
+         result = array.sel(delta=slice(array.delta[0], array.delta[-1]))
+         assert_equal(result, array)
+ 
+-    def test_sel_float(self) -> None:
++    @pytest.mark.parametrize(
++        ["coord_values", "indices"],
++        (
++            pytest.param(
++                np.array([0.0, 0.111, 0.222, 0.333], dtype="float64"),
++                slice(1, 3),
++                id="float64",
++            ),
++            pytest.param(
++                np.array([0.0, 0.111, 0.222, 0.333], dtype="float32"),
++                slice(1, 3),
++                id="float32",
++            ),
++            pytest.param(
++                np.array([0.0, 0.111, 0.222, 0.333], dtype="float32"), [2], id="scalar"
++            ),
++        ),
++    )
++    def test_sel_float(self, coord_values, indices) -> None:
+         data_values = np.arange(4)
+ 
+-        # case coords are float32 and label is list of floats
+-        float_values = [0.0, 0.111, 0.222, 0.333]
+-        coord_values = np.asarray(float_values, dtype="float32")
+-        array = DataArray(data_values, [("float32_coord", coord_values)])
+-        expected = DataArray(data_values[1:3], [("float32_coord", coord_values[1:3])])
+-        actual = array.sel(float32_coord=float_values[1:3])
+-        # case coords are float16 and label is list of floats
+-        coord_values_16 = np.asarray(float_values, dtype="float16")
+-        expected_16 = DataArray(
+-            data_values[1:3], [("float16_coord", coord_values_16[1:3])]
+-        )
+-        array_16 = DataArray(data_values, [("float16_coord", coord_values_16)])
+-        actual_16 = array_16.sel(float16_coord=float_values[1:3])
++        arr = DataArray(data_values, coords={"x": coord_values}, dims="x")
+ 
+-        # case coord, label are scalars
+-        expected_scalar = DataArray(
+-            data_values[2], coords={"float32_coord": coord_values[2]}
++        actual = arr.sel(x=coord_values[indices])
++        expected = DataArray(
++            data_values[indices], coords={"x": coord_values[indices]}, dims="x"
+         )
+-        actual_scalar = array.sel(float32_coord=float_values[2])
+ 
+-        assert_equal(expected, actual)
+-        assert_equal(expected_scalar, actual_scalar)
+-        assert_equal(expected_16, actual_16)
++        assert_equal(actual, expected)
++
++    def test_sel_float16(self) -> None:
++        data_values = np.arange(4)
++        coord_values = np.array([0.0, 0.111, 0.222, 0.333], dtype="float16")
++        indices = slice(1, 3)
++
++        message = "`pandas.Index` does not support the `float16` dtype.*"
++
++        with pytest.warns(DeprecationWarning, match=message):
++            arr = DataArray(data_values, coords={"x": coord_values}, dims="x")
++        with pytest.warns(DeprecationWarning, match=message):
++            expected = DataArray(
++                data_values[indices], coords={"x": coord_values[indices]}, dims="x"
++            )
++
++        actual = arr.sel(x=coord_values[indices])
++
++        assert_equal(actual, expected)
+ 
+     def test_sel_float_multiindex(self) -> None:
+         # regression test https://github.com/pydata/xarray/issues/5691
+
+diff --git a/xarray/tests/test_dataset.py b/xarray/tests/test_dataset.py
+index 2e23d02..4528672 100644
+--- a/xarray/tests/test_dataset.py
++++ b/xarray/tests/test_dataset.py
+@@ -36,6 +36,7 @@ from xarray.core.indexes import Index, PandasIndex
+ from xarray.core.pycompat import array_type, integer_types
+ from xarray.core.utils import is_scalar
+ from xarray.tests import (
++    DuckArrayWrapper,
+     InaccessibleArray,
+     UnexpectedDataAccess,
+     assert_allclose,
+@@ -101,57 +102,63 @@ def create_append_test_data(seed=None) -> tuple[Dataset, Dataset, Dataset]:
+     bool_var = np.array([True, False, True], dtype=bool)
+     bool_var_to_append = np.array([False, True], dtype=bool)
+ 
+-    ds = xr.Dataset(
+-        data_vars={
+-            "da": xr.DataArray(
+-                rs.rand(3, 3, nt1),
+-                coords=[lat, lon, time1],
+-                dims=["lat", "lon", "time"],
+-            ),
+-            "string_var": xr.DataArray(string_var, coords=[time1], dims=["time"]),
+-            "string_var_fixed_length": xr.DataArray(
+-                string_var_fixed_length, coords=[time1], dims=["time"]
+-            ),
+-            "unicode_var": xr.DataArray(
+-                unicode_var, coords=[time1], dims=["time"]
+-            ).astype(np.unicode_),
+-            "datetime_var": xr.DataArray(datetime_var, coords=[time1], dims=["time"]),
+-            "bool_var": xr.DataArray(bool_var, coords=[time1], dims=["time"]),
+-        }
+-    )
++    with warnings.catch_warnings():
++        warnings.filterwarnings("ignore", "Converting non-nanosecond")
++        ds = xr.Dataset(
++            data_vars={
++                "da": xr.DataArray(
++                    rs.rand(3, 3, nt1),
++                    coords=[lat, lon, time1],
++                    dims=["lat", "lon", "time"],
++                ),
++                "string_var": xr.DataArray(string_var, coords=[time1], dims=["time"]),
++                "string_var_fixed_length": xr.DataArray(
++                    string_var_fixed_length, coords=[time1], dims=["time"]
++                ),
++                "unicode_var": xr.DataArray(
++                    unicode_var, coords=[time1], dims=["time"]
++                ).astype(np.unicode_),
++                "datetime_var": xr.DataArray(
++                    datetime_var, coords=[time1], dims=["time"]
++                ),
++                "bool_var": xr.DataArray(bool_var, coords=[time1], dims=["time"]),
++            }
++        )
+ 
+-    ds_to_append = xr.Dataset(
+-        data_vars={
+-            "da": xr.DataArray(
+-                rs.rand(3, 3, nt2),
+-                coords=[lat, lon, time2],
+-                dims=["lat", "lon", "time"],
+-            ),
+-            "string_var": xr.DataArray(
+-                string_var_to_append, coords=[time2], dims=["time"]
+-            ),
+-            "string_var_fixed_length": xr.DataArray(
+-                string_var_fixed_length_to_append, coords=[time2], dims=["time"]
+-            ),
+-            "unicode_var": xr.DataArray(
+-                unicode_var[:nt2], coords=[time2], dims=["time"]
+-            ).astype(np.unicode_),
+-            "datetime_var": xr.DataArray(
+-                datetime_var_to_append, coords=[time2], dims=["time"]
+-            ),
+-            "bool_var": xr.DataArray(bool_var_to_append, coords=[time2], dims=["time"]),
+-        }
+-    )
++        ds_to_append = xr.Dataset(
++            data_vars={
++                "da": xr.DataArray(
++                    rs.rand(3, 3, nt2),
++                    coords=[lat, lon, time2],
++                    dims=["lat", "lon", "time"],
++                ),
++                "string_var": xr.DataArray(
++                    string_var_to_append, coords=[time2], dims=["time"]
++                ),
++                "string_var_fixed_length": xr.DataArray(
++                    string_var_fixed_length_to_append, coords=[time2], dims=["time"]
++                ),
++                "unicode_var": xr.DataArray(
++                    unicode_var[:nt2], coords=[time2], dims=["time"]
++                ).astype(np.unicode_),
++                "datetime_var": xr.DataArray(
++                    datetime_var_to_append, coords=[time2], dims=["time"]
++                ),
++                "bool_var": xr.DataArray(
++                    bool_var_to_append, coords=[time2], dims=["time"]
++                ),
++            }
++        )
+ 
+-    ds_with_new_var = xr.Dataset(
+-        data_vars={
+-            "new_var": xr.DataArray(
+-                rs.rand(3, 3, nt1 + nt2),
+-                coords=[lat, lon, time1.append(time2)],
+-                dims=["lat", "lon", "time"],
+-            )
+-        }
+-    )
++        ds_with_new_var = xr.Dataset(
++            data_vars={
++                "new_var": xr.DataArray(
++                    rs.rand(3, 3, nt1 + nt2),
++                    coords=[lat, lon, time1.append(time2)],
++                    dims=["lat", "lon", "time"],
++                )
++            }
++        )
+ 
+     assert all(objp.data.flags.writeable for objp in ds.variables.values())
+     assert all(objp.data.flags.writeable for objp in ds_to_append.variables.values())
+@@ -203,6 +210,10 @@ def create_test_stacked_array() -> tuple[DataArray, DataArray]:
+ 
+ 
+ class InaccessibleVariableDataStore(backends.InMemoryDataStore):
++    """
++    Store that does not allow any data access.
++    """
++
+     def __init__(self):
+         super().__init__()
+         self._indexvars = set()
+@@ -223,6 +234,47 @@ class InaccessibleVariableDataStore(backends.InMemoryDataStore):
+         return {k: lazy_inaccessible(k, v) for k, v in self._variables.items()}
+ 
+ 
++class DuckBackendArrayWrapper(backends.common.BackendArray):
++    """Mimic a BackendArray wrapper around DuckArrayWrapper"""
++
++    def __init__(self, array):
++        self.array = DuckArrayWrapper(array)
++        self.shape = array.shape
++        self.dtype = array.dtype
++
++    def get_array(self):
++        return self.array
++
++    def __getitem__(self, key):
++        return self.array[key.tuple]
++
++
++class AccessibleAsDuckArrayDataStore(backends.InMemoryDataStore):
++    """
++    Store that returns a duck array, not convertible to numpy array,
++    on read. Modeled after nVIDIA's kvikio.
++    """
++
++    def __init__(self):
++        super().__init__()
++        self._indexvars = set()
++
++    def store(self, variables, *args, **kwargs) -> None:
++        super().store(variables, *args, **kwargs)
++        for k, v in variables.items():
++            if isinstance(v, IndexVariable):
++                self._indexvars.add(k)
++
++    def get_variables(self) -> dict[Any, xr.Variable]:
++        def lazy_accessible(k, v) -> xr.Variable:
++            if k in self._indexvars:
++                return v
++            data = indexing.LazilyIndexedArray(DuckBackendArrayWrapper(v.values))
++            return Variable(v.dims, data, v.attrs)
++
++        return {k: lazy_accessible(k, v) for k, v in self._variables.items()}
++
++
+ class TestDataset:
+     def test_repr(self) -> None:
+         data = create_test_data(seed=123)
+@@ -443,6 +495,7 @@ class TestDataset:
+         actual = Dataset({"x": [5, 6, 7, 8, 9]})
+         assert_identical(expected, actual)
+ 
++    @pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+     def test_constructor_0d(self) -> None:
+         expected = Dataset({"x": ([], 1)})
+         for arg in [1, np.array(1), expected["x"]]:
+@@ -2827,6 +2880,21 @@ class TestDataset:
+         with pytest.raises(ValueError, match=r"contain all variables in original"):
+             orig.copy(data={"var1": new_var1})
+ 
++    def test_reset_encoding(self) -> None:
++        orig = create_test_data()
++        vencoding = {"scale_factor": 10}
++        orig.encoding = {"foo": "bar"}
++
++        for k, v in orig.variables.items():
++            orig[k].encoding = vencoding
++
++        actual = orig.reset_encoding()
++        assert actual.encoding == {}
++        for k, v in actual.variables.items():
++            assert v.encoding == {}
++
++        assert_equal(actual, orig)
++
+     def test_rename(self) -> None:
+         data = create_test_data()
+         newnames = {
+@@ -4684,6 +4752,29 @@ class TestDataset:
+             ds.isel(time=10)
+             ds.isel(time=slice(10), dim1=[0]).isel(dim1=0, dim2=-1)
+ 
++    def test_lazy_load_duck_array(self) -> None:
++        store = AccessibleAsDuckArrayDataStore()
++        create_test_data().dump_to_store(store)
++
++        for decode_cf in [True, False]:
++            ds = open_dataset(store, decode_cf=decode_cf)
++            with pytest.raises(UnexpectedDataAccess):
++                ds["var1"].values
++
++            # these should not raise UnexpectedDataAccess:
++            ds.var1.data
++            ds.isel(time=10)
++            ds.isel(time=slice(10), dim1=[0]).isel(dim1=0, dim2=-1)
++            repr(ds)
++
++            # preserve the duck array type and don't cast to array
++            assert isinstance(ds["var1"].load().data, DuckArrayWrapper)
++            assert isinstance(
++                ds["var1"].isel(dim2=0, dim1=0).load().data, DuckArrayWrapper
++            )
++
++            ds.close()
++
+     def test_dropna(self) -> None:
+         x = np.random.randn(4, 4)
+         x[::2, 0] = np.nan
+@@ -5495,6 +5586,7 @@ class TestDataset:
+         expected = ds + other.reindex_like(ds)
+         assert_identical(expected, actual)
+ 
++    @pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+     def test_dataset_math_errors(self) -> None:
+         ds = self.make_example_math_dataset()
+ 
+@@ -6494,6 +6586,7 @@ def test_differentiate(dask, edge_order) -> None:
+         da.differentiate("x2d")
+ 
+ 
++@pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+ @pytest.mark.parametrize("dask", [True, False])
+ def test_differentiate_datetime(dask) -> None:
+     rs = np.random.RandomState(42)
+@@ -6690,6 +6783,7 @@ def test_cumulative_integrate(dask) -> None:
+         da.cumulative_integrate("x2d")
+ 
+ 
++@pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+ @pytest.mark.parametrize("dask", [True, False])
+ @pytest.mark.parametrize("which_datetime", ["np", "cftime"])
+ def test_trapz_datetime(dask, which_datetime) -> None:
+
+diff --git a/xarray/tests/test_distributed.py b/xarray/tests/test_distributed.py
+index e13667a..a57f872 100644
+--- a/xarray/tests/test_distributed.py
++++ b/xarray/tests/test_distributed.py
+@@ -35,17 +35,13 @@ from xarray.tests import (
+     has_h5netcdf,
+     has_netCDF4,
+     has_scipy,
+-    requires_cfgrib,
+     requires_cftime,
+     requires_netCDF4,
+-    requires_rasterio,
+     requires_zarr,
+ )
+ from xarray.tests.test_backends import (
+     ON_WINDOWS,
+     create_tmp_file,
+-    create_tmp_geotiff,
+-    open_example_dataset,
+ )
+ from xarray.tests.test_dataset import create_test_data
+ 
+@@ -198,32 +194,6 @@ def test_dask_distributed_zarr_integration_test(
+                     assert_allclose(original, computed)
+ 
+ 
+-@requires_rasterio
+-@pytest.mark.filterwarnings("ignore:deallocating CachingFileManager")
+-def test_dask_distributed_rasterio_integration_test(loop) -> None:
+-    with create_tmp_geotiff() as (tmp_file, expected):
+-        with cluster() as (s, [a, b]):
+-            with pytest.warns(DeprecationWarning), Client(s["address"], loop=loop):
+-                da_tiff = xr.open_rasterio(tmp_file, chunks={"band": 1})
+-                assert isinstance(da_tiff.data, da.Array)
+-                actual = da_tiff.compute()
+-                assert_allclose(actual, expected)
+-
+-
+-@requires_cfgrib
+-@pytest.mark.filterwarnings("ignore:deallocating CachingFileManager")
+-def test_dask_distributed_cfgrib_integration_test(loop) -> None:
+-    with cluster() as (s, [a, b]):
+-        with Client(s["address"], loop=loop):
+-            with open_example_dataset(
+-                "example.grib", engine="cfgrib", chunks={"time": 1}
+-            ) as ds:
+-                with open_example_dataset("example.grib", engine="cfgrib") as expected:
+-                    assert isinstance(ds["t"].data, da.Array)
+-                    actual = ds.compute()
+-                    assert_allclose(actual, expected)
+-
+-
+ @pytest.mark.xfail(
+     condition=Version(distributed.__version__) < Version("2022.02.0"),
+     reason="https://github.com/dask/distributed/pull/5739",
+
+diff --git a/xarray/tests/test_formatting.py b/xarray/tests/test_formatting.py
+index 3cba5b9..bf5f7d0 100644
+--- a/xarray/tests/test_formatting.py
++++ b/xarray/tests/test_formatting.py
+@@ -542,7 +542,7 @@ def test_set_numpy_options() -> None:
+     assert np.get_printoptions() == original_options
+ 
+ 
+-def test_short_numpy_repr() -> None:
++def test_short_array_repr() -> None:
+     cases = [
+         np.random.randn(500),
+         np.random.randn(20, 20),
+@@ -552,16 +552,16 @@ def test_short_numpy_repr() -> None:
+     ]
+     # number of lines:
+     # for default numpy repr: 167, 140, 254, 248, 599
+-    # for short_numpy_repr: 1, 7, 24, 19, 25
++    # for short_array_repr: 1, 7, 24, 19, 25
+     for array in cases:
+-        num_lines = formatting.short_numpy_repr(array).count("\n") + 1
++        num_lines = formatting.short_array_repr(array).count("\n") + 1
+         assert num_lines < 30
+ 
+     # threshold option (default: 200)
+     array2 = np.arange(100)
+-    assert "..." not in formatting.short_numpy_repr(array2)
++    assert "..." not in formatting.short_array_repr(array2)
+     with xr.set_options(display_values_threshold=10):
+-        assert "..." in formatting.short_numpy_repr(array2)
++        assert "..." in formatting.short_array_repr(array2)
+ 
+ 
+ def test_large_array_repr_length() -> None:
+
+diff --git a/xarray/tests/test_groupby.py b/xarray/tests/test_groupby.py
+index a7d9840..52c1af9 100644
+--- a/xarray/tests/test_groupby.py
++++ b/xarray/tests/test_groupby.py
+@@ -6,7 +6,6 @@ import warnings
+ import numpy as np
+ import pandas as pd
+ import pytest
+-from pandas.tseries.frequencies import to_offset
+ 
+ import xarray as xr
+ from xarray import DataArray, Dataset, Variable
+@@ -17,6 +16,7 @@ from xarray.tests import (
+     assert_equal,
+     assert_identical,
+     create_test_data,
++    has_cftime,
+     has_pandas_version_two,
+     requires_dask,
+     requires_flox,
+@@ -501,6 +501,7 @@ def test_groupby_repr_datetime(obj) -> None:
+     assert actual == expected
+ 
+ 
++@pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+ @pytest.mark.filterwarnings("ignore:invalid value encountered in divide:RuntimeWarning")
+ def test_groupby_drops_nans() -> None:
+     # GH2383
+@@ -807,6 +808,25 @@ def test_groupby_math_more() -> None:
+         ds + ds.groupby("time.month")
+ 
+ 
++@pytest.mark.parametrize("use_flox", [True, False])
++def test_groupby_bins_cut_kwargs(use_flox: bool) -> None:
++    da = xr.DataArray(np.arange(12).reshape(6, 2), dims=("x", "y"))
++    x_bins = (0, 2, 4, 6)
++
++    with xr.set_options(use_flox=use_flox):
++        actual = da.groupby_bins(
++            "x", bins=x_bins, include_lowest=True, right=False
++        ).mean()
++    expected = xr.DataArray(
++        np.array([[1.0, 2.0], [5.0, 6.0], [9.0, 10.0]]),
++        dims=("x_bins", "y"),
++        coords={
++            "x_bins": ("x_bins", pd.IntervalIndex.from_breaks(x_bins, closed="left"))
++        },
++    )
++    assert_identical(expected, actual)
++
++
+ @pytest.mark.parametrize("indexed_coord", [True, False])
+ def test_groupby_bins_math(indexed_coord) -> None:
+     N = 7
+@@ -1466,20 +1486,74 @@ class TestDataArrayGroupBy:
+ 
+ 
+ class TestDataArrayResample:
+-    def test_resample(self):
+-        times = pd.date_range("2000-01-01", freq="6H", periods=10)
++    @pytest.mark.parametrize("use_cftime", [True, False])
++    def test_resample(self, use_cftime: bool) -> None:
++        if use_cftime and not has_cftime:
++            pytest.skip()
++        times = xr.date_range(
++            "2000-01-01", freq="6H", periods=10, use_cftime=use_cftime
++        )
++
++        def resample_as_pandas(array, *args, **kwargs):
++            array_ = array.copy(deep=True)
++            if use_cftime:
++                array_["time"] = times.to_datetimeindex()
++            result = DataArray.from_series(
++                array_.to_series().resample(*args, **kwargs).mean()
++            )
++            if use_cftime:
++                result = result.convert_calendar(
++                    calendar="standard", use_cftime=use_cftime
++                )
++            return result
++
+         array = DataArray(np.arange(10), [("time", times)])
+ 
+         actual = array.resample(time="24H").mean()
+-        expected = DataArray(array.to_series().resample("24H").mean())
++        expected = resample_as_pandas(array, "24H")
+         assert_identical(expected, actual)
+ 
+         actual = array.resample(time="24H").reduce(np.mean)
+         assert_identical(expected, actual)
+ 
++        actual = array.resample(time="24H", closed="right").mean()
++        expected = resample_as_pandas(array, "24H", closed="right")
++        assert_identical(expected, actual)
++
+         with pytest.raises(ValueError, match=r"index must be monotonic"):
+             array[[2, 0, 1]].resample(time="1D")
+ 
++    @pytest.mark.parametrize("use_cftime", [True, False])
++    def test_resample_doctest(self, use_cftime: bool) -> None:
++        # run the doctest example here so we are not surprised
++        if use_cftime and not has_cftime:
++            pytest.skip()
++
++        da = xr.DataArray(
++            np.array([1, 2, 3, 1, 2, np.nan]),
++            dims="time",
++            coords=dict(
++                time=(
++                    "time",
++                    xr.date_range(
++                        "2001-01-01", freq="M", periods=6, use_cftime=use_cftime
++                    ),
++                ),
++                labels=("time", np.array(["a", "b", "c", "c", "b", "a"])),
++            ),
++        )
++        actual = da.resample(time="3M").count()
++        expected = DataArray(
++            [1, 3, 1],
++            dims="time",
++            coords={
++                "time": xr.date_range(
++                    "2001-01-01", freq="3M", periods=3, use_cftime=use_cftime
++                )
++            },
++        )
++        assert_identical(actual, expected)
++
+     def test_da_resample_func_args(self):
+         def func(arg1, arg2, arg3=0.0):
+             return arg1.mean("time") + arg2 + arg3
+@@ -1732,6 +1806,7 @@ class TestDataArrayResample:
+             assert_allclose(expected, actual, rtol=1e-16)
+ 
+     @requires_scipy
++    @pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+     def test_upsample_interpolate_bug_2197(self):
+         dates = pd.date_range("2007-02-01", "2007-03-01", freq="D")
+         da = xr.DataArray(np.arange(len(dates)), [("time", dates)])
+@@ -1805,7 +1880,9 @@ class TestDataArrayResample:
+ 
+         with pytest.warns(FutureWarning, match="the `base` parameter to resample"):
+             actual = array.resample(time="24H", base=base).mean()
+-        expected = DataArray(array.to_series().resample("24H", base=base).mean())
++        expected = DataArray(
++            array.to_series().resample("24H", offset=f"{base}H").mean()
++        )
+         assert_identical(expected, actual)
+ 
+     def test_resample_offset(self) -> None:
+@@ -1842,15 +1919,22 @@ class TestDataArrayResample:
+ 
+         with pytest.warns(FutureWarning, match="`loffset` parameter"):
+             actual = array.resample(time="24H", loffset=loffset).mean()
+-        expected = DataArray(array.to_series().resample("24H", loffset=loffset).mean())
++        series = array.to_series().resample("24H").mean()
++        if not isinstance(loffset, pd.DateOffset):
++            loffset = pd.Timedelta(loffset)
++        series.index = series.index + loffset
++        expected = DataArray(series)
+         assert_identical(actual, expected)
+ 
+     def test_resample_invalid_loffset(self) -> None:
+         times = pd.date_range("2000-01-01", freq="6H", periods=10)
+         array = DataArray(np.arange(10), [("time", times)])
+ 
+-        with pytest.raises(ValueError, match="`loffset` must be"):
+-            array.resample(time="24H", loffset=1).mean()  # type: ignore
++        with pytest.warns(
++            FutureWarning, match="Following pandas, the `loffset` parameter"
++        ):
++            with pytest.raises(ValueError, match="`loffset` must be"):
++                array.resample(time="24H", loffset=1).mean()  # type: ignore
+ 
+ 
+ class TestDatasetResample:
+@@ -1938,14 +2022,6 @@ class TestDatasetResample:
+         )
+         ds.attrs["dsmeta"] = "dsdata"
+ 
+-        # Our use of `loffset` may change if we align our API with pandas' changes.
+-        # ref https://github.com/pydata/xarray/pull/4537
+-        actual = ds.resample(time="24H", loffset="-12H").mean().bar
+-        expected_ = ds.bar.to_series().resample("24H").mean()
+-        expected_.index += to_offset("-12H")
+-        expected = DataArray.from_series(expected_)
+-        assert_allclose(actual, expected)
+-
+     def test_resample_by_mean_discarding_attrs(self):
+         times = pd.date_range("2000-01-01", freq="6H", periods=10)
+         ds = Dataset(
+@@ -2126,6 +2202,3 @@ def test_resample_cumsum(method: str, expected_array: list[float]) -> None:
+     actual = getattr(ds.foo.resample(time="3M"), method)(dim="time")
+     expected.coords["time"] = ds.time
+     assert_identical(expected.drop_vars(["time"]).foo, actual)
+-
+-
+-# TODO: move other groupby tests from test_dataset and test_dataarray over here
+
+diff --git a/xarray/tests/test_interp.py b/xarray/tests/test_interp.py
+index e66045e..026edf9 100644
+--- a/xarray/tests/test_interp.py
++++ b/xarray/tests/test_interp.py
+@@ -605,6 +605,7 @@ def test_interp_like() -> None:
+         pytest.param("2000-01-01T12:00", 0.5, marks=pytest.mark.xfail),
+     ],
+ )
++@pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+ def test_datetime(x_new, expected) -> None:
+     da = xr.DataArray(
+         np.arange(24),
+
+diff --git a/xarray/tests/test_plot.py b/xarray/tests/test_plot.py
+index b7b5f00..b587b89 100644
+--- a/xarray/tests/test_plot.py
++++ b/xarray/tests/test_plot.py
+@@ -1204,6 +1204,13 @@ class TestDiscreteColorMap:
+         primitive = self.darray.plot.contourf(norm=norm)
+         np.testing.assert_allclose(primitive.levels, norm.boundaries)
+ 
++    def test_discrete_colormap_provided_boundary_norm_matching_cmap_levels(
++        self,
++    ) -> None:
++        norm = mpl.colors.BoundaryNorm([0, 5, 10, 15], 4)
++        primitive = self.darray.plot.contourf(norm=norm)
++        assert primitive.colorbar.norm.Ncmap == primitive.colorbar.norm.N
++
+ 
+ class Common2dMixin:
+     """
+@@ -2804,6 +2811,7 @@ class TestDatetimePlot(PlotTestCase):
+         # mpl.dates.AutoDateLocator passes and no other subclasses:
+         assert type(ax.xaxis.get_major_locator()) is mpl.dates.AutoDateLocator
+ 
++    @pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+     def test_datetime_plot2d(self) -> None:
+         # Test that matplotlib-native datetime works:
+         da = DataArray(
+
+diff --git a/xarray/tests/test_plugins.py b/xarray/tests/test_plugins.py
+index 2160b8d..0882bc1 100644
+--- a/xarray/tests/test_plugins.py
++++ b/xarray/tests/test_plugins.py
+@@ -2,11 +2,27 @@ from __future__ import annotations
+ 
+ import sys
+ from importlib.metadata import EntryPoint
++
++if sys.version_info >= (3, 10):
++    from importlib.metadata import EntryPoints
++else:
++    EntryPoints = list[EntryPoint]
+ from unittest import mock
+ 
+ import pytest
+ 
+ from xarray.backends import common, plugins
++from xarray.tests import (
++    has_h5netcdf,
++    has_netCDF4,
++    has_pseudonetcdf,
++    has_pydap,
++    has_pynio,
++    has_scipy,
++    has_zarr,
++)
++
++# Do not import list_engines here, this will break the lazy tests
+ 
+ importlib_metadata_mock = "importlib.metadata"
+ 
+@@ -57,7 +73,7 @@ def test_broken_plugin() -> None:
+         "xarray.backends",
+     )
+     with pytest.warns(RuntimeWarning) as record:
+-        _ = plugins.build_engines([broken_backend])
++        _ = plugins.build_engines(EntryPoints([broken_backend]))
+     assert len(record) == 1
+     message = str(record[0].message)
+     assert "Engine 'broken_backend'" in message
+@@ -99,23 +115,29 @@ def test_set_missing_parameters() -> None:
+     assert backend_1.open_dataset_parameters == ("filename_or_obj", "decoder")
+     assert backend_2.open_dataset_parameters == ("filename_or_obj",)
+ 
+-    backend = DummyBackendEntrypointKwargs()
+-    backend.open_dataset_parameters = ("filename_or_obj", "decoder")  # type: ignore[misc]
+-    plugins.set_missing_parameters({"engine": backend})
+-    assert backend.open_dataset_parameters == ("filename_or_obj", "decoder")
++    backend_kwargs = DummyBackendEntrypointKwargs
++    backend_kwargs.open_dataset_parameters = ("filename_or_obj", "decoder")
++    plugins.set_missing_parameters({"engine": backend_kwargs})
++    assert backend_kwargs.open_dataset_parameters == ("filename_or_obj", "decoder")
+ 
+-    backend_args = DummyBackendEntrypointArgs()
+-    backend_args.open_dataset_parameters = ("filename_or_obj", "decoder")  # type: ignore[misc]
++    backend_args = DummyBackendEntrypointArgs
++    backend_args.open_dataset_parameters = ("filename_or_obj", "decoder")
+     plugins.set_missing_parameters({"engine": backend_args})
+     assert backend_args.open_dataset_parameters == ("filename_or_obj", "decoder")
+ 
++    # reset
++    backend_1.open_dataset_parameters = None
++    backend_1.open_dataset_parameters = None
++    backend_kwargs.open_dataset_parameters = None
++    backend_args.open_dataset_parameters = None
++
+ 
+ def test_set_missing_parameters_raise_error() -> None:
+-    backend = DummyBackendEntrypointKwargs()
++    backend = DummyBackendEntrypointKwargs
+     with pytest.raises(TypeError):
+         plugins.set_missing_parameters({"engine": backend})
+ 
+-    backend_args = DummyBackendEntrypointArgs()
++    backend_args = DummyBackendEntrypointArgs
+     with pytest.raises(TypeError):
+         plugins.set_missing_parameters({"engine": backend_args})
+ 
+@@ -126,12 +148,12 @@ def test_set_missing_parameters_raise_error() -> None:
+ )
+ def test_build_engines() -> None:
+     dummy_pkg_entrypoint = EntryPoint(
+-        "cfgrib", "xarray.tests.test_plugins:backend_1", "xarray_backends"
++        "dummy", "xarray.tests.test_plugins:backend_1", "xarray_backends"
+     )
+-    backend_entrypoints = plugins.build_engines([dummy_pkg_entrypoint])
++    backend_entrypoints = plugins.build_engines(EntryPoints([dummy_pkg_entrypoint]))
+ 
+-    assert isinstance(backend_entrypoints["cfgrib"], DummyBackendEntrypoint1)
+-    assert backend_entrypoints["cfgrib"].open_dataset_parameters == (
++    assert isinstance(backend_entrypoints["dummy"], DummyBackendEntrypoint1)
++    assert backend_entrypoints["dummy"].open_dataset_parameters == (
+         "filename_or_obj",
+         "decoder",
+     )
+@@ -142,10 +164,16 @@ def test_build_engines() -> None:
+     mock.MagicMock(return_value=DummyBackendEntrypoint1),
+ )
+ def test_build_engines_sorted() -> None:
+-    dummy_pkg_entrypoints = [
+-        EntryPoint("dummy2", "xarray.tests.test_plugins:backend_1", "xarray.backends"),
+-        EntryPoint("dummy1", "xarray.tests.test_plugins:backend_1", "xarray.backends"),
+-    ]
++    dummy_pkg_entrypoints = EntryPoints(
++        [
++            EntryPoint(
++                "dummy2", "xarray.tests.test_plugins:backend_1", "xarray.backends"
++            ),
++            EntryPoint(
++                "dummy1", "xarray.tests.test_plugins:backend_1", "xarray.backends"
++            ),
++        ]
++    )
+     backend_entrypoints = list(plugins.build_engines(dummy_pkg_entrypoints))
+ 
+     indices = []
+@@ -192,7 +220,6 @@ def test_lazy_import() -> None:
+     Only when running code for the first time that requires them.
+     """
+     blacklisted = [
+-        # "cfgrib",  # TODO: cfgrib has its own plugin now, deprecate?
+         "h5netcdf",
+         "netCDF4",
+         "PseudoNetCDF",
+@@ -240,3 +267,57 @@ def test_lazy_import() -> None:
+     finally:
+         # restore original
+         sys.modules.update(modules_backup)
++
++
++def test_list_engines() -> None:
++    from xarray.backends import list_engines
++
++    engines = list_engines()
++    assert list_engines.cache_info().currsize == 1
++
++    assert ("scipy" in engines) == has_scipy
++    assert ("h5netcdf" in engines) == has_h5netcdf
++    assert ("netcdf4" in engines) == has_netCDF4
++    assert ("pseudonetcdf" in engines) == has_pseudonetcdf
++    assert ("pydap" in engines) == has_pydap
++    assert ("zarr" in engines) == has_zarr
++    assert ("pynio" in engines) == has_pynio
++    assert "store" in engines
++
++
++def test_refresh_engines() -> None:
++    from xarray.backends import list_engines, refresh_engines
++
++    EntryPointMock1 = mock.MagicMock()
++    EntryPointMock1.name = "test1"
++    EntryPointMock1.load.return_value = DummyBackendEntrypoint1
++
++    if sys.version_info >= (3, 10):
++        return_value = EntryPoints([EntryPointMock1])
++    else:
++        return_value = {"xarray.backends": [EntryPointMock1]}
++
++    with mock.patch("xarray.backends.plugins.entry_points", return_value=return_value):
++        list_engines.cache_clear()
++        engines = list_engines()
++    assert "test1" in engines
++    assert isinstance(engines["test1"], DummyBackendEntrypoint1)
++
++    EntryPointMock2 = mock.MagicMock()
++    EntryPointMock2.name = "test2"
++    EntryPointMock2.load.return_value = DummyBackendEntrypoint2
++
++    if sys.version_info >= (3, 10):
++        return_value2 = EntryPoints([EntryPointMock2])
++    else:
++        return_value2 = {"xarray.backends": [EntryPointMock2]}
++
++    with mock.patch("xarray.backends.plugins.entry_points", return_value=return_value2):
++        refresh_engines()
++        engines = list_engines()
++    assert "test1" not in engines
++    assert "test2" in engines
++    assert isinstance(engines["test2"], DummyBackendEntrypoint2)
++
++    # reset to original
++    refresh_engines()
+
+diff --git a/xarray/tests/test_utils.py b/xarray/tests/test_utils.py
+index 0f6f353..36f62fa 100644
+--- a/xarray/tests/test_utils.py
++++ b/xarray/tests/test_utils.py
+@@ -23,11 +23,13 @@ class TestAlias:
+ 
+ 
+ @pytest.mark.parametrize(
+-    "a, b, expected", [["a", "b", np.array(["a", "b"])], [1, 2, pd.Index([1, 2])]]
++    ["a", "b", "expected"],
++    [
++        [np.array(["a"]), np.array(["b"]), np.array(["a", "b"])],
++        [np.array([1], dtype="int64"), np.array([2], dtype="int64"), pd.Index([1, 2])],
++    ],
+ )
+ def test_maybe_coerce_to_str(a, b, expected):
+-    a = np.array([a])
+-    b = np.array([b])
+     index = pd.Index(a).append(pd.Index(b))
+ 
+     actual = utils.maybe_coerce_to_str(index, [a, b])
+
+diff --git a/xarray/tests/test_variable.py b/xarray/tests/test_variable.py
+index f656818..f9fa79d 100644
+--- a/xarray/tests/test_variable.py
++++ b/xarray/tests/test_variable.py
+@@ -204,6 +204,7 @@ class VariableSubclassobjects:
+         x = self.cls(["x"], [value])
+         self._assertIndexedLikeNDArray(x, value, dtype)
+ 
++    @pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+     def test_index_0d_datetime(self):
+         d = datetime(2000, 1, 1)
+         x = self.cls(["x"], [d])
+@@ -215,6 +216,7 @@ class VariableSubclassobjects:
+         x = self.cls(["x"], pd.DatetimeIndex([d]))
+         self._assertIndexedLikeNDArray(x, np.datetime64(d), "datetime64[ns]")
+ 
++    @pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+     def test_index_0d_timedelta64(self):
+         td = timedelta(hours=1)
+ 
+@@ -275,6 +277,7 @@ class VariableSubclassobjects:
+         expected = np.datetime64("2000-01-01", "ns")
+         assert x[0].values == expected
+ 
++    @pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+     def test_datetime64_conversion(self):
+         times = pd.date_range("2000-01-01", periods=3)
+         for values, preserve_source in [
+@@ -290,6 +293,7 @@ class VariableSubclassobjects:
+             same_source = source_ndarray(v.values) is source_ndarray(values)
+             assert preserve_source == same_source
+ 
++    @pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+     def test_timedelta64_conversion(self):
+         times = pd.timedelta_range(start=0, periods=3)
+         for values, preserve_source in [
+@@ -310,6 +314,7 @@ class VariableSubclassobjects:
+         actual = self.cls("x", data)
+         assert actual.dtype == data.dtype
+ 
++    @pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+     def test_datetime64_valid_range(self):
+         data = np.datetime64("1250-01-01", "us")
+         pderror = pd.errors.OutOfBoundsDatetime
+@@ -317,6 +322,7 @@ class VariableSubclassobjects:
+             self.cls(["t"], [data])
+ 
+     @pytest.mark.xfail(reason="pandas issue 36615")
++    @pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+     def test_timedelta64_valid_range(self):
+         data = np.timedelta64("200000", "D")
+         pderror = pd.errors.OutOfBoundsTimedelta
+@@ -455,6 +461,23 @@ class VariableSubclassobjects:
+             assert_identical(expected.to_base_variable(), actual.to_base_variable())
+             assert expected.encoding == actual.encoding
+ 
++    def test_reset_encoding(self) -> None:
++        encoding1 = {"scale_factor": 1}
++        # encoding set via cls constructor
++        v1 = self.cls(["a"], [0, 1, 2], encoding=encoding1)
++        assert v1.encoding == encoding1
++        v2 = v1.reset_encoding()
++        assert v1.encoding == encoding1
++        assert v2.encoding == {}
++
++        # encoding set via setter
++        encoding3 = {"scale_factor": 10}
++        v3 = self.cls(["a"], [0, 1, 2], encoding=encoding3)
++        assert v3.encoding == encoding3
++        v4 = v3.reset_encoding()
++        assert v3.encoding == encoding3
++        assert v4.encoding == {}
++
+     def test_concat(self):
+         x = np.arange(5)
+         y = np.arange(5, 10)
+@@ -1062,6 +1085,7 @@ class TestVariable(VariableSubclassobjects):
+         v = IndexVariable("x", np.arange(5))
+         assert 2 == v.searchsorted(2)
+ 
++    @pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+     def test_datetime64_conversion_scalar(self):
+         expected = np.datetime64("2000-01-01", "ns")
+         for values in [
+@@ -1074,6 +1098,7 @@ class TestVariable(VariableSubclassobjects):
+             assert v.values == expected
+             assert v.values.dtype == np.dtype("datetime64[ns]")
+ 
++    @pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+     def test_timedelta64_conversion_scalar(self):
+         expected = np.timedelta64(24 * 60 * 60 * 10**9, "ns")
+         for values in [
+@@ -1100,6 +1125,7 @@ class TestVariable(VariableSubclassobjects):
+         assert v.dtype == np.dtype("datetime64[ns]")
+         assert v.values == np.datetime64("2000-01-01", "ns")
+ 
++    @pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+     def test_0d_timedelta(self):
+         for td in [pd.to_timedelta("1s"), np.timedelta64(1, "s")]:
+             v = Variable([], td)
+@@ -1538,6 +1564,7 @@ class TestVariable(VariableSubclassobjects):
+             v.transpose(..., "not_a_dim", missing_dims="warn")
+             assert_identical(expected_ell, actual)
+ 
++    @pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+     def test_transpose_0d(self):
+         for value in [
+             3.5,
+@@ -2201,9 +2228,13 @@ class TestVariable(VariableSubclassobjects):
+         assert new.attrs == _attrs
+ 
+ 
++def _init_dask_variable(*args, **kwargs):
++    return Variable(*args, **kwargs).chunk()
++
++
+ @requires_dask
+ class TestVariableWithDask(VariableSubclassobjects):
+-    cls = staticmethod(lambda *args: Variable(*args).chunk())
++    cls = staticmethod(_init_dask_variable)
+ 
+     def test_chunk(self):
+         unblocked = Variable(["dim_0", "dim_1"], np.ones((3, 4)))
+@@ -2519,6 +2550,7 @@ class TestAsCompatibleData:
+         assert_array_equal(expected, actual)
+         assert np.dtype(float) == actual.dtype
+ 
++    @pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+     def test_datetime(self):
+         expected = np.datetime64("2000-01-01")
+         actual = as_compatible_data(expected)

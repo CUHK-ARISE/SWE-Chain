@@ -1,0 +1,3330 @@
+diff --git a/ci/minimum_versions.py b/ci/minimum_versions.py
+deleted file mode 100644
+index 21123bf..0000000
+--- a/ci/minimum_versions.py
++++ /dev/null
+@@ -1,335 +0,0 @@
+-import asyncio
+-import bisect
+-import datetime
+-import pathlib
+-import sys
+-from dataclasses import dataclass, field
+-
+-import rich_click as click
+-import yaml
+-from dateutil.relativedelta import relativedelta
+-from rattler import Gateway, Version
+-from rich.console import Console
+-from rich.panel import Panel
+-from rich.style import Style
+-from rich.table import Column, Table
+-from tlz.functoolz import curry, pipe
+-from tlz.itertoolz import concat, groupby
+-
+-click.rich_click.SHOW_ARGUMENTS = True
+-
+-channels = ["conda-forge"]
+-platforms = ["noarch", "linux-64"]
+-# these packages don't fail the CI, but will be printed in the report
+-ignore_failure_packages = [
+-    # remove when we can pin to pydap 3.5.1 without error
+-    "pydap",
+-]
+-# these packages are completely ignored
+-ignored_packages = [
+-    "coveralls",
+-    "pip",
+-    "pytest",
+-    "pytest-asyncio",
+-    "pytest-cov",
+-    "pytest-env",
+-    "pytest-mypy-plugins",
+-    "pytest-timeout",
+-    "pytest-xdist",
+-    "hypothesis",
+-]
+-
+-
+-@dataclass
+-class Policy:
+-    package_months: dict
+-    default_months: int
+-    overrides: dict[str, Version] = field(default_factory=dict)
+-
+-    def minimum_version(self, package_name, releases):
+-        if (override := self.overrides.get(package_name)) is not None:
+-            return override
+-
+-        policy_months = self.package_months.get(package_name, self.default_months)
+-        today = datetime.date.today()
+-
+-        cutoff_date = today - relativedelta(months=policy_months)
+-
+-        index = bisect.bisect_left(
+-            releases, cutoff_date, key=lambda x: x.timestamp.date()
+-        )
+-        return releases[index - 1 if index > 0 else 0]
+-
+-
+-@dataclass
+-class Spec:
+-    name: str
+-    version: Version | None
+-
+-    @classmethod
+-    def parse(cls, spec_text):
+-        warnings = []
+-        if ">" in spec_text or "<" in spec_text:
+-            warnings.append(
+-                f"package should be pinned with an exact version: {spec_text!r}"
+-            )
+-
+-            spec_text = spec_text.replace(">", "").replace("<", "")
+-
+-        if "=" in spec_text:
+-            name, version_text = spec_text.split("=", maxsplit=1)
+-            version = Version(version_text)
+-            segments = version.segments()
+-
+-            if len(segments) != 2 or (len(segments) == 3 and segments[2] != 0):
+-                warnings.append(
+-                    f"package should be pinned to a minor version (got {version})"
+-                )
+-        else:
+-            name = spec_text
+-            version = None
+-
+-        return cls(name, version), (name, warnings)
+-
+-
+-@dataclass(order=True)
+-class Release:
+-    version: Version
+-    build_number: int
+-    timestamp: datetime.datetime = field(compare=False)
+-
+-    @classmethod
+-    def from_repodata_record(cls, repo_data):
+-        return cls(
+-            version=repo_data.version,
+-            build_number=repo_data.build_number,
+-            timestamp=repo_data.timestamp,
+-        )
+-
+-
+-def parse_environment(text):
+-    env = yaml.safe_load(text)
+-
+-    specs = []
+-    warnings = []
+-    for dep in env["dependencies"]:
+-        spec, warnings_ = Spec.parse(dep)
+-
+-        warnings.append(warnings_)
+-        specs.append(spec)
+-
+-    return specs, warnings
+-
+-
+-def is_preview(version):
+-    candidates = ["rc", "beta", "alpha"]
+-
+-    *_, last_segment = version.segments()
+-    return any(candidate in last_segment for candidate in candidates)
+-
+-
+-def group_packages(records):
+-    groups = groupby(lambda r: r.name.normalized, records)
+-    return {
+-        name: sorted(map(Release.from_repodata_record, group))
+-        for name, group in groups.items()
+-    }
+-
+-
+-def filter_releases(predicate, releases):
+-    return {
+-        name: [r for r in records if predicate(r)] for name, records in releases.items()
+-    }
+-
+-
+-def deduplicate_releases(package_info):
+-    def deduplicate(releases):
+-        return min(releases, key=lambda p: p.timestamp)
+-
+-    return {
+-        name: list(map(deduplicate, groupby(lambda p: p.version, group).values()))
+-        for name, group in package_info.items()
+-    }
+-
+-
+-def find_policy_versions(policy, releases):
+-    return {
+-        name: policy.minimum_version(name, package_releases)
+-        for name, package_releases in releases.items()
+-    }
+-
+-
+-def is_suitable_release(release):
+-    if release.timestamp is None:
+-        return False
+-
+-    segments = release.version.extend_to_length(3).segments()
+-
+-    return segments[2] == [0]
+-
+-
+-def lookup_spec_release(spec, releases):
+-    version = spec.version.extend_to_length(3)
+-
+-    return releases[spec.name][version]
+-
+-
+-def compare_versions(environments, policy_versions):
+-    status = {}
+-    for env, specs in environments.items():
+-        env_status = any(
+-            (
+-                (spec.version > policy_versions[spec.name].version)
+-                and (spec.name not in ignore_failure_packages)
+-            )
+-            for spec in specs
+-        )
+-        status[env] = env_status
+-    return status
+-
+-
+-def version_comparison_symbol(required, policy):
+-    if required < policy:
+-        return "<"
+-    elif required > policy:
+-        return ">"
+-    else:
+-        return "="
+-
+-
+-def format_bump_table(specs, policy_versions, releases, warnings):
+-    table = Table(
+-        Column("Package", width=20),
+-        Column("Required", width=8),
+-        "Required (date)",
+-        Column("Policy", width=8),
+-        "Policy (date)",
+-        "Status",
+-    )
+-
+-    heading_style = Style(color="#ff0000", bold=True)
+-    warning_style = Style(color="#ffff00", bold=True)
+-    styles = {
+-        ">": Style(color="#ff0000", bold=True),
+-        "=": Style(color="#008700", bold=True),
+-        "<": Style(color="#d78700", bold=True),
+-    }
+-
+-    for spec in specs:
+-        policy_release = policy_versions[spec.name]
+-        policy_version = policy_release.version.with_segments(0, 2)
+-        policy_date = policy_release.timestamp
+-
+-        required_version = spec.version
+-        required_date = lookup_spec_release(spec, releases).timestamp
+-
+-        status = version_comparison_symbol(required_version, policy_version)
+-        style = styles[status]
+-
+-        table.add_row(
+-            spec.name,
+-            str(required_version),
+-            f"{required_date:%Y-%m-%d}",
+-            str(policy_version),
+-            f"{policy_date:%Y-%m-%d}",
+-            status,
+-            style=style,
+-        )
+-
+-    grid = Table.grid(expand=True, padding=(0, 2))
+-    grid.add_column(style=heading_style, vertical="middle")
+-    grid.add_column()
+-    grid.add_row("Version summary", table)
+-
+-    if any(warnings.values()):
+-        warning_table = Table(width=table.width, expand=True)
+-        warning_table.add_column("Package")
+-        warning_table.add_column("Warning")
+-
+-        for package, messages in warnings.items():
+-            if not messages:
+-                continue
+-            warning_table.add_row(package, messages[0], style=warning_style)
+-            for message in messages[1:]:
+-                warning_table.add_row("", message, style=warning_style)
+-
+-        grid.add_row("Warnings", warning_table)
+-
+-    return grid
+-
+-
+-@click.command()
+-@click.argument(
+-    "environment_paths",
+-    type=click.Path(exists=True, readable=True, path_type=pathlib.Path),
+-    nargs=-1,
+-)
+-def main(environment_paths):
+-    console = Console()
+-
+-    parsed_environments = {
+-        path.stem: parse_environment(path.read_text()) for path in environment_paths
+-    }
+-
+-    warnings = {
+-        env: dict(warnings_) for env, (_, warnings_) in parsed_environments.items()
+-    }
+-    environments = {
+-        env: [spec for spec in specs if spec.name not in ignored_packages]
+-        for env, (specs, _) in parsed_environments.items()
+-    }
+-
+-    all_packages = list(
+-        dict.fromkeys(spec.name for spec in concat(environments.values()))
+-    )
+-
+-    policy_months = {
+-        "python": 30,
+-        "numpy": 18,
+-    }
+-    policy_months_default = 12
+-    overrides = {}
+-
+-    policy = Policy(
+-        policy_months, default_months=policy_months_default, overrides=overrides
+-    )
+-
+-    gateway = Gateway()
+-    query = gateway.query(channels, platforms, all_packages, recursive=False)
+-    records = asyncio.run(query)
+-
+-    package_releases = pipe(
+-        records,
+-        concat,
+-        group_packages,
+-        curry(filter_releases, lambda r: r.timestamp is not None),
+-        deduplicate_releases,
+-    )
+-    policy_versions = pipe(
+-        package_releases,
+-        curry(filter_releases, is_suitable_release),
+-        curry(find_policy_versions, policy),
+-    )
+-    status = compare_versions(environments, policy_versions)
+-
+-    release_lookup = {
+-        n: {r.version: r for r in releases} for n, releases in package_releases.items()
+-    }
+-    grids = {
+-        env: format_bump_table(specs, policy_versions, release_lookup, warnings[env])
+-        for env, specs in environments.items()
+-    }
+-    root_grid = Table.grid()
+-    root_grid.add_column()
+-
+-    for env, grid in grids.items():
+-        root_grid.add_row(Panel(grid, title=env, expand=True))
+-
+-    console.print(root_grid)
+-
+-    status_code = 1 if any(status.values()) else 0
+-    sys.exit(status_code)
+-
+-
+-if __name__ == "__main__":
+-    main()
+
+diff --git a/conftest.py b/conftest.py
+index 2006964..ed197c2 100644
+--- a/conftest.py
++++ b/conftest.py
+@@ -41,6 +41,12 @@ def pytest_collection_modifyitems(items):
+             item.add_marker(pytest.mark.mypy)
+ 
+ 
++@pytest.fixture(autouse=True)
++def set_zarr_v3_api(monkeypatch):
++    """Set ZARR_V3_EXPERIMENTAL_API environment variable for all tests."""
++    monkeypatch.setenv("ZARR_V3_EXPERIMENTAL_API", "1")
++
++
+ @pytest.fixture(autouse=True)
+ def add_standard_imports(doctest_namespace, tmpdir):
+     import numpy as np
+
+diff --git a/xarray/__init__.py b/xarray/__init__.py
+index 04fb5b0..7901fff 100644
+--- a/xarray/__init__.py
++++ b/xarray/__init__.py
+@@ -4,6 +4,7 @@ from xarray import coders, groupers, indexes, testing, tutorial, ufuncs
+ from xarray.backends.api import (
+     load_dataarray,
+     load_dataset,
++    load_datatree,
+     open_dataarray,
+     open_dataset,
+     open_datatree,
+@@ -96,6 +97,7 @@ __all__ = (  # noqa: RUF022
+     "infer_freq",
+     "load_dataarray",
+     "load_dataset",
++    "load_datatree",
+     "map_blocks",
+     "map_over_datasets",
+     "merge",
+
+diff --git a/xarray/backends/api.py b/xarray/backends/api.py
+index af1f573..48d1a4c 100644
+--- a/xarray/backends/api.py
++++ b/xarray/backends/api.py
+@@ -17,7 +17,6 @@ from numbers import Number
+ from typing import (
+     TYPE_CHECKING,
+     Any,
+-    Final,
+     Literal,
+     TypeVar,
+     Union,
+@@ -31,13 +30,14 @@ from xarray import backends, conventions
+ from xarray.backends import plugins
+ from xarray.backends.common import (
+     AbstractDataStore,
++    AbstractWritableDataStore,
+     ArrayWriter,
+     BytesIOProxy,
+     T_PathFileOrDataStore,
+     _find_absolute_paths,
+     _normalize_path,
+ )
+-from xarray.backends.locks import _get_scheduler
++from xarray.backends.locks import get_dask_scheduler
+ from xarray.coders import CFDatetimeCoder, CFTimedeltaCoder
+ from xarray.core import dtypes, indexing
+ from xarray.core.coordinates import Coordinates
+@@ -97,69 +97,44 @@ if TYPE_CHECKING:
+ DATAARRAY_NAME = "__xarray_dataarray_name__"
+ DATAARRAY_VARIABLE = "__xarray_dataarray_variable__"
+ 
+-ENGINES = {
+-    "netcdf4": backends.NetCDF4DataStore.open,
+-    "scipy": backends.ScipyDataStore,
+-    "pydap": backends.PydapDataStore.open,
+-    "h5netcdf": backends.H5NetCDFStore.open,
+-    "zarr": backends.ZarrStore.open_group,
+-}
+-
+-
+-def _get_default_engine_remote_uri() -> Literal["netcdf4", "pydap"]:
+-    engine: Literal["netcdf4", "pydap"]
+-    try:
+-        import netCDF4  # noqa: F401
+-
+-        engine = "netcdf4"
+-    except ImportError:  # pragma: no cover
+-        try:
+-            import pydap  # noqa: F401
+-
+-            engine = "pydap"
+-        except ImportError as err:
+-            raise ValueError(
+-                "netCDF4 or pydap is required for accessing remote datasets via OPeNDAP"
+-            ) from err
+-    return engine
+-
+ 
+-def _get_default_engine_gz() -> Literal["scipy"]:
+-    try:
+-        import scipy  # noqa: F401
++def get_default_netcdf_write_engine(
++    format: T_NetcdfTypes | None,
++    to_fileobject_or_memoryview: bool,
++) -> Literal["netcdf4", "h5netcdf", "scipy"]:
++    """Return the default netCDF library to use for writing a netCDF file."""
++    module_names = {
++        "netcdf4": "netCDF4",
++        "scipy": "scipy",
++        "h5netcdf": "h5netcdf",
++    }
+ 
+-        engine: Final = "scipy"
+-    except ImportError as err:  # pragma: no cover
+-        raise ValueError("scipy is required for accessing .gz files") from err
+-    return engine
++    candidates = list(plugins.NETCDF_BACKENDS_ORDER)
+ 
++    if format is not None:
++        if format.upper().startswith("NETCDF3"):
++            candidates.remove("h5netcdf")
++        elif format.upper().startswith("NETCDF4"):
++            candidates.remove("scipy")
++        else:
++            raise ValueError(f"unexpected {format=}")
+ 
+-def _get_default_engine_netcdf() -> Literal["netcdf4", "h5netcdf", "scipy"]:
+-    candidates: list[tuple[str, str]] = [
+-        ("netcdf4", "netCDF4"),
+-        ("h5netcdf", "h5netcdf"),
+-        ("scipy", "scipy.io.netcdf"),
+-    ]
++    if to_fileobject_or_memoryview:
++        candidates.remove("netcdf4")
+ 
+-    for engine, module_name in candidates:
++    for engine in candidates:
++        module_name = module_names[engine]
+         if importlib.util.find_spec(module_name) is not None:
+             return cast(Literal["netcdf4", "h5netcdf", "scipy"], engine)
+ 
++    format_str = f" with {format=}" if format is not None else ""
++    libraries = ", ".join(module_names[c] for c in candidates)
+     raise ValueError(
+-        "cannot read or write NetCDF files because none of "
+-        "'netCDF4-python', 'h5netcdf', or 'scipy' are installed"
++        f"cannot write NetCDF files{format_str} because none of the suitable "
++        f"backend libraries ({libraries}) are installed"
+     )
+ 
+ 
+-def _get_default_engine(path: str, allow_remote: bool = False) -> T_NetcdfEngine:
+-    if allow_remote and is_remote_uri(path):
+-        return _get_default_engine_remote_uri()  # type: ignore[return-value]
+-    elif path.endswith(".gz"):
+-        return _get_default_engine_gz()
+-    else:
+-        return _get_default_engine_netcdf()
+-
+-
+ def _validate_dataset_names(dataset: Dataset) -> None:
+     """DataArray.name and Dataset keys must be a string or None"""
+ 
+@@ -262,7 +237,10 @@ def _sanitize_unlimited_dims(dataset, unlimited_dims):
+                 f"but not part of current dataset dimensions. "
+                 f"Consider removing {undeclared_dims!r} from {msg_origin!r}."
+             )
+-            raise ValueError(msg)
++            if msg_origin == "unlimited_dims-kwarg":
++                raise ValueError(msg)
++            else:
++                emit_user_level_warning(msg)
+         return unlimited_dims
+ 
+ 
+@@ -304,21 +282,27 @@ def _protect_dataset_variables_inplace(dataset: Dataset, cache: bool) -> None:
+ 
+ def _protect_datatree_variables_inplace(tree: DataTree, cache: bool) -> None:
+     for node in tree.subtree:
+-        _protect_dataset_variables_inplace(node, cache)
++        _protect_dataset_variables_inplace(node.dataset, cache)
+ 
+ 
+-def _finalize_store(write, store):
++def _finalize_store(writes, store):
+     """Finalize this store by explicitly syncing and closing"""
+-    del write  # ensure writing is done first
++    del writes  # ensure writing is done first
+     store.close()
+ 
+ 
++def delayed_close_after_writes(writes, store):
++    import dask
++
++    return dask.delayed(_finalize_store)(writes, store)
++
++
+ def _multi_file_closer(closers):
+     for closer in closers:
+         closer()
+ 
+ 
+-def load_dataset(filename_or_obj, **kwargs) -> Dataset:
++def load_dataset(filename_or_obj: T_PathFileOrDataStore, **kwargs) -> Dataset:
+     """Open, load into memory, and close a Dataset from a file or file-like
+     object.
+ 
+@@ -344,7 +328,7 @@ def load_dataset(filename_or_obj, **kwargs) -> Dataset:
+         return ds.load()
+ 
+ 
+-def load_dataarray(filename_or_obj, **kwargs):
++def load_dataarray(filename_or_obj: T_PathFileOrDataStore, **kwargs) -> DataArray:
+     """Open, load into memory, and close a DataArray from a file or file-like
+     object containing a single data variable.
+ 
+@@ -370,6 +354,32 @@ def load_dataarray(filename_or_obj, **kwargs):
+         return da.load()
+ 
+ 
++def load_datatree(filename_or_obj: T_PathFileOrDataStore, **kwargs) -> DataTree:
++    """Open, load into memory, and close a DataTree from a file or file-like
++    object.
++
++    This is a thin wrapper around :py:meth:`~xarray.open_datatree`. It differs
++    from `open_datatree` in that it loads the DataTree into memory, closes the
++    file, and returns the DataTree. In contrast, `open_datatree` keeps the file
++    handle open and lazy loads its contents. All parameters are passed directly
++    to `open_datatree`. See that documentation for further details.
++
++    Returns
++    -------
++    datatree : DataTree
++        The newly created DataTree.
++
++    See Also
++    --------
++    open_datatree
++    """
++    if "cache" in kwargs:
++        raise TypeError("cache has no effect in this context")
++
++    with open_datatree(filename_or_obj, **kwargs) as dt:
++        return dt.load()
++
++
+ def _chunk_ds(
+     backend_ds,
+     filename_or_obj,
+@@ -1855,6 +1865,39 @@ WRITEABLE_STORES: dict[T_NetcdfEngine, Callable] = {
+ }
+ 
+ 
++def get_writable_netcdf_store(
++    target,
++    engine: T_NetcdfEngine,
++    *,
++    format: T_NetcdfTypes | None,
++    mode: NetcdfWriteModes,
++    autoclose: bool,
++    invalid_netcdf: bool,
++    auto_complex: bool | None,
++) -> AbstractWritableDataStore:
++    """Create a store for writing to a netCDF file."""
++    try:
++        store_open = WRITEABLE_STORES[engine]
++    except KeyError as err:
++        raise ValueError(f"unrecognized engine for to_netcdf: {engine!r}") from err
++
++    if format is not None:
++        format = format.upper()  # type: ignore[assignment]
++
++    kwargs = dict(autoclose=True) if autoclose else {}
++    if invalid_netcdf:
++        if engine == "h5netcdf":
++            kwargs["invalid_netcdf"] = invalid_netcdf
++        else:
++            raise ValueError(
++                f"unrecognized option 'invalid_netcdf' for engine {engine}"
++            )
++    if auto_complex is not None:
++        kwargs["auto_complex"] = auto_complex
++
++    return store_open(target, mode=mode, format=format, **kwargs)
++
++
+ # multifile=True returns writer and datastore
+ @overload
+ def to_netcdf(
+@@ -1889,7 +1932,7 @@ def to_netcdf(
+     multifile: Literal[False] = False,
+     invalid_netcdf: bool = False,
+     auto_complex: bool | None = None,
+-) -> bytes | memoryview: ...
++) -> memoryview: ...
+ 
+ 
+ # compute=False returns dask.Delayed
+@@ -1982,7 +2025,7 @@ def to_netcdf(
+     multifile: bool = False,
+     invalid_netcdf: bool = False,
+     auto_complex: bool | None = None,
+-) -> tuple[ArrayWriter, AbstractDataStore] | bytes | memoryview | Delayed | None: ...
++) -> tuple[ArrayWriter, AbstractDataStore] | memoryview | Delayed | None: ...
+ 
+ 
+ def to_netcdf(
+@@ -1998,7 +2041,7 @@ def to_netcdf(
+     multifile: bool = False,
+     invalid_netcdf: bool = False,
+     auto_complex: bool | None = None,
+-) -> tuple[ArrayWriter, AbstractDataStore] | bytes | memoryview | Delayed | None:
++) -> tuple[ArrayWriter, AbstractDataStore] | memoryview | Delayed | None:
+     """This function creates an appropriate datastore for writing a dataset to
+     disk as a netCDF file
+ 
+@@ -2006,33 +2049,14 @@ def to_netcdf(
+ 
+     The ``multifile`` argument is only for the private use of save_mfdataset.
+     """
+-    if isinstance(path_or_file, os.PathLike):
+-        path_or_file = os.fspath(path_or_file)
+-
+     if encoding is None:
+         encoding = {}
+ 
+-    if isinstance(path_or_file, str):
+-        if engine is None:
+-            engine = _get_default_engine(path_or_file)
+-        path_or_file = _normalize_path(path_or_file)
+-    else:
+-        # writing to bytes/memoryview or a file-like object
+-        if engine is None:
+-            # TODO: only use 'scipy' if format is None or a netCDF3 format
+-            engine = "scipy"
+-        elif engine not in ("scipy", "h5netcdf"):
+-            raise ValueError(
+-                "invalid engine for creating bytes/memoryview or writing to a "
+-                f"file-like object with to_netcdf: {engine!r}. Only "
+-                "engine=None, engine='scipy' and engine='h5netcdf' is "
+-                "supported."
+-            )
+-        if not compute:
+-            raise NotImplementedError(
+-                "to_netcdf() with compute=False is not yet implemented when "
+-                "returning bytes"
+-            )
++    path_or_file = _normalize_path(path_or_file)
++
++    if engine is None:
++        to_fileobject_or_memoryview = not isinstance(path_or_file, str)
++        engine = get_default_netcdf_write_engine(format, to_fileobject_or_memoryview)
+ 
+     # validate Dataset keys, DataArray names, and attr keys/values
+     _validate_dataset_names(dataset)
+@@ -2040,16 +2064,8 @@ def to_netcdf(
+     # sanitize unlimited_dims
+     unlimited_dims = _sanitize_unlimited_dims(dataset, unlimited_dims)
+ 
+-    try:
+-        store_open = WRITEABLE_STORES[engine]
+-    except KeyError as err:
+-        raise ValueError(f"unrecognized engine for to_netcdf: {engine!r}") from err
+-
+-    if format is not None:
+-        format = format.upper()  # type: ignore[assignment]
+-
+     # handle scheduler specific logic
+-    scheduler = _get_scheduler()
++    scheduler = get_dask_scheduler()
+     have_chunks = any(v.chunks is not None for v in dataset.variables.values())
+ 
+     autoclose = have_chunks and scheduler in ["distributed", "multiprocessing"]
+@@ -2060,22 +2076,26 @@ def to_netcdf(
+         )
+ 
+     if path_or_file is None:
++        if not compute:
++            raise NotImplementedError(
++                "to_netcdf() with compute=False is not yet implemented when "
++                "returning a memoryview"
++            )
+         target = BytesIOProxy()
+     else:
+         target = path_or_file  # type: ignore[assignment]
+ 
+-    kwargs = dict(autoclose=True) if autoclose else {}
+-    if invalid_netcdf:
+-        if engine == "h5netcdf":
+-            kwargs["invalid_netcdf"] = invalid_netcdf
+-        else:
+-            raise ValueError(
+-                f"unrecognized option 'invalid_netcdf' for engine {engine}"
+-            )
+-    if auto_complex is not None:
+-        kwargs["auto_complex"] = auto_complex
+-
+-    store = store_open(target, mode, format, group, **kwargs)
++    store = get_writable_netcdf_store(
++        target,
++        engine,
++        mode=mode,
++        format=format,
++        autoclose=autoclose,
++        invalid_netcdf=invalid_netcdf,
++        auto_complex=auto_complex,
++    )
++    if group is not None:
++        store = store.get_child_store(group)
+ 
+     writer = ArrayWriter()
+ 
+@@ -2096,17 +2116,18 @@ def to_netcdf(
+         writes = writer.sync(compute=compute)
+ 
+     finally:
+-        if not multifile and compute:  # type: ignore[redundant-expr]
+-            store.close()
++        if not multifile:
++            if compute:
++                store.close()
++            else:
++                store.sync()
+ 
+     if path_or_file is None:
+         assert isinstance(target, BytesIOProxy)  # created in this function
+-        return target.getvalue_or_getbuffer()
++        return target.getbuffer()
+ 
+     if not compute:
+-        import dask
+-
+-        return dask.delayed(_finalize_store)(writes, store)
++        return delayed_close_after_writes(writes, store)
+ 
+     return None
+ 
+@@ -2262,20 +2283,71 @@ def save_mfdataset(
+     try:
+         writes = [w.sync(compute=compute) for w in writers]
+     finally:
+-        if compute:
+-            for store in stores:
++        for store in stores:
++            if compute:
+                 store.close()
++            else:
++                store.sync()
+ 
+     if not compute:
+         import dask
+ 
+         return dask.delayed(
+-            list(
+-                starmap(dask.delayed(_finalize_store), zip(writes, stores, strict=True))
+-            )
++            list(starmap(delayed_close_after_writes, zip(writes, stores, strict=True)))
+         )
+ 
+ 
++def get_writable_zarr_store(
++    store: ZarrStoreLike | None = None,
++    *,
++    chunk_store: MutableMapping | str | os.PathLike | None = None,
++    mode: ZarrWriteModes | None = None,
++    synchronizer=None,
++    group: str | None = None,
++    consolidated: bool | None = None,
++    append_dim: Hashable | None = None,
++    region: Mapping[str, slice | Literal["auto"]] | Literal["auto"] | None = None,
++    safe_chunks: bool = True,
++    align_chunks: bool = False,
++    storage_options: dict[str, str] | None = None,
++    zarr_version: int | None = None,
++    zarr_format: int | None = None,
++    write_empty_chunks: bool | None = None,
++) -> backends.ZarrStore:
++    """Create a store for writing to Zarr."""
++    from xarray.backends.zarr import _choose_default_mode, _get_mappers
++
++    kwargs, mapper, chunk_mapper = _get_mappers(
++        storage_options=storage_options, store=store, chunk_store=chunk_store
++    )
++    mode = _choose_default_mode(mode=mode, append_dim=append_dim, region=region)
++
++    if mode == "r+":
++        already_consolidated = consolidated
++        consolidate_on_close = False
++    else:
++        already_consolidated = False
++        consolidate_on_close = consolidated or consolidated is None
++
++    return backends.ZarrStore.open_group(
++        store=mapper,
++        mode=mode,
++        synchronizer=synchronizer,
++        group=group,
++        consolidated=already_consolidated,
++        consolidate_on_close=consolidate_on_close,
++        chunk_store=chunk_mapper,
++        append_dim=append_dim,
++        write_region=region,
++        safe_chunks=safe_chunks,
++        align_chunks=align_chunks,
++        zarr_version=zarr_version,
++        zarr_format=zarr_format,
++        write_empty=write_empty_chunks,
++        **kwargs,
++    )
++
++
+ # compute=True returns ZarrStore
+ @overload
+ def to_zarr(
+@@ -2350,7 +2422,6 @@ def to_zarr(
+ 
+     See `Dataset.to_zarr` for full API docs.
+     """
+-    from xarray.backends.zarr import _choose_default_mode, _get_mappers
+ 
+     # validate Dataset keys, DataArray names
+     _validate_dataset_names(dataset)
+@@ -2365,53 +2436,39 @@ def to_zarr(
+     if encoding is None:
+         encoding = {}
+ 
+-    kwargs, mapper, chunk_mapper = _get_mappers(
+-        storage_options=storage_options, store=store, chunk_store=chunk_store
+-    )
+-    mode = _choose_default_mode(mode=mode, append_dim=append_dim, region=region)
+-
+-    if mode == "r+":
+-        already_consolidated = consolidated
+-        consolidate_on_close = False
+-    else:
+-        already_consolidated = False
+-        consolidate_on_close = consolidated or consolidated is None
+-
+-    zstore = backends.ZarrStore.open_group(
+-        store=mapper,
++    zstore = get_writable_zarr_store(
++        store,
++        chunk_store=chunk_store,
+         mode=mode,
+         synchronizer=synchronizer,
+         group=group,
+-        consolidated=already_consolidated,
+-        consolidate_on_close=consolidate_on_close,
+-        chunk_store=chunk_mapper,
++        consolidated=consolidated,
+         append_dim=append_dim,
+-        write_region=region,
++        region=region,
+         safe_chunks=safe_chunks,
+         align_chunks=align_chunks,
++        storage_options=storage_options,
+         zarr_version=zarr_version,
+         zarr_format=zarr_format,
+-        write_empty=write_empty_chunks,
+-        **kwargs,
++        write_empty_chunks=write_empty_chunks,
+     )
+ 
+-    dataset = zstore._validate_and_autodetect_region(
+-        dataset,
+-    )
++    dataset = zstore._validate_and_autodetect_region(dataset)
+     zstore._validate_encoding(encoding)
+ 
+     writer = ArrayWriter()
+-    # TODO: figure out how to properly handle unlimited_dims
+-    dump_to_store(dataset, zstore, writer, encoding=encoding)
+-    writes = writer.sync(
+-        compute=compute, chunkmanager_store_kwargs=chunkmanager_store_kwargs
+-    )
+ 
+-    if compute:
+-        _finalize_store(writes, zstore)
+-    else:
+-        import dask
++    # TODO: figure out how to properly handle unlimited_dims
++    try:
++        dump_to_store(dataset, zstore, writer, encoding=encoding)
++        writes = writer.sync(
++            compute=compute, chunkmanager_store_kwargs=chunkmanager_store_kwargs
++        )
++    finally:
++        if compute:
++            zstore.close()
+ 
+-        return dask.delayed(_finalize_store)(writes, zstore)
++    if not compute:
++        return delayed_close_after_writes(writes, zstore)
+ 
+     return zstore
+
+diff --git a/xarray/backends/common.py b/xarray/backends/common.py
+index 5e9be75..a725fa2 100644
+--- a/xarray/backends/common.py
++++ b/xarray/backends/common.py
+@@ -11,7 +11,7 @@ from typing import (
+     TYPE_CHECKING,
+     Any,
+     ClassVar,
+-    Generic,
++    Self,
+     TypeVar,
+     Union,
+     overload,
+@@ -197,18 +197,13 @@ def _find_absolute_paths(
+     return _normalize_path_list(paths)
+ 
+ 
+-BytesOrMemory = TypeVar("BytesOrMemory", bytes, memoryview)
+-
+-
+ @dataclass
+-class BytesIOProxy(Generic[BytesOrMemory]):
+-    """Proxy object for a write that returns either bytes or a memoryview."""
++class BytesIOProxy:
++    """Proxy object for a write that a memoryview."""
+ 
+-    # TODO: remove this in favor of BytesIO when Dataset.to_netcdf() stops
+-    # returning bytes from the scipy engine
+-    getvalue: Callable[[], BytesOrMemory] | None = None
++    getvalue: Callable[[], memoryview] | None = None
+ 
+-    def getvalue_or_getbuffer(self) -> BytesOrMemory:
++    def getbuffer(self) -> memoryview:
+         """Get the value of this write as bytes or memory."""
+         if self.getvalue is None:
+             raise ValueError("must set getvalue before fetching value")
+@@ -312,7 +307,7 @@ class BackendArray(NdimSizeLenMixin, indexing.ExplicitlyIndexed):
+     __slots__ = ()
+ 
+     async def async_getitem(self, key: indexing.ExplicitIndexer) -> np.typing.ArrayLike:
+-        raise NotImplementedError("Backend does not not support asynchronous loading")
++        raise NotImplementedError("Backend does not support asynchronous loading")
+ 
+     def get_duck_array(self, dtype: np.typing.DTypeLike = None):
+         key = indexing.BasicIndexer((slice(None),) * self.ndim)
+@@ -326,6 +321,10 @@ class BackendArray(NdimSizeLenMixin, indexing.ExplicitlyIndexed):
+ class AbstractDataStore:
+     __slots__ = ()
+ 
++    def get_child_store(self, group: str) -> Self:  # pragma: no cover
++        """Get a store corresponding to the indicated child group."""
++        raise NotImplementedError()
++
+     def get_dimensions(self):  # pragma: no cover
+         raise NotImplementedError()
+ 
+@@ -606,6 +605,10 @@ class AbstractWritableDataStore(AbstractDataStore):
+                 is_unlimited = dim in unlimited_dims
+                 self.set_dimension(dim, length, is_unlimited)
+ 
++    def sync(self):
++        """Write all buffered data to disk."""
++        raise NotImplementedError()
++
+ 
+ def _infer_dtype(array, name=None):
+     """Given an object array with no missing values, infer its dtype from all elements."""
+
+diff --git a/xarray/backends/h5netcdf_.py b/xarray/backends/h5netcdf_.py
+index 2c8e3c2..01275d8 100644
+--- a/xarray/backends/h5netcdf_.py
++++ b/xarray/backends/h5netcdf_.py
+@@ -4,7 +4,7 @@ import functools
+ import io
+ import os
+ from collections.abc import Iterable
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING, Any, Self
+ 
+ import numpy as np
+ 
+@@ -150,6 +150,17 @@ class H5NetCDFStore(WritableCFDataStore):
+         self.lock = ensure_lock(lock)
+         self.autoclose = autoclose
+ 
++    def get_child_store(self, group: str) -> Self:
++        if self._group is not None:
++            group = os.path.join(self._group, group)
++        return type(self)(
++            self._manager,
++            group=group,
++            mode=self._mode,
++            lock=self.lock,
++            autoclose=self.autoclose,
++        )
++
+     @classmethod
+     def open(
+         cls,
+
+diff --git a/xarray/backends/locks.py b/xarray/backends/locks.py
+index c6a06dd..82d3e0b 100644
+--- a/xarray/backends/locks.py
++++ b/xarray/backends/locks.py
+@@ -134,7 +134,7 @@ def _get_lock_maker(scheduler=None):
+         raise KeyError(scheduler)
+ 
+ 
+-def _get_scheduler(get=None, collection=None) -> str | None:
++def get_dask_scheduler(get=None, collection=None) -> str | None:
+     """Determine the dask scheduler that is being used.
+ 
+     None is returned if no dask scheduler is active.
+@@ -184,7 +184,7 @@ def get_write_lock(key):
+     -------
+     Lock object that can be used like a threading.Lock object.
+     """
+-    scheduler = _get_scheduler()
++    scheduler = get_dask_scheduler()
+     lock_maker = _get_lock_maker(scheduler)
+     return lock_maker(key)
+ 
+
+diff --git a/xarray/backends/netCDF4_.py b/xarray/backends/netCDF4_.py
+index ecd652f..d6a37b0 100644
+--- a/xarray/backends/netCDF4_.py
++++ b/xarray/backends/netCDF4_.py
+@@ -5,7 +5,7 @@ import operator
+ import os
+ from collections.abc import Iterable
+ from contextlib import suppress
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING, Any, Self
+ 
+ import numpy as np
+ 
+@@ -401,6 +401,17 @@ class NetCDF4DataStore(WritableCFDataStore):
+         self.lock = ensure_lock(lock)
+         self.autoclose = autoclose
+ 
++    def get_child_store(self, group: str) -> Self:
++        if self._group is not None:
++            group = os.path.join(self._group, group)
++        return type(self)(
++            self._manager,
++            group=group,
++            mode=self._mode,
++            lock=self.lock,
++            autoclose=self.autoclose,
++        )
++
+     @classmethod
+     def open(
+         cls,
+@@ -730,6 +741,7 @@ class NetCDF4BackendEntrypoint(BackendEntrypoint):
+             clobber=clobber,
+             diskless=diskless,
+             persist=persist,
++            auto_complex=auto_complex,
+             lock=lock,
+             autoclose=autoclose,
+             **kwargs,
+@@ -769,6 +781,7 @@ class NetCDF4BackendEntrypoint(BackendEntrypoint):
+             clobber=clobber,
+             diskless=diskless,
+             persist=persist,
++            auto_complex=auto_complex,
+             lock=lock,
+             autoclose=autoclose,
+         )
+
+diff --git a/xarray/backends/plugins.py b/xarray/backends/plugins.py
+index 76df963..354fca6 100644
+--- a/xarray/backends/plugins.py
++++ b/xarray/backends/plugins.py
+@@ -18,7 +18,7 @@ if TYPE_CHECKING:
+     from xarray.backends.common import AbstractDataStore
+     from xarray.core.types import ReadBuffer
+ 
+-STANDARD_BACKENDS_ORDER = ["netcdf4", "h5netcdf", "scipy"]
++NETCDF_BACKENDS_ORDER = ["netcdf4", "h5netcdf", "scipy"]
+ 
+ 
+ def remove_duplicates(entrypoints: EntryPoints) -> list[EntryPoint]:
+@@ -92,7 +92,7 @@ def sort_backends(
+     backend_entrypoints: dict[str, type[BackendEntrypoint]],
+ ) -> dict[str, type[BackendEntrypoint]]:
+     ordered_backends_entrypoints = {}
+-    for be_name in STANDARD_BACKENDS_ORDER:
++    for be_name in NETCDF_BACKENDS_ORDER:
+         if backend_entrypoints.get(be_name) is not None:
+             ordered_backends_entrypoints[be_name] = backend_entrypoints.pop(be_name)
+     ordered_backends_entrypoints.update(
+
+diff --git a/xarray/backends/scipy_.py b/xarray/backends/scipy_.py
+index a93c646..40c610b 100644
+--- a/xarray/backends/scipy_.py
++++ b/xarray/backends/scipy_.py
+@@ -30,7 +30,6 @@ from xarray.core.utils import (
+     Frozen,
+     FrozenDict,
+     close_on_error,
+-    emit_user_level_warning,
+     module_available,
+     try_read_magic_number_from_file_or_path,
+ )
+@@ -169,20 +168,9 @@ class ScipyDataStore(WritableCFDataStore):
+         self.lock = ensure_lock(lock)
+ 
+         if isinstance(filename_or_obj, BytesIOProxy):
+-            emit_user_level_warning(
+-                "return value of to_netcdf() without a target for "
+-                "engine='scipy' is currently bytes, but will switch to "
+-                "memoryview in a future version of Xarray. To silence this "
+-                "warning, use the following pattern or switch to "
+-                "to_netcdf(engine='h5netcdf'):\n"
+-                "    target = io.BytesIO()\n"
+-                "    dataset.to_netcdf(target)\n"
+-                "    result = target.getbuffer()",
+-                FutureWarning,
+-            )
+             source = filename_or_obj
+             filename_or_obj = io.BytesIO()
+-            source.getvalue = filename_or_obj.getvalue
++            source.getvalue = filename_or_obj.getbuffer
+ 
+         if isinstance(filename_or_obj, str):  # path
+             manager = CachingFileManager(
+@@ -278,8 +266,8 @@ class ScipyDataStore(WritableCFDataStore):
+ 
+         data = variable.data
+         # nb. this still creates a numpy array in all memory, even though we
+-        # don't write the data yet; scipy.io.netcdf does not not support
+-        # incremental writes.
++        # don't write the data yet; scipy.io.netcdf does not support incremental
++        # writes.
+         if name not in self.ds.variables:
+             self.ds.createVariable(name, data.dtype, variable.dims)
+         scipy_var = self.ds.variables[name]
+
+diff --git a/xarray/backends/zarr.py b/xarray/backends/zarr.py
+index 65ba5ac..452a575 100644
+--- a/xarray/backends/zarr.py
++++ b/xarray/backends/zarr.py
+@@ -5,7 +5,7 @@ import json
+ import os
+ import struct
+ from collections.abc import Hashable, Iterable, Mapping
+-from typing import TYPE_CHECKING, Any, Literal, cast
++from typing import TYPE_CHECKING, Any, Literal, Self, cast
+ 
+ import numpy as np
+ import pandas as pd
+@@ -785,6 +785,22 @@ class ZarrStore(AbstractWritableDataStore):
+             # on demand.
+             self._members = self._fetch_members()
+ 
++    def get_child_store(self, group: str) -> Self:
++        zarr_group = self.zarr_group.require_group(group)
++        return type(self)(
++            zarr_group=zarr_group,
++            mode=self._mode,
++            consolidate_on_close=self._consolidate_on_close,
++            append_dim=self._append_dim,
++            write_region=self._write_region,
++            safe_chunks=self._safe_chunks,
++            write_empty=self._write_empty,
++            close_store_on_close=self._close_store_on_close,
++            use_zarr_fill_value_as_mask=self._use_zarr_fill_value_as_mask,
++            align_chunks=self._align_chunks,
++            cache_members=self._cache_members,
++        )
++
+     @property
+     def members(self) -> dict[str, ZarrArray | ZarrGroup]:
+         """
+@@ -1046,9 +1062,6 @@ class ZarrStore(AbstractWritableDataStore):
+                 kwargs["zarr_format"] = self.zarr_group.metadata.zarr_format
+             zarr.consolidate_metadata(self.zarr_group.store, **kwargs)
+ 
+-    def sync(self):
+-        pass
+-
+     def _open_existing_array(self, *, name) -> ZarrArray:
+         import zarr
+         from zarr import Array as ZarrArray
+@@ -1266,6 +1279,9 @@ class ZarrStore(AbstractWritableDataStore):
+ 
+             writer.add(v.data, zarr_array, region)
+ 
++    def sync(self) -> None:
++        pass
++
+     def close(self) -> None:
+         if self._close_store_on_close:
+             self.zarr_group.store.close()
+@@ -1602,8 +1618,10 @@ class ZarrBackendEntrypoint(BackendEntrypoint):
+ 
+     def guess_can_open(self, filename_or_obj: T_PathFileOrDataStore) -> bool:
+         if isinstance(filename_or_obj, str | os.PathLike):
+-            _, ext = os.path.splitext(filename_or_obj)
+-            return ext == ".zarr"
++            # allow a trailing slash to account for an autocomplete
++            # adding it.
++            _, ext = os.path.splitext(str(filename_or_obj).rstrip("/"))
++            return ext in [".zarr"]
+ 
+         return False
+ 
+
+diff --git a/xarray/coding/cftime_offsets.py b/xarray/coding/cftime_offsets.py
+index e8d407b..5ddbe55 100644
+--- a/xarray/coding/cftime_offsets.py
++++ b/xarray/coding/cftime_offsets.py
+@@ -609,14 +609,19 @@ class YearEnd(YearOffset):
+             return date - YearEnd(month=self.month)
+ 
+ 
+-class Day(Tick):
+-    _freq = "D"
++class Day(BaseCFTimeOffset):
++    """Day offset following definition in pandas/_libs/tslibs/offsets.pyx"""
+ 
+-    def as_timedelta(self) -> timedelta:
+-        return timedelta(days=self.n)
++    _freq = "D"
+ 
+     def __apply__(self, other):
+-        return other + self.as_timedelta()
++        if isinstance(other, Day):
++            return Day(self.n + other.n)
++        else:
++            return other + timedelta(days=self.n)
++
++    def onOffset(self, date) -> bool:
++        return True
+ 
+ 
+ class Hour(Tick):
+@@ -718,8 +723,8 @@ _PATTERN = rf"^((?P<multiple>[+-]?\d+)|())(?P<freq>({_FREQUENCY_CONDITION}))$"
+ 
+ 
+ # pandas defines these offsets as "Tick" objects, which for instance have
+-# distinct behavior from monthly or longer frequencies in resample.
+-CFTIME_TICKS = (Day, Hour, Minute, Second)
++# distinct behavior from daily or longer frequencies in resample.
++CFTIME_TICKS = (Hour, Minute, Second)
+ 
+ 
+ def _generate_anchored_deprecated_frequencies(
+@@ -801,16 +806,13 @@ def delta_to_tick(delta: timedelta | pd.Timedelta) -> Tick:
+             "nanoseconds to 'CFTimeOffset' object"
+         )
+     if delta.microseconds == 0:
+-        if delta.seconds == 0:
+-            return Day(n=delta.days)
++        seconds = delta.days * 86400 + delta.seconds
++        if seconds % 3600 == 0:
++            return Hour(n=seconds // 3600)
++        elif seconds % 60 == 0:
++            return Minute(n=seconds // 60)
+         else:
+-            seconds = delta.days * 86400 + delta.seconds
+-            if seconds % 3600 == 0:
+-                return Hour(n=seconds // 3600)
+-            elif seconds % 60 == 0:
+-                return Minute(n=seconds // 60)
+-            else:
+-                return Second(n=seconds)
++            return Second(n=seconds)
+     # Regardless of the days and seconds this will always be a Millisecond
+     # or Microsecond object
+     elif delta.microseconds % 1_000 == 0:
+@@ -1424,7 +1426,7 @@ def date_range(
+ 
+     if _is_standard_calendar(calendar) and use_cftime is not True:
+         try:
+-            return pd.date_range(
++            return pd.date_range(  # type: ignore[call-overload,unused-ignore]
+                 start=start,
+                 end=end,
+                 periods=periods,
+
+diff --git a/xarray/coding/cftimeindex.py b/xarray/coding/cftimeindex.py
+index 210bbf2..b4bde14 100644
+--- a/xarray/coding/cftimeindex.py
++++ b/xarray/coding/cftimeindex.py
+@@ -456,7 +456,7 @@ class CFTimeIndex(pd.Index):
+         """Needed for .loc based partial-string indexing"""
+         return self.__contains__(key)
+ 
+-    def shift(  # type: ignore[override]  # freq is typed Any, we are more precise
++    def shift(  # type: ignore[override,unused-ignore]
+         self,
+         periods: int | float,
+         freq: str | timedelta | BaseCFTimeOffset | None = None,
+@@ -490,7 +490,7 @@ class CFTimeIndex(pd.Index):
+         >>> index.shift(1, "ME")
+         CFTimeIndex([2000-02-29 00:00:00],
+                     dtype='object', length=1, calendar='standard', freq=None)
+-        >>> index.shift(1.5, "D")
++        >>> index.shift(1.5, "24h")
+         CFTimeIndex([2000-02-01 12:00:00],
+                     dtype='object', length=1, calendar='standard', freq=None)
+         """
+@@ -707,16 +707,22 @@ class CFTimeIndex(pd.Index):
+ 
+     def _round_via_method(self, freq, method):
+         """Round dates using a specified method."""
+-        from xarray.coding.cftime_offsets import CFTIME_TICKS, to_offset
++        from xarray.coding.cftime_offsets import CFTIME_TICKS, Day, to_offset
+ 
+         if not self._data.size:
+             return CFTimeIndex(np.array(self))
+ 
+         offset = to_offset(freq)
+-        if not isinstance(offset, CFTIME_TICKS):
++        if isinstance(offset, Day):
++            # Following pandas, "In the 'round' context, Day unambiguously
++            # means 24h, not calendar-day"
++            offset_as_timedelta = timedelta(days=offset.n)
++        elif isinstance(offset, CFTIME_TICKS):
++            offset_as_timedelta = offset.as_timedelta()
++        else:
+             raise ValueError(f"{offset} is a non-fixed frequency")
+ 
+-        unit = _total_microseconds(offset.as_timedelta())
++        unit = _total_microseconds(offset_as_timedelta)
+         values = self.asi8
+         rounded = method(values, unit)
+         return _cftimeindex_from_i8(rounded, self.date_type, self.name)
+
+diff --git a/xarray/coding/times.py b/xarray/coding/times.py
+index 49a2747..b5ba123 100644
+--- a/xarray/coding/times.py
++++ b/xarray/coding/times.py
+@@ -1416,8 +1416,9 @@ def resolve_time_unit_from_attrs_dtype(
+     dtype = np.dtype(attrs_dtype)
+     resolution, _ = np.datetime_data(dtype)
+     resolution = cast(NPDatetimeUnitOptions, resolution)
++    time_unit: PDDatetimeUnitOptions
+     if np.timedelta64(1, resolution) > np.timedelta64(1, "s"):
+-        time_unit = cast(PDDatetimeUnitOptions, "s")
++        time_unit = "s"
+         message = (
+             f"Following pandas, xarray only supports decoding to timedelta64 "
+             f"values with a resolution of 's', 'ms', 'us', or 'ns'. Encoded "
+@@ -1430,7 +1431,7 @@ def resolve_time_unit_from_attrs_dtype(
+         )
+         emit_user_level_warning(message)
+     elif np.timedelta64(1, resolution) < np.timedelta64(1, "ns"):
+-        time_unit = cast(PDDatetimeUnitOptions, "ns")
++        time_unit = "ns"
+         message = (
+             f"Following pandas, xarray only supports decoding to timedelta64 "
+             f"values with a resolution of 's', 'ms', 'us', or 'ns'. Encoded "
+@@ -1534,7 +1535,7 @@ class CFTimedeltaCoder(VariableCoder):
+                         FutureWarning,
+                     )
+                 if self.time_unit is None:
+-                    time_unit = cast(PDDatetimeUnitOptions, "ns")
++                    time_unit = "ns"
+                 else:
+                     time_unit = self.time_unit
+ 
+
+diff --git a/xarray/coding/variables.py b/xarray/coding/variables.py
+index bff0f52..1a1bb7c 100644
+--- a/xarray/coding/variables.py
++++ b/xarray/coding/variables.py
+@@ -302,15 +302,12 @@ class CFMaskCoder(VariableCoder):
+         if fv_exists:
+             # Ensure _FillValue is cast to same dtype as data's
+             # but not for packed data
+-            encoding["_FillValue"] = (
+-                _encode_unsigned_fill_value(name, fv, dtype)
+-                if has_unsigned
+-                else (
+-                    dtype.type(fv)
+-                    if "add_offset" not in encoding and "scale_factor" not in encoding
+-                    else fv
+-                )
+-            )
++            if has_unsigned:
++                encoding["_FillValue"] = _encode_unsigned_fill_value(name, fv, dtype)
++            elif "add_offset" not in encoding and "scale_factor" not in encoding:
++                encoding["_FillValue"] = dtype.type(fv)
++            else:
++                encoding["_FillValue"] = fv
+             fill_value = pop_to(encoding, attrs, "_FillValue", name=name)
+ 
+         if mv_exists:
+
+diff --git a/xarray/conventions.py b/xarray/conventions.py
+index 17f1e06..46342a2 100644
+--- a/xarray/conventions.py
++++ b/xarray/conventions.py
+@@ -4,7 +4,7 @@ import itertools
+ import warnings
+ from collections import defaultdict
+ from collections.abc import Hashable, Iterable, Mapping, MutableMapping
+-from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union
++from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union, cast
+ 
+ import numpy as np
+ 
+@@ -414,7 +414,9 @@ def decode_cf_variables(
+                 v,
+                 concat_characters=_item_or_default(concat_characters, k, True),
+                 mask_and_scale=_item_or_default(mask_and_scale, k, True),
+-                decode_times=_item_or_default(decode_times, k, True),
++                decode_times=cast(
++                    bool | CFDatetimeCoder, _item_or_default(decode_times, k, True)
++                ),
+                 stack_char_dim=stack_char_dim,
+                 use_cftime=_item_or_default(use_cftime, k, None),
+                 decode_timedelta=_item_or_default(decode_timedelta, k, None),
+
+diff --git a/xarray/core/coordinates.py b/xarray/core/coordinates.py
+index 572e9c2..df6abe0 100644
+--- a/xarray/core/coordinates.py
++++ b/xarray/core/coordinates.py
+@@ -1,6 +1,6 @@
+ from __future__ import annotations
+ 
+-from collections.abc import Hashable, Iterator, Mapping, Sequence
++from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
+ from contextlib import contextmanager
+ from typing import (
+     TYPE_CHECKING,
+@@ -21,7 +21,7 @@ from xarray.core.indexes import (
+     assert_no_index_corrupted,
+     create_default_index_implicit,
+ )
+-from xarray.core.types import DataVars, Self, T_DataArray, T_Xarray
++from xarray.core.types import DataVars, ErrorOptions, Self, T_DataArray, T_Xarray
+ from xarray.core.utils import (
+     Frozen,
+     ReprObject,
+@@ -180,10 +180,12 @@ class AbstractCoordinates(Mapping[Hashable, "T_DataArray"]):
+                     np.tile(np.repeat(code, repeat_counts[i]), tile_counts[i])
+                     for code in codes
+                 ]
+-                level_list += levels
++                level_list += [list(level) for level in levels]
+                 names += index.names
+ 
+-        return pd.MultiIndex(levels=level_list, codes=code_list, names=names)
++        return pd.MultiIndex(
++            levels=level_list, codes=[list(c) for c in code_list], names=names
++        )
+ 
+ 
+ class Coordinates(AbstractCoordinates):
+@@ -561,6 +563,35 @@ class Coordinates(AbstractCoordinates):
+             variables=coords, coord_names=coord_names, indexes=indexes
+         )
+ 
++    def __or__(self, other: Mapping[Any, Any] | None) -> Coordinates:
++        """Merge two sets of coordinates to create a new Coordinates object
++
++        The method implements the logic used for joining coordinates in the
++        result of a binary operation performed on xarray objects:
++
++        - If two index coordinates conflict (are not equal), an exception is
++          raised. You must align your data before passing it to this method.
++        - If an index coordinate and a non-index coordinate conflict, the non-
++          index coordinate is dropped.
++        - If two non-index coordinates conflict, both are dropped.
++
++        Parameters
++        ----------
++        other : dict-like, optional
++            A :py:class:`Coordinates` object or any mapping that can be turned
++            into coordinates.
++
++        Returns
++        -------
++        merged : Coordinates
++            A new Coordinates object with merged coordinates.
++
++        See Also
++        --------
++        Coordinates.merge
++        """
++        return self.merge(other).coords
++
+     def __setitem__(self, key: Hashable, value: Any) -> None:
+         self.update({key: value})
+ 
+@@ -719,6 +750,108 @@ class Coordinates(AbstractCoordinates):
+             ),
+         )
+ 
++    def drop_vars(
++        self,
++        names: str
++        | Iterable[Hashable]
++        | Callable[
++            [Coordinates | Dataset | DataArray | DataTree],
++            str | Iterable[Hashable],
++        ],
++        *,
++        errors: ErrorOptions = "raise",
++    ) -> Self:
++        """Drop variables from this Coordinates object.
++
++        Note that indexes that depend on these variables will also be dropped.
++
++        Parameters
++        ----------
++        names : hashable or iterable or callable
++            Name(s) of variables to drop. If a callable, this is object is passed as its
++            only argument and its result is used.
++        errors : {"raise", "ignore"}, default: "raise"
++            Error treatment.
++
++            - ``'raise'``: raises a :py:class:`ValueError` error if any of the variable
++              passed are not in the dataset
++            - ``'ignore'``: any given names that are in the dataset are dropped and no
++              error is raised.
++        """
++        return cast(Self, self.to_dataset().drop_vars(names, errors=errors).coords)
++
++    def drop_dims(
++        self,
++        drop_dims: str | Iterable[Hashable],
++        *,
++        errors: ErrorOptions = "raise",
++    ) -> Self:
++        """Drop dimensions and associated variables from this dataset.
++
++        Parameters
++        ----------
++        drop_dims : str or Iterable of Hashable
++            Dimension or dimensions to drop.
++        errors : {"raise", "ignore"}, default: "raise"
++            If 'raise', raises a ValueError error if any of the
++            dimensions passed are not in the dataset. If 'ignore', any given
++            dimensions that are in the dataset are dropped and no error is raised.
++
++        Returns
++        -------
++        obj : Coordinates
++            Coordinates object without the given dimensions (or any coordinates
++            containing those dimensions).
++        """
++        return cast(Self, self.to_dataset().drop_dims(drop_dims, errors=errors).coords)
++
++    def rename_dims(
++        self,
++        dims_dict: Mapping[Any, Hashable] | None = None,
++        **dims: Hashable,
++    ) -> Self:
++        """Returns a new object with renamed dimensions only.
++
++        Parameters
++        ----------
++        dims_dict : dict-like, optional
++            Dictionary whose keys are current dimension names and
++            whose values are the desired names. The desired names must
++            not be the name of an existing dimension or Variable in the Coordinates.
++        **dims : optional
++            Keyword form of ``dims_dict``.
++            One of dims_dict or dims must be provided.
++
++        Returns
++        -------
++        renamed : Coordinates
++            Coordinates object with renamed dimensions.
++        """
++        return cast(Self, self.to_dataset().rename_dims(dims_dict, **dims).coords)
++
++    def rename_vars(
++        self,
++        name_dict: Mapping[Any, Hashable] | None = None,
++        **names: Hashable,
++    ) -> Coordinates:
++        """Returns a new object with renamed variables.
++
++        Parameters
++        ----------
++        name_dict : dict-like, optional
++            Dictionary whose keys are current variable or coordinate names and
++            whose values are the desired names.
++        **names : optional
++            Keyword form of ``name_dict``.
++            One of name_dict or names must be provided.
++
++        Returns
++        -------
++        renamed : Coordinates
++            Coordinates object with renamed variables
++        """
++        return cast(Self, self.to_dataset().rename_vars(name_dict, **names).coords)
++
+ 
+ class DatasetCoordinates(Coordinates):
+     """Dictionary like container for Dataset coordinates (variables + indexes).
+
+diff --git a/xarray/core/dataarray.py b/xarray/core/dataarray.py
+index b1833d3..a9326cc 100644
+--- a/xarray/core/dataarray.py
++++ b/xarray/core/dataarray.py
+@@ -4067,7 +4067,7 @@ class DataArray(
+         compute: bool = True,
+         invalid_netcdf: bool = False,
+         auto_complex: bool | None = None,
+-    ) -> bytes | memoryview: ...
++    ) -> memoryview: ...
+ 
+     # compute=False returns dask.Delayed
+     @overload
+@@ -4131,17 +4131,15 @@ class DataArray(
+         compute: bool = True,
+         invalid_netcdf: bool = False,
+         auto_complex: bool | None = None,
+-    ) -> bytes | memoryview | Delayed | None:
++    ) -> memoryview | Delayed | None:
+         """Write DataArray contents to a netCDF file.
+ 
+         Parameters
+         ----------
+-        path : str, path-like or None, optional
+-            Path to which to save this dataset. File-like objects are only
+-            supported by the scipy engine. If no path is provided, this
+-            function returns the resulting netCDF file as bytes; in this case,
+-            we need to use scipy, which does not support netCDF version 4 (the
+-            default format becomes NETCDF3_64BIT).
++        path : str, path-like, file-like or None, optional
++            Path to which to save this datatree, or a file-like object to write
++            it to (which must support read and write and be seekable) or None
++            (default) to return in-memory bytes as a memoryview.
+         mode : {"w", "a"}, default: "w"
+             Write ('w') or append ('a') mode. If mode='w', any existing file at
+             this location will be overwritten. If mode='a', existing variables
+@@ -4201,7 +4199,7 @@ class DataArray(
+ 
+         Returns
+         -------
+-            * ``bytes`` or ``memoryview`` if path is None
++            * ``memoryview`` if path is None
+             * ``dask.delayed.Delayed`` if compute is False
+             * None otherwise
+ 
+
+diff --git a/xarray/core/dataset.py b/xarray/core/dataset.py
+index f51853f..fffe78f 100644
+--- a/xarray/core/dataset.py
++++ b/xarray/core/dataset.py
+@@ -35,12 +35,7 @@ from xarray.compat.array_api_compat import to_like_array
+ from xarray.computation import ops
+ from xarray.computation.arithmetic import DatasetArithmetic
+ from xarray.core import dtypes as xrdtypes
+-from xarray.core import (
+-    duck_array_ops,
+-    formatting,
+-    formatting_html,
+-    utils,
+-)
++from xarray.core import duck_array_ops, formatting, formatting_html, utils
+ from xarray.core._aggregations import DatasetAggregations
+ from xarray.core.common import (
+     DataWithCoords,
+@@ -1958,7 +1953,7 @@ class Dataset(
+         compute: bool = True,
+         invalid_netcdf: bool = False,
+         auto_complex: bool | None = None,
+-    ) -> bytes | memoryview: ...
++    ) -> memoryview: ...
+ 
+     # compute=False returns dask.Delayed
+     @overload
+@@ -2022,17 +2017,15 @@ class Dataset(
+         compute: bool = True,
+         invalid_netcdf: bool = False,
+         auto_complex: bool | None = None,
+-    ) -> bytes | memoryview | Delayed | None:
++    ) -> memoryview | Delayed | None:
+         """Write dataset contents to a netCDF file.
+ 
+         Parameters
+         ----------
+-        path : str, path-like or file-like, optional
+-            Path to which to save this dataset. File-like objects are only
+-            supported by the scipy engine. If no path is provided, this
+-            function returns the resulting netCDF file as bytes; in this case,
+-            we need to use scipy, which does not support netCDF version 4 (the
+-            default format becomes NETCDF3_64BIT).
++        path : str, path-like, file-like or None, optional
++            Path to which to save this datatree, or a file-like object to write
++            it to (which must support read and write and be seekable) or None
++            (default) to return in-memory bytes as a memoryview.
+         mode : {"w", "a"}, default: "w"
+             Write ('w') or append ('a') mode. If mode='w', any existing file at
+             this location will be overwritten. If mode='a', existing variables
+@@ -2094,7 +2087,7 @@ class Dataset(
+ 
+         Returns
+         -------
+-            * ``bytes`` or ``memoryview`` if path is None
++            * ``memoryview`` if path is None
+             * ``dask.delayed.Delayed`` if compute is False
+             * ``None`` otherwise
+ 
+@@ -2491,13 +2484,16 @@ class Dataset(
+         sizes along that dimension will not be updated; non-dask arrays will be
+         converted into dask arrays with a single block.
+ 
+-        Along datetime-like dimensions, a :py:class:`groupers.TimeResampler` object is also accepted.
++        Along datetime-like dimensions, a :py:class:`Resampler` object
++        (e.g. :py:class:`groupers.TimeResampler` or :py:class:`groupers.SeasonResampler`)
++        is also accepted.
+ 
+         Parameters
+         ----------
+-        chunks : int, tuple of int, "auto" or mapping of hashable to int or a TimeResampler, optional
++        chunks : int, tuple of int, "auto" or mapping of hashable to int or a Resampler, optional
+             Chunk sizes along each dimension, e.g., ``5``, ``"auto"``, or
+-            ``{"x": 5, "y": 5}`` or ``{"x": 5, "time": TimeResampler(freq="YE")}``.
++            ``{"x": 5, "y": 5}`` or ``{"x": 5, "time": TimeResampler(freq="YE")}`` or
++            ``{"time": SeasonResampler(["DJF", "MAM", "JJA", "SON"])}``.
+         name_prefix : str, default: "xarray-"
+             Prefix for the name of any new dask arrays.
+         token : str, optional
+@@ -2532,8 +2528,7 @@ class Dataset(
+         xarray.unify_chunks
+         dask.array.from_array
+         """
+-        from xarray.core.dataarray import DataArray
+-        from xarray.groupers import TimeResampler
++        from xarray.groupers import Resampler
+ 
+         if chunks is None and not chunks_kwargs:
+             warnings.warn(
+@@ -2561,41 +2556,29 @@ class Dataset(
+                 f"chunks keys {tuple(bad_dims)} not found in data dimensions {tuple(self.sizes.keys())}"
+             )
+ 
+-        def _resolve_frequency(
+-            name: Hashable, resampler: TimeResampler
+-        ) -> tuple[int, ...]:
++        def _resolve_resampler(name: Hashable, resampler: Resampler) -> tuple[int, ...]:
+             variable = self._variables.get(name, None)
+             if variable is None:
+                 raise ValueError(
+-                    f"Cannot chunk by resampler {resampler!r} for virtual variables."
++                    f"Cannot chunk by resampler {resampler!r} for virtual variable {name!r}."
+                 )
+-            elif not _contains_datetime_like_objects(variable):
++            if variable.ndim != 1:
+                 raise ValueError(
+-                    f"chunks={resampler!r} only supported for datetime variables. "
+-                    f"Received variable {name!r} with dtype {variable.dtype!r} instead."
++                    f"chunks={resampler!r} only supported for 1D variables. "
++                    f"Received variable {name!r} with {variable.ndim} dimensions instead."
+                 )
+-
+-            assert variable.ndim == 1
+-            chunks = (
+-                DataArray(
+-                    np.ones(variable.shape, dtype=int),
+-                    dims=(name,),
+-                    coords={name: variable},
++            newchunks = resampler.compute_chunks(variable, dim=name)
++            if sum(newchunks) != variable.shape[0]:
++                raise ValueError(
++                    f"Logic bug in rechunking variable {name!r} using {resampler!r}. "
++                    "New chunks tuple does not match size of data. Please open an issue."
+                 )
+-                .resample({name: resampler})
+-                .sum()
+-            )
+-            # When bins (binning) or time periods are missing (resampling)
+-            # we can end up with NaNs. Drop them.
+-            if chunks.dtype.kind == "f":
+-                chunks = chunks.dropna(name).astype(int)
+-            chunks_tuple: tuple[int, ...] = tuple(chunks.data.tolist())
+-            return chunks_tuple
++            return newchunks
+ 
+         chunks_mapping_ints: Mapping[Any, T_ChunkDim] = {
+             name: (
+-                _resolve_frequency(name, chunks)
+-                if isinstance(chunks, TimeResampler)
++                _resolve_resampler(name, chunks)
++                if isinstance(chunks, Resampler)
+                 else chunks
+             )
+             for name, chunks in chunks_mapping.items()
+@@ -2636,7 +2619,7 @@ class Dataset(
+ 
+         # all indexers should be int, slice, np.ndarrays, or Variable
+         for k, v in indexers.items():
+-            if isinstance(v, int | slice | Variable):
++            if isinstance(v, int | slice | Variable) and not isinstance(v, bool):
+                 yield k, v
+             elif isinstance(v, DataArray):
+                 yield k, v.variable
+@@ -7401,7 +7384,7 @@ class Dataset(
+ 
+         if isinstance(idx, pd.MultiIndex):
+             dims = tuple(
+-                name if name is not None else f"level_{n}"  # type: ignore[redundant-expr]
++                name if name is not None else f"level_{n}"  # type: ignore[redundant-expr,unused-ignore]
+                 for n, name in enumerate(idx.names)
+             )
+             for dim, lev in zip(dims, idx.levels, strict=True):
+
+diff --git a/xarray/core/datatree.py b/xarray/core/datatree.py
+index af71ec6..5fe1362 100644
+--- a/xarray/core/datatree.py
++++ b/xarray/core/datatree.py
+@@ -18,6 +18,7 @@ from typing import (
+     TYPE_CHECKING,
+     Any,
+     Concatenate,
++    Literal,
+     NoReturn,
+     ParamSpec,
+     TypeVar,
+@@ -75,7 +76,9 @@ except ImportError:
+ if TYPE_CHECKING:
+     import numpy as np
+     import pandas as pd
++    from dask.delayed import Delayed
+ 
++    from xarray.backends import ZarrStore
+     from xarray.core.datatree_io import T_DataTreeNetcdfEngine, T_DataTreeNetcdfTypes
+     from xarray.core.types import (
+         Dims,
+@@ -439,7 +442,7 @@ class DatasetView(Dataset):
+ 
+ 
+ class DataTree(
+-    NamedNode["DataTree"],
++    NamedNode,
+     DataTreeAggregations,
+     DataTreeOpsMixin,
+     TreeAttrAccessMixin,
+@@ -559,9 +562,12 @@ class DataTree(
+ 
+     @property
+     def _coord_variables(self) -> ChainMap[Hashable, Variable]:
++        # ChainMap is incorrected typed in typeshed (only the first argument
++        # needs to be mutable)
++        # https://github.com/python/typeshed/issues/8430
+         return ChainMap(
+             self._node_coord_variables,
+-            *(p._node_coord_variables_with_index for p in self.parents),
++            *(p._node_coord_variables_with_index for p in self.parents),  # type: ignore[arg-type]
+         )
+ 
+     @property
+@@ -1340,7 +1346,7 @@ class DataTree(
+         )
+ 
+     def _inherited_coords_set(self) -> set[str]:
+-        return set(self.parent.coords if self.parent else [])
++        return set(self.parent.coords if self.parent else [])  # type: ignore[arg-type]
+ 
+     def identical(self, other: DataTree) -> bool:
+         """
+@@ -1563,9 +1569,33 @@ class DataTree(
+         }
+         return DataTree.from_dict(matching_nodes, name=self.name)
+ 
++    @overload
+     def map_over_datasets(
+         self,
+-        func: Callable,
++        func: Callable[..., Dataset | None],
++        *args: Any,
++        kwargs: Mapping[str, Any] | None = None,
++    ) -> DataTree: ...
++
++    @overload
++    def map_over_datasets(
++        self,
++        func: Callable[..., tuple[Dataset | None, Dataset | None]],
++        *args: Any,
++        kwargs: Mapping[str, Any] | None = None,
++    ) -> tuple[DataTree, DataTree]: ...
++
++    @overload
++    def map_over_datasets(
++        self,
++        func: Callable[..., tuple[Dataset | None, ...]],
++        *args: Any,
++        kwargs: Mapping[str, Any] | None = None,
++    ) -> tuple[DataTree, ...]: ...
++
++    def map_over_datasets(
++        self,
++        func: Callable[..., Dataset | None | tuple[Dataset | None, ...]],
+         *args: Any,
+         kwargs: Mapping[str, Any] | None = None,
+     ) -> DataTree | tuple[DataTree, ...]:
+@@ -1600,8 +1630,7 @@ class DataTree(
+         map_over_datasets
+         """
+         # TODO this signature means that func has no way to know which node it is being called upon - change?
+-        # TODO fix this typing error
+-        return map_over_datasets(func, self, *args, kwargs=kwargs)
++        return map_over_datasets(func, self, *args, kwargs=kwargs)  # type: ignore[arg-type]
+ 
+     @overload
+     def pipe(
+@@ -1695,7 +1724,7 @@ class DataTree(
+ 
+     def _unary_op(self, f, *args, **kwargs) -> DataTree:
+         # TODO do we need to any additional work to avoid duplication etc.? (Similar to aggregations)
+-        return self.map_over_datasets(functools.partial(f, **kwargs), *args)  # type: ignore[return-value]
++        return self.map_over_datasets(functools.partial(f, **kwargs), *args)
+ 
+     def _binary_op(self, other, f, reflexive=False, join=None) -> DataTree:
+         from xarray.core.groupby import GroupBy
+@@ -1744,6 +1773,7 @@ class DataTree(
+         **kwargs,
+     ) -> memoryview: ...
+ 
++    # compute=False returns dask.Delayed
+     @overload
+     def to_netcdf(
+         self,
+@@ -1755,7 +1785,24 @@ class DataTree(
+         engine: T_DataTreeNetcdfEngine | None = None,
+         group: str | None = None,
+         write_inherited_coords: bool = False,
+-        compute: bool = True,
++        *,
++        compute: Literal[False],
++        **kwargs,
++    ) -> Delayed: ...
++
++    # default return None
++    @overload
++    def to_netcdf(
++        self,
++        filepath: str | PathLike | io.IOBase,
++        mode: NetcdfWriteModes = "w",
++        encoding=None,
++        unlimited_dims=None,
++        format: T_DataTreeNetcdfTypes | None = None,
++        engine: T_DataTreeNetcdfEngine | None = None,
++        group: str | None = None,
++        write_inherited_coords: bool = False,
++        compute: Literal[True] = True,
+         **kwargs,
+     ) -> None: ...
+ 
+@@ -1771,7 +1818,7 @@ class DataTree(
+         write_inherited_coords: bool = False,
+         compute: bool = True,
+         **kwargs,
+-    ) -> None | memoryview:
++    ) -> None | memoryview | Delayed:
+         """
+         Write datatree contents to a netCDF file.
+ 
+@@ -1815,13 +1862,13 @@ class DataTree(
+         compute : bool, default: True
+             If true compute immediately, otherwise return a
+             ``dask.delayed.Delayed`` object that can be computed later.
+-            Currently, ``compute=False`` is not supported.
+         kwargs :
+             Additional keyword arguments to be passed to ``xarray.Dataset.to_netcdf``
+ 
+         Returns
+         -------
+             * ``memoryview`` if path is None
++            * ``dask.delayed.Delayed`` if compute is False
+             * ``None`` otherwise
+ 
+         Note
+@@ -1845,6 +1892,35 @@ class DataTree(
+             **kwargs,
+         )
+ 
++    # compute=False returns dask.Delayed
++    @overload
++    def to_zarr(
++        self,
++        store,
++        mode: ZarrWriteModes = "w-",
++        encoding=None,
++        consolidated: bool = True,
++        group: str | None = None,
++        write_inherited_coords: bool = False,
++        *,
++        compute: Literal[False],
++        **kwargs,
++    ) -> Delayed: ...
++
++    # default returns ZarrStore
++    @overload
++    def to_zarr(
++        self,
++        store,
++        mode: ZarrWriteModes = "w-",
++        encoding=None,
++        consolidated: bool = True,
++        group: str | None = None,
++        write_inherited_coords: bool = False,
++        compute: Literal[True] = True,
++        **kwargs,
++    ) -> ZarrStore: ...
++
+     def to_zarr(
+         self,
+         store,
+@@ -1855,7 +1931,7 @@ class DataTree(
+         write_inherited_coords: bool = False,
+         compute: bool = True,
+         **kwargs,
+-    ):
++    ) -> ZarrStore | Delayed:
+         """
+         Write datatree contents to a Zarr store.
+ 
+@@ -1886,8 +1962,7 @@ class DataTree(
+         compute : bool, default: True
+             If true compute immediately, otherwise return a
+             ``dask.delayed.Delayed`` object that can be computed later. Metadata
+-            is always updated eagerly. Currently, ``compute=False`` is not
+-            supported.
++            is always updated eagerly.
+         kwargs :
+             Additional keyword arguments to be passed to ``xarray.Dataset.to_zarr``
+ 
+@@ -1898,7 +1973,7 @@ class DataTree(
+         """
+         from xarray.core.datatree_io import _datatree_to_zarr
+ 
+-        _datatree_to_zarr(
++        return _datatree_to_zarr(
+             self,
+             store,
+             mode=mode,
+@@ -1911,7 +1986,7 @@ class DataTree(
+         )
+ 
+     def _get_all_dims(self) -> set:
+-        all_dims = set()
++        all_dims: set[Any] = set()
+         for node in self.subtree:
+             all_dims.update(node._node_dims)
+         return all_dims
+
+diff --git a/xarray/core/datatree_io.py b/xarray/core/datatree_io.py
+index c586caa..f425170 100644
+--- a/xarray/core/datatree_io.py
++++ b/xarray/core/datatree_io.py
+@@ -1,10 +1,20 @@
+ from __future__ import annotations
+ 
+ import io
+-from collections.abc import Mapping
++from collections.abc import Hashable, Mapping, MutableMapping
+ from os import PathLike
+ from typing import TYPE_CHECKING, Any, Literal, get_args
+ 
++from xarray.backends.api import (
++    _normalize_path,
++    delayed_close_after_writes,
++    dump_to_store,
++    get_default_netcdf_write_engine,
++    get_writable_netcdf_store,
++    get_writable_zarr_store,
++)
++from xarray.backends.common import ArrayWriter, BytesIOProxy
++from xarray.backends.locks import get_dask_scheduler
+ from xarray.core.datatree import DataTree
+ from xarray.core.types import NetcdfWriteModes, ZarrWriteModes
+ 
+@@ -12,6 +22,9 @@ T_DataTreeNetcdfEngine = Literal["netcdf4", "h5netcdf", "pydap"]
+ T_DataTreeNetcdfTypes = Literal["NETCDF4"]
+ 
+ if TYPE_CHECKING:
++    from dask.delayed import Delayed
++
++    from xarray.backends import ZarrStore
+     from xarray.core.types import ZarrStoreLike
+ 
+ 
+@@ -26,8 +39,9 @@ def _datatree_to_netcdf(
+     group: str | None = None,
+     write_inherited_coords: bool = False,
+     compute: bool = True,
+-    **kwargs,
+-) -> None | memoryview:
++    invalid_netcdf: bool = False,
++    auto_complex: bool | None = None,
++) -> None | memoryview | Delayed:
+     """Implementation of `DataTree.to_netcdf`."""
+ 
+     if format not in [None, *get_args(T_DataTreeNetcdfTypes)]:
+@@ -38,17 +52,20 @@ def _datatree_to_netcdf(
+             "DataTree.to_netcdf only supports the netcdf4 and h5netcdf engines"
+         )
+ 
++    filepath = _normalize_path(filepath)
++
+     if engine is None:
+-        engine = "h5netcdf"
++        to_fileobject_or_memoryview = not isinstance(filepath, str)
++        engine = get_default_netcdf_write_engine(
++            format="NETCDF4",  # required for supporting groups
++            to_fileobject_or_memoryview=to_fileobject_or_memoryview,
++        )  # type: ignore[assignment]
+ 
+     if group is not None:
+         raise NotImplementedError(
+             "specifying a root group for the tree has not been implemented"
+         )
+ 
+-    if not compute:
+-        raise NotImplementedError("compute=False has not been implemented yet")
+-
+     if encoding is None:
+         encoding = {}
+ 
+@@ -61,36 +78,71 @@ def _datatree_to_netcdf(
+         )
+ 
+     if filepath is None:
+-        # No need to use BytesIOProxy here because the legacy scipy backend
+-        # cannot write netCDF files with groups
+-        target = io.BytesIO()
++        if not compute:
++            raise NotImplementedError(
++                "to_netcdf() with compute=False is not yet implemented when "
++                "returning a memoryview"
++            )
++        target = BytesIOProxy()
+     else:
+         target = filepath  # type: ignore[assignment]
+ 
+     if unlimited_dims is None:
+         unlimited_dims = {}
+ 
+-    for node in dt.subtree:
+-        at_root = node is dt
+-        ds = node.to_dataset(inherit=write_inherited_coords or at_root)
+-        group_path = None if at_root else "/" + node.relative_to(dt)
+-        ds.to_netcdf(
+-            target,
+-            group=group_path,
+-            mode=mode,
+-            encoding=encoding.get(node.path),
+-            unlimited_dims=unlimited_dims.get(node.path),
+-            engine=engine,
+-            format=format,
+-            compute=compute,
+-            **kwargs,
+-        )
+-        mode = "a"
++    scheduler = get_dask_scheduler()
++    have_chunks = any(
++        v.chunks is not None for node in dt.subtree for v in node.variables.values()
++    )
++    autoclose = have_chunks and scheduler in ["distributed", "multiprocessing"]
++
++    root_store = get_writable_netcdf_store(
++        target,
++        engine,  # type: ignore[arg-type]
++        mode=mode,
++        format=format,
++        autoclose=autoclose,
++        invalid_netcdf=invalid_netcdf,
++        auto_complex=auto_complex,
++    )
++
++    writer = ArrayWriter()
++
++    # TODO: allow this work (setting up the file for writing array data)
++    # to be parallelized with dask
++    try:
++        for node in dt.subtree:
++            at_root = node is dt
++            dataset = node.to_dataset(inherit=write_inherited_coords or at_root)
++            node_store = (
++                root_store if at_root else root_store.get_child_store(node.path)
++            )
++            dump_to_store(
++                dataset,
++                node_store,
++                writer,
++                encoding=encoding.get(node.path),
++                unlimited_dims=unlimited_dims.get(node.path),
++            )
++
++        if autoclose:
++            root_store.close()
++
++        writes = writer.sync(compute=compute)
++
++    finally:
++        if compute:
++            root_store.close()
++        else:
++            root_store.sync()
+ 
+     if filepath is None:
+-        assert isinstance(target, io.BytesIO)
++        assert isinstance(target, BytesIOProxy)  # created in this function
+         return target.getbuffer()
+ 
++    if not compute:
++        return delayed_close_after_writes(writes, root_store)
++
+     return None
+ 
+ 
+@@ -99,22 +151,31 @@ def _datatree_to_zarr(
+     store: ZarrStoreLike,
+     mode: ZarrWriteModes = "w-",
+     encoding: Mapping[str, Any] | None = None,
+-    consolidated: bool = True,
++    synchronizer=None,
+     group: str | None = None,
+     write_inherited_coords: bool = False,
++    *,
++    chunk_store: MutableMapping | str | PathLike | None = None,
+     compute: bool = True,
+-    **kwargs,
+-):
++    consolidated: bool | None = None,
++    append_dim: Hashable | None = None,
++    region: Mapping[str, slice | Literal["auto"]] | Literal["auto"] | None = None,
++    safe_chunks: bool = True,
++    align_chunks: bool = False,
++    storage_options: dict[str, str] | None = None,
++    zarr_version: int | None = None,
++    zarr_format: int | None = None,
++    write_empty_chunks: bool | None = None,
++    chunkmanager_store_kwargs: dict[str, Any] | None = None,
++) -> ZarrStore | Delayed:
+     """Implementation of `DataTree.to_zarr`."""
+ 
+-    from zarr import consolidate_metadata
+-
+     if group is not None:
+         raise NotImplementedError(
+             "specifying a root group for the tree has not been implemented"
+         )
+ 
+-    if "append_dim" in kwargs:
++    if append_dim is not None:
+         raise NotImplementedError(
+             "specifying ``append_dim`` with ``DataTree.to_zarr`` has not been implemented"
+         )
+@@ -130,21 +191,51 @@ def _datatree_to_zarr(
+             f"unexpected encoding group name(s) provided: {set(encoding) - set(dt.groups)}"
+         )
+ 
+-    for node in dt.subtree:
+-        at_root = node is dt
+-        ds = node.to_dataset(inherit=write_inherited_coords or at_root)
+-        group_path = None if at_root else "/" + node.relative_to(dt)
+-        ds.to_zarr(
+-            store,
+-            group=group_path,
+-            mode=mode,
+-            encoding=encoding.get(node.path),
+-            consolidated=False,
+-            compute=compute,
+-            **kwargs,
++    root_store = get_writable_zarr_store(
++        store,
++        chunk_store=chunk_store,
++        mode=mode,
++        synchronizer=synchronizer,
++        group=group,
++        consolidated=consolidated,
++        append_dim=append_dim,
++        region=region,
++        safe_chunks=safe_chunks,
++        align_chunks=align_chunks,
++        storage_options=storage_options,
++        zarr_version=zarr_version,
++        zarr_format=zarr_format,
++        write_empty_chunks=write_empty_chunks,
++    )
++
++    writer = ArrayWriter()
++
++    try:
++        for rel_path, node in dt.subtree_with_keys:
++            at_root = node is dt
++            dataset = node.to_dataset(inherit=write_inherited_coords or at_root)
++            # Use a relative path for group, because absolute paths are broken
++            # with consolidated metadata in zarr 3.1.2 and earlier:
++            # https://github.com/zarr-developers/zarr-python/pull/3428
++            node_store = root_store if at_root else root_store.get_child_store(rel_path)
++
++            dataset = node_store._validate_and_autodetect_region(dataset)
++            node_store._validate_encoding(encoding)
++
++            dump_to_store(
++                dataset,
++                node_store,
++                writer,
++                encoding=encoding.get(node.path),
++            )
++        writes = writer.sync(
++            compute=compute, chunkmanager_store_kwargs=chunkmanager_store_kwargs
+         )
+-        if "w" in mode:
+-            mode = "a"
++    finally:
++        if compute:
++            root_store.close()
++
++    if not compute:
++        return delayed_close_after_writes(writes, root_store)
+ 
+-    if consolidated:
+-        consolidate_metadata(store)
++    return root_store
+
+diff --git a/xarray/core/datatree_mapping.py b/xarray/core/datatree_mapping.py
+index f9fd550..dc2fc59 100644
+--- a/xarray/core/datatree_mapping.py
++++ b/xarray/core/datatree_mapping.py
+@@ -13,15 +13,14 @@ if TYPE_CHECKING:
+ 
+ @overload
+ def map_over_datasets(
+-    func: Callable[
+-        ...,
+-        Dataset | None,
+-    ],
++    func: Callable[..., Dataset | None],
+     *args: Any,
+     kwargs: Mapping[str, Any] | None = None,
+ ) -> DataTree: ...
+ 
+ 
++# add an explicit overload for the most common case of two return values
++# (python typing does not have a way to match tuple lengths in general)
+ @overload
+ def map_over_datasets(
+     func: Callable[..., tuple[Dataset | None, Dataset | None]],
+@@ -30,8 +29,6 @@ def map_over_datasets(
+ ) -> tuple[DataTree, DataTree]: ...
+ 
+ 
+-# add an expect overload for the most common case of two return values
+-# (python typing does not have a way to match tuple lengths in general)
+ @overload
+ def map_over_datasets(
+     func: Callable[..., tuple[Dataset | None, ...]],
+@@ -41,7 +38,7 @@ def map_over_datasets(
+ 
+ 
+ def map_over_datasets(
+-    func: Callable[..., Dataset | tuple[Dataset | None, ...] | None],
++    func: Callable[..., Dataset | None | tuple[Dataset | None, ...]],
+     *args: Any,
+     kwargs: Mapping[str, Any] | None = None,
+ ) -> DataTree | tuple[DataTree, ...]:
+
+diff --git a/xarray/core/groupby.py b/xarray/core/groupby.py
+index 6ff5d49..7a53735 100644
+--- a/xarray/core/groupby.py
++++ b/xarray/core/groupby.py
+@@ -540,7 +540,7 @@ class ComposedGrouper:
+         _flatcodes = where(mask.data, -1, _flatcodes)
+ 
+         full_index = pd.MultiIndex.from_product(
+-            [grouper.full_index.values for grouper in groupers],
++            [list(grouper.full_index.values) for grouper in groupers],
+             names=tuple(grouper.name for grouper in groupers),
+         )
+         if not full_index.is_unique:
+
+diff --git a/xarray/core/indexes.py b/xarray/core/indexes.py
+index d22fc37..72d8db4 100644
+--- a/xarray/core/indexes.py
++++ b/xarray/core/indexes.py
+@@ -817,7 +817,7 @@ class PandasIndex(Index):
+             # scalar indexer: drop index
+             return None
+ 
+-        return self._replace(self.index[indxr])  # type: ignore[index]
++        return self._replace(self.index[indxr])  # type: ignore[index,unused-ignore]
+ 
+     def sel(
+         self, labels: dict[Any, Any], method=None, tolerance=None
+@@ -1009,7 +1009,7 @@ class PandasMultiIndex(PandasIndex):
+     index: pd.MultiIndex
+     dim: Hashable
+     coord_dtype: Any
+-    level_coords_dtype: dict[str, Any]
++    level_coords_dtype: dict[Hashable | None, Any]
+ 
+     __slots__ = ("coord_dtype", "dim", "index", "level_coords_dtype")
+ 
+@@ -1052,7 +1052,7 @@ class PandasMultiIndex(PandasIndex):
+         dim = next(iter(variables.values())).dims[0]
+ 
+         index = pd.MultiIndex.from_arrays(
+-            [var.values for var in variables.values()], names=variables.keys()
++            [var.values for var in variables.values()], names=list(variables.keys())
+         )
+         index.name = dim
+         level_coords_dtype = {name: var.dtype for name, var in variables.items()}
+@@ -1108,7 +1108,7 @@ class PandasMultiIndex(PandasIndex):
+         # https://github.com/pandas-dev/pandas/issues/14672
+         if all(index.is_monotonic_increasing for index in level_indexes):
+             index = pd.MultiIndex.from_product(
+-                level_indexes, sortorder=0, names=variables.keys()
++                level_indexes, sortorder=0, names=list(variables.keys())
+             )
+         else:
+             split_labels, levels = zip(
+@@ -1118,7 +1118,7 @@ class PandasMultiIndex(PandasIndex):
+             labels = [x.ravel().tolist() for x in labels_mesh]
+ 
+             index = pd.MultiIndex(
+-                levels=levels, codes=labels, sortorder=0, names=variables.keys()
++                levels=levels, codes=labels, sortorder=0, names=list(variables.keys())
+             )
+         level_coords_dtype = {k: var.dtype for k, var in variables.items()}
+ 
+@@ -1192,7 +1192,8 @@ class PandasMultiIndex(PandasIndex):
+             level_variables[name] = var
+ 
+         codes_as_lists = [list(x) for x in codes]
+-        index = pd.MultiIndex(levels=levels, codes=codes_as_lists, names=names)
++        levels_as_lists = [list(level) for level in levels]
++        index = pd.MultiIndex(levels=levels_as_lists, codes=codes_as_lists, names=names)
+         level_coords_dtype = {k: var.dtype for k, var in level_variables.items()}
+         obj = cls(index, dim, level_coords_dtype=level_coords_dtype)
+         index_vars = obj.create_variables(level_variables)
+@@ -1247,7 +1248,7 @@ class PandasMultiIndex(PandasIndex):
+                 dtype = None
+             else:
+                 level = name
+-                dtype = self.level_coords_dtype[name]  # type: ignore[index]  # TODO: are Hashables ok?
++                dtype = self.level_coords_dtype[name]
+ 
+             var = variables.get(name)
+             if var is not None:
+
+diff --git a/xarray/core/indexing.py b/xarray/core/indexing.py
+index 16276b5..94c5aa7 100644
+--- a/xarray/core/indexing.py
++++ b/xarray/core/indexing.py
+@@ -496,7 +496,7 @@ class OuterIndexer(ExplicitIndexer):
+ 
+         new_key = []
+         for k in key:
+-            if isinstance(k, integer_types):
++            if isinstance(k, integer_types) and not isinstance(k, bool):
+                 k = int(k)
+             elif isinstance(k, slice):
+                 k = as_integer_slice(k)
+@@ -513,7 +513,7 @@ class OuterIndexer(ExplicitIndexer):
+                 k = duck_array_ops.astype(k, np.int64, copy=False)
+             else:
+                 raise TypeError(
+-                    f"unexpected indexer type for {type(self).__name__}: {k!r}"
++                    f"unexpected indexer type for {type(self).__name__}: {k!r}, {type(k)}"
+                 )
+             new_key.append(k)
+ 
+@@ -1387,7 +1387,7 @@ def _decompose_outer_indexer(
+             elif isinstance(k, integer_types):
+                 backend_indexer.append(k)
+             else:  # slice:  convert positive step slice for backend
+-                bk_slice, np_slice = _decompose_slice(k, s)
++                bk_slice, np_slice = _decompose_slice(cast(slice, k), s)
+                 backend_indexer.append(bk_slice)
+                 np_indexer.append(np_slice)
+ 
+@@ -1425,7 +1425,7 @@ def _decompose_outer_indexer(
+         elif isinstance(k, integer_types):
+             backend_indexer.append(k)
+         else:  # slice:  convert positive step slice for backend
+-            bk_slice, np_slice = _decompose_slice(k, s)
++            bk_slice, np_slice = _decompose_slice(cast(slice, k), s)
+             backend_indexer.append(bk_slice)
+             np_indexer.append(np_slice)
+ 
+@@ -1639,7 +1639,7 @@ def is_fancy_indexer(indexer: Any) -> bool:
+     """Return False if indexer is a int, slice, a 1-dimensional list, or a 0 or
+     1-dimensional ndarray; in all other cases return True
+     """
+-    if isinstance(indexer, int | slice):
++    if isinstance(indexer, int | slice) and not isinstance(indexer, bool):
+         return False
+     if isinstance(indexer, np.ndarray):
+         return indexer.ndim > 1
+@@ -1771,11 +1771,7 @@ class ArrayApiIndexingAdapter(IndexingAdapter):
+ 
+ 
+ def _apply_vectorized_indexer_dask_wrapper(indices, coord):
+-    from xarray.core.indexing import (
+-        VectorizedIndexer,
+-        apply_indexer,
+-        as_indexable,
+-    )
++    from xarray.core.indexing import VectorizedIndexer, apply_indexer, as_indexable
+ 
+     return apply_indexer(
+         as_indexable(coord), VectorizedIndexer((indices.squeeze(axis=-1),))
+
+diff --git a/xarray/core/resample_cftime.py b/xarray/core/resample_cftime.py
+index 9b636f6..82e99fc 100644
+--- a/xarray/core/resample_cftime.py
++++ b/xarray/core/resample_cftime.py
+@@ -45,6 +45,7 @@ import numpy as np
+ import pandas as pd
+ 
+ from xarray.coding.cftime_offsets import (
++    CFTIME_TICKS,
+     BaseCFTimeOffset,
+     MonthEnd,
+     QuarterEnd,
+@@ -56,6 +57,7 @@ from xarray.coding.cftime_offsets import (
+ )
+ from xarray.coding.cftimeindex import CFTimeIndex
+ from xarray.core.types import SideOptions
++from xarray.core.utils import emit_user_level_warning
+ 
+ if typing.TYPE_CHECKING:
+     from xarray.core.types import CFTimeDatetime, ResampleCompatible
+@@ -84,6 +86,22 @@ class CFTimeGrouper:
+         self.freq = to_offset(freq)
+         self.origin = origin
+ 
++        if not isinstance(self.freq, CFTIME_TICKS):
++            if offset is not None:
++                message = (
++                    "The 'offset' keyword does not take effect when "
++                    "resampling with a 'freq' that is not Tick-like (h, m, s, "
++                    "ms, us)"
++                )
++                emit_user_level_warning(message, category=RuntimeWarning)
++            if origin != "start_day":
++                message = (
++                    "The 'origin' keyword does not take effect when "
++                    "resampling with a 'freq' that is not Tick-like (h, m, s, "
++                    "ms, us)"
++                )
++                emit_user_level_warning(message, category=RuntimeWarning)
++
+         if isinstance(self.freq, MonthEnd | QuarterEnd | YearEnd) or self.origin in [
+             "end",
+             "end_day",
+
+diff --git a/xarray/core/treenode.py b/xarray/core/treenode.py
+index a38ec6b..d15dc51 100644
+--- a/xarray/core/treenode.py
++++ b/xarray/core/treenode.py
+@@ -7,7 +7,6 @@ from pathlib import PurePosixPath
+ from typing import (
+     TYPE_CHECKING,
+     Any,
+-    Generic,
+     TypeVar,
+ )
+ 
+@@ -15,7 +14,7 @@ from xarray.core.types import Self
+ from xarray.core.utils import Frozen, is_dict_like
+ 
+ if TYPE_CHECKING:
+-    from xarray.core.types import T_DataArray
++    from xarray.core.dataarray import DataArray
+ 
+ 
+ class InvalidTreeError(Exception):
+@@ -44,10 +43,7 @@ class NodePath(PurePosixPath):
+         # TODO should we also forbid suffixes to avoid node names with dots in them?
+ 
+ 
+-Tree = TypeVar("Tree", bound="TreeNode")
+-
+-
+-class TreeNode(Generic[Tree]):
++class TreeNode:
+     """
+     Base class representing a node of a tree, with methods for traversing and altering the tree.
+ 
+@@ -74,10 +70,10 @@ class TreeNode(Generic[Tree]):
+ 
+     """
+ 
+-    _parent: Tree | None
+-    _children: dict[str, Tree]
++    _parent: Self | None
++    _children: dict[str, Self]
+ 
+-    def __init__(self, children: Mapping[str, Tree] | None = None):
++    def __init__(self, children: Mapping[str, Self] | None = None):
+         """Create a parentless node."""
+         self._parent = None
+         self._children = {}
+@@ -87,18 +83,18 @@ class TreeNode(Generic[Tree]):
+             self.children = {name: child.copy() for name, child in children.items()}
+ 
+     @property
+-    def parent(self) -> Tree | None:
++    def parent(self) -> Self | None:
+         """Parent of this node."""
+         return self._parent
+ 
+     @parent.setter
+-    def parent(self: Tree, new_parent: Tree) -> None:
++    def parent(self, new_parent: Self) -> None:
+         raise AttributeError(
+             "Cannot set parent attribute directly, you must modify the children of the other node instead using dict-like syntax"
+         )
+ 
+     def _set_parent(
+-        self, new_parent: Tree | None, child_name: str | None = None
++        self, new_parent: Self | None, child_name: str | None = None
+     ) -> None:
+         # TODO is it possible to refactor in a way that removes this private method?
+ 
+@@ -114,7 +110,7 @@ class TreeNode(Generic[Tree]):
+             self._detach(old_parent)
+             self._attach(new_parent, child_name)
+ 
+-    def _check_loop(self, new_parent: Tree | None) -> None:
++    def _check_loop(self, new_parent: Self | None) -> None:
+         """Checks that assignment of this new parent will not create a cycle."""
+         if new_parent is not None:
+             if new_parent is self:
+@@ -127,10 +123,10 @@ class TreeNode(Generic[Tree]):
+                     "Cannot set parent, as intended parent is already a descendant of this node."
+                 )
+ 
+-    def _is_descendant_of(self, node: Tree) -> bool:
++    def _is_descendant_of(self, node: Self) -> bool:
+         return any(n is self for n in node.parents)
+ 
+-    def _detach(self, parent: Tree | None) -> None:
++    def _detach(self, parent: Self | None) -> None:
+         if parent is not None:
+             self._pre_detach(parent)
+             parents_children = parent.children
+@@ -142,7 +138,7 @@ class TreeNode(Generic[Tree]):
+             self._parent = None
+             self._post_detach(parent)
+ 
+-    def _attach(self, parent: Tree | None, child_name: str | None = None) -> None:
++    def _attach(self, parent: Self | None, child_name: str | None = None) -> None:
+         if parent is not None:
+             if child_name is None:
+                 raise ValueError(
+@@ -165,12 +161,12 @@ class TreeNode(Generic[Tree]):
+         self._set_parent(new_parent=None)
+ 
+     @property
+-    def children(self: Tree) -> Mapping[str, Tree]:
++    def children(self) -> Mapping[str, Self]:
+         """Child nodes of this node, stored under a mapping via their names."""
+         return Frozen(self._children)
+ 
+     @children.setter
+-    def children(self: Tree, children: Mapping[str, Tree]) -> None:
++    def children(self, children: Mapping[str, Self]) -> None:
+         self._check_children(children)
+         children = {**children}
+ 
+@@ -198,7 +194,7 @@ class TreeNode(Generic[Tree]):
+         self._post_detach_children(children)
+ 
+     @staticmethod
+-    def _check_children(children: Mapping[str, Tree]) -> None:
++    def _check_children(children: Mapping[str, TreeNode]) -> None:
+         """Check children for correct types and for any duplicates."""
+         if not is_dict_like(children):
+             raise TypeError(
+@@ -224,19 +220,19 @@ class TreeNode(Generic[Tree]):
+     def __repr__(self) -> str:
+         return f"TreeNode(children={dict(self._children)})"
+ 
+-    def _pre_detach_children(self: Tree, children: Mapping[str, Tree]) -> None:
++    def _pre_detach_children(self, children: Mapping[str, Self]) -> None:
+         """Method call before detaching `children`."""
+         pass
+ 
+-    def _post_detach_children(self: Tree, children: Mapping[str, Tree]) -> None:
++    def _post_detach_children(self, children: Mapping[str, Self]) -> None:
+         """Method call after detaching `children`."""
+         pass
+ 
+-    def _pre_attach_children(self: Tree, children: Mapping[str, Tree]) -> None:
++    def _pre_attach_children(self, children: Mapping[str, Self]) -> None:
+         """Method call before attaching `children`."""
+         pass
+ 
+-    def _post_attach_children(self: Tree, children: Mapping[str, Tree]) -> None:
++    def _post_attach_children(self, children: Mapping[str, Self]) -> None:
+         """Method call after attaching `children`."""
+         pass
+ 
+@@ -300,14 +296,14 @@ class TreeNode(Generic[Tree]):
+     def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
+         return self._copy_subtree(inherit=True, deep=True, memo=memo)
+ 
+-    def _iter_parents(self: Tree) -> Iterator[Tree]:
++    def _iter_parents(self) -> Iterator[Self]:
+         """Iterate up the tree, starting from the current node's parent."""
+-        node: Tree | None = self.parent
++        node: Self | None = self.parent
+         while node is not None:
+             yield node
+             node = node.parent
+ 
+-    def iter_lineage(self: Tree) -> tuple[Tree, ...]:
++    def iter_lineage(self) -> tuple[Self, ...]:
+         """Iterate up the tree, starting from the current node."""
+         from warnings import warn
+ 
+@@ -320,7 +316,7 @@ class TreeNode(Generic[Tree]):
+         return (self, *self.parents)
+ 
+     @property
+-    def lineage(self: Tree) -> tuple[Tree, ...]:
++    def lineage(self) -> tuple[Self, ...]:
+         """All parent nodes and their parent nodes, starting with the closest."""
+         from warnings import warn
+ 
+@@ -333,12 +329,12 @@ class TreeNode(Generic[Tree]):
+         return self.iter_lineage()
+ 
+     @property
+-    def parents(self: Tree) -> tuple[Tree, ...]:
++    def parents(self) -> tuple[Self, ...]:
+         """All parent nodes and their parent nodes, starting with the closest."""
+         return tuple(self._iter_parents())
+ 
+     @property
+-    def ancestors(self: Tree) -> tuple[Tree, ...]:
++    def ancestors(self) -> tuple[Self, ...]:
+         """All parent nodes and their parent nodes, starting with the most distant."""
+ 
+         from warnings import warn
+@@ -352,7 +348,7 @@ class TreeNode(Generic[Tree]):
+         return (*reversed(self.parents), self)
+ 
+     @property
+-    def root(self: Tree) -> Tree:
++    def root(self) -> Self:
+         """Root node of the tree"""
+         node = self
+         while node.parent is not None:
+@@ -374,7 +370,7 @@ class TreeNode(Generic[Tree]):
+         return self.children == {}
+ 
+     @property
+-    def leaves(self: Tree) -> tuple[Tree, ...]:
++    def leaves(self) -> tuple[Self, ...]:
+         """
+         All leaf nodes.
+ 
+@@ -383,7 +379,7 @@ class TreeNode(Generic[Tree]):
+         return tuple(node for node in self.subtree if node.is_leaf)
+ 
+     @property
+-    def siblings(self: Tree) -> dict[str, Tree]:
++    def siblings(self) -> dict[str, Self]:
+         """
+         Nodes with the same parent as this node.
+         """
+@@ -397,7 +393,7 @@ class TreeNode(Generic[Tree]):
+             return {}
+ 
+     @property
+-    def subtree(self: Tree) -> Iterator[Tree]:
++    def subtree(self) -> Iterator[Self]:
+         """
+         Iterate over all nodes in this tree, including both self and all descendants.
+ 
+@@ -417,7 +413,7 @@ class TreeNode(Generic[Tree]):
+             queue.extend(node.children.values())
+ 
+     @property
+-    def subtree_with_keys(self: Tree) -> Iterator[tuple[str, Tree]]:
++    def subtree_with_keys(self) -> Iterator[tuple[str, Self]]:
+         """
+         Iterate over relative paths and node pairs for all nodes in this tree.
+ 
+@@ -436,7 +432,7 @@ class TreeNode(Generic[Tree]):
+             queue.extend((path / name, child) for name, child in node.children.items())
+ 
+     @property
+-    def descendants(self: Tree) -> tuple[Tree, ...]:
++    def descendants(self) -> tuple[Self, ...]:
+         """
+         Child nodes and all their child nodes.
+ 
+@@ -451,7 +447,7 @@ class TreeNode(Generic[Tree]):
+         return tuple(descendants)
+ 
+     @property
+-    def level(self: Tree) -> int:
++    def level(self) -> int:
+         """
+         Level of this node.
+ 
+@@ -470,7 +466,7 @@ class TreeNode(Generic[Tree]):
+         return len(self.parents)
+ 
+     @property
+-    def depth(self: Tree) -> int:
++    def depth(self) -> int:
+         """
+         Maximum level of this tree.
+ 
+@@ -488,7 +484,7 @@ class TreeNode(Generic[Tree]):
+         return max(node.level for node in self.root.subtree)
+ 
+     @property
+-    def width(self: Tree) -> int:
++    def width(self) -> int:
+         """
+         Number of nodes at this level in the tree.
+ 
+@@ -505,23 +501,23 @@ class TreeNode(Generic[Tree]):
+         """
+         return len([node for node in self.root.subtree if node.level == self.level])
+ 
+-    def _pre_detach(self: Tree, parent: Tree) -> None:
++    def _pre_detach(self, parent: Self) -> None:
+         """Method call before detaching from `parent`."""
+         pass
+ 
+-    def _post_detach(self: Tree, parent: Tree) -> None:
++    def _post_detach(self, parent: Self) -> None:
+         """Method call after detaching from `parent`."""
+         pass
+ 
+-    def _pre_attach(self: Tree, parent: Tree, name: str) -> None:
++    def _pre_attach(self, parent: Self, name: str) -> None:
+         """Method call before attaching to `parent`."""
+         pass
+ 
+-    def _post_attach(self: Tree, parent: Tree, name: str) -> None:
++    def _post_attach(self, parent: Self, name: str) -> None:
+         """Method call after attaching to `parent`."""
+         pass
+ 
+-    def get(self: Tree, key: str, default: Tree | None = None) -> Tree | None:
++    def get(self, key: str, default: Self | None = None) -> Self | None:
+         """
+         Return the child node with the specified key.
+ 
+@@ -535,7 +531,7 @@ class TreeNode(Generic[Tree]):
+ 
+     # TODO `._walk` method to be called by both `_get_item` and `_set_item`
+ 
+-    def _get_item(self: Tree, path: str | NodePath) -> Tree | T_DataArray:
++    def _get_item(self, path: str | NodePath) -> Self | DataArray:
+         """
+         Returns the object lying at the given path.
+ 
+@@ -559,13 +555,14 @@ class TreeNode(Generic[Tree]):
+                     current_node = current_node.parent
+             elif part in ("", "."):
+                 pass
+-            elif current_node.get(part) is None:
+-                raise KeyError(f"Could not find node at {path}")
+             else:
+-                current_node = current_node.get(part)
++                child = current_node.get(part)
++                if child is None:
++                    raise KeyError(f"Could not find node at {path}")
++                current_node = child
+         return current_node
+ 
+-    def _set(self: Tree, key: str, val: Tree) -> None:
++    def _set(self, key: str, val: Any) -> None:
+         """
+         Set the child node with the specified key to value.
+ 
+@@ -575,9 +572,9 @@ class TreeNode(Generic[Tree]):
+         self.children = new_children
+ 
+     def _set_item(
+-        self: Tree,
++        self,
+         path: str | NodePath,
+-        item: Tree | T_DataArray,
++        item: Any,
+         new_nodes_along_path: bool = False,
+         allow_overwrite: bool = True,
+     ) -> None:
+@@ -649,7 +646,7 @@ class TreeNode(Generic[Tree]):
+         else:
+             current_node._set(name, item)
+ 
+-    def __delitem__(self: Tree, key: str) -> None:
++    def __delitem__(self, key: str) -> None:
+         """Remove a child node from this tree object."""
+         if key in self.children:
+             child = self._children[key]
+@@ -658,7 +655,7 @@ class TreeNode(Generic[Tree]):
+         else:
+             raise KeyError(key)
+ 
+-    def same_tree(self, other: Tree) -> bool:
++    def same_tree(self, other: Self) -> bool:
+         """True if other node is in the same tree as this node."""
+         return self.root is other.root
+ 
+@@ -674,7 +671,7 @@ def _validate_name(name: str | None) -> None:
+             raise ValueError("node names cannot contain forward slashes")
+ 
+ 
+-class NamedNode(TreeNode, Generic[Tree]):
++class NamedNode(TreeNode):
+     """
+     A TreeNode which knows its own name.
+ 
+@@ -682,10 +679,12 @@ class NamedNode(TreeNode, Generic[Tree]):
+     """
+ 
+     _name: str | None
+-    _parent: Tree | None
+-    _children: dict[str, Tree]
+ 
+-    def __init__(self, name=None, children=None):
++    def __init__(
++        self,
++        name: str | None = None,
++        children: Mapping[str, Self] | None = None,
++    ):
+         super().__init__(children=children)
+         _validate_name(name)
+         self._name = name
+@@ -738,9 +737,9 @@ class NamedNode(TreeNode, Generic[Tree]):
+             root, *ancestors = tuple(reversed(self.parents))
+             # don't include name of root because (a) root might not have a name & (b) we want path relative to root.
+             names = [*(node.name for node in ancestors), self.name]
+-            return "/" + "/".join(names)
++            return "/" + "/".join(names)  # type: ignore[arg-type]
+ 
+-    def relative_to(self: NamedNode, other: NamedNode) -> str:
++    def relative_to(self, other: Self) -> str:
+         """
+         Compute the relative path from this node to node `other`.
+ 
+@@ -761,7 +760,7 @@ class NamedNode(TreeNode, Generic[Tree]):
+                 path_to_common_ancestor / this_path.relative_to(common_ancestor.path)
+             )
+ 
+-    def find_common_ancestor(self, other: NamedNode) -> NamedNode:
++    def find_common_ancestor(self, other: Self) -> Self:
+         """
+         Find the first common ancestor of two nodes in the same tree.
+ 
+@@ -779,7 +778,7 @@ class NamedNode(TreeNode, Generic[Tree]):
+             "Cannot find common ancestor because nodes do not lie within the same tree"
+         )
+ 
+-    def _path_to_ancestor(self, ancestor: NamedNode) -> NodePath:
++    def _path_to_ancestor(self, ancestor: Self) -> NodePath:
+         """Return the relative path from this node to the given ancestor node"""
+ 
+         if not self.same_tree(ancestor):
+
+diff --git a/xarray/core/types.py b/xarray/core/types.py
+index 736a11f..2305ce5 100644
+--- a/xarray/core/types.py
++++ b/xarray/core/types.py
+@@ -32,7 +32,7 @@ if TYPE_CHECKING:
+     from xarray.core.indexes import Index, Indexes
+     from xarray.core.utils import Frozen
+     from xarray.core.variable import IndexVariable, Variable
+-    from xarray.groupers import Grouper, TimeResampler
++    from xarray.groupers import Grouper, Resampler
+     from xarray.structure.alignment import Aligner
+ 
+     GroupInput: TypeAlias = (
+@@ -201,7 +201,7 @@ Dims = Union[str, Collection[Hashable], EllipsisType, None]
+ # FYI in some cases we don't allow `None`, which this doesn't take account of.
+ # FYI the `str` is for a size string, e.g. "16MB", supported by dask.
+ T_ChunkDim: TypeAlias = str | int | Literal["auto"] | tuple[int, ...] | None  # noqa: PYI051
+-T_ChunkDimFreq: TypeAlias = Union["TimeResampler", T_ChunkDim]
++T_ChunkDimFreq: TypeAlias = Union["Resampler", T_ChunkDim]
+ T_ChunksFreq: TypeAlias = T_ChunkDim | Mapping[Any, T_ChunkDimFreq]
+ # We allow the tuple form of this (though arguably we could transition to named dims only)
+ T_Chunks: TypeAlias = T_ChunkDim | Mapping[Any, T_ChunkDim]
+
+diff --git a/xarray/core/variable.py b/xarray/core/variable.py
+index aed4b39..f3c8435 100644
+--- a/xarray/core/variable.py
++++ b/xarray/core/variable.py
+@@ -400,7 +400,7 @@ class Variable(NamedArray, AbstractArray, VariableArithmetic):
+             dims=dims, data=as_compatible_data(data, fastpath=fastpath), attrs=attrs
+         )
+ 
+-        self._encoding = None
++        self._encoding: dict[Any, Any] | None = None
+         if encoding is not None:
+             self.encoding = encoding
+ 
+@@ -465,7 +465,7 @@ class Variable(NamedArray, AbstractArray, VariableArithmetic):
+             return duck_array.array
+         return duck_array
+ 
+-    @data.setter
++    @data.setter  # type: ignore[override,unused-ignore]
+     def data(self, data: T_DuckArray | ArrayLike) -> None:
+         data = as_compatible_data(data)
+         self._check_shape(data)
+@@ -647,7 +647,10 @@ class Variable(NamedArray, AbstractArray, VariableArithmetic):
+             k.item() if isinstance(k, np.ndarray) and k.ndim == 0 else k for k in key
+         )
+ 
+-        if all(isinstance(k, BASIC_INDEXING_TYPES) for k in key):
++        if all(
++            (isinstance(k, BASIC_INDEXING_TYPES) and not isinstance(k, bool))
++            for k in key
++        ):
+             return self._broadcast_indexes_basic(key)
+ 
+         self._validate_indexers(key)
+@@ -903,7 +906,8 @@ class Variable(NamedArray, AbstractArray, VariableArithmetic):
+     def encoding(self) -> dict[Any, Any]:
+         """Dictionary of encodings on this variable."""
+         if self._encoding is None:
+-            self._encoding = {}
++            encoding: dict[Any, Any] = {}
++            self._encoding = encoding
+         return self._encoding
+ 
+     @encoding.setter
+@@ -2950,13 +2954,13 @@ class IndexVariable(Variable):
+             return index
+ 
+     @property
+-    def level_names(self) -> list[str] | None:
++    def level_names(self) -> list[Hashable | None] | None:
+         """Return MultiIndex level names or None if this IndexVariable has no
+         MultiIndex.
+         """
+         index = self.to_index()
+         if isinstance(index, pd.MultiIndex):
+-            return index.names
++            return list(index.names)
+         else:
+             return None
+ 
+
+diff --git a/xarray/groupers.py b/xarray/groupers.py
+index f01d4b8..0f2ec8a 100644
+--- a/xarray/groupers.py
++++ b/xarray/groupers.py
+@@ -12,7 +12,7 @@ import itertools
+ import operator
+ from abc import ABC, abstractmethod
+ from collections import defaultdict
+-from collections.abc import Mapping, Sequence
++from collections.abc import Hashable, Mapping, Sequence
+ from dataclasses import dataclass, field
+ from itertools import chain, pairwise
+ from typing import TYPE_CHECKING, Any, Literal, cast
+@@ -52,6 +52,8 @@ __all__ = [
+     "EncodedGroups",
+     "Grouper",
+     "Resampler",
++    "SeasonGrouper",
++    "SeasonResampler",
+     "TimeResampler",
+     "UniqueGrouper",
+ ]
+@@ -169,7 +171,26 @@ class Resampler(Grouper):
+     Currently only used for TimeResampler, but could be used for SpaceResampler in the future.
+     """
+ 
+-    pass
++    def compute_chunks(self, variable: Variable, *, dim: Hashable) -> tuple[int, ...]:
++        """
++        Compute chunk sizes for this resampler.
++
++        This method should be implemented by subclasses to provide appropriate
++        chunking behavior for their specific resampling strategy.
++
++        Parameters
++        ----------
++        variable : Variable
++            The variable being chunked.
++        dim : Hashable
++            The name of the dimension being chunked.
++
++        Returns
++        -------
++        tuple[int, ...]
++            A tuple of chunk sizes for the dimension.
++        """
++        raise NotImplementedError("Subclasses must implement compute_chunks method")
+ 
+ 
+ @dataclass
+@@ -565,6 +586,49 @@ class TimeResampler(Resampler):
+             coords=coordinates_from_variable(unique_coord),
+         )
+ 
++    def compute_chunks(self, variable: Variable, *, dim: Hashable) -> tuple[int, ...]:
++        """
++        Compute chunk sizes for this time resampler.
++
++        This method is used during chunking operations to determine appropriate
++        chunk sizes for the given variable when using this resampler.
++
++        Parameters
++        ----------
++        name : Hashable
++            The name of the dimension being chunked.
++        variable : Variable
++            The variable being chunked.
++
++        Returns
++        -------
++        tuple[int, ...]
++            A tuple of chunk sizes for the dimension.
++        """
++        from xarray.core.dataarray import DataArray
++
++        if not _contains_datetime_like_objects(variable):
++            raise ValueError(
++                f"Computing chunks with {type(self)!r} only supported for datetime variables. "
++                f"Received variable with dtype {variable.dtype!r} instead."
++            )
++
++        chunks = (
++            DataArray(
++                np.ones(variable.shape, dtype=int),
++                dims=(dim,),
++                coords={dim: variable},
++            )
++            .resample({dim: self})
++            .sum()
++        )
++        # When bins (binning) or time periods are missing (resampling)
++        # we can end up with NaNs. Drop them.
++        if chunks.dtype.kind == "f":
++            chunks = chunks.dropna(dim).astype(int)
++        chunks_tuple: tuple[int, ...] = tuple(chunks.data.tolist())
++        return chunks_tuple
++
+ 
+ def _factorize_given_labels(data: np.ndarray, labels: np.ndarray) -> np.ndarray:
+     # Copied from flox
+@@ -967,5 +1031,58 @@ class SeasonResampler(Resampler):
+ 
+         return EncodedGroups(codes=codes, full_index=full_index)
+ 
++    def compute_chunks(self, variable: Variable, *, dim: Hashable) -> tuple[int, ...]:
++        """
++        Compute chunk sizes for this season resampler.
++
++        This method is used during chunking operations to determine appropriate
++        chunk sizes for the given variable when using this resampler.
++
++        Parameters
++        ----------
++        name : Hashable
++            The name of the dimension being chunked.
++        variable : Variable
++            The variable being chunked.
++
++        Returns
++        -------
++        tuple[int, ...]
++            A tuple of chunk sizes for the dimension.
++        """
++        from xarray.core.dataarray import DataArray
++
++        if not _contains_datetime_like_objects(variable):
++            raise ValueError(
++                f"Computing chunks with {type(self)!r} only supported for datetime variables. "
++                f"Received variable with dtype {variable.dtype!r} instead."
++            )
++
++        if len("".join(self.seasons)) != 12:
++            raise ValueError(
++                "Cannot rechunk with a SeasonResampler that does not cover all 12 months. "
++                f"Received `seasons={self.seasons!r}`."
++            )
++
++        # Create a temporary resampler that ignores drop_incomplete for chunking
++        # This prevents data from being silently dropped during chunking
++        resampler_for_chunking = type(self)(seasons=self.seasons, drop_incomplete=False)
++
++        chunks = (
++            DataArray(
++                np.ones(variable.shape, dtype=int),
++                dims=(dim,),
++                coords={dim: variable},
++            )
++            .resample({dim: resampler_for_chunking})
++            .sum()
++        )
++        # When bins (binning) or time periods are missing (resampling)
++        # we can end up with NaNs. Drop them.
++        if chunks.dtype.kind == "f":
++            chunks = chunks.dropna(dim).astype(int)
++        chunks_tuple: tuple[int, ...] = tuple(chunks.data.tolist())
++        return chunks_tuple
++
+     def reset(self) -> Self:
+         return type(self)(seasons=self.seasons, drop_incomplete=self.drop_incomplete)
+
+diff --git a/xarray/indexes/nd_point_index.py b/xarray/indexes/nd_point_index.py
+index 95af1dd..b4b533e 100644
+--- a/xarray/indexes/nd_point_index.py
++++ b/xarray/indexes/nd_point_index.py
+@@ -80,7 +80,7 @@ class ScipyKDTreeAdapter(TreeAdapter):
+         self._kdtree = KDTree(points, **options)
+ 
+     def query(self, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+-        return self._kdtree.query(points)
++        return self._kdtree.query(points)  # type: ignore[return-value,unused-ignore]
+ 
+     def equals(self, other: Self) -> bool:
+         return np.array_equal(self._kdtree.data, other._kdtree.data)
+
+diff --git a/xarray/plot/dataarray_plot.py b/xarray/plot/dataarray_plot.py
+index 301cb5b..921f3dc 100644
+--- a/xarray/plot/dataarray_plot.py
++++ b/xarray/plot/dataarray_plot.py
+@@ -1594,7 +1594,7 @@ artist :
+             kwargs["levels"] = cmap_params["levels"]
+             # if colors == a single color, matplotlib draws dashed negative
+             # contours. we lose this feature if we pass cmap and not colors
+-            if isinstance(colors, str):
++            if colors is not None:
+                 cmap_params["cmap"] = None
+                 kwargs["colors"] = colors
+ 
+
+diff --git a/xarray/plot/utils.py b/xarray/plot/utils.py
+index a716135..a8aeb05 100644
+--- a/xarray/plot/utils.py
++++ b/xarray/plot/utils.py
+@@ -931,9 +931,6 @@ def _process_cmap_cbar_kwargs(
+ 
+     cbar_kwargs = {} if cbar_kwargs is None else dict(cbar_kwargs)
+ 
+-    if "contour" in func.__name__ and levels is None:
+-        levels = 7  # this is the matplotlib default
+-
+     # colors is mutually exclusive with cmap
+     if cmap and colors:
+         raise ValueError("Can't specify both cmap and colors.")
+
+diff --git a/xarray/structure/alignment.py b/xarray/structure/alignment.py
+index 5cda7c2..a9c0832 100644
+--- a/xarray/structure/alignment.py
++++ b/xarray/structure/alignment.py
+@@ -6,7 +6,7 @@ from collections import defaultdict
+ from collections.abc import Callable, Hashable, Iterable, Mapping
+ from contextlib import suppress
+ from itertools import starmap
+-from typing import TYPE_CHECKING, Any, Final, Generic, TypeVar, cast, get_args, overload
++from typing import TYPE_CHECKING, Any, Final, Generic, TypeVar, get_args, overload
+ 
+ import numpy as np
+ import pandas as pd
+@@ -1166,9 +1166,9 @@ def _broadcast_helper(
+ 
+     # remove casts once https://github.com/python/mypy/issues/12800 is resolved
+     if isinstance(arg, DataArray):
+-        return cast(T_Alignable, _broadcast_array(arg))
++        return _broadcast_array(arg)  # type: ignore[return-value,unused-ignore]
+     elif isinstance(arg, Dataset):
+-        return cast(T_Alignable, _broadcast_dataset(arg))
++        return _broadcast_dataset(arg)  # type: ignore[return-value,unused-ignore]
+     else:
+         raise ValueError("all input must be Dataset or DataArray objects")
+ 
+
+diff --git a/xarray/structure/concat.py b/xarray/structure/concat.py
+index d809dd7..f732502 100644
+--- a/xarray/structure/concat.py
++++ b/xarray/structure/concat.py
+@@ -597,6 +597,7 @@ def _dataset_concat(
+             "The elements in the input list need to be either all 'Dataset's or all 'DataArray's"
+         )
+ 
++    dim_var: Variable | None
+     if isinstance(dim, DataArray):
+         dim_var = dim.variable
+     elif isinstance(dim, Variable):

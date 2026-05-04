@@ -1,0 +1,4798 @@
+diff --git a/asv_bench/benchmarks/interp.py b/asv_bench/benchmarks/interp.py
+index 4b6691b..ca1d0a2 100644
+--- a/asv_bench/benchmarks/interp.py
++++ b/asv_bench/benchmarks/interp.py
+@@ -25,23 +25,37 @@ class Interpolation:
+                 "var1": (("x", "y"), randn_xy),
+                 "var2": (("x", "t"), randn_xt),
+                 "var3": (("t",), randn_t),
++                "var4": (("z",), np.array(["text"])),
++                "var5": (("k",), np.array(["a", "b", "c"])),
+             },
+             coords={
+                 "x": np.arange(nx),
+                 "y": np.linspace(0, 1, ny),
+                 "t": pd.date_range("1970-01-01", periods=nt, freq="D"),
+                 "x_coords": ("x", np.linspace(1.1, 2.1, nx)),
++                "z": np.array([1]),
++                "k": np.linspace(0, nx, 3),
+             },
+         )
+ 
+     @parameterized(["method", "is_short"], (["linear", "cubic"], [True, False]))
+-    def time_interpolation(self, method, is_short):
++    def time_interpolation_numeric_1d(self, method, is_short):
+         new_x = new_x_short if is_short else new_x_long
+-        self.ds.interp(x=new_x, method=method).load()
++        self.ds.interp(x=new_x, method=method).compute()
+ 
+     @parameterized(["method"], (["linear", "nearest"]))
+-    def time_interpolation_2d(self, method):
+-        self.ds.interp(x=new_x_long, y=new_y_long, method=method).load()
++    def time_interpolation_numeric_2d(self, method):
++        self.ds.interp(x=new_x_long, y=new_y_long, method=method).compute()
++
++    @parameterized(["is_short"], ([True, False]))
++    def time_interpolation_string_scalar(self, is_short):
++        new_z = new_x_short if is_short else new_x_long
++        self.ds.interp(z=new_z).compute()
++
++    @parameterized(["is_short"], ([True, False]))
++    def time_interpolation_string_1d(self, is_short):
++        new_k = new_x_short if is_short else new_x_long
++        self.ds.interp(k=new_k).compute()
+ 
+ 
+ class InterpolationDask(Interpolation):
+
+diff --git a/ci/minimum_versions.py b/ci/minimum_versions.py
+index 08808d0..21123bf 100644
+--- a/ci/minimum_versions.py
++++ b/ci/minimum_versions.py
+@@ -30,6 +30,7 @@ ignored_packages = [
+     "coveralls",
+     "pip",
+     "pytest",
++    "pytest-asyncio",
+     "pytest-cov",
+     "pytest-env",
+     "pytest-mypy-plugins",
+
+diff --git a/doc/conf.py b/doc/conf.py
+index 15d39f6..4a0cca2 100644
+--- a/doc/conf.py
++++ b/doc/conf.py
+@@ -282,11 +282,11 @@ html_css_files = ["style.css"]
+ # configuration for sphinxext.opengraph
+ ogp_site_url = "https://docs.xarray.dev/en/latest/"
+ ogp_image = "https://docs.xarray.dev/en/stable/_static/logos/Xarray_Logo_RGB_Final.png"
+-ogp_custom_meta_tags = [
++ogp_custom_meta_tags = (
+     '<meta name="twitter:card" content="summary_large_image" />',
+     '<meta property="twitter:site" content="@xarray_dev" />',
+     '<meta name="image" property="og:image" content="https://docs.xarray.dev/en/stable/_static/logos/Xarray_Logo_RGB_Final.png" />',
+-]
++)
+ 
+ # Redirects for pages that were moved to new locations
+ rediraffe_redirects = {
+
+diff --git a/xarray/backends/api.py b/xarray/backends/api.py
+index cfd3ff7..af1f573 100644
+--- a/xarray/backends/api.py
++++ b/xarray/backends/api.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import importlib.util
+ import os
+ from collections.abc import (
+     Callable,
+@@ -10,7 +11,7 @@ from collections.abc import (
+     Sequence,
+ )
+ from functools import partial
+-from io import BytesIO
++from io import IOBase
+ from itertools import starmap
+ from numbers import Number
+ from typing import (
+@@ -18,6 +19,7 @@ from typing import (
+     Any,
+     Final,
+     Literal,
++    TypeVar,
+     Union,
+     cast,
+     overload,
+@@ -30,20 +32,22 @@ from xarray.backends import plugins
+ from xarray.backends.common import (
+     AbstractDataStore,
+     ArrayWriter,
++    BytesIOProxy,
++    T_PathFileOrDataStore,
+     _find_absolute_paths,
+     _normalize_path,
+ )
+ from xarray.backends.locks import _get_scheduler
+ from xarray.coders import CFDatetimeCoder, CFTimedeltaCoder
+-from xarray.core import indexing
++from xarray.core import dtypes, indexing
+ from xarray.core.coordinates import Coordinates
+ from xarray.core.dataarray import DataArray
+ from xarray.core.dataset import Dataset
+ from xarray.core.datatree import DataTree
+ from xarray.core.indexes import Index
+ from xarray.core.treenode import group_subtrees
+-from xarray.core.types import NetcdfWriteModes, ZarrWriteModes
+-from xarray.core.utils import is_remote_uri
++from xarray.core.types import NetcdfWriteModes, ReadBuffer, ZarrWriteModes
++from xarray.core.utils import emit_user_level_warning, is_remote_uri
+ from xarray.namedarray.daskmanager import DaskManager
+ from xarray.namedarray.parallelcompat import guess_chunkmanager
+ from xarray.structure.chunks import _get_chunk, _maybe_chunk
+@@ -52,6 +56,13 @@ from xarray.structure.combine import (
+     _nested_combine,
+     combine_by_coords,
+ )
++from xarray.util.deprecation_helpers import (
++    _COMPAT_DEFAULT,
++    _COORDS_DEFAULT,
++    _DATA_VARS_DEFAULT,
++    _JOIN_DEFAULT,
++    CombineKwargDefault,
++)
+ 
+ if TYPE_CHECKING:
+     try:
+@@ -63,6 +74,7 @@ if TYPE_CHECKING:
+     from xarray.core.types import (
+         CombineAttrsOptions,
+         CompatOptions,
++        ErrorOptionsWithWarn,
+         JoinOptions,
+         NestedSequence,
+         ReadBuffer,
+@@ -122,23 +134,21 @@ def _get_default_engine_gz() -> Literal["scipy"]:
+     return engine
+ 
+ 
+-def _get_default_engine_netcdf() -> Literal["netcdf4", "scipy"]:
+-    engine: Literal["netcdf4", "scipy"]
+-    try:
+-        import netCDF4  # noqa: F401
++def _get_default_engine_netcdf() -> Literal["netcdf4", "h5netcdf", "scipy"]:
++    candidates: list[tuple[str, str]] = [
++        ("netcdf4", "netCDF4"),
++        ("h5netcdf", "h5netcdf"),
++        ("scipy", "scipy.io.netcdf"),
++    ]
+ 
+-        engine = "netcdf4"
+-    except ImportError:  # pragma: no cover
+-        try:
+-            import scipy.io.netcdf  # noqa: F401
++    for engine, module_name in candidates:
++        if importlib.util.find_spec(module_name) is not None:
++            return cast(Literal["netcdf4", "h5netcdf", "scipy"], engine)
+ 
+-            engine = "scipy"
+-        except ImportError as err:
+-            raise ValueError(
+-                "cannot read or write netCDF files without "
+-                "netCDF4-python or scipy installed"
+-            ) from err
+-    return engine
++    raise ValueError(
++        "cannot read or write NetCDF files because none of "
++        "'netCDF4-python', 'h5netcdf', or 'scipy' are installed"
++    )
+ 
+ 
+ def _get_default_engine(path: str, allow_remote: bool = False) -> T_NetcdfEngine:
+@@ -234,6 +244,28 @@ def _validate_attrs(dataset, engine, invalid_netcdf=False):
+             check_attr(k, v, valid_types)
+ 
+ 
++def _sanitize_unlimited_dims(dataset, unlimited_dims):
++    msg_origin = "unlimited_dims-kwarg"
++    if unlimited_dims is None:
++        unlimited_dims = dataset.encoding.get("unlimited_dims", None)
++        msg_origin = "dataset.encoding"
++    if unlimited_dims is not None:
++        if isinstance(unlimited_dims, str) or not isinstance(unlimited_dims, Iterable):
++            unlimited_dims = [unlimited_dims]
++        else:
++            unlimited_dims = list(unlimited_dims)
++        dataset_dims = set(dataset.dims)
++        unlimited_dims = set(unlimited_dims)
++        if undeclared_dims := (unlimited_dims - dataset_dims):
++            msg = (
++                f"Unlimited dimension(s) {undeclared_dims!r} declared in {msg_origin!r}, "
++                f"but not part of current dataset dimensions. "
++                f"Consider removing {undeclared_dims!r} from {msg_origin!r}."
++            )
++            raise ValueError(msg)
++        return unlimited_dims
++
++
+ def _resolve_decoders_kwargs(decode_cf, open_backend_dataset_parameters, **decoders):
+     for d in list(decoders):
+         if decode_cf is False and d in open_backend_dataset_parameters:
+@@ -497,7 +529,7 @@ def _datatree_from_backend_datatree(
+ 
+ 
+ def open_dataset(
+-    filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++    filename_or_obj: T_PathFileOrDataStore,
+     *,
+     engine: T_Engine = None,
+     chunks: T_Chunks = None,
+@@ -527,12 +559,13 @@ def open_dataset(
+ 
+     Parameters
+     ----------
+-    filename_or_obj : str, Path, file-like or DataStore
++    filename_or_obj : str, Path, file-like, bytes, memoryview or DataStore
+         Strings and Path objects are interpreted as a path to a netCDF file
+         or an OpenDAP URL and opened with python-netCDF4, unless the filename
+         ends with .gz, in which case the file is gunzipped and opened with
+-        scipy.io.netcdf (only netCDF3 supported). Byte-strings or file-like
+-        objects are opened by scipy.io.netcdf (netCDF3) or h5py (netCDF4/HDF).
++        scipy.io.netcdf (only netCDF3 supported). Bytes, memoryview and
++        file-like objects are opened by scipy.io.netcdf (netCDF3) or h5netcdf
++        (netCDF4).
+     engine : {"netcdf4", "scipy", "pydap", "h5netcdf", "zarr", None}\
+         , installed backend \
+         or subclass of xarray.backends.BackendEntrypoint, optional
+@@ -545,8 +578,10 @@ def open_dataset(
+ 
+         - ``chunks="auto"`` will use dask ``auto`` chunking taking into account the
+           engine preferred chunks.
+-        - ``chunks=None`` skips using dask, which is generally faster for
+-          small arrays.
++        - ``chunks=None`` skips using dask. This uses xarray's internally private
++          :ref:`lazy indexing classes <internal design.lazy indexing>`,
++          but data is eagerly loaded into memory as numpy arrays when accessed.
++          This can be more efficient for smaller arrays or when large arrays are sliced before computation.
+         - ``chunks=-1`` loads the data with dask using a single chunk for all arrays.
+         - ``chunks={}`` loads the data with dask using the engine's preferred chunk
+           size, generally identical to the format's chunk size. If not available, a
+@@ -737,7 +772,7 @@ def open_dataset(
+ 
+ 
+ def open_dataarray(
+-    filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++    filename_or_obj: T_PathFileOrDataStore,
+     *,
+     engine: T_Engine = None,
+     chunks: T_Chunks = None,
+@@ -768,12 +803,13 @@ def open_dataarray(
+ 
+     Parameters
+     ----------
+-    filename_or_obj : str, Path, file-like or DataStore
++    filename_or_obj : str, Path, file-like, bytes, memoryview or DataStore
+         Strings and Path objects are interpreted as a path to a netCDF file
+         or an OpenDAP URL and opened with python-netCDF4, unless the filename
+         ends with .gz, in which case the file is gunzipped and opened with
+-        scipy.io.netcdf (only netCDF3 supported). Byte-strings or file-like
+-        objects are opened by scipy.io.netcdf (netCDF3) or h5py (netCDF4/HDF).
++        scipy.io.netcdf (only netCDF3 supported). Bytes, memoryview and
++        file-like objects are opened by scipy.io.netcdf (netCDF3) or h5netcdf
++        (netCDF4).
+     engine : {"netcdf4", "scipy", "pydap", "h5netcdf", "zarr", None}\
+         , installed backend \
+         or subclass of xarray.backends.BackendEntrypoint, optional
+@@ -785,8 +821,10 @@ def open_dataarray(
+ 
+         - ``chunks='auto'`` will use dask ``auto`` chunking taking into account the
+           engine preferred chunks.
+-        - ``chunks=None`` skips using dask, which is generally faster for
+-          small arrays.
++        - ``chunks=None`` skips using dask. This uses xarray's internally private
++          :ref:`lazy indexing classes <internal design.lazy indexing>`,
++          but data is eagerly loaded into memory as numpy arrays when accessed.
++          This can be more efficient for smaller arrays, though results may vary.
+         - ``chunks=-1`` loads the data with dask using a single chunk for all arrays.
+         - ``chunks={}`` loads the data with dask using engine preferred chunks if
+           exposed by the backend, otherwise with a single chunk for all arrays.
+@@ -964,7 +1002,7 @@ def open_dataarray(
+ 
+ 
+ def open_datatree(
+-    filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++    filename_or_obj: T_PathFileOrDataStore,
+     *,
+     engine: T_Engine = None,
+     chunks: T_Chunks = None,
+@@ -995,8 +1033,10 @@ def open_datatree(
+ 
+     Parameters
+     ----------
+-    filename_or_obj : str, Path, file-like, or DataStore
+-        Strings and Path objects are interpreted as a path to a netCDF file or Zarr store.
++    filename_or_obj : str, Path, file-like, bytes or DataStore
++        Strings and Path objects are interpreted as a path to a netCDF file or
++        Zarr store. Bytes and memoryview objects are interpreted as file
++        contents.
+     engine : {"netcdf4", "h5netcdf", "zarr", None}, \
+              installed backend or xarray.backends.BackendEntrypoint, optional
+         Engine to use when reading files. If not provided, the default engine
+@@ -1008,8 +1048,10 @@ def open_datatree(
+ 
+         - ``chunks="auto"`` will use dask ``auto`` chunking taking into account the
+           engine preferred chunks.
+-        - ``chunks=None`` skips using dask, which is generally faster for
+-          small arrays.
++        - ``chunks=None`` skips using dask. This uses xarray's internally private
++          :ref:`lazy indexing classes <internal design.lazy indexing>`,
++          but data is eagerly loaded into memory as numpy arrays when accessed.
++          This can be more efficient for smaller arrays, though results may vary.
+         - ``chunks=-1`` loads the data with dask using a single chunk for all arrays.
+         - ``chunks={}`` loads the data with dask using the engine's preferred chunk
+           size, generally identical to the format's chunk size. If not available, a
+@@ -1202,7 +1244,7 @@ def open_datatree(
+ 
+ 
+ def open_groups(
+-    filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++    filename_or_obj: T_PathFileOrDataStore,
+     *,
+     engine: T_Engine = None,
+     chunks: T_Chunks = None,
+@@ -1237,8 +1279,10 @@ def open_groups(
+ 
+     Parameters
+     ----------
+-    filename_or_obj : str, Path, file-like, or DataStore
+-        Strings and Path objects are interpreted as a path to a netCDF file or Zarr store.
++    filename_or_obj : str, Path, file-like, bytes, memoryview or DataStore
++        Strings and Path objects are interpreted as a path to a netCDF file or
++        Zarr store. Bytes and memoryview objects are interpreted as file
++        contents.
+     engine : {"netcdf4", "h5netcdf", "zarr", None}, \
+              installed backend or xarray.backends.BackendEntrypoint, optional
+         Engine to use when reading files. If not provided, the default engine
+@@ -1250,8 +1294,10 @@ def open_groups(
+ 
+         - ``chunks="auto"`` will use dask ``auto`` chunking taking into account the
+           engine preferred chunks.
+-        - ``chunks=None`` skips using dask, which is generally faster for
+-          small arrays.
++        - ``chunks=None`` skips using dask. This uses xarray's internally private
++          :ref:`lazy indexing classes <internal design.lazy indexing>`,
++          but data is eagerly loaded into memory as numpy arrays when accessed.
++          This can be more efficient for smaller arrays, though results may vary.
+         - ``chunks=-1`` loads the data with dask using a single chunk for all arrays.
+         - ``chunks={}`` loads the data with dask using the engine's preferred chunk
+           size, generally identical to the format's chunk size. If not available, a
+@@ -1445,6 +1491,28 @@ def open_groups(
+     return groups
+ 
+ 
++_FLike = TypeVar("_FLike", bound=Union[str, ReadBuffer])
++
++
++def _remove_path(
++    paths: NestedSequence[_FLike], paths_to_remove: set[_FLike]
++) -> NestedSequence[_FLike]:
++    # Initialize an empty list to store the result
++    result: list[Union[_FLike, NestedSequence[_FLike]]] = []
++
++    for item in paths:
++        if isinstance(item, list):
++            # If the current item is a list, recursively call remove_elements on it
++            nested_result = _remove_path(item, paths_to_remove)
++            if nested_result:  # Only add non-empty lists to avoid adding empty lists
++                result.append(nested_result)
++        elif item not in paths_to_remove:
++            # Add the item to the result if it is not in the set of elements to remove
++            result.append(item)
++
++    return result
++
++
+ def open_mfdataset(
+     paths: str
+     | os.PathLike
+@@ -1460,16 +1528,20 @@ def open_mfdataset(
+         | Sequence[Index]
+         | None
+     ) = None,
+-    compat: CompatOptions = "no_conflicts",
++    compat: CompatOptions | CombineKwargDefault = _COMPAT_DEFAULT,
+     preprocess: Callable[[Dataset], Dataset] | None = None,
+     engine: T_Engine = None,
+-    data_vars: Literal["all", "minimal", "different"] | list[str] = "all",
+-    coords="different",
++    data_vars: Literal["all", "minimal", "different"]
++    | None
++    | list[str]
++    | CombineKwargDefault = _DATA_VARS_DEFAULT,
++    coords=_COORDS_DEFAULT,
+     combine: Literal["by_coords", "nested"] = "by_coords",
+     parallel: bool = False,
+-    join: JoinOptions = "outer",
++    join: JoinOptions | CombineKwargDefault = _JOIN_DEFAULT,
+     attrs_file: str | os.PathLike | None = None,
+     combine_attrs: CombineAttrsOptions = "override",
++    errors: ErrorOptionsWithWarn = "raise",
+     **kwargs,
+ ) -> Dataset:
+     """Open multiple files as a single dataset.
+@@ -1596,6 +1668,12 @@ def open_mfdataset(
+ 
+         If a callable, it must expect a sequence of ``attrs`` dicts and a context object
+         as its only parameters.
++    errors : {"raise", "warn", "ignore"}, default: "raise"
++        String indicating how to handle errors in opening dataset.
++
++        - "raise": invalid dataset will raise an exception.
++        - "warn": a warning will be issued for each invalid dataset.
++        - "ignore": invalid dataset will be ignored.
+     **kwargs : optional
+         Additional arguments passed on to :py:func:`xarray.open_dataset`. For an
+         overview of some of the possible options, see the documentation of
+@@ -1688,7 +1766,32 @@ def open_mfdataset(
+         open_ = open_dataset
+         getattr_ = getattr
+ 
+-    datasets = [open_(p, **open_kwargs) for p in paths1d]
++    if errors not in ("raise", "warn", "ignore"):
++        raise ValueError(
++            f"'errors' must be 'raise', 'warn' or 'ignore', got '{errors}'"
++        )
++
++    datasets = []
++    invalid_paths = set()
++    for p in paths1d:
++        try:
++            ds = open_(p, **open_kwargs)
++            datasets.append(ds)
++        except Exception as e:
++            if errors == "raise":
++                raise
++            elif errors == "warn":
++                emit_user_level_warning(f"Could not open {p} due to {e}. Ignoring.")
++            # remove invalid paths
++            invalid_paths.add(p)
++
++    if invalid_paths:
++        paths = _remove_path(paths, invalid_paths)
++        if combine == "nested":
++            # Create new ids and paths based on removed items
++            combined_ids_paths = _infer_concat_order_from_positions(paths)
++            ids = list(combined_ids_paths.keys())
++
+     closers = [getattr_(ds, "_close") for ds in datasets]
+     if preprocess is not None:
+         datasets = [preprocess(ds) for ds in datasets]
+@@ -1712,6 +1815,7 @@ def open_mfdataset(
+                 ids=ids,
+                 join=join,
+                 combine_attrs=combine_attrs,
++                fill_value=dtypes.NA,
+             )
+         elif combine == "by_coords":
+             # Redo ordering from coordinates, ignoring how they were ordered
+@@ -1770,7 +1874,7 @@ def to_netcdf(
+ ) -> tuple[ArrayWriter, AbstractDataStore]: ...
+ 
+ 
+-# path=None writes to bytes
++# path=None writes to bytes or memoryview, depending on store
+ @overload
+ def to_netcdf(
+     dataset: Dataset,
+@@ -1785,7 +1889,7 @@ def to_netcdf(
+     multifile: Literal[False] = False,
+     invalid_netcdf: bool = False,
+     auto_complex: bool | None = None,
+-) -> bytes: ...
++) -> bytes | memoryview: ...
+ 
+ 
+ # compute=False returns dask.Delayed
+@@ -1811,7 +1915,7 @@ def to_netcdf(
+ @overload
+ def to_netcdf(
+     dataset: Dataset,
+-    path_or_file: str | os.PathLike,
++    path_or_file: str | os.PathLike | IOBase,
+     mode: NetcdfWriteModes = "w",
+     format: T_NetcdfTypes | None = None,
+     group: str | None = None,
+@@ -1867,7 +1971,7 @@ def to_netcdf(
+ @overload
+ def to_netcdf(
+     dataset: Dataset,
+-    path_or_file: str | os.PathLike | None,
++    path_or_file: str | os.PathLike | IOBase | None,
+     mode: NetcdfWriteModes = "w",
+     format: T_NetcdfTypes | None = None,
+     group: str | None = None,
+@@ -1878,12 +1982,12 @@ def to_netcdf(
+     multifile: bool = False,
+     invalid_netcdf: bool = False,
+     auto_complex: bool | None = None,
+-) -> tuple[ArrayWriter, AbstractDataStore] | bytes | Delayed | None: ...
++) -> tuple[ArrayWriter, AbstractDataStore] | bytes | memoryview | Delayed | None: ...
+ 
+ 
+ def to_netcdf(
+     dataset: Dataset,
+-    path_or_file: str | os.PathLike | None = None,
++    path_or_file: str | os.PathLike | IOBase | None = None,
+     mode: NetcdfWriteModes = "w",
+     format: T_NetcdfTypes | None = None,
+     group: str | None = None,
+@@ -1894,7 +1998,7 @@ def to_netcdf(
+     multifile: bool = False,
+     invalid_netcdf: bool = False,
+     auto_complex: bool | None = None,
+-) -> tuple[ArrayWriter, AbstractDataStore] | bytes | Delayed | None:
++) -> tuple[ArrayWriter, AbstractDataStore] | bytes | memoryview | Delayed | None:
+     """This function creates an appropriate datastore for writing a dataset to
+     disk as a netCDF file
+ 
+@@ -1908,30 +2012,33 @@ def to_netcdf(
+     if encoding is None:
+         encoding = {}
+ 
+-    if path_or_file is None:
++    if isinstance(path_or_file, str):
+         if engine is None:
++            engine = _get_default_engine(path_or_file)
++        path_or_file = _normalize_path(path_or_file)
++    else:
++        # writing to bytes/memoryview or a file-like object
++        if engine is None:
++            # TODO: only use 'scipy' if format is None or a netCDF3 format
+             engine = "scipy"
+-        elif engine != "scipy":
++        elif engine not in ("scipy", "h5netcdf"):
+             raise ValueError(
+-                "invalid engine for creating bytes with "
+-                f"to_netcdf: {engine!r}. Only the default engine "
+-                "or engine='scipy' is supported"
++                "invalid engine for creating bytes/memoryview or writing to a "
++                f"file-like object with to_netcdf: {engine!r}. Only "
++                "engine=None, engine='scipy' and engine='h5netcdf' is "
++                "supported."
+             )
+         if not compute:
+             raise NotImplementedError(
+                 "to_netcdf() with compute=False is not yet implemented when "
+                 "returning bytes"
+             )
+-    elif isinstance(path_or_file, str):
+-        if engine is None:
+-            engine = _get_default_engine(path_or_file)
+-        path_or_file = _normalize_path(path_or_file)
+-    else:  # file-like object
+-        engine = "scipy"
+ 
+     # validate Dataset keys, DataArray names, and attr keys/values
+     _validate_dataset_names(dataset)
+     _validate_attrs(dataset, engine, invalid_netcdf)
++    # sanitize unlimited_dims
++    unlimited_dims = _sanitize_unlimited_dims(dataset, unlimited_dims)
+ 
+     try:
+         store_open = WRITEABLE_STORES[engine]
+@@ -1952,7 +2059,11 @@ def to_netcdf(
+             f"is not currently supported with dask's {scheduler} scheduler"
+         )
+ 
+-    target = path_or_file if path_or_file is not None else BytesIO()
++    if path_or_file is None:
++        target = BytesIOProxy()
++    else:
++        target = path_or_file  # type: ignore[assignment]
++
+     kwargs = dict(autoclose=True) if autoclose else {}
+     if invalid_netcdf:
+         if engine == "h5netcdf":
+@@ -1966,14 +2077,6 @@ def to_netcdf(
+ 
+     store = store_open(target, mode, format, group, **kwargs)
+ 
+-    if unlimited_dims is None:
+-        unlimited_dims = dataset.encoding.get("unlimited_dims", None)
+-    if unlimited_dims is not None:
+-        if isinstance(unlimited_dims, str) or not isinstance(unlimited_dims, Iterable):
+-            unlimited_dims = [unlimited_dims]
+-        else:
+-            unlimited_dims = list(unlimited_dims)
+-
+     writer = ArrayWriter()
+ 
+     # TODO: figure out how to refactor this logic (here and in save_mfdataset)
+@@ -1992,17 +2095,19 @@ def to_netcdf(
+ 
+         writes = writer.sync(compute=compute)
+ 
+-        if isinstance(target, BytesIO):
+-            store.sync()
+-            return target.getvalue()
+     finally:
+         if not multifile and compute:  # type: ignore[redundant-expr]
+             store.close()
+ 
++    if path_or_file is None:
++        assert isinstance(target, BytesIOProxy)  # created in this function
++        return target.getvalue_or_getbuffer()
++
+     if not compute:
+         import dask
+ 
+         return dask.delayed(_finalize_store)(writes, store)
++
+     return None
+ 
+ 
+
+diff --git a/xarray/backends/common.py b/xarray/backends/common.py
+index 8b56c8a..5e9be75 100644
+--- a/xarray/backends/common.py
++++ b/xarray/backends/common.py
+@@ -4,9 +4,18 @@ import logging
+ import os
+ import time
+ import traceback
+-from collections.abc import Hashable, Iterable, Mapping, Sequence
++from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
++from dataclasses import dataclass
+ from glob import glob
+-from typing import TYPE_CHECKING, Any, ClassVar, TypeVar, Union, overload
++from typing import (
++    TYPE_CHECKING,
++    Any,
++    ClassVar,
++    Generic,
++    TypeVar,
++    Union,
++    overload,
++)
+ 
+ import numpy as np
+ import pandas as pd
+@@ -188,6 +197,24 @@ def _find_absolute_paths(
+     return _normalize_path_list(paths)
+ 
+ 
++BytesOrMemory = TypeVar("BytesOrMemory", bytes, memoryview)
++
++
++@dataclass
++class BytesIOProxy(Generic[BytesOrMemory]):
++    """Proxy object for a write that returns either bytes or a memoryview."""
++
++    # TODO: remove this in favor of BytesIO when Dataset.to_netcdf() stops
++    # returning bytes from the scipy engine
++    getvalue: Callable[[], BytesOrMemory] | None = None
++
++    def getvalue_or_getbuffer(self) -> BytesOrMemory:
++        """Get the value of this write as bytes or memory."""
++        if self.getvalue is None:
++            raise ValueError("must set getvalue before fetching value")
++        return self.getvalue()
++
++
+ def _open_remote_file(file, mode, storage_options=None):
+     import fsspec
+ 
+@@ -229,6 +256,20 @@ def find_root_and_group(ds):
+     return ds, group
+ 
+ 
++def collect_ancestor_dimensions(group) -> dict[str, int]:
++    """Returns dimensions defined in parent groups.
++
++    If dimensions are defined in multiple ancestors, use the size of the closest
++    ancestor.
++    """
++    dims = {}
++    while (group := group.parent) is not None:
++        for k, v in group.dimensions.items():
++            if k not in dims:
++                dims[k] = len(v)
++    return dims
++
++
+ def datatree_from_dict_with_io_cleanup(groups_dict: Mapping[str, Dataset]) -> DataTree:
+     """DataTree.from_dict with file clean-up."""
+     try:
+@@ -270,10 +311,17 @@ def robust_getitem(array, key, catch=Exception, max_retries=6, initial_delay=500
+ class BackendArray(NdimSizeLenMixin, indexing.ExplicitlyIndexed):
+     __slots__ = ()
+ 
++    async def async_getitem(self, key: indexing.ExplicitIndexer) -> np.typing.ArrayLike:
++        raise NotImplementedError("Backend does not not support asynchronous loading")
++
+     def get_duck_array(self, dtype: np.typing.DTypeLike = None):
+         key = indexing.BasicIndexer((slice(None),) * self.ndim)
+         return self[key]  # type: ignore[index]
+ 
++    async def async_get_duck_array(self, dtype: np.typing.DTypeLike = None):
++        key = indexing.BasicIndexer((slice(None),) * self.ndim)
++        return await self.async_getitem(key)
++
+ 
+ class AbstractDataStore:
+     __slots__ = ()
+@@ -281,6 +329,9 @@ class AbstractDataStore:
+     def get_dimensions(self):  # pragma: no cover
+         raise NotImplementedError()
+ 
++    def get_parent_dimensions(self):  # pragma: no cover
++        return {}
++
+     def get_attrs(self):  # pragma: no cover
+         raise NotImplementedError()
+ 
+@@ -324,6 +375,11 @@ class AbstractDataStore:
+         self.close()
+ 
+ 
++T_PathFileOrDataStore = (
++    str | os.PathLike[Any] | ReadBuffer | bytes | memoryview | AbstractDataStore
++)
++
++
+ class ArrayWriter:
+     __slots__ = ("lock", "regions", "sources", "targets")
+ 
+@@ -531,13 +587,14 @@ class AbstractWritableDataStore(AbstractDataStore):
+         if unlimited_dims is None:
+             unlimited_dims = set()
+ 
++        parent_dims = self.get_parent_dimensions()
+         existing_dims = self.get_dimensions()
+ 
+         dims = {}
+         for v in unlimited_dims:  # put unlimited_dims first
+             dims[v] = None
+         for v in variables.values():
+-            dims.update(dict(zip(v.dims, v.shape, strict=True)))
++            dims |= v.sizes
+ 
+         for dim, length in dims.items():
+             if dim in existing_dims and length != existing_dims[dim]:
+@@ -545,7 +602,7 @@ class AbstractWritableDataStore(AbstractDataStore):
+                     "Unable to update size for existing dimension"
+                     f"{dim!r} ({length} != {existing_dims[dim]})"
+                 )
+-            elif dim not in existing_dims:
++            elif dim not in existing_dims and length != parent_dims.get(dim):
+                 is_unlimited = dim in unlimited_dims
+                 self.set_dimension(dim, length, is_unlimited)
+ 
+@@ -705,7 +762,12 @@ class BackendEntrypoint:
+ 
+     def open_dataset(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: str
++        | os.PathLike[Any]
++        | ReadBuffer
++        | bytes
++        | memoryview
++        | AbstractDataStore,
+         *,
+         drop_variables: str | Iterable[str] | None = None,
+     ) -> Dataset:
+@@ -717,7 +779,12 @@ class BackendEntrypoint:
+ 
+     def guess_can_open(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: str
++        | os.PathLike[Any]
++        | ReadBuffer
++        | bytes
++        | memoryview
++        | AbstractDataStore,
+     ) -> bool:
+         """
+         Backend open_dataset method used by Xarray in :py:func:`~xarray.open_dataset`.
+@@ -727,7 +794,12 @@ class BackendEntrypoint:
+ 
+     def open_datatree(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: str
++        | os.PathLike[Any]
++        | ReadBuffer
++        | bytes
++        | memoryview
++        | AbstractDataStore,
+         *,
+         drop_variables: str | Iterable[str] | None = None,
+     ) -> DataTree:
+@@ -739,7 +811,12 @@ class BackendEntrypoint:
+ 
+     def open_groups_as_dict(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: str
++        | os.PathLike[Any]
++        | ReadBuffer
++        | bytes
++        | memoryview
++        | AbstractDataStore,
+         *,
+         drop_variables: str | Iterable[str] | None = None,
+     ) -> dict[str, Dataset]:
+
+diff --git a/xarray/backends/file_manager.py b/xarray/backends/file_manager.py
+index 77c6859..2a6f369 100644
+--- a/xarray/backends/file_manager.py
++++ b/xarray/backends/file_manager.py
+@@ -339,8 +339,11 @@ class _HashedSequence(list):
+ class DummyFileManager(FileManager):
+     """FileManager that simply wraps an open file in the FileManager interface."""
+ 
+-    def __init__(self, value):
++    def __init__(self, value, *, close=None):
++        if close is None:
++            close = value.close
+         self._value = value
++        self._close = close
+ 
+     def acquire(self, needs_lock=True):
+         del needs_lock  # ignored
+@@ -353,4 +356,4 @@ class DummyFileManager(FileManager):
+ 
+     def close(self, needs_lock=True):
+         del needs_lock  # ignored
+-        self._value.close()
++        self._close()
+
+diff --git a/xarray/backends/h5netcdf_.py b/xarray/backends/h5netcdf_.py
+index f3e434c..2c8e3c2 100644
+--- a/xarray/backends/h5netcdf_.py
++++ b/xarray/backends/h5netcdf_.py
+@@ -11,13 +11,20 @@ import numpy as np
+ from xarray.backends.common import (
+     BACKEND_ENTRYPOINTS,
+     BackendEntrypoint,
++    BytesIOProxy,
++    T_PathFileOrDataStore,
+     WritableCFDataStore,
+     _normalize_path,
+     _open_remote_file,
++    collect_ancestor_dimensions,
+     datatree_from_dict_with_io_cleanup,
+     find_root_and_group,
+ )
+-from xarray.backends.file_manager import CachingFileManager, DummyFileManager
++from xarray.backends.file_manager import (
++    CachingFileManager,
++    DummyFileManager,
++    FileManager,
++)
+ from xarray.backends.locks import HDF5_LOCK, combine_locks, ensure_lock, get_write_lock
+ from xarray.backends.netCDF4_ import (
+     BaseNetCDF4Array,
+@@ -40,6 +47,8 @@ from xarray.core.utils import (
+ from xarray.core.variable import Variable
+ 
+ if TYPE_CHECKING:
++    import h5netcdf
++
+     from xarray.backends.common import AbstractDataStore
+     from xarray.core.dataset import Dataset
+     from xarray.core.datatree import DataTree
+@@ -109,7 +118,14 @@ class H5NetCDFStore(WritableCFDataStore):
+         "lock",
+     )
+ 
+-    def __init__(self, manager, group=None, mode=None, lock=HDF5_LOCK, autoclose=False):
++    def __init__(
++        self,
++        manager: FileManager | h5netcdf.File | h5netcdf.Group,
++        group=None,
++        mode=None,
++        lock=HDF5_LOCK,
++        autoclose=False,
++    ):
+         import h5netcdf
+ 
+         if isinstance(manager, h5netcdf.File | h5netcdf.Group):
+@@ -158,12 +174,12 @@ class H5NetCDFStore(WritableCFDataStore):
+                 filename, mode=mode_, storage_options=storage_options
+             )
+ 
+-        if isinstance(filename, bytes):
+-            raise ValueError(
+-                "can't open netCDF4/HDF5 as bytes "
+-                "try passing a path or file-like object"
+-            )
+-        elif isinstance(filename, io.IOBase):
++        if isinstance(filename, BytesIOProxy):
++            source = filename
++            filename = io.BytesIO()
++            source.getvalue = filename.getbuffer
++
++        if isinstance(filename, io.IOBase) and mode == "r":
+             magic_number = read_magic_number_from_file(filename)
+             if not magic_number.startswith(b"\211HDF\r\n\032\n"):
+                 raise ValueError(
+@@ -189,7 +205,11 @@ class H5NetCDFStore(WritableCFDataStore):
+             else:
+                 lock = combine_locks([HDF5_LOCK, get_write_lock(filename)])
+ 
+-        manager = CachingFileManager(h5netcdf.File, filename, mode=mode, kwargs=kwargs)
++        manager = (
++            CachingFileManager(h5netcdf.File, filename, mode=mode, kwargs=kwargs)
++            if isinstance(filename, str)
++            else h5netcdf.File(filename, mode=mode, **kwargs)
++        )
+         return cls(manager, group=group, mode=mode, lock=lock, autoclose=autoclose)
+ 
+     def _acquire(self, needs_lock=True):
+@@ -268,6 +288,9 @@ class H5NetCDFStore(WritableCFDataStore):
+     def get_dimensions(self):
+         return FrozenDict((k, len(v)) for k, v in self.ds.dimensions.items())
+ 
++    def get_parent_dimensions(self):
++        return FrozenDict(collect_ancestor_dimensions(self.ds))
++
+     def get_encoding(self):
+         return {
+             "unlimited_dims": {
+@@ -388,6 +411,15 @@ def _emit_phony_dims_warning():
+     )
+ 
+ 
++def _normalize_filename_or_obj(
++    filename_or_obj: T_PathFileOrDataStore,
++) -> str | ReadBuffer | AbstractDataStore:
++    if isinstance(filename_or_obj, bytes | memoryview):
++        return io.BytesIO(filename_or_obj)
++    else:
++        return _normalize_path(filename_or_obj)
++
++
+ class H5netcdfBackendEntrypoint(BackendEntrypoint):
+     """
+     Backend for netCDF files based on the h5netcdf package.
+@@ -415,10 +447,8 @@ class H5netcdfBackendEntrypoint(BackendEntrypoint):
+     )
+     url = "https://docs.xarray.dev/en/stable/generated/xarray.backends.H5netcdfBackendEntrypoint.html"
+ 
+-    def guess_can_open(
+-        self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
+-    ) -> bool:
++    def guess_can_open(self, filename_or_obj: T_PathFileOrDataStore) -> bool:
++        filename_or_obj = _normalize_filename_or_obj(filename_or_obj)
+         magic_number = try_read_magic_number_from_file_or_path(filename_or_obj)
+         if magic_number is not None:
+             return magic_number.startswith(b"\211HDF\r\n\032\n")
+@@ -431,7 +461,7 @@ class H5netcdfBackendEntrypoint(BackendEntrypoint):
+ 
+     def open_dataset(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: T_PathFileOrDataStore,
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+@@ -454,7 +484,7 @@ class H5netcdfBackendEntrypoint(BackendEntrypoint):
+         # remove and set phony_dims="access" above
+         emit_phony_dims_warning, phony_dims = _check_phony_dims(phony_dims)
+ 
+-        filename_or_obj = _normalize_path(filename_or_obj)
++        filename_or_obj = _normalize_filename_or_obj(filename_or_obj)
+         store = H5NetCDFStore.open(
+             filename_or_obj,
+             format=format,
+@@ -491,7 +521,7 @@ class H5netcdfBackendEntrypoint(BackendEntrypoint):
+ 
+     def open_datatree(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: T_PathFileOrDataStore,
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+@@ -534,7 +564,7 @@ class H5netcdfBackendEntrypoint(BackendEntrypoint):
+ 
+     def open_groups_as_dict(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: T_PathFileOrDataStore,
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+@@ -561,7 +591,7 @@ class H5netcdfBackendEntrypoint(BackendEntrypoint):
+         # remove and set phony_dims="access" above
+         emit_phony_dims_warning, phony_dims = _check_phony_dims(phony_dims)
+ 
+-        filename_or_obj = _normalize_path(filename_or_obj)
++        filename_or_obj = _normalize_filename_or_obj(filename_or_obj)
+         store = H5NetCDFStore.open(
+             filename_or_obj,
+             format=format,
+
+diff --git a/xarray/backends/netCDF4_.py b/xarray/backends/netCDF4_.py
+index 8c3a01e..ecd652f 100644
+--- a/xarray/backends/netCDF4_.py
++++ b/xarray/backends/netCDF4_.py
+@@ -13,8 +13,10 @@ from xarray.backends.common import (
+     BACKEND_ENTRYPOINTS,
+     BackendArray,
+     BackendEntrypoint,
++    T_PathFileOrDataStore,
+     WritableCFDataStore,
+     _normalize_path,
++    collect_ancestor_dimensions,
+     datatree_from_dict_with_io_cleanup,
+     find_root_and_group,
+     robust_getitem,
+@@ -49,10 +51,8 @@ if TYPE_CHECKING:
+     from h5netcdf.core import EnumType as h5EnumType
+     from netCDF4 import EnumType as ncEnumType
+ 
+-    from xarray.backends.common import AbstractDataStore
+     from xarray.core.dataset import Dataset
+     from xarray.core.datatree import DataTree
+-    from xarray.core.types import ReadBuffer
+ 
+ # This lookup table maps from dtype.byteorder to a readable endian
+ # string used by netCDF4.
+@@ -519,6 +519,9 @@ class NetCDF4DataStore(WritableCFDataStore):
+     def get_dimensions(self):
+         return FrozenDict((k, len(v)) for k, v in self.ds.dimensions.items())
+ 
++    def get_parent_dimensions(self):
++        return FrozenDict(collect_ancestor_dimensions(self.ds))
++
+     def get_encoding(self):
+         return {
+             "unlimited_dims": {
+@@ -629,10 +632,7 @@ class NetCDF4BackendEntrypoint(BackendEntrypoint):
+     )
+     url = "https://docs.xarray.dev/en/stable/generated/xarray.backends.NetCDF4BackendEntrypoint.html"
+ 
+-    def guess_can_open(
+-        self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
+-    ) -> bool:
++    def guess_can_open(self, filename_or_obj: T_PathFileOrDataStore) -> bool:
+         if isinstance(filename_or_obj, str) and is_remote_uri(filename_or_obj):
+             return True
+         magic_number = try_read_magic_number_from_path(filename_or_obj)
+@@ -648,7 +648,7 @@ class NetCDF4BackendEntrypoint(BackendEntrypoint):
+ 
+     def open_dataset(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: T_PathFileOrDataStore,
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+@@ -697,7 +697,7 @@ class NetCDF4BackendEntrypoint(BackendEntrypoint):
+ 
+     def open_datatree(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: T_PathFileOrDataStore,
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+@@ -739,7 +739,7 @@ class NetCDF4BackendEntrypoint(BackendEntrypoint):
+ 
+     def open_groups_as_dict(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: T_PathFileOrDataStore,
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+
+diff --git a/xarray/backends/plugins.py b/xarray/backends/plugins.py
+index 555538c..76df963 100644
+--- a/xarray/backends/plugins.py
++++ b/xarray/backends/plugins.py
+@@ -138,7 +138,12 @@ def refresh_engines() -> None:
+ 
+ 
+ def guess_engine(
+-    store_spec: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++    store_spec: str
++    | os.PathLike[Any]
++    | ReadBuffer
++    | bytes
++    | memoryview
++    | AbstractDataStore,
+ ) -> str | type[BackendEntrypoint]:
+     engines = list_engines()
+ 
+
+diff --git a/xarray/backends/pydap_.py b/xarray/backends/pydap_.py
+index 73b719f..4fbfe8e 100644
+--- a/xarray/backends/pydap_.py
++++ b/xarray/backends/pydap_.py
+@@ -10,6 +10,7 @@ from xarray.backends.common import (
+     AbstractDataStore,
+     BackendArray,
+     BackendEntrypoint,
++    T_PathFileOrDataStore,
+     _normalize_path,
+     datatree_from_dict_with_io_cleanup,
+     robust_getitem,
+@@ -207,15 +208,14 @@ class PydapBackendEntrypoint(BackendEntrypoint):
+     description = "Open remote datasets via OPeNDAP using pydap in Xarray"
+     url = "https://docs.xarray.dev/en/stable/generated/xarray.backends.PydapBackendEntrypoint.html"
+ 
+-    def guess_can_open(
+-        self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
+-    ) -> bool:
++    def guess_can_open(self, filename_or_obj: T_PathFileOrDataStore) -> bool:
+         return isinstance(filename_or_obj, str) and is_remote_uri(filename_or_obj)
+ 
+     def open_dataset(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: (
++            str | os.PathLike[Any] | ReadBuffer | bytes | memoryview | AbstractDataStore
++        ),
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+@@ -258,7 +258,7 @@ class PydapBackendEntrypoint(BackendEntrypoint):
+ 
+     def open_datatree(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: T_PathFileOrDataStore,
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+@@ -295,7 +295,7 @@ class PydapBackendEntrypoint(BackendEntrypoint):
+ 
+     def open_groups_as_dict(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: T_PathFileOrDataStore,
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+
+diff --git a/xarray/backends/scipy_.py b/xarray/backends/scipy_.py
+index b98d226..a93c646 100644
+--- a/xarray/backends/scipy_.py
++++ b/xarray/backends/scipy_.py
+@@ -12,6 +12,8 @@ from xarray.backends.common import (
+     BACKEND_ENTRYPOINTS,
+     BackendArray,
+     BackendEntrypoint,
++    BytesIOProxy,
++    T_PathFileOrDataStore,
+     WritableCFDataStore,
+     _normalize_path,
+ )
+@@ -28,12 +30,15 @@ from xarray.core.utils import (
+     Frozen,
+     FrozenDict,
+     close_on_error,
++    emit_user_level_warning,
+     module_available,
+     try_read_magic_number_from_file_or_path,
+ )
+ from xarray.core.variable import Variable
+ 
+ if TYPE_CHECKING:
++    import scipy.io
++
+     from xarray.backends.common import AbstractDataStore
+     from xarray.core.dataset import Dataset
+     from xarray.core.types import ReadBuffer
+@@ -119,10 +124,6 @@ def _open_scipy_netcdf(filename, mode, mmap, version):
+             else:
+                 raise
+ 
+-    if isinstance(filename, bytes) and filename.startswith(b"CDF"):
+-        # it's a NetCDF3 bytestring
+-        filename = io.BytesIO(filename)
+-
+     try:
+         return scipy.io.netcdf_file(filename, mode=mode, mmap=mmap, version=version)
+     except TypeError as e:  # netcdf3 message is obscure in this case
+@@ -141,7 +142,7 @@ def _open_scipy_netcdf(filename, mode, mmap, version):
+ 
+ 
+ class ScipyDataStore(WritableCFDataStore):
+-    """Store for reading and writing data via scipy.io.netcdf.
++    """Store for reading and writing data via scipy.io.netcdf_file.
+ 
+     This store has the advantage of being able to be initialized with a
+     StringIO object, allow for serialization without writing to disk.
+@@ -167,7 +168,23 @@ class ScipyDataStore(WritableCFDataStore):
+ 
+         self.lock = ensure_lock(lock)
+ 
+-        if isinstance(filename_or_obj, str):
++        if isinstance(filename_or_obj, BytesIOProxy):
++            emit_user_level_warning(
++                "return value of to_netcdf() without a target for "
++                "engine='scipy' is currently bytes, but will switch to "
++                "memoryview in a future version of Xarray. To silence this "
++                "warning, use the following pattern or switch to "
++                "to_netcdf(engine='h5netcdf'):\n"
++                "    target = io.BytesIO()\n"
++                "    dataset.to_netcdf(target)\n"
++                "    result = target.getbuffer()",
++                FutureWarning,
++            )
++            source = filename_or_obj
++            filename_or_obj = io.BytesIO()
++            source.getvalue = filename_or_obj.getvalue
++
++        if isinstance(filename_or_obj, str):  # path
+             manager = CachingFileManager(
+                 _open_scipy_netcdf,
+                 filename_or_obj,
+@@ -175,16 +192,32 @@ class ScipyDataStore(WritableCFDataStore):
+                 lock=lock,
+                 kwargs=dict(mmap=mmap, version=version),
+             )
+-        else:
++        elif hasattr(filename_or_obj, "seek"):  # file object
++            # Note: checking for .seek matches the check for file objects
++            # in scipy.io.netcdf_file
+             scipy_dataset = _open_scipy_netcdf(
+                 filename_or_obj, mode=mode, mmap=mmap, version=version
+             )
+-            manager = DummyFileManager(scipy_dataset)
++            # scipy.io.netcdf_file.close() incorrectly closes file objects that
++            # were passed in as constructor arguments:
++            # https://github.com/scipy/scipy/issues/13905
++            # Instead of closing such files, only call flush(), which is
++            # equivalent as long as the netcdf_file object is not mmapped.
++            # This suffices to keep BytesIO objects open long enough to read
++            # their contents from to_netcdf(), but underlying files still get
++            # closed when the netcdf_file is garbage collected (via __del__),
++            # and will need to be fixed upstream in scipy.
++            assert not scipy_dataset.use_mmap  # no mmap for file objects
++            manager = DummyFileManager(scipy_dataset, close=scipy_dataset.flush)
++        else:
++            raise ValueError(
++                f"cannot open {filename_or_obj=} with scipy.io.netcdf_file"
++            )
+ 
+         self._manager = manager
+ 
+     @property
+-    def ds(self):
++    def ds(self) -> scipy.io.netcdf_file:
+         return self._manager.acquire()
+ 
+     def open_store_variable(self, name, var):
+@@ -265,6 +298,20 @@ class ScipyDataStore(WritableCFDataStore):
+         self._manager.close()
+ 
+ 
++def _normalize_filename_or_obj(
++    filename_or_obj: str
++    | os.PathLike[Any]
++    | ReadBuffer
++    | bytes
++    | memoryview
++    | AbstractDataStore,
++) -> str | ReadBuffer | AbstractDataStore:
++    if isinstance(filename_or_obj, bytes | memoryview):
++        return io.BytesIO(filename_or_obj)
++    else:
++        return _normalize_path(filename_or_obj)  # type: ignore[return-value]
++
++
+ class ScipyBackendEntrypoint(BackendEntrypoint):
+     """
+     Backend for netCDF files based on the scipy package.
+@@ -291,8 +338,9 @@ class ScipyBackendEntrypoint(BackendEntrypoint):
+ 
+     def guess_can_open(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: T_PathFileOrDataStore,
+     ) -> bool:
++        filename_or_obj = _normalize_filename_or_obj(filename_or_obj)
+         magic_number = try_read_magic_number_from_file_or_path(filename_or_obj)
+         if magic_number is not None and magic_number.startswith(b"\x1f\x8b"):
+             with gzip.open(filename_or_obj) as f:  # type: ignore[arg-type]
+@@ -308,7 +356,7 @@ class ScipyBackendEntrypoint(BackendEntrypoint):
+ 
+     def open_dataset(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: T_PathFileOrDataStore,
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+@@ -323,7 +371,7 @@ class ScipyBackendEntrypoint(BackendEntrypoint):
+         mmap=None,
+         lock=None,
+     ) -> Dataset:
+-        filename_or_obj = _normalize_path(filename_or_obj)
++        filename_or_obj = _normalize_filename_or_obj(filename_or_obj)
+         store = ScipyDataStore(
+             filename_or_obj, mode=mode, format=format, group=group, mmap=mmap, lock=lock
+         )
+
+diff --git a/xarray/backends/store.py b/xarray/backends/store.py
+index de52aa1..2c3cd42 100644
+--- a/xarray/backends/store.py
++++ b/xarray/backends/store.py
+@@ -1,36 +1,32 @@
+ from __future__ import annotations
+ 
+ from collections.abc import Iterable
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING
+ 
+ from xarray import conventions
+ from xarray.backends.common import (
+     BACKEND_ENTRYPOINTS,
+     AbstractDataStore,
+     BackendEntrypoint,
++    T_PathFileOrDataStore,
+ )
+ from xarray.core.coordinates import Coordinates
+ from xarray.core.dataset import Dataset
+ 
+ if TYPE_CHECKING:
+-    import os
+-
+-    from xarray.core.types import ReadBuffer
++    pass
+ 
+ 
+ class StoreBackendEntrypoint(BackendEntrypoint):
+     description = "Open AbstractDataStore instances in Xarray"
+     url = "https://docs.xarray.dev/en/stable/generated/xarray.backends.StoreBackendEntrypoint.html"
+ 
+-    def guess_can_open(
+-        self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
+-    ) -> bool:
++    def guess_can_open(self, filename_or_obj: T_PathFileOrDataStore) -> bool:
+         return isinstance(filename_or_obj, AbstractDataStore)
+ 
+     def open_dataset(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: T_PathFileOrDataStore,
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+
+diff --git a/xarray/backends/zarr.py b/xarray/backends/zarr.py
+index 8b26a6b..65ba5ac 100644
+--- a/xarray/backends/zarr.py
++++ b/xarray/backends/zarr.py
+@@ -17,6 +17,7 @@ from xarray.backends.common import (
+     AbstractWritableDataStore,
+     BackendArray,
+     BackendEntrypoint,
++    T_PathFileOrDataStore,
+     _encode_variable_name,
+     _normalize_path,
+     datatree_from_dict_with_io_cleanup,
+@@ -39,10 +40,9 @@ from xarray.namedarray.pycompat import integer_types
+ from xarray.namedarray.utils import module_available
+ 
+ if TYPE_CHECKING:
+-    from xarray.backends.common import AbstractDataStore
+     from xarray.core.dataset import Dataset
+     from xarray.core.datatree import DataTree
+-    from xarray.core.types import ReadBuffer, ZarrArray, ZarrGroup
++    from xarray.core.types import ZarrArray, ZarrGroup
+ 
+ 
+ def _get_mappers(*, storage_options, store, chunk_store):
+@@ -180,12 +180,23 @@ def encode_zarr_attr_value(value):
+     return encoded
+ 
+ 
++def has_zarr_async_index() -> bool:
++    try:
++        import zarr
++
++        return hasattr(zarr.AsyncArray, "oindex")
++    except (ImportError, AttributeError):
++        return False
++
++
+ class ZarrArrayWrapper(BackendArray):
+     __slots__ = ("_array", "dtype", "shape")
+ 
+     def __init__(self, zarr_array):
+         # some callers attempt to evaluate an array if an `array` property exists on the object.
+         # we prefix with _ to avoid this inference.
++
++        # TODO type hint this?
+         self._array = zarr_array
+         self.shape = self._array.shape
+ 
+@@ -213,6 +224,33 @@ class ZarrArrayWrapper(BackendArray):
+     def _getitem(self, key):
+         return self._array[key]
+ 
++    async def _async_getitem(self, key):
++        if not _zarr_v3():
++            raise NotImplementedError(
++                "For lazy basic async indexing with zarr, zarr-python=>v3.0.0 is required"
++            )
++
++        async_array = self._array._async_array
++        return await async_array.getitem(key)
++
++    async def _async_oindex(self, key):
++        if not has_zarr_async_index():
++            raise NotImplementedError(
++                "For lazy orthogonal async indexing with zarr, zarr-python=>v3.1.2 is required"
++            )
++
++        async_array = self._array._async_array
++        return await async_array.oindex.getitem(key)
++
++    async def _async_vindex(self, key):
++        if not has_zarr_async_index():
++            raise NotImplementedError(
++                "For lazy vectorized async indexing with zarr, zarr-python=>v3.1.2 is required"
++            )
++
++        async_array = self._array._async_array
++        return await async_array.vindex.getitem(key)
++
+     def __getitem__(self, key):
+         array = self._array
+         if isinstance(key, indexing.BasicIndexer):
+@@ -228,6 +266,18 @@ class ZarrArrayWrapper(BackendArray):
+         # if self.ndim == 0:
+         # could possibly have a work-around for 0d data here
+ 
++    async def async_getitem(self, key):
++        array = self._array
++        if isinstance(key, indexing.BasicIndexer):
++            method = self._async_getitem
++        elif isinstance(key, indexing.VectorizedIndexer):
++            method = self._async_vindex
++        elif isinstance(key, indexing.OuterIndexer):
++            method = self._async_oindex
++        return await indexing.async_explicit_indexing_adapter(
++            key, array.shape, indexing.IndexingSupport.VECTORIZED, method
++        )
++
+ 
+ def _determine_zarr_chunks(enc_chunks, var_chunks, ndim, name):
+     """
+@@ -1370,8 +1420,10 @@ def open_zarr(
+ 
+         - ``chunks='auto'`` will use dask ``auto`` chunking taking into account the
+           engine preferred chunks.
+-        - ``chunks=None`` skips using dask, which is generally faster for
+-          small arrays.
++        - ``chunks=None`` skips using dask. This uses xarray's internally private
++          :ref:`lazy indexing classes <internal design.lazy indexing>`,
++          but data is eagerly loaded into memory as numpy arrays when accessed.
++          This can be more efficient for smaller arrays, though results may vary.
+         - ``chunks=-1`` loads the data with dask using a single chunk for all arrays.
+         - ``chunks={}`` loads the data with dask using engine preferred chunks if
+           exposed by the backend, otherwise with a single chunk for all arrays.
+@@ -1548,10 +1600,7 @@ class ZarrBackendEntrypoint(BackendEntrypoint):
+     description = "Open zarr files (.zarr) using zarr in Xarray"
+     url = "https://docs.xarray.dev/en/stable/generated/xarray.backends.ZarrBackendEntrypoint.html"
+ 
+-    def guess_can_open(
+-        self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
+-    ) -> bool:
++    def guess_can_open(self, filename_or_obj: T_PathFileOrDataStore) -> bool:
+         if isinstance(filename_or_obj, str | os.PathLike):
+             _, ext = os.path.splitext(filename_or_obj)
+             return ext == ".zarr"
+@@ -1560,7 +1609,7 @@ class ZarrBackendEntrypoint(BackendEntrypoint):
+ 
+     def open_dataset(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: T_PathFileOrDataStore,
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+@@ -1615,7 +1664,7 @@ class ZarrBackendEntrypoint(BackendEntrypoint):
+ 
+     def open_datatree(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: T_PathFileOrDataStore,
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+@@ -1657,7 +1706,7 @@ class ZarrBackendEntrypoint(BackendEntrypoint):
+ 
+     def open_groups_as_dict(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | ReadBuffer | AbstractDataStore,
++        filename_or_obj: T_PathFileOrDataStore,
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+
+diff --git a/xarray/coding/calendar_ops.py b/xarray/coding/calendar_ops.py
+index 5fdd106..a6f0254 100644
+--- a/xarray/coding/calendar_ops.py
++++ b/xarray/coding/calendar_ops.py
+@@ -213,7 +213,7 @@ def convert_calendar(
+         out[dim] = new_times
+ 
+         # Remove NaN that where put on invalid dates in target calendar
+-        out = out.sel(time=out[dim].notnull())
++        out = out.sel({dim: out[dim].notnull()})
+ 
+         if use_cftime:
+             # Reassign times to ensure time index of output is a CFTimeIndex
+
+diff --git a/xarray/coding/common.py b/xarray/coding/common.py
+index 0e8d7e1..79e5e75 100644
+--- a/xarray/coding/common.py
++++ b/xarray/coding/common.py
+@@ -79,6 +79,9 @@ class _ElementwiseFunctionArray(indexing.ExplicitlyIndexedNDArrayMixin):
+     def get_duck_array(self):
+         return self.func(self.array.get_duck_array())
+ 
++    async def async_get_duck_array(self):
++        return self.func(await self.array.async_get_duck_array())
++
+     def __repr__(self) -> str:
+         return f"{type(self).__name__}({self.array!r}, func={self.func!r}, dtype={self.dtype!r})"
+ 
+
+diff --git a/xarray/coding/times.py b/xarray/coding/times.py
+index d6567ba..49a2747 100644
+--- a/xarray/coding/times.py
++++ b/xarray/coding/times.py
+@@ -1517,20 +1517,20 @@ class CFTimedeltaCoder(VariableCoder):
+                     time_unit = self.time_unit
+             else:
+                 if self._emit_decode_timedelta_future_warning:
++                    var_string = f"the variable {name!r}" if name else ""
+                     emit_user_level_warning(
+                         "In a future version, xarray will not decode "
+-                        "timedelta values based on the presence of a "
+-                        "timedelta-like units attribute by default. Instead "
+-                        "it will rely on the presence of a timedelta64 dtype "
+-                        "attribute, which is now xarray's default way of "
+-                        "encoding timedelta64 values. To continue decoding "
+-                        "timedeltas based on the presence of a timedelta-like "
+-                        "units attribute, users will need to explicitly "
+-                        "opt-in by passing True or "
+-                        "CFTimedeltaCoder(decode_via_units=True) to "
+-                        "decode_timedelta. To silence this warning, set "
+-                        "decode_timedelta to True, False, or a "
+-                        "'CFTimedeltaCoder' instance.",
++                        f"{var_string} into a timedelta64 dtype based on the "
++                        "presence of a timedelta-like 'units' attribute by "
++                        "default. Instead it will rely on the presence of a "
++                        "timedelta64 'dtype' attribute, which is now xarray's "
++                        "default way of encoding timedelta64 values.\n"
++                        "To continue decoding into a timedelta64 dtype, either "
++                        "set `decode_timedelta=True` when opening this "
++                        "dataset, or add the attribute "
++                        "`dtype='timedelta64[ns]'` to this variable on disk.\n"
++                        "To opt-in to future behavior, set "
++                        "`decode_timedelta=False`.",
+                         FutureWarning,
+                     )
+                 if self.time_unit is None:
+
+diff --git a/xarray/coding/variables.py b/xarray/coding/variables.py
+index eff08c7..bff0f52 100644
+--- a/xarray/coding/variables.py
++++ b/xarray/coding/variables.py
+@@ -70,6 +70,9 @@ class NativeEndiannessArray(indexing.ExplicitlyIndexedNDArrayMixin):
+     def get_duck_array(self):
+         return duck_array_ops.astype(self.array.get_duck_array(), dtype=self.dtype)
+ 
++    def transpose(self, order):
++        return type(self)(self.array.transpose(order))
++
+ 
+ class BoolTypeArray(indexing.ExplicitlyIndexedNDArrayMixin):
+     """Decode arrays on the fly from integer to boolean datatype
+@@ -111,6 +114,9 @@ class BoolTypeArray(indexing.ExplicitlyIndexedNDArrayMixin):
+     def get_duck_array(self):
+         return duck_array_ops.astype(self.array.get_duck_array(), dtype=self.dtype)
+ 
++    def transpose(self, order):
++        return type(self)(self.array.transpose(order))
++
+ 
+ def _apply_mask(
+     data: np.ndarray,
+
+diff --git a/xarray/computation/ops.py b/xarray/computation/ops.py
+index 61834a8..1514f16 100644
+--- a/xarray/computation/ops.py
++++ b/xarray/computation/ops.py
+@@ -8,12 +8,15 @@ functions.
+ from __future__ import annotations
+ 
+ import operator
+-from typing import Literal
++from typing import TYPE_CHECKING, Literal
+ 
+ import numpy as np
+ 
+ from xarray.core import dtypes, duck_array_ops
+ 
++if TYPE_CHECKING:
++    pass
++
+ try:
+     import bottleneck as bn
+ 
+@@ -158,8 +161,8 @@ def fillna(data, other, join="left", dataset_join="left"):
+     )
+ 
+ 
+-# Unsure why we get a mypy error here
+-def where_method(self, cond, other=dtypes.NA):  # type: ignore[has-type]
++# TODO: type this properly
++def where_method(self, cond, other=dtypes.NA):  # type: ignore[unused-ignore,has-type]
+     """Return elements from `self` or `other` depending on `cond`.
+ 
+     Parameters
+
+diff --git a/xarray/core/accessor_dt.py b/xarray/core/accessor_dt.py
+index 86e875c..f91bdd1 100644
+--- a/xarray/core/accessor_dt.py
++++ b/xarray/core/accessor_dt.py
+@@ -206,7 +206,7 @@ def _strftime_through_cftimeindex(values, date_format: str):
+     values_as_cftimeindex = CFTimeIndex(duck_array_ops.ravel(values))
+ 
+     field_values = values_as_cftimeindex.strftime(date_format)
+-    return field_values.values.reshape(values.shape)
++    return field_values.to_numpy().reshape(values.shape)
+ 
+ 
+ def _strftime_through_series(values, date_format: str):
+@@ -215,7 +215,7 @@ def _strftime_through_series(values, date_format: str):
+     """
+     values_as_series = pd.Series(duck_array_ops.ravel(values), copy=False)
+     strs = values_as_series.dt.strftime(date_format)
+-    return strs.values.reshape(values.shape)
++    return strs.to_numpy().reshape(values.shape)
+ 
+ 
+ def _strftime(values, date_format):
+
+diff --git a/xarray/core/coordinates.py b/xarray/core/coordinates.py
+index 28cbc5b..572e9c2 100644
+--- a/xarray/core/coordinates.py
++++ b/xarray/core/coordinates.py
+@@ -177,7 +177,7 @@ class AbstractCoordinates(Mapping[Hashable, "T_DataArray"]):
+ 
+                 # compute the cartesian product
+                 code_list += [
+-                    np.tile(np.repeat(code, repeat_counts[i]), tile_counts[i]).tolist()
++                    np.tile(np.repeat(code, repeat_counts[i]), tile_counts[i])
+                     for code in codes
+                 ]
+                 level_list += levels
+@@ -1027,10 +1027,10 @@ def drop_indexed_coords(
+         if isinstance(idx, PandasMultiIndex) and idx_drop_coords == {idx.dim}:
+             idx_drop_coords.update(idx.index.names)
+             emit_user_level_warning(
+-                f"updating coordinate {idx.dim!r} with a PandasMultiIndex would leave "
++                f"updating coordinate {idx.dim!r}, which is a PandasMultiIndex, would leave "
+                 f"the multi-index level coordinates {list(idx.index.names)!r} in an inconsistent state. "
+-                f"This will raise an error in the future. Use `.drop_vars({list(idx_coords)!r})` before "
+-                "assigning new coordinate values.",
++                f"This will raise an error in the future. Use `.drop_vars({list(idx_coords)!r})` "
++                "to drop the coordinates' values before assigning new coordinate values.",
+                 FutureWarning,
+             )
+ 
+
+diff --git a/xarray/core/dataarray.py b/xarray/core/dataarray.py
+index 73b0eb1..b1833d3 100644
+--- a/xarray/core/dataarray.py
++++ b/xarray/core/dataarray.py
+@@ -1135,10 +1135,11 @@ class DataArray(
+         return cls(variable, coords, name=name, indexes=indexes, fastpath=True)
+ 
+     def load(self, **kwargs) -> Self:
+-        """Manually trigger loading of this array's data from disk or a
+-        remote source into memory and return this array.
++        """Trigger loading data into memory and return this dataarray.
+ 
+-        Unlike compute, the original dataset is modified and returned.
++        Data will be computed and/or loaded from disk or a remote source.
++
++        Unlike ``.compute``, the original dataarray is modified and returned.
+ 
+         Normally, it should not be necessary to call this method in user code,
+         because all xarray functions should either work on deferred data or
+@@ -1150,9 +1151,18 @@ class DataArray(
+         **kwargs : dict
+             Additional keyword arguments passed on to ``dask.compute``.
+ 
++        Returns
++        -------
++        object : DataArray
++            Same object but with lazy data and coordinates as in-memory arrays.
++
+         See Also
+         --------
+         dask.compute
++        DataArray.load_async
++        DataArray.compute
++        Dataset.load
++        Variable.load
+         """
+         ds = self._to_temp_dataset().load(**kwargs)
+         new = self._from_temp_dataset(ds)
+@@ -1160,11 +1170,49 @@ class DataArray(
+         self._coords = new._coords
+         return self
+ 
++    async def load_async(self, **kwargs) -> Self:
++        """Trigger and await asynchronous loading of data into memory and return this dataarray.
++
++        Data will be computed and/or loaded from disk or a remote source.
++
++        Unlike ``.compute``, the original dataarray is modified and returned.
++
++        Only works when opening data lazily from IO storage backends which support lazy asynchronous loading.
++        Otherwise will raise a NotImplementedError.
++
++        Note users are expected to limit concurrency themselves - xarray does not internally limit concurrency in any way.
++
++        Parameters
++        ----------
++        **kwargs : dict
++            Additional keyword arguments passed on to ``dask.compute``.
++
++        Returns
++        -------
++        object : Dataarray
++            Same object but with lazy data and coordinates as in-memory arrays.
++
++        See Also
++        --------
++        dask.compute
++        DataArray.compute
++        DataArray.load
++        Dataset.load_async
++        Variable.load_async
++        """
++        temp_ds = self._to_temp_dataset()
++        ds = await temp_ds.load_async(**kwargs)
++        new = self._from_temp_dataset(ds)
++        self._variable = new._variable
++        self._coords = new._coords
++        return self
++
+     def compute(self, **kwargs) -> Self:
+-        """Manually trigger loading of this array's data from disk or a
+-        remote source into memory and return a new array.
++        """Trigger loading data into memory and return a new dataarray.
++
++        Data will be computed and/or loaded from disk or a remote source.
+ 
+-        Unlike load, the original is left unaltered.
++        Unlike ``.load``, the original dataarray is left unaltered.
+ 
+         Normally, it should not be necessary to call this method in user code,
+         because all xarray functions should either work on deferred data or
+@@ -1184,6 +1232,10 @@ class DataArray(
+         See Also
+         --------
+         dask.compute
++        DataArray.load
++        DataArray.load_async
++        Dataset.compute
++        Variable.compute
+         """
+         new = self.copy(deep=False)
+         return new.load(**kwargs)
+@@ -4015,7 +4067,7 @@ class DataArray(
+         compute: bool = True,
+         invalid_netcdf: bool = False,
+         auto_complex: bool | None = None,
+-    ) -> bytes: ...
++    ) -> bytes | memoryview: ...
+ 
+     # compute=False returns dask.Delayed
+     @overload
+@@ -4079,7 +4131,7 @@ class DataArray(
+         compute: bool = True,
+         invalid_netcdf: bool = False,
+         auto_complex: bool | None = None,
+-    ) -> bytes | Delayed | None:
++    ) -> bytes | memoryview | Delayed | None:
+         """Write DataArray contents to a netCDF file.
+ 
+         Parameters
+@@ -4149,8 +4201,7 @@ class DataArray(
+ 
+         Returns
+         -------
+-        store: bytes or Delayed or None
+-            * ``bytes`` if path is None
++            * ``bytes`` or ``memoryview`` if path is None
+             * ``dask.delayed.Delayed`` if compute is False
+             * None otherwise
+ 
+
+diff --git a/xarray/core/dataset.py b/xarray/core/dataset.py
+index 0f2dd26..f51853f 100644
+--- a/xarray/core/dataset.py
++++ b/xarray/core/dataset.py
+@@ -1,7 +1,9 @@
+ from __future__ import annotations
+ 
++import asyncio
+ import copy
+ import datetime
++import io
+ import math
+ import sys
+ import warnings
+@@ -26,7 +28,6 @@ from typing import IO, TYPE_CHECKING, Any, Literal, cast, overload
+ 
+ import numpy as np
+ import pandas as pd
+-from pandas.api.types import is_extension_array_dtype
+ 
+ from xarray.coding.calendar_ops import convert_calendar, interp_calendar
+ from xarray.coding.cftimeindex import CFTimeIndex, _parse_array_of_cftime_strings
+@@ -91,6 +92,7 @@ from xarray.core.utils import (
+     either_dict_or_kwargs,
+     emit_user_level_warning,
+     infix_dims,
++    is_allowed_extension_array,
+     is_dict_like,
+     is_duck_array,
+     is_duck_dask_array,
+@@ -122,7 +124,13 @@ from xarray.structure.merge import (
+     merge_coordinates_without_align,
+     merge_data_and_coords,
+ )
+-from xarray.util.deprecation_helpers import _deprecate_positional_args, deprecate_dims
++from xarray.util.deprecation_helpers import (
++    _COMPAT_DEFAULT,
++    _JOIN_DEFAULT,
++    CombineKwargDefault,
++    _deprecate_positional_args,
++    deprecate_dims,
++)
+ 
+ if TYPE_CHECKING:
+     from dask.dataframe import DataFrame as DaskDataFrame
+@@ -513,9 +521,11 @@ class Dataset(
+         )
+ 
+     def load(self, **kwargs) -> Self:
+-        """Manually trigger loading and/or computation of this dataset's data
+-        from disk or a remote source into memory and return this dataset.
+-        Unlike compute, the original dataset is modified and returned.
++        """Trigger loading data into memory and return this dataset.
++
++        Data will be computed and/or loaded from disk or a remote source.
++
++        Unlike ``.compute``, the original dataset is modified and returned.
+ 
+         Normally, it should not be necessary to call this method in user code,
+         because all xarray functions should either work on deferred data or
+@@ -527,29 +537,93 @@ class Dataset(
+         **kwargs : dict
+             Additional keyword arguments passed on to ``dask.compute``.
+ 
++        Returns
++        -------
++        object : Dataset
++            Same object but with lazy data variables and coordinates as in-memory arrays.
++
+         See Also
+         --------
+         dask.compute
++        Dataset.compute
++        Dataset.load_async
++        DataArray.load
++        Variable.load
+         """
+         # access .data to coerce everything to numpy or dask arrays
+-        lazy_data = {
++        chunked_data = {
+             k: v._data for k, v in self.variables.items() if is_chunked_array(v._data)
+         }
+-        if lazy_data:
+-            chunkmanager = get_chunked_array_type(*lazy_data.values())
++        if chunked_data:
++            chunkmanager = get_chunked_array_type(*chunked_data.values())
+ 
+             # evaluate all the chunked arrays simultaneously
+             evaluated_data: tuple[np.ndarray[Any, Any], ...] = chunkmanager.compute(
+-                *lazy_data.values(), **kwargs
++                *chunked_data.values(), **kwargs
+             )
+ 
+-            for k, data in zip(lazy_data, evaluated_data, strict=False):
++            for k, data in zip(chunked_data, evaluated_data, strict=False):
+                 self.variables[k].data = data
+ 
+         # load everything else sequentially
+-        for k, v in self.variables.items():
+-            if k not in lazy_data:
+-                v.load()
++        [v.load() for k, v in self.variables.items() if k not in chunked_data]
++
++        return self
++
++    async def load_async(self, **kwargs) -> Self:
++        """Trigger and await asynchronous loading of data into memory and return this dataset.
++
++        Data will be computed and/or loaded from disk or a remote source.
++
++        Unlike ``.compute``, the original dataset is modified and returned.
++
++        Only works when opening data lazily from IO storage backends which support lazy asynchronous loading.
++        Otherwise will raise a NotImplementedError.
++
++        Note users are expected to limit concurrency themselves - xarray does not internally limit concurrency in any way.
++
++        Parameters
++        ----------
++        **kwargs : dict
++            Additional keyword arguments passed on to ``dask.compute``.
++
++        Returns
++        -------
++        object : Dataset
++            Same object but with lazy data variables and coordinates as in-memory arrays.
++
++        See Also
++        --------
++        dask.compute
++        Dataset.compute
++        Dataset.load
++        DataArray.load_async
++        Variable.load_async
++        """
++        # TODO refactor this to pull out the common chunked_data codepath
++
++        # this blocks on chunked arrays but not on lazily indexed arrays
++
++        # access .data to coerce everything to numpy or dask arrays
++        chunked_data = {
++            k: v._data for k, v in self.variables.items() if is_chunked_array(v._data)
++        }
++        if chunked_data:
++            chunkmanager = get_chunked_array_type(*chunked_data.values())
++
++            # evaluate all the chunked arrays simultaneously
++            evaluated_data: tuple[np.ndarray[Any, Any], ...] = chunkmanager.compute(
++                *chunked_data.values(), **kwargs
++            )
++
++            for k, data in zip(chunked_data, evaluated_data, strict=False):
++                self.variables[k].data = data
++
++        # load everything else concurrently
++        coros = [
++            v.load_async() for k, v in self.variables.items() if k not in chunked_data
++        ]
++        await asyncio.gather(*coros)
+ 
+         return self
+ 
+@@ -688,9 +762,11 @@ class Dataset(
+         )
+ 
+     def compute(self, **kwargs) -> Self:
+-        """Manually trigger loading and/or computation of this dataset's data
+-        from disk or a remote source into memory and return a new dataset.
+-        Unlike load, the original dataset is left unaltered.
++        """Trigger loading data into memory and return a new dataset.
++
++        Data will be computed and/or loaded from disk or a remote source.
++
++        Unlike ``.load``, the original dataset is left unaltered.
+ 
+         Normally, it should not be necessary to call this method in user code,
+         because all xarray functions should either work on deferred data or
+@@ -710,6 +786,10 @@ class Dataset(
+         See Also
+         --------
+         dask.compute
++        Dataset.load
++        Dataset.load_async
++        DataArray.compute
++        Variable.compute
+         """
+         new = self.copy(deep=False)
+         return new.load(**kwargs)
+@@ -1878,7 +1958,7 @@ class Dataset(
+         compute: bool = True,
+         invalid_netcdf: bool = False,
+         auto_complex: bool | None = None,
+-    ) -> bytes: ...
++    ) -> bytes | memoryview: ...
+ 
+     # compute=False returns dask.Delayed
+     @overload
+@@ -1901,7 +1981,7 @@ class Dataset(
+     @overload
+     def to_netcdf(
+         self,
+-        path: str | PathLike,
++        path: str | PathLike | io.IOBase,
+         mode: NetcdfWriteModes = "w",
+         format: T_NetcdfTypes | None = None,
+         group: str | None = None,
+@@ -1932,7 +2012,7 @@ class Dataset(
+ 
+     def to_netcdf(
+         self,
+-        path: str | PathLike | None = None,
++        path: str | PathLike | io.IOBase | None = None,
+         mode: NetcdfWriteModes = "w",
+         format: T_NetcdfTypes | None = None,
+         group: str | None = None,
+@@ -1942,7 +2022,7 @@ class Dataset(
+         compute: bool = True,
+         invalid_netcdf: bool = False,
+         auto_complex: bool | None = None,
+-    ) -> bytes | Delayed | None:
++    ) -> bytes | memoryview | Delayed | None:
+         """Write dataset contents to a netCDF file.
+ 
+         Parameters
+@@ -2014,9 +2094,9 @@ class Dataset(
+ 
+         Returns
+         -------
+-            * ``bytes`` if path is None
++            * ``bytes`` or ``memoryview`` if path is None
+             * ``dask.delayed.Delayed`` if compute is False
+-            * None otherwise
++            * ``None`` otherwise
+ 
+         See Also
+         --------
+@@ -3851,13 +3931,22 @@ class Dataset(
+                 var_indexers = {k: v for k, v in use_indexers.items() if k in var.dims}
+                 variables[name] = missing.interp(var, var_indexers, method, **kwargs)
+             elif dtype_kind in "ObU" and (use_indexers.keys() & var.dims):
+-                # For types that we do not understand do stepwise
+-                # interpolation to avoid modifying the elements.
+-                # reindex the variable instead because it supports
+-                # booleans and objects and retains the dtype but inside
+-                # this loop there might be some duplicate code that slows it
+-                # down, therefore collect these signals and run it later:
+-                reindex_vars.append(name)
++                if all(var.sizes[d] == 1 for d in (use_indexers.keys() & var.dims)):
++                    # Broadcastable, can be handled quickly without reindex:
++                    to_broadcast = (var.squeeze(),) + tuple(
++                        dest for _, dest in use_indexers.values()
++                    )
++                    variables[name] = broadcast_variables(*to_broadcast)[0].copy(
++                        deep=True
++                    )
++                else:
++                    # For types that we do not understand do stepwise
++                    # interpolation to avoid modifying the elements.
++                    # reindex the variable instead because it supports
++                    # booleans and objects and retains the dtype but inside
++                    # this loop there might be some duplicate code that slows it
++                    # down, therefore collect these signals and run it later:
++                    reindex_vars.append(name)
+             elif all(d not in indexers for d in var.dims):
+                 # For anything else we can only keep variables if they
+                 # are not dependent on any coords that are being
+@@ -5312,7 +5401,14 @@ class Dataset(
+ 
+         # concatenate the arrays
+         stackable_vars = [stack_dataarray(da) for da in self.data_vars.values()]
+-        data_array = concat(stackable_vars, dim=new_dim)
++        data_array = concat(
++            stackable_vars,
++            dim=new_dim,
++            data_vars="all",
++            coords="different",
++            compat="equals",
++            join="outer",
++        )
+ 
+         if name is not None:
+             data_array.name = name
+@@ -5556,8 +5652,8 @@ class Dataset(
+         self,
+         other: CoercibleMapping | DataArray,
+         overwrite_vars: Hashable | Iterable[Hashable] = frozenset(),
+-        compat: CompatOptions = "no_conflicts",
+-        join: JoinOptions = "outer",
++        compat: CompatOptions | CombineKwargDefault = _COMPAT_DEFAULT,
++        join: JoinOptions | CombineKwargDefault = _JOIN_DEFAULT,
+         fill_value: Any = xrdtypes.NA,
+         combine_attrs: CombineAttrsOptions = "override",
+     ) -> Self:
+@@ -5807,11 +5903,10 @@ class Dataset(
+                 other_names.update(idx_other_names)
+         if other_names:
+             names_set |= set(other_names)
+-            warnings.warn(
++            emit_user_level_warning(
+                 f"Deleting a single level of a MultiIndex is deprecated. Previously, this deleted all levels of a MultiIndex. "
+                 f"Please also drop the following variables: {other_names!r} to avoid an error in the future.",
+                 DeprecationWarning,
+-                stacklevel=2,
+             )
+ 
+         assert_no_index_corrupted(self.xindexes, names_set)
+@@ -6772,7 +6867,7 @@ class Dataset(
+             elif (
+                 # Some reduction functions (e.g. std, var) need to run on variables
+                 # that don't have the reduce dims: PR5393
+-                not is_extension_array_dtype(var.dtype)
++                not pd.api.types.is_extension_array_dtype(var.dtype)  # noqa: TID251
+                 and (
+                     not reduce_dims
+                     or not numeric_only
+@@ -7097,12 +7192,12 @@ class Dataset(
+         non_extension_array_columns = [
+             k
+             for k in columns_in_order
+-            if not is_extension_array_dtype(self.variables[k].data)
++            if not pd.api.types.is_extension_array_dtype(self.variables[k].data)  # noqa: TID251
+         ]
+         extension_array_columns = [
+             k
+             for k in columns_in_order
+-            if is_extension_array_dtype(self.variables[k].data)
++            if pd.api.types.is_extension_array_dtype(self.variables[k].data)  # noqa: TID251
+         ]
+         extension_array_columns_different_index = [
+             k
+@@ -7294,7 +7389,7 @@ class Dataset(
+         arrays = []
+         extension_arrays = []
+         for k, v in dataframe.items():
+-            if not is_extension_array_dtype(v) or isinstance(
++            if not is_allowed_extension_array(v) or isinstance(
+                 v.array, UNSUPPORTED_EXTENSION_ARRAY_TYPES
+             ):
+                 arrays.append((k, np.asarray(v)))
+
+diff --git a/xarray/core/datatree.py b/xarray/core/datatree.py
+index afef2f2..af71ec6 100644
+--- a/xarray/core/datatree.py
++++ b/xarray/core/datatree.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import functools
++import io
+ import itertools
+ import textwrap
+ from collections import ChainMap
+@@ -12,6 +13,7 @@ from collections.abc import (
+     Mapping,
+ )
+ from html import escape
++from os import PathLike
+ from typing import (
+     TYPE_CHECKING,
+     Any,
+@@ -1448,6 +1450,73 @@ class DataTree(
+         other_keys = {key for key, _ in other.subtree_with_keys}
+         return self.filter(lambda node: node.relative_to(self) in other_keys)
+ 
++    def prune(self, drop_size_zero_vars: bool = False) -> DataTree:
++        """
++        Remove empty nodes from the tree.
++
++        Returns a new tree containing only nodes that contain data variables with actual data.
++        Intermediate nodes are kept if they are required to support non-empty children.
++
++        Parameters
++        ----------
++        drop_size_zero_vars : bool, default False
++            If True, also considers variables with zero size as empty.
++            If False, keeps nodes with data variables even if they have zero size.
++
++        Returns
++        -------
++        DataTree
++            A new tree with empty nodes removed.
++
++        See Also
++        --------
++        filter
++
++        Examples
++        --------
++        >>> dt = xr.DataTree.from_dict(
++        ...     {
++        ...         "/a": xr.Dataset({"foo": ("x", [1, 2])}),
++        ...         "/b": xr.Dataset({"bar": ("x", [])}),
++        ...         "/c": xr.Dataset(),
++        ...     }
++        ... )
++        >>> dt.prune()  # doctest: +ELLIPSIS,+NORMALIZE_WHITESPACE
++        <xarray.DataTree>
++        Group: /
++        ├── Group: /a
++        │       Dimensions:  (x: 2)
++        │       Dimensions without coordinates: x
++        │       Data variables:
++        │           foo      (x) int64 16B 1 2
++        └── Group: /b
++                Dimensions:  (x: 0)
++                Dimensions without coordinates: x
++                Data variables:
++                    bar      (x) float64 0B...
++
++        The ``drop_size_zero_vars`` parameter controls whether variables
++        with zero size are considered empty:
++
++        >>> dt.prune(drop_size_zero_vars=True)
++        <xarray.DataTree>
++        Group: /
++        └── Group: /a
++                Dimensions:  (x: 2)
++                Dimensions without coordinates: x
++                Data variables:
++                    foo      (x) int64 16B 1 2
++        """
++        non_empty_cond: Callable[[DataTree], bool]
++        if drop_size_zero_vars:
++            non_empty_cond = lambda node: len(node.data_vars) > 0 and any(
++                var.size > 0 for var in node.data_vars.values()
++            )
++        else:
++            non_empty_cond = lambda node: len(node.data_vars) > 0
++
++        return self.filter(non_empty_cond)
++
+     def match(self, pattern: str) -> DataTree:
+         """
+         Return nodes with paths matching pattern.
+@@ -1659,9 +1728,11 @@ class DataTree(
+     def __eq__(self, other: DtCompatible) -> Self:  # type: ignore[override]
+         return super().__eq__(other)
+ 
++    # filepath=None writes to a memoryview
++    @overload
+     def to_netcdf(
+         self,
+-        filepath,
++        filepath: None = None,
+         mode: NetcdfWriteModes = "w",
+         encoding=None,
+         unlimited_dims=None,
+@@ -1671,14 +1742,45 @@ class DataTree(
+         write_inherited_coords: bool = False,
+         compute: bool = True,
+         **kwargs,
+-    ):
++    ) -> memoryview: ...
++
++    @overload
++    def to_netcdf(
++        self,
++        filepath: str | PathLike | io.IOBase,
++        mode: NetcdfWriteModes = "w",
++        encoding=None,
++        unlimited_dims=None,
++        format: T_DataTreeNetcdfTypes | None = None,
++        engine: T_DataTreeNetcdfEngine | None = None,
++        group: str | None = None,
++        write_inherited_coords: bool = False,
++        compute: bool = True,
++        **kwargs,
++    ) -> None: ...
++
++    def to_netcdf(
++        self,
++        filepath: str | PathLike | io.IOBase | None = None,
++        mode: NetcdfWriteModes = "w",
++        encoding=None,
++        unlimited_dims=None,
++        format: T_DataTreeNetcdfTypes | None = None,
++        engine: T_DataTreeNetcdfEngine | None = None,
++        group: str | None = None,
++        write_inherited_coords: bool = False,
++        compute: bool = True,
++        **kwargs,
++    ) -> None | memoryview:
+         """
+         Write datatree contents to a netCDF file.
+ 
+         Parameters
+         ----------
+-        filepath : str or Path
+-            Path to which to save this datatree.
++        filepath : str or PathLike or file-like object or None
++            Path to which to save this datatree, or a file-like object to write
++            it to (which must support read and write and be seekable) or None
++            to return in-memory bytes as a memoryview.
+         mode : {"w", "a"}, default: "w"
+             Write ('w') or append ('a') mode. If mode='w', any existing file at
+             this location will be overwritten. If mode='a', existing variables
+@@ -1717,6 +1819,11 @@ class DataTree(
+         kwargs :
+             Additional keyword arguments to be passed to ``xarray.Dataset.to_netcdf``
+ 
++        Returns
++        -------
++            * ``memoryview`` if path is None
++            * ``None`` otherwise
++
+         Note
+         ----
+             Due to file format specifications the on-disk root group name
+@@ -1724,7 +1831,7 @@ class DataTree(
+         """
+         from xarray.core.datatree_io import _datatree_to_netcdf
+ 
+-        _datatree_to_netcdf(
++        return _datatree_to_netcdf(
+             self,
+             filepath,
+             mode=mode,
+
+diff --git a/xarray/core/datatree_io.py b/xarray/core/datatree_io.py
+index cf3626d..c586caa 100644
+--- a/xarray/core/datatree_io.py
++++ b/xarray/core/datatree_io.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import io
+ from collections.abc import Mapping
+ from os import PathLike
+ from typing import TYPE_CHECKING, Any, Literal, get_args
+@@ -16,7 +17,7 @@ if TYPE_CHECKING:
+ 
+ def _datatree_to_netcdf(
+     dt: DataTree,
+-    filepath: str | PathLike,
++    filepath: str | PathLike | io.IOBase | None = None,
+     mode: NetcdfWriteModes = "w",
+     encoding: Mapping[str, Any] | None = None,
+     unlimited_dims: Mapping | None = None,
+@@ -26,18 +27,19 @@ def _datatree_to_netcdf(
+     write_inherited_coords: bool = False,
+     compute: bool = True,
+     **kwargs,
+-) -> None:
+-    """This function creates an appropriate datastore for writing a datatree to
+-    disk as a netCDF file.
+-
+-    See `DataTree.to_netcdf` for full API docs.
+-    """
++) -> None | memoryview:
++    """Implementation of `DataTree.to_netcdf`."""
+ 
+     if format not in [None, *get_args(T_DataTreeNetcdfTypes)]:
+-        raise ValueError("to_netcdf only supports the NETCDF4 format")
++        raise ValueError("DataTree.to_netcdf only supports the NETCDF4 format")
+ 
+     if engine not in [None, *get_args(T_DataTreeNetcdfEngine)]:
+-        raise ValueError("to_netcdf only supports the netcdf4 and h5netcdf engines")
++        raise ValueError(
++            "DataTree.to_netcdf only supports the netcdf4 and h5netcdf engines"
++        )
++
++    if engine is None:
++        engine = "h5netcdf"
+ 
+     if group is not None:
+         raise NotImplementedError(
+@@ -58,6 +60,13 @@ def _datatree_to_netcdf(
+             f"unexpected encoding group name(s) provided: {set(encoding) - set(dt.groups)}"
+         )
+ 
++    if filepath is None:
++        # No need to use BytesIOProxy here because the legacy scipy backend
++        # cannot write netCDF files with groups
++        target = io.BytesIO()
++    else:
++        target = filepath  # type: ignore[assignment]
++
+     if unlimited_dims is None:
+         unlimited_dims = {}
+ 
+@@ -66,7 +75,7 @@ def _datatree_to_netcdf(
+         ds = node.to_dataset(inherit=write_inherited_coords or at_root)
+         group_path = None if at_root else "/" + node.relative_to(dt)
+         ds.to_netcdf(
+-            filepath,
++            target,
+             group=group_path,
+             mode=mode,
+             encoding=encoding.get(node.path),
+@@ -78,6 +87,12 @@ def _datatree_to_netcdf(
+         )
+         mode = "a"
+ 
++    if filepath is None:
++        assert isinstance(target, io.BytesIO)
++        return target.getbuffer()
++
++    return None
++
+ 
+ def _datatree_to_zarr(
+     dt: DataTree,
+@@ -90,11 +105,7 @@ def _datatree_to_zarr(
+     compute: bool = True,
+     **kwargs,
+ ):
+-    """This function creates an appropriate datastore for writing a datatree
+-    to a zarr store.
+-
+-    See `DataTree.to_zarr` for full API docs.
+-    """
++    """Implementation of `DataTree.to_zarr`."""
+ 
+     from zarr import consolidate_metadata
+ 
+
+diff --git a/xarray/core/dtypes.py b/xarray/core/dtypes.py
+index c959a7f..0a7b172 100644
+--- a/xarray/core/dtypes.py
++++ b/xarray/core/dtypes.py
+@@ -4,7 +4,7 @@ import functools
+ from typing import Any
+ 
+ import numpy as np
+-from pandas.api.types import is_extension_array_dtype
++import pandas as pd
+ 
+ from xarray.compat import array_api_compat, npcompat
+ from xarray.compat.npcompat import HAS_STRING_DTYPE
+@@ -213,7 +213,7 @@ def isdtype(dtype, kind: str | tuple[str, ...], xp=None) -> bool:
+ 
+     if isinstance(dtype, np.dtype):
+         return npcompat.isdtype(dtype, kind)
+-    elif is_extension_array_dtype(dtype):
++    elif pd.api.types.is_extension_array_dtype(dtype):  # noqa: TID251
+         # we never want to match pandas extension array dtypes
+         return False
+     else:
+
+diff --git a/xarray/core/duck_array_ops.py b/xarray/core/duck_array_ops.py
+index 0c7d401..b8a4011 100644
+--- a/xarray/core/duck_array_ops.py
++++ b/xarray/core/duck_array_ops.py
+@@ -23,7 +23,6 @@ from numpy import (
+     take,
+     unravel_index,  # noqa: F401
+ )
+-from pandas.api.types import is_extension_array_dtype
+ 
+ from xarray.compat import dask_array_compat, dask_array_ops
+ from xarray.compat.array_api_compat import get_array_namespace
+@@ -184,7 +183,7 @@ def isnull(data):
+         dtype = xp.bool_ if hasattr(xp, "bool_") else xp.bool
+         return full_like(data, dtype=dtype, fill_value=False)
+     # at this point, array should have dtype=object
+-    elif isinstance(data, np.ndarray) or is_extension_array_dtype(data):
++    elif isinstance(data, np.ndarray) or pd.api.types.is_extension_array_dtype(data):  # noqa: TID251
+         return pandas_isnull(data)
+     else:
+         # Not reachable yet, but intended for use with other duck array
+@@ -266,10 +265,12 @@ def asarray(data, xp=np, dtype=None):
+ 
+ def as_shared_dtype(scalars_or_arrays, xp=None):
+     """Cast arrays to a shared dtype using xarray's type promotion rules."""
+-    if any(is_extension_array_dtype(x) for x in scalars_or_arrays):
+-        extension_array_types = [
+-            x.dtype for x in scalars_or_arrays if is_extension_array_dtype(x)
+-        ]
++    extension_array_types = [
++        x.dtype
++        for x in scalars_or_arrays
++        if pd.api.types.is_extension_array_dtype(x)  # noqa: TID251
++    ]
++    if len(extension_array_types) >= 1:
+         non_nans = [x for x in scalars_or_arrays if not isna(x)]
+         if len(extension_array_types) == len(non_nans) and all(
+             isinstance(x, type(extension_array_types[0])) for x in extension_array_types
+
+diff --git a/xarray/core/extension_array.py b/xarray/core/extension_array.py
+index d85f7e6..9262982 100644
+--- a/xarray/core/extension_array.py
++++ b/xarray/core/extension_array.py
+@@ -8,10 +8,9 @@ from typing import Any, Generic, cast
+ import numpy as np
+ import pandas as pd
+ from packaging.version import Version
+-from pandas.api.types import is_extension_array_dtype
+ 
+ from xarray.core.types import DTypeLikeSave, T_ExtensionArray
+-from xarray.core.utils import NDArrayMixin
++from xarray.core.utils import NDArrayMixin, is_allowed_extension_array
+ 
+ HANDLED_EXTENSION_ARRAY_FUNCTIONS: dict[Callable, Callable] = {}
+ 
+@@ -100,10 +99,11 @@ class PandasExtensionArray(NDArrayMixin, Generic[T_ExtensionArray]):
+             raise TypeError(f"{self.array} is not an pandas ExtensionArray.")
+         # This does not use the UNSUPPORTED_EXTENSION_ARRAY_TYPES whitelist because
+         # we do support extension arrays from datetime, for example, that need
+-        # duck array support internally via this class.
+-        if isinstance(self.array, pd.arrays.NumpyExtensionArray):
++        # duck array support internally via this class.  These can appear from `DatetimeIndex`
++        # wrapped by `PandasIndex` internally, for example.
++        if not is_allowed_extension_array(self.array):
+             raise TypeError(
+-                "`NumpyExtensionArray` should be converted to a numpy array in `xarray` internally."
++                f"{self.array.dtype!r} should be converted to a numpy array in `xarray` internally."
+             )
+ 
+     def __array_function__(self, func, types, args, kwargs):
+@@ -126,7 +126,7 @@ class PandasExtensionArray(NDArrayMixin, Generic[T_ExtensionArray]):
+         if func not in HANDLED_EXTENSION_ARRAY_FUNCTIONS:
+             raise KeyError("Function not registered for pandas extension arrays.")
+         res = HANDLED_EXTENSION_ARRAY_FUNCTIONS[func](*args, **kwargs)
+-        if is_extension_array_dtype(res):
++        if is_allowed_extension_array(res):
+             return PandasExtensionArray(res)
+         return res
+ 
+@@ -135,7 +135,7 @@ class PandasExtensionArray(NDArrayMixin, Generic[T_ExtensionArray]):
+ 
+     def __getitem__(self, key) -> PandasExtensionArray[T_ExtensionArray]:
+         item = self.array[key]
+-        if is_extension_array_dtype(item):
++        if is_allowed_extension_array(item):
+             return PandasExtensionArray(item)
+         if np.isscalar(item) or isinstance(key, int):
+             return PandasExtensionArray(type(self.array)._from_sequence([item]))  # type: ignore[call-arg,attr-defined,unused-ignore]
+
+diff --git a/xarray/core/groupby.py b/xarray/core/groupby.py
+index 446fd13..6ff5d49 100644
+--- a/xarray/core/groupby.py
++++ b/xarray/core/groupby.py
+@@ -1628,7 +1628,14 @@ class DataArrayGroupByBase(GroupBy["DataArray"], DataArrayGroupbyArithmetic):
+         if shortcut:
+             combined = self._concat_shortcut(applied, dim, positions)
+         else:
+-            combined = concat(applied, dim)
++            combined = concat(
++                applied,
++                dim,
++                data_vars="all",
++                coords="different",
++                compat="equals",
++                join="outer",
++            )
+             combined = _maybe_reorder(combined, dim, positions, N=self.group1d.size)
+ 
+         if isinstance(combined, type(self._obj)):
+@@ -1789,7 +1796,14 @@ class DatasetGroupByBase(GroupBy["Dataset"], DatasetGroupbyArithmetic):
+         """Recombine the applied objects like the original."""
+         applied_example, applied = peek_at(applied)
+         dim, positions = self._infer_concat_args(applied_example)
+-        combined = concat(applied, dim)
++        combined = concat(
++            applied,
++            dim,
++            data_vars="all",
++            coords="different",
++            compat="equals",
++            join="outer",
++        )
+         combined = _maybe_reorder(combined, dim, positions, N=self.group1d.size)
+         # assign coord when the applied function does not return that coord
+         if dim not in applied_example.dims:
+
+diff --git a/xarray/core/indexes.py b/xarray/core/indexes.py
+index c233c69..d22fc37 100644
+--- a/xarray/core/indexes.py
++++ b/xarray/core/indexes.py
+@@ -23,6 +23,7 @@ from xarray.core.utils import (
+     Frozen,
+     emit_user_level_warning,
+     get_valid_numpy_dtype,
++    is_allowed_extension_array_dtype,
+     is_dict_like,
+     is_scalar,
+ )
+@@ -666,9 +667,8 @@ class PandasIndex(Index):
+ 
+         self.index = index
+         self.dim = dim
+-
+         if coord_dtype is None:
+-            if pd.api.types.is_extension_array_dtype(index.dtype):
++            if is_allowed_extension_array_dtype(index.dtype):
+                 cast(pd.api.extensions.ExtensionDtype, index.dtype)
+                 coord_dtype = index.dtype
+             else:
+
+diff --git a/xarray/core/indexing.py b/xarray/core/indexing.py
+index 8e4458f..16276b5 100644
+--- a/xarray/core/indexing.py
++++ b/xarray/core/indexing.py
+@@ -24,8 +24,11 @@ from xarray.core.utils import (
+     NDArrayMixin,
+     either_dict_or_kwargs,
+     get_valid_numpy_dtype,
++    is_allowed_extension_array,
++    is_allowed_extension_array_dtype,
+     is_duck_array,
+     is_duck_dask_array,
++    is_full_slice,
+     is_scalar,
+     is_valid_numpy_dtype,
+     to_0d_array,
+@@ -41,6 +44,9 @@ if TYPE_CHECKING:
+     from xarray.namedarray._typing import _Shape, duckarray
+     from xarray.namedarray.parallelcompat import ChunkManagerEntrypoint
+ 
++BasicIndexerType = int | np.integer | slice
++OuterIndexerType = BasicIndexerType | np.ndarray[Any, np.dtype[np.integer]]
++
+ 
+ @dataclass
+ class IndexSelResult:
+@@ -298,19 +304,83 @@ def slice_slice(old_slice: slice, applied_slice: slice, size: int) -> slice:
+     return slice(start, stop, step)
+ 
+ 
+-def _index_indexer_1d(old_indexer, applied_indexer, size: int):
+-    if isinstance(applied_indexer, slice) and applied_indexer == slice(None):
++def normalize_array(
++    array: np.ndarray[Any, np.dtype[np.integer]], size: int
++) -> np.ndarray[Any, np.dtype[np.integer]]:
++    """
++    Ensure that the given array only contains positive values.
++
++    Examples
++    --------
++    >>> normalize_array(np.array([-1, -2, -3, -4]), 10)
++    array([9, 8, 7, 6])
++    >>> normalize_array(np.array([-5, 3, 5, -1, 8]), 12)
++    array([ 7,  3,  5, 11,  8])
++    """
++    if np.issubdtype(array.dtype, np.unsignedinteger):
++        return array
++
++    return np.where(array >= 0, array, array + size)
++
++
++def slice_slice_by_array(
++    old_slice: slice,
++    array: np.ndarray[Any, np.dtype[np.integer]],
++    size: int,
++) -> np.ndarray[Any, np.dtype[np.integer]]:
++    """Given a slice and the size of the dimension to which it will be applied,
++    index it with an array to return a new array equivalent to applying
++    the slices sequentially
++
++    Examples
++    --------
++    >>> slice_slice_by_array(slice(2, 10), np.array([1, 3, 5]), 12)
++    array([3, 5, 7])
++    >>> slice_slice_by_array(slice(1, None, 2), np.array([1, 3, 7, 8]), 20)
++    array([ 3,  7, 15, 17])
++    >>> slice_slice_by_array(slice(None, None, -1), np.array([2, 4, 7]), 20)
++    array([17, 15, 12])
++    """
++    # to get a concrete slice, limited to the size of the array
++    normalized_slice = normalize_slice(old_slice, size)
++
++    size_after_slice = len(range(*normalized_slice.indices(size)))
++    normalized_array = normalize_array(array, size_after_slice)
++
++    new_indexer = normalized_array * normalized_slice.step + normalized_slice.start
++
++    if np.any(new_indexer >= size):
++        raise IndexError("indices out of bounds")  # TODO: more helpful error message
++
++    return new_indexer
++
++
++def _index_indexer_1d(
++    old_indexer: OuterIndexerType,
++    applied_indexer: OuterIndexerType,
++    size: int,
++) -> OuterIndexerType:
++    if is_full_slice(applied_indexer):
+         # shortcut for the usual case
+         return old_indexer
++    if is_full_slice(old_indexer):
++        # shortcut for full slices
++        return applied_indexer
++
++    indexer: OuterIndexerType
+     if isinstance(old_indexer, slice):
+         if isinstance(applied_indexer, slice):
+             indexer = slice_slice(old_indexer, applied_indexer, size)
+         elif isinstance(applied_indexer, integer_types):
+-            indexer = range(*old_indexer.indices(size))[applied_indexer]  # type: ignore[assignment]
++            indexer = range(*old_indexer.indices(size))[applied_indexer]
+         else:
+-            indexer = _expand_slice(old_indexer, size)[applied_indexer]
+-    else:
++            indexer = slice_slice_by_array(old_indexer, applied_indexer, size)
++    elif isinstance(old_indexer, np.ndarray):
+         indexer = old_indexer[applied_indexer]
++    else:
++        # should be unreachable
++        raise ValueError("cannot index integers. Please open an issuec-")
++
+     return indexer
+ 
+ 
+@@ -387,7 +457,7 @@ class BasicIndexer(ExplicitIndexer):
+ 
+     __slots__ = ()
+ 
+-    def __init__(self, key: tuple[int | np.integer | slice, ...]):
++    def __init__(self, key: tuple[BasicIndexerType, ...]):
+         if not isinstance(key, tuple):
+             raise TypeError(f"key must be a tuple: {key!r}")
+ 
+@@ -419,9 +489,7 @@ class OuterIndexer(ExplicitIndexer):
+ 
+     def __init__(
+         self,
+-        key: tuple[
+-            int | np.integer | slice | np.ndarray[Any, np.dtype[np.generic]], ...
+-        ],
++        key: tuple[BasicIndexerType | np.ndarray[Any, np.dtype[np.generic]], ...],
+     ):
+         if not isinstance(key, tuple):
+             raise TypeError(f"key must be a tuple: {key!r}")
+@@ -518,8 +586,10 @@ class ExplicitlyIndexedNDArrayMixin(NDArrayMixin, ExplicitlyIndexed):
+     __slots__ = ()
+ 
+     def get_duck_array(self):
+-        key = BasicIndexer((slice(None),) * self.ndim)
+-        return self[key]
++        raise NotImplementedError
++
++    async def async_get_duck_array(self):
++        raise NotImplementedError
+ 
+     def _oindex_get(self, indexer: OuterIndexer):
+         raise NotImplementedError(
+@@ -557,6 +627,22 @@ class ExplicitlyIndexedNDArrayMixin(NDArrayMixin, ExplicitlyIndexed):
+         return IndexCallable(self._vindex_get, self._vindex_set)
+ 
+ 
++class IndexingAdapter(ExplicitlyIndexedNDArrayMixin):
++    """Marker class for indexing adapters.
++
++    These classes translate between Xarray's indexing semantics and the underlying array's
++    indexing semantics.
++    """
++
++    def get_duck_array(self):
++        key = BasicIndexer((slice(None),) * self.ndim)
++        return self[key]
++
++    async def async_get_duck_array(self):
++        """These classes are applied to in-memory arrays, so specific async support isn't needed."""
++        return self.get_duck_array()
++
++
+ class ImplicitToExplicitIndexingAdapter(NDArrayMixin):
+     """Wrap an array, converting tuples into the indicated explicit indexer."""
+ 
+@@ -627,7 +713,8 @@ class LazilyIndexedArray(ExplicitlyIndexedNDArrayMixin):
+ 
+     def _updated_key(self, new_key: ExplicitIndexer) -> BasicIndexer | OuterIndexer:
+         iter_new_key = iter(expanded_indexer(new_key.tuple, self.ndim))
+-        full_key = []
++
++        full_key: list[OuterIndexerType] = []
+         for size, k in zip(self.array.shape, self.key.tuple, strict=True):
+             if isinstance(k, integer_types):
+                 full_key.append(k)
+@@ -636,7 +723,7 @@ class LazilyIndexedArray(ExplicitlyIndexedNDArrayMixin):
+         full_key_tuple = tuple(full_key)
+ 
+         if all(isinstance(k, integer_types + (slice,)) for k in full_key_tuple):
+-            return BasicIndexer(full_key_tuple)
++            return BasicIndexer(cast(tuple[BasicIndexerType, ...], full_key_tuple))
+         return OuterIndexer(full_key_tuple)
+ 
+     @property
+@@ -644,19 +731,25 @@ class LazilyIndexedArray(ExplicitlyIndexedNDArrayMixin):
+         return self._shape
+ 
+     def get_duck_array(self):
+-        if isinstance(self.array, ExplicitlyIndexedNDArrayMixin):
+-            array = apply_indexer(self.array, self.key)
+-        else:
+-            # If the array is not an ExplicitlyIndexedNDArrayMixin,
+-            # it may wrap a BackendArray so use its __getitem__
++        from xarray.backends.common import BackendArray
++
++        if isinstance(self.array, BackendArray):
+             array = self.array[self.key]
++        else:
++            array = apply_indexer(self.array, self.key)
++            if isinstance(array, ExplicitlyIndexed):
++                array = array.get_duck_array()
++        return _wrap_numpy_scalars(array)
+ 
+-        # self.array[self.key] is now a numpy array when
+-        # self.array is a BackendArray subclass
+-        # and self.key is BasicIndexer((slice(None, None, None),))
+-        # so we need the explicit check for ExplicitlyIndexed
+-        if isinstance(array, ExplicitlyIndexed):
+-            array = array.get_duck_array()
++    async def async_get_duck_array(self):
++        from xarray.backends.common import BackendArray
++
++        if isinstance(self.array, BackendArray):
++            array = await self.array.async_getitem(self.key)
++        else:
++            array = apply_indexer(self.array, self.key)
++            if isinstance(array, ExplicitlyIndexed):
++                array = await array.async_get_duck_array()
+         return _wrap_numpy_scalars(array)
+ 
+     def transpose(self, order):
+@@ -720,18 +813,25 @@ class LazilyVectorizedIndexedArray(ExplicitlyIndexedNDArrayMixin):
+         return np.broadcast(*self.key.tuple).shape
+ 
+     def get_duck_array(self):
+-        if isinstance(self.array, ExplicitlyIndexedNDArrayMixin):
++        from xarray.backends.common import BackendArray
++
++        if isinstance(self.array, BackendArray):
++            array = self.array[self.key]
++        else:
+             array = apply_indexer(self.array, self.key)
++            if isinstance(array, ExplicitlyIndexed):
++                array = array.get_duck_array()
++        return _wrap_numpy_scalars(array)
++
++    async def async_get_duck_array(self):
++        from xarray.backends.common import BackendArray
++
++        if isinstance(self.array, BackendArray):
++            array = await self.array.async_getitem(self.key)
+         else:
+-            # If the array is not an ExplicitlyIndexedNDArrayMixin,
+-            # it may wrap a BackendArray so use its __getitem__
+-            array = self.array[self.key]
+-        # self.array[self.key] is now a numpy array when
+-        # self.array is a BackendArray subclass
+-        # and self.key is BasicIndexer((slice(None, None, None),))
+-        # so we need the explicit check for ExplicitlyIndexed
+-        if isinstance(array, ExplicitlyIndexed):
+-            array = array.get_duck_array()
++            array = apply_indexer(self.array, self.key)
++            if isinstance(array, ExplicitlyIndexed):
++                array = await array.async_get_duck_array()
+         return _wrap_numpy_scalars(array)
+ 
+     def _updated_key(self, new_key: ExplicitIndexer):
+@@ -796,6 +896,9 @@ class CopyOnWriteArray(ExplicitlyIndexedNDArrayMixin):
+     def get_duck_array(self):
+         return self.array.get_duck_array()
+ 
++    async def async_get_duck_array(self):
++        return await self.array.async_get_duck_array()
++
+     def _oindex_get(self, indexer: OuterIndexer):
+         return type(self)(_wrap_numpy_scalars(self.array.oindex[indexer]))
+ 
+@@ -836,12 +939,17 @@ class MemoryCachedArray(ExplicitlyIndexedNDArrayMixin):
+     def __init__(self, array):
+         self.array = _wrap_numpy_scalars(as_indexable(array))
+ 
+-    def _ensure_cached(self):
+-        self.array = as_indexable(self.array.get_duck_array())
+-
+     def get_duck_array(self):
+-        self._ensure_cached()
+-        return self.array.get_duck_array()
++        duck_array = self.array.get_duck_array()
++        # ensure the array object is cached in-memory
++        self.array = as_indexable(duck_array)
++        return duck_array
++
++    async def async_get_duck_array(self):
++        duck_array = await self.array.async_get_duck_array()
++        # ensure the array object is cached in-memory
++        self.array = as_indexable(duck_array)
++        return duck_array
+ 
+     def _oindex_get(self, indexer: OuterIndexer):
+         return type(self)(_wrap_numpy_scalars(self.array.oindex[indexer]))
+@@ -1026,6 +1134,21 @@ def explicit_indexing_adapter(
+     return result
+ 
+ 
++async def async_explicit_indexing_adapter(
++    key: ExplicitIndexer,
++    shape: _Shape,
++    indexing_support: IndexingSupport,
++    raw_indexing_method: Callable[..., Any],
++) -> Any:
++    raw_key, numpy_indices = decompose_indexer(key, shape, indexing_support)
++    result = await raw_indexing_method(raw_key.tuple)
++    if numpy_indices.tuple:
++        # index the loaded duck array
++        indexable = as_indexable(result)
++        result = apply_indexer(indexable, numpy_indices)
++    return result
++
++
+ def apply_indexer(indexable, indexer: ExplicitIndexer):
+     """Apply an indexer to an indexable object."""
+     if isinstance(indexer, VectorizedIndexer):
+@@ -1525,7 +1648,7 @@ def is_fancy_indexer(indexer: Any) -> bool:
+     return True
+ 
+ 
+-class NumpyIndexingAdapter(ExplicitlyIndexedNDArrayMixin):
++class NumpyIndexingAdapter(IndexingAdapter):
+     """Wrap a NumPy array to use explicit indexing."""
+ 
+     __slots__ = ("array",)
+@@ -1604,7 +1727,7 @@ class NdArrayLikeIndexingAdapter(NumpyIndexingAdapter):
+         self.array = array
+ 
+ 
+-class ArrayApiIndexingAdapter(ExplicitlyIndexedNDArrayMixin):
++class ArrayApiIndexingAdapter(IndexingAdapter):
+     """Wrap an array API array to use explicit indexing."""
+ 
+     __slots__ = ("array",)
+@@ -1669,7 +1792,7 @@ def _assert_not_chunked_indexer(idxr: tuple[Any, ...]) -> None:
+         )
+ 
+ 
+-class DaskIndexingAdapter(ExplicitlyIndexedNDArrayMixin):
++class DaskIndexingAdapter(IndexingAdapter):
+     """Wrap a dask array to support explicit indexing."""
+ 
+     __slots__ = ("array",)
+@@ -1745,7 +1868,7 @@ class DaskIndexingAdapter(ExplicitlyIndexedNDArrayMixin):
+         return self.array.transpose(order)
+ 
+ 
+-class PandasIndexingAdapter(ExplicitlyIndexedNDArrayMixin):
++class PandasIndexingAdapter(IndexingAdapter):
+     """Wrap a pandas.Index to preserve dtypes and handle explicit indexing."""
+ 
+     __slots__ = ("_dtype", "array")
+@@ -1763,12 +1886,12 @@ class PandasIndexingAdapter(ExplicitlyIndexedNDArrayMixin):
+         self.array = safe_cast_to_index(array)
+ 
+         if dtype is None:
+-            if pd.api.types.is_extension_array_dtype(array.dtype):
++            if is_allowed_extension_array(array):
+                 cast(pd.api.extensions.ExtensionDtype, array.dtype)
+                 self._dtype = array.dtype
+             else:
+                 self._dtype = get_valid_numpy_dtype(array)
+-        elif pd.api.types.is_extension_array_dtype(dtype):
++        elif is_allowed_extension_array_dtype(dtype):
+             self._dtype = cast(pd.api.extensions.ExtensionDtype, dtype)
+         else:
+             self._dtype = np.dtype(cast(DTypeLike, dtype))
+@@ -1816,10 +1939,7 @@ class PandasIndexingAdapter(ExplicitlyIndexedNDArrayMixin):
+         # We return an PandasExtensionArray wrapper type that satisfies
+         # duck array protocols.
+         # `NumpyExtensionArray` is excluded
+-        if pd.api.types.is_extension_array_dtype(self.array) and not isinstance(
+-            self.array.array,
+-            pd.arrays.NumpyExtensionArray,  # type: ignore[attr-defined]
+-        ):
++        if is_allowed_extension_array(self.array):
+             from xarray.core.extension_array import PandasExtensionArray
+ 
+             return PandasExtensionArray(self.array.array)
+@@ -1916,7 +2036,7 @@ class PandasIndexingAdapter(ExplicitlyIndexedNDArrayMixin):
+ 
+     @property
+     def nbytes(self) -> int:
+-        if pd.api.types.is_extension_array_dtype(self.dtype):
++        if is_allowed_extension_array(self.array):
+             return self.array.nbytes
+ 
+         dtype = self._get_numpy_dtype()
+@@ -2005,7 +2125,7 @@ class PandasMultiIndexingAdapter(PandasIndexingAdapter):
+         return type(self)(array, self._dtype, self.level)
+ 
+ 
+-class CoordinateTransformIndexingAdapter(ExplicitlyIndexedNDArrayMixin):
++class CoordinateTransformIndexingAdapter(IndexingAdapter):
+     """Wrap a CoordinateTransform as a lazy coordinate array.
+ 
+     Supports explicit indexing (both outer and vectorized).
+
+diff --git a/xarray/core/options.py b/xarray/core/options.py
+index 9077536..791d3bd 100644
+--- a/xarray/core/options.py
++++ b/xarray/core/options.py
+@@ -30,6 +30,7 @@ if TYPE_CHECKING:
+         "keep_attrs",
+         "warn_for_unclosed_files",
+         "use_bottleneck",
++        "use_new_combine_kwarg_defaults",
+         "use_numbagg",
+         "use_opt_einsum",
+         "use_flox",
+@@ -59,6 +60,7 @@ if TYPE_CHECKING:
+         warn_for_unclosed_files: bool
+         use_bottleneck: bool
+         use_flox: bool
++        use_new_combine_kwarg_defaults: bool
+         use_numbagg: bool
+         use_opt_einsum: bool
+ 
+@@ -87,6 +89,7 @@ OPTIONS: T_Options = {
+     "warn_for_unclosed_files": False,
+     "use_bottleneck": True,
+     "use_flox": True,
++    "use_new_combine_kwarg_defaults": False,
+     "use_numbagg": True,
+     "use_opt_einsum": True,
+ }
+@@ -117,6 +120,7 @@ _VALIDATORS = {
+     "file_cache_maxsize": _positive_integer,
+     "keep_attrs": lambda choice: choice in [True, False, "default"],
+     "use_bottleneck": lambda value: isinstance(value, bool),
++    "use_new_combine_kwarg_defaults": lambda value: isinstance(value, bool),
+     "use_numbagg": lambda value: isinstance(value, bool),
+     "use_opt_einsum": lambda value: isinstance(value, bool),
+     "use_flox": lambda value: isinstance(value, bool),
+@@ -256,6 +260,15 @@ class set_options:
+     use_flox : bool, default: True
+         Whether to use ``numpy_groupies`` and `flox`` to
+         accelerate groupby and resampling reductions.
++    use_new_combine_kwarg_defaults : bool, default False
++        Whether to use new kwarg default values for combine functions:
++        :py:func:`~xarray.concat`, :py:func:`~xarray.merge`,
++        :py:func:`~xarray.open_mfdataset`. New values are:
++
++        * ``data_vars``: None
++        * ``coords``: "minimal"
++        * ``compat``: "override"
++        * ``join``: "exact"
+     use_numbagg : bool, default: True
+         Whether to use ``numbagg`` to accelerate reductions.
+         Takes precedence over ``use_bottleneck`` when both are True.
+
+diff --git a/xarray/core/parallel.py b/xarray/core/parallel.py
+index 8bb9811..a718ef5 100644
+--- a/xarray/core/parallel.py
++++ b/xarray/core/parallel.py
+@@ -351,7 +351,9 @@ def map_blocks(
+         result = func(*converted_args, **kwargs)
+ 
+         merged_coordinates = merge(
+-            [arg.coords for arg in args if isinstance(arg, Dataset | DataArray)]
++            [arg.coords for arg in args if isinstance(arg, Dataset | DataArray)],
++            join="exact",
++            compat="override",
+         ).coords
+ 
+         # check all dims are present
+@@ -441,7 +443,11 @@ def map_blocks(
+     # rechunk any numpy variables appropriately
+     xarray_objs = tuple(arg.chunk(arg.chunksizes) for arg in xarray_objs)
+ 
+-    merged_coordinates = merge([arg.coords for arg in aligned]).coords
++    merged_coordinates = merge(
++        [arg.coords for arg in aligned],
++        join="exact",
++        compat="override",
++    ).coords
+ 
+     _, npargs = unzip(
+         sorted(
+@@ -474,7 +480,10 @@ def map_blocks(
+         )
+ 
+         coordinates = merge(
+-            (preserved_coords, template.coords.to_dataset()[new_coord_vars])
++            (preserved_coords, template.coords.to_dataset()[new_coord_vars]),
++            # FIXME: this should be join="exact", but breaks a test
++            join="outer",
++            compat="override",
+         ).coords
+         output_chunks: Mapping[Hashable, tuple[int, ...]] = {
+             dim: input_chunks[dim] for dim in template.dims if dim in input_chunks
+
+diff --git a/xarray/core/utils.py b/xarray/core/utils.py
+index 562706a..e490fc0 100644
+--- a/xarray/core/utils.py
++++ b/xarray/core/utils.py
+@@ -104,6 +104,20 @@ V = TypeVar("V")
+ T = TypeVar("T")
+ 
+ 
++def is_allowed_extension_array_dtype(dtype: Any):
++    return pd.api.types.is_extension_array_dtype(dtype) and not isinstance(  # noqa: TID251
++        dtype, pd.StringDtype
++    )
++
++
++def is_allowed_extension_array(array: Any) -> bool:
++    return (
++        hasattr(array, "dtype")
++        and is_allowed_extension_array_dtype(array.dtype)
++        and not isinstance(array, pd.arrays.NumpyExtensionArray)  # type: ignore[attr-defined]
++    )
++
++
+ def alias_message(old_name: str, new_name: str) -> str:
+     return f"{old_name} has been deprecated. Use {new_name} instead."
+ 
+@@ -680,15 +694,12 @@ def is_remote_uri(path: str) -> bool:
+ 
+ def read_magic_number_from_file(filename_or_obj, count=8) -> bytes:
+     # check byte header to determine file type
+-    if isinstance(filename_or_obj, bytes):
+-        magic_number = filename_or_obj[:count]
+-    elif isinstance(filename_or_obj, io.IOBase):
+-        if filename_or_obj.tell() != 0:
+-            filename_or_obj.seek(0)
+-        magic_number = filename_or_obj.read(count)
+-        filename_or_obj.seek(0)
+-    else:
++    if not isinstance(filename_or_obj, io.IOBase):
+         raise TypeError(f"cannot read the magic number from {type(filename_or_obj)}")
++    if filename_or_obj.tell() != 0:
++        filename_or_obj.seek(0)
++    magic_number = filename_or_obj.read(count)
++    filename_or_obj.seek(0)
+     return magic_number
+ 
+ 
+
+diff --git a/xarray/core/variable.py b/xarray/core/variable.py
+index bcc2ca4..aed4b39 100644
+--- a/xarray/core/variable.py
++++ b/xarray/core/variable.py
+@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, NoReturn, cast
+ import numpy as np
+ import pandas as pd
+ from numpy.typing import ArrayLike
++from packaging.version import Version
+ 
+ import xarray as xr  # only for Dataset and DataArray
+ from xarray.compat.array_api_compat import to_like_array
+@@ -40,6 +41,7 @@ from xarray.core.utils import (
+     emit_user_level_warning,
+     ensure_us_time_resolution,
+     infix_dims,
++    is_allowed_extension_array,
+     is_dict_like,
+     is_duck_array,
+     is_duck_dask_array,
+@@ -48,6 +50,7 @@ from xarray.core.utils import (
+ from xarray.namedarray.core import NamedArray, _raise_if_any_duplicate_dimensions
+ from xarray.namedarray.parallelcompat import get_chunked_array_type
+ from xarray.namedarray.pycompat import (
++    async_to_duck_array,
+     integer_types,
+     is_0d_dask_array,
+     is_chunked_array,
+@@ -198,14 +201,19 @@ def _maybe_wrap_data(data):
+         return PandasIndexingAdapter(data)
+     if isinstance(data, UNSUPPORTED_EXTENSION_ARRAY_TYPES):
+         return data.to_numpy()
+-    if isinstance(data, pd.api.extensions.ExtensionArray):
++    if isinstance(
++        data, pd.api.extensions.ExtensionArray
++    ) and is_allowed_extension_array(data):
+         return PandasExtensionArray(data)
+     return data
+ 
+ 
+ def _possibly_convert_objects(values):
+     """Convert object arrays into datetime64 and timedelta64 according
+-    to the pandas convention.
++    to the pandas convention.  For backwards compat, as of 3.0.0 pandas,
++    object dtype inputs are cast to strings by `pandas.Series`
++    but we output them as object dtype with the input metadata preserved as well.
++
+ 
+     * datetime.datetime
+     * datetime.timedelta
+@@ -220,6 +228,17 @@ def _possibly_convert_objects(values):
+             result.flags.writeable = True
+         except ValueError:
+             result = result.copy()
++    # For why we need this behavior: https://github.com/pandas-dev/pandas/issues/61938
++    # Object datatype inputs that are strings
++    # will be converted to strings by `pandas.Series`, and as of 3.0.0, lose
++    # `dtype.metadata`.  If the roundtrip back to numpy in this function yields an
++    # object array again, the dtype.metadata will be preserved.
++    if (
++        result.dtype.kind == "O"
++        and values.dtype.kind == "O"
++        and Version(pd.__version__) >= Version("3.0.0dev0")
++    ):
++        result.dtype = values.dtype
+     return result
+ 
+ 
+@@ -261,7 +280,8 @@ def as_compatible_data(
+     if isinstance(data, pd.Series | pd.DataFrame):
+         if (
+             isinstance(data, pd.Series)
+-            and pd.api.types.is_extension_array_dtype(data)
++            and is_allowed_extension_array(data.array)
++            # Some datetime types are not allowed as well as backing Variable types
+             and not isinstance(data.array, UNSUPPORTED_EXTENSION_ARRAY_TYPES)
+         ):
+             pandas_data = data.array
+@@ -951,14 +971,16 @@ class Variable(NamedArray, AbstractArray, VariableArithmetic):
+             data = copy.copy(self.data)
+         if attrs is _default:
+             attrs = copy.copy(self._attrs)
+-
+         if encoding is _default:
+             encoding = copy.copy(self._encoding)
+         return type(self)(dims, data, attrs, encoding, fastpath=True)
+ 
+-    def load(self, **kwargs):
+-        """Manually trigger loading of this variable's data from disk or a
+-        remote source into memory and return this variable.
++    def load(self, **kwargs) -> Self:
++        """Trigger loading data into memory and return this variable.
++
++        Data will be computed and/or loaded from disk or a remote source.
++
++        Unlike ``.compute``, the original variable is modified and returned.
+ 
+         Normally, it should not be necessary to call this method in user code,
+         because all xarray functions should either work on deferred data or
+@@ -969,17 +991,61 @@ class Variable(NamedArray, AbstractArray, VariableArithmetic):
+         **kwargs : dict
+             Additional keyword arguments passed on to ``dask.array.compute``.
+ 
++        Returns
++        -------
++        object : Variable
++            Same object but with lazy data as an in-memory array.
++
+         See Also
+         --------
+         dask.array.compute
++        Variable.compute
++        Variable.load_async
++        DataArray.load
++        Dataset.load
+         """
+         self._data = to_duck_array(self._data, **kwargs)
+         return self
+ 
+-    def compute(self, **kwargs):
+-        """Manually trigger loading of this variable's data from disk or a
+-        remote source into memory and return a new variable. The original is
+-        left unaltered.
++    async def load_async(self, **kwargs) -> Self:
++        """Trigger and await asynchronous loading of data into memory and return this variable.
++
++        Data will be computed and/or loaded from disk or a remote source.
++
++        Unlike ``.compute``, the original variable is modified and returned.
++
++        Only works when opening data lazily from IO storage backends which support lazy asynchronous loading.
++        Otherwise will raise a NotImplementedError.
++
++        Note users are expected to limit concurrency themselves - xarray does not internally limit concurrency in any way.
++
++        Parameters
++        ----------
++        **kwargs : dict
++            Additional keyword arguments passed on to ``dask.array.compute``.
++
++        Returns
++        -------
++        object : Variable
++            Same object but with lazy data as an in-memory array.
++
++        See Also
++        --------
++        dask.array.compute
++        Variable.load
++        Variable.compute
++        DataArray.load_async
++        Dataset.load_async
++        """
++        self._data = await async_to_duck_array(self._data, **kwargs)
++        return self
++
++    def compute(self, **kwargs) -> Self:
++        """Trigger loading data into memory and return a new variable.
++
++        Data will be computed and/or loaded from disk or a remote source.
++
++        The original variable is left unaltered.
+ 
+         Normally, it should not be necessary to call this method in user code,
+         because all xarray functions should either work on deferred data or
+@@ -990,9 +1056,18 @@ class Variable(NamedArray, AbstractArray, VariableArithmetic):
+         **kwargs : dict
+             Additional keyword arguments passed on to ``dask.array.compute``.
+ 
++        Returns
++        -------
++        object : Variable
++            New object with the data as an in-memory array.
++
+         See Also
+         --------
+         dask.array.compute
++        Variable.load
++        Variable.load_async
++        DataArray.compute
++        Dataset.compute
+         """
+         new = self.copy(deep=False)
+         return new.load(**kwargs)
+@@ -2681,6 +2756,10 @@ class IndexVariable(Variable):
+         # data is already loaded into memory for IndexVariable
+         return self
+ 
++    async def load_async(self):
++        # data is already loaded into memory for IndexVariable
++        return self
++
+     # https://github.com/python/mypy/issues/1465
+     @Variable.data.setter  # type: ignore[attr-defined]
+     def data(self, data):
+
+diff --git a/xarray/groupers.py b/xarray/groupers.py
+index 4424c65..f01d4b8 100644
+--- a/xarray/groupers.py
++++ b/xarray/groupers.py
+@@ -691,8 +691,7 @@ def find_independent_seasons(seasons: Sequence[str]) -> Sequence[SeasonsGroup]:
+     >>> find_independent_seasons(
+     ...     ["DJF", "FMA", "AMJ", "JJA", "ASO", "OND"]
+     ... )  # doctest: +NORMALIZE_WHITESPACE
+-    [SeasonsGroup(seasons=('DJF', 'AMJ', 'ASO'), inds=((12, 1, 2), (4, 5, 6), (8, 9, 10)), codes=[0, 2, 4]),
+-    SeasonsGroup(seasons=('FMA', 'JJA', 'OND'), inds=((2, 3, 4), (6, 7, 8), (10, 11, 12)), codes=[1, 3, 5])]
++    [SeasonsGroup(seasons=('DJF', 'AMJ', 'ASO'), inds=((12, 1, 2), (4, 5, 6), (8, 9, 10)), codes=[0, 2, 4]), SeasonsGroup(seasons=('FMA', 'JJA', 'OND'), inds=((2, 3, 4), (6, 7, 8), (10, 11, 12)), codes=[1, 3, 5])]
+ 
+     >>> find_independent_seasons(["DJF", "MAM", "JJA", "SON"])
+     [SeasonsGroup(seasons=('DJF', 'MAM', 'JJA', 'SON'), inds=((12, 1, 2), (3, 4, 5), (6, 7, 8), (9, 10, 11)), codes=[0, 1, 2, 3])]
+
+diff --git a/xarray/indexes/range_index.py b/xarray/indexes/range_index.py
+index 34e6c2f..ab619c6 100644
+--- a/xarray/indexes/range_index.py
++++ b/xarray/indexes/range_index.py
+@@ -20,8 +20,9 @@ class RangeCoordinateTransform(CoordinateTransform):
+ 
+     start: float
+     stop: float
++    _step: float | None
+ 
+-    __slots__ = ("start", "stop")
++    __slots__ = ("_step", "start", "stop")
+ 
+     def __init__(
+         self,
+@@ -39,6 +40,7 @@ class RangeCoordinateTransform(CoordinateTransform):
+ 
+         self.start = start
+         self.stop = stop
++        self._step = None  # Will be calculated by property
+ 
+     @property
+     def coord_name(self) -> Hashable:
+@@ -54,7 +56,13 @@ class RangeCoordinateTransform(CoordinateTransform):
+ 
+     @property
+     def step(self) -> float:
+-        return (self.stop - self.start) / self.size
++        if self._step is not None:
++            return self._step
++        if self.size > 0:
++            return (self.stop - self.start) / self.size
++        else:
++            # For empty arrays, default to 1.0
++            return 1.0
+ 
+     def forward(self, dim_positions: dict[str, Any]) -> dict[Hashable, Any]:
+         positions = dim_positions[self.dim]
+@@ -81,12 +89,22 @@ class RangeCoordinateTransform(CoordinateTransform):
+     def slice(self, sl: slice) -> "RangeCoordinateTransform":
+         new_range = range(self.size)[sl]
+         new_size = len(new_range)
++
+         new_start = self.start + new_range.start * self.step
+         new_stop = self.start + new_range.stop * self.step
+ 
+-        return type(self)(
+-            new_start, new_stop, new_size, self.coord_name, self.dim, dtype=self.dtype
++        result = type(self)(
++            new_start,
++            new_stop,
++            new_size,
++            self.coord_name,
++            self.dim,
++            dtype=self.dtype,
+         )
++        if new_size == 0:
++            # For empty slices, preserve step from parent
++            result._step = self.step
++        return result
+ 
+ 
+ class RangeIndex(CoordinateTransformIndex):
+
+diff --git a/xarray/namedarray/pycompat.py b/xarray/namedarray/pycompat.py
+index 68b6a78..5832f7c 100644
+--- a/xarray/namedarray/pycompat.py
++++ b/xarray/namedarray/pycompat.py
+@@ -145,3 +145,17 @@ def to_duck_array(data: Any, **kwargs: dict[str, Any]) -> duckarray[_ShapeType,
+         return data
+     else:
+         return np.asarray(data)  # type: ignore[return-value]
++
++
++async def async_to_duck_array(
++    data: Any, **kwargs: dict[str, Any]
++) -> duckarray[_ShapeType, _DType]:
++    from xarray.core.indexing import (
++        ExplicitlyIndexed,
++        ImplicitToExplicitIndexingAdapter,
++    )
++
++    if isinstance(data, ExplicitlyIndexed | ImplicitToExplicitIndexingAdapter):
++        return await data.async_get_duck_array()  # type: ignore[union-attr, no-any-return]
++    else:
++        return to_duck_array(data, **kwargs)
+
+diff --git a/xarray/plot/dataarray_plot.py b/xarray/plot/dataarray_plot.py
+index 537fbd5..301cb5b 100644
+--- a/xarray/plot/dataarray_plot.py
++++ b/xarray/plot/dataarray_plot.py
+@@ -196,7 +196,13 @@ def _prepare_plot1d_data(
+                 dim = coords_to_plot.get(v, None)
+                 if (dim is not None) and (dim in darray.dims):
+                     darray_nan = np.nan * darray.isel({dim: -1})
+-                    darray = concat([darray, darray_nan], dim=dim)
++                    darray = concat(
++                        [darray, darray_nan],
++                        dim=dim,
++                        coords="minimal",
++                        compat="override",
++                        join="exact",
++                    )
+                     dims_T.append(coords_to_plot[v])
+ 
+         # Lines should never connect to the same coordinate when stacked,
+
+diff --git a/xarray/structure/alignment.py b/xarray/structure/alignment.py
+index b05271d..5cda7c2 100644
+--- a/xarray/structure/alignment.py
++++ b/xarray/structure/alignment.py
+@@ -6,7 +6,7 @@ from collections import defaultdict
+ from collections.abc import Callable, Hashable, Iterable, Mapping
+ from contextlib import suppress
+ from itertools import starmap
+-from typing import TYPE_CHECKING, Any, Final, Generic, TypeVar, cast, overload
++from typing import TYPE_CHECKING, Any, Final, Generic, TypeVar, cast, get_args, overload
+ 
+ import numpy as np
+ import pandas as pd
+@@ -20,9 +20,10 @@ from xarray.core.indexes import (
+     indexes_all_equal,
+     safe_cast_to_index,
+ )
+-from xarray.core.types import T_Alignable
+-from xarray.core.utils import is_dict_like, is_full_slice
++from xarray.core.types import JoinOptions, T_Alignable
++from xarray.core.utils import emit_user_level_warning, is_dict_like, is_full_slice
+ from xarray.core.variable import Variable, as_compatible_data, calculate_dimensions
++from xarray.util.deprecation_helpers import CombineKwargDefault
+ 
+ if TYPE_CHECKING:
+     from xarray.core.dataarray import DataArray
+@@ -155,11 +156,10 @@ class Aligner(Generic[T_Alignable]):
+ 
+     objects: tuple[T_Alignable, ...]
+     results: tuple[T_Alignable, ...]
+-    objects_matching_indexes: tuple[dict[MatchingIndexKey, Index], ...]
+     objects_matching_index_vars: tuple[
+         dict[MatchingIndexKey, dict[Hashable, Variable]], ...
+     ]
+-    join: str
++    join: JoinOptions | CombineKwargDefault
+     exclude_dims: frozenset[Hashable]
+     exclude_vars: frozenset[Hashable]
+     copy: bool
+@@ -180,7 +180,7 @@ class Aligner(Generic[T_Alignable]):
+     def __init__(
+         self,
+         objects: Iterable[T_Alignable],
+-        join: str = "inner",
++        join: JoinOptions | CombineKwargDefault = "inner",
+         indexes: Mapping[Any, Any] | None = None,
+         exclude_dims: str | Iterable[Hashable] = frozenset(),
+         exclude_vars: Iterable[Hashable] = frozenset(),
+@@ -191,10 +191,12 @@ class Aligner(Generic[T_Alignable]):
+         sparse: bool = False,
+     ):
+         self.objects = tuple(objects)
+-        self.objects_matching_indexes = ()
++        self.objects_matching_indexes: tuple[Any, ...] = ()
+         self.objects_matching_index_vars = ()
+ 
+-        if join not in ["inner", "outer", "override", "exact", "left", "right"]:
++        if not isinstance(join, CombineKwargDefault) and join not in get_args(
++            JoinOptions
++        ):
+             raise ValueError(f"invalid value for join: {join}")
+         self.join = join
+ 
+@@ -451,12 +453,34 @@ class Aligner(Generic[T_Alignable]):
+                 else:
+                     need_reindex = False
+                 if need_reindex:
++                    if (
++                        isinstance(self.join, CombineKwargDefault)
++                        and self.join != "exact"
++                    ):
++                        emit_user_level_warning(
++                            self.join.warning_message(
++                                "This change will result in the following ValueError: "
++                                "cannot be aligned with join='exact' because "
++                                "index/labels/sizes are not equal along "
++                                "these coordinates (dimensions): "
++                                + ", ".join(
++                                    f"{name!r} {dims!r}" for name, dims in key[0]
++                                ),
++                                recommend_set_options=False,
++                            ),
++                            FutureWarning,
++                        )
+                     if self.join == "exact":
+                         raise AlignmentError(
+                             "cannot align objects with join='exact' where "
+                             "index/labels/sizes are not equal along "
+                             "these coordinates (dimensions): "
+                             + ", ".join(f"{name!r} {dims!r}" for name, dims in key[0])
++                            + (
++                                self.join.error_message()
++                                if isinstance(self.join, CombineKwargDefault)
++                                else ""
++                            )
+                         )
+                     joiner = self._get_index_joiner(index_cls)
+                     joined_index = joiner(matching_indexes)
+@@ -656,7 +680,7 @@ def align(
+     obj1: T_Obj1,
+     /,
+     *,
+-    join: JoinOptions = "inner",
++    join: JoinOptions | CombineKwargDefault = "inner",
+     copy: bool = True,
+     indexes=None,
+     exclude: str | Iterable[Hashable] = frozenset(),
+@@ -670,7 +694,7 @@ def align(
+     obj2: T_Obj2,
+     /,
+     *,
+-    join: JoinOptions = "inner",
++    join: JoinOptions | CombineKwargDefault = "inner",
+     copy: bool = True,
+     indexes=None,
+     exclude: str | Iterable[Hashable] = frozenset(),
+@@ -685,7 +709,7 @@ def align(
+     obj3: T_Obj3,
+     /,
+     *,
+-    join: JoinOptions = "inner",
++    join: JoinOptions | CombineKwargDefault = "inner",
+     copy: bool = True,
+     indexes=None,
+     exclude: str | Iterable[Hashable] = frozenset(),
+@@ -701,7 +725,7 @@ def align(
+     obj4: T_Obj4,
+     /,
+     *,
+-    join: JoinOptions = "inner",
++    join: JoinOptions | CombineKwargDefault = "inner",
+     copy: bool = True,
+     indexes=None,
+     exclude: str | Iterable[Hashable] = frozenset(),
+@@ -718,7 +742,7 @@ def align(
+     obj5: T_Obj5,
+     /,
+     *,
+-    join: JoinOptions = "inner",
++    join: JoinOptions | CombineKwargDefault = "inner",
+     copy: bool = True,
+     indexes=None,
+     exclude: str | Iterable[Hashable] = frozenset(),
+@@ -729,7 +753,7 @@ def align(
+ @overload
+ def align(
+     *objects: T_Alignable,
+-    join: JoinOptions = "inner",
++    join: JoinOptions | CombineKwargDefault = "inner",
+     copy: bool = True,
+     indexes=None,
+     exclude: str | Iterable[Hashable] = frozenset(),
+@@ -739,7 +763,7 @@ def align(
+ 
+ def align(
+     *objects: T_Alignable,
+-    join: JoinOptions = "inner",
++    join: JoinOptions | CombineKwargDefault = "inner",
+     copy: bool = True,
+     indexes=None,
+     exclude: str | Iterable[Hashable] = frozenset(),
+@@ -947,7 +971,7 @@ def align(
+ 
+ def deep_align(
+     objects: Iterable[Any],
+-    join: JoinOptions = "inner",
++    join: JoinOptions | CombineKwargDefault = "inner",
+     copy: bool = True,
+     indexes=None,
+     exclude: str | Iterable[Hashable] = frozenset(),
+
+diff --git a/xarray/structure/combine.py b/xarray/structure/combine.py
+index 63c3e4c..b1dbc8e 100644
+--- a/xarray/structure/combine.py
++++ b/xarray/structure/combine.py
+@@ -10,8 +10,16 @@ from xarray.core import dtypes
+ from xarray.core.dataarray import DataArray
+ from xarray.core.dataset import Dataset
+ from xarray.core.utils import iterate_nested
++from xarray.structure.alignment import AlignmentError
+ from xarray.structure.concat import concat
+ from xarray.structure.merge import merge
++from xarray.util.deprecation_helpers import (
++    _COMPAT_DEFAULT,
++    _COORDS_DEFAULT,
++    _DATA_VARS_DEFAULT,
++    _JOIN_DEFAULT,
++    CombineKwargDefault,
++)
+ 
+ if TYPE_CHECKING:
+     from xarray.core.types import (
+@@ -200,12 +208,12 @@ def _check_shape_tile_ids(combined_tile_ids):
+ def _combine_nd(
+     combined_ids,
+     concat_dims,
+-    data_vars="all",
+-    coords="different",
+-    compat: CompatOptions = "no_conflicts",
+-    fill_value=dtypes.NA,
+-    join: JoinOptions = "outer",
+-    combine_attrs: CombineAttrsOptions = "drop",
++    data_vars,
++    coords,
++    compat: CompatOptions | CombineKwargDefault,
++    fill_value,
++    join: JoinOptions | CombineKwargDefault,
++    combine_attrs: CombineAttrsOptions,
+ ):
+     """
+     Combines an N-dimensional structure of datasets into one by applying a
+@@ -262,10 +270,10 @@ def _combine_all_along_first_dim(
+     dim,
+     data_vars,
+     coords,
+-    compat: CompatOptions,
+-    fill_value=dtypes.NA,
+-    join: JoinOptions = "outer",
+-    combine_attrs: CombineAttrsOptions = "drop",
++    compat: CompatOptions | CombineKwargDefault,
++    fill_value,
++    join: JoinOptions | CombineKwargDefault,
++    combine_attrs: CombineAttrsOptions,
+ ):
+     # Group into lines of datasets which must be combined along dim
+     grouped = groupby_defaultdict(list(combined_ids.items()), key=_new_tile_id)
+@@ -276,7 +284,14 @@ def _combine_all_along_first_dim(
+         combined_ids = dict(sorted(group))
+         datasets = combined_ids.values()
+         new_combined_ids[new_id] = _combine_1d(
+-            datasets, dim, compat, data_vars, coords, fill_value, join, combine_attrs
++            datasets,
++            concat_dim=dim,
++            compat=compat,
++            data_vars=data_vars,
++            coords=coords,
++            fill_value=fill_value,
++            join=join,
++            combine_attrs=combine_attrs,
+         )
+     return new_combined_ids
+ 
+@@ -284,12 +299,12 @@ def _combine_all_along_first_dim(
+ def _combine_1d(
+     datasets,
+     concat_dim,
+-    compat: CompatOptions = "no_conflicts",
+-    data_vars="all",
+-    coords="different",
+-    fill_value=dtypes.NA,
+-    join: JoinOptions = "outer",
+-    combine_attrs: CombineAttrsOptions = "drop",
++    compat: CompatOptions | CombineKwargDefault,
++    data_vars,
++    coords,
++    fill_value,
++    join: JoinOptions | CombineKwargDefault,
++    combine_attrs: CombineAttrsOptions,
+ ):
+     """
+     Applies either concat or merge to 1D list of datasets depending on value
+@@ -320,13 +335,20 @@ def _combine_1d(
+             else:
+                 raise
+     else:
+-        combined = merge(
+-            datasets,
+-            compat=compat,
+-            fill_value=fill_value,
+-            join=join,
+-            combine_attrs=combine_attrs,
+-        )
++        try:
++            combined = merge(
++                datasets,
++                compat=compat,
++                fill_value=fill_value,
++                join=join,
++                combine_attrs=combine_attrs,
++            )
++        except AlignmentError as e:
++            e.add_note(
++                "If you are intending to concatenate datasets, please specify the concatenation dimension explicitly. "
++                "Using merge to concatenate is quite inefficient."
++            )
++            raise e
+ 
+     return combined
+ 
+@@ -343,9 +365,9 @@ def _nested_combine(
+     data_vars,
+     coords,
+     ids,
+-    fill_value=dtypes.NA,
+-    join: JoinOptions = "outer",
+-    combine_attrs: CombineAttrsOptions = "drop",
++    fill_value,
++    join: JoinOptions | CombineKwargDefault,
++    combine_attrs: CombineAttrsOptions,
+ ):
+     if len(datasets) == 0:
+         return Dataset()
+@@ -366,7 +388,7 @@ def _nested_combine(
+     # Apply series of concatenate or merge operations along each dimension
+     combined = _combine_nd(
+         combined_ids,
+-        concat_dims,
++        concat_dims=concat_dims,
+         compat=compat,
+         data_vars=data_vars,
+         coords=coords,
+@@ -383,12 +405,12 @@ DATASET_HYPERCUBE = Union[Dataset, Iterable["DATASET_HYPERCUBE"]]
+ 
+ def combine_nested(
+     datasets: DATASET_HYPERCUBE,
+-    concat_dim: str | DataArray | Sequence[str | DataArray | pd.Index | None] | None,
+-    compat: str = "no_conflicts",
+-    data_vars: str = "all",
+-    coords: str = "different",
++    concat_dim: str | DataArray | Sequence[str | DataArray | pd.Index | None],
++    compat: str | CombineKwargDefault = _COMPAT_DEFAULT,
++    data_vars: str | CombineKwargDefault = _DATA_VARS_DEFAULT,
++    coords: str | CombineKwargDefault = _COORDS_DEFAULT,
+     fill_value: object = dtypes.NA,
+-    join: JoinOptions = "outer",
++    join: JoinOptions | CombineKwargDefault = _JOIN_DEFAULT,
+     combine_attrs: CombineAttrsOptions = "drop",
+ ) -> Dataset:
+     """
+@@ -439,9 +461,36 @@ def combine_nested(
+           of all non-null values.
+         - "override": skip comparing and pick variable from first dataset
+     data_vars : {"minimal", "different", "all" or list of str}, optional
+-        Details are in the documentation of concat
++        These data variables will be concatenated together:
++          * "minimal": Only data variables in which the dimension already
++            appears are included.
++          * "different": Data variables which are not equal (ignoring
++            attributes) across all datasets are also concatenated (as well as
++            all for which dimension already appears). Beware: this option may
++            load the data payload of data variables into memory if they are not
++            already loaded.
++          * "all": All data variables will be concatenated.
++          * None: Means ``"all"`` if ``dim`` is not present in any of the ``objs``,
++            and ``"minimal"`` if ``dim`` is present in any of ``objs``.
++          * list of dims: The listed data variables will be concatenated, in
++            addition to the "minimal" data variables.
++
+     coords : {"minimal", "different", "all" or list of str}, optional
+-        Details are in the documentation of concat
++        These coordinate variables will be concatenated together:
++          * "minimal": Only coordinates in which the dimension already appears
++            are included. If concatenating over a dimension _not_
++            present in any of the objects, then all data variables will
++            be concatenated along that new dimension.
++          * "different": Coordinates which are not equal (ignoring attributes)
++            across all datasets are also concatenated (as well as all for which
++            dimension already appears). Beware: this option may load the data
++            payload of coordinate variables into memory if they are not already
++            loaded.
++          * "all": All coordinate variables will be concatenated, except
++            those corresponding to other dimensions.
++          * list of Hashable: The listed coordinate variables will be concatenated,
++            in addition to the "minimal" coordinates.
++
+     fill_value : scalar or dict-like, optional
+         Value to use for newly missing values. If a dict-like, maps
+         variable names to fill values. Use a data array's name to
+@@ -619,12 +668,12 @@ def groupby_defaultdict(
+ 
+ def _combine_single_variable_hypercube(
+     datasets,
+-    fill_value=dtypes.NA,
+-    data_vars="all",
+-    coords="different",
+-    compat: CompatOptions = "no_conflicts",
+-    join: JoinOptions = "outer",
+-    combine_attrs: CombineAttrsOptions = "no_conflicts",
++    fill_value,
++    data_vars,
++    coords,
++    compat: CompatOptions | CombineKwargDefault,
++    join: JoinOptions | CombineKwargDefault,
++    combine_attrs: CombineAttrsOptions,
+ ):
+     """
+     Attempt to combine a list of Datasets into a hypercube using their
+@@ -678,11 +727,14 @@ def _combine_single_variable_hypercube(
+ 
+ def combine_by_coords(
+     data_objects: Iterable[Dataset | DataArray] = [],
+-    compat: CompatOptions = "no_conflicts",
+-    data_vars: Literal["all", "minimal", "different"] | list[str] = "all",
+-    coords: str = "different",
++    compat: CompatOptions | CombineKwargDefault = _COMPAT_DEFAULT,
++    data_vars: Literal["all", "minimal", "different"]
++    | None
++    | list[str]
++    | CombineKwargDefault = _DATA_VARS_DEFAULT,
++    coords: str | CombineKwargDefault = _COORDS_DEFAULT,
+     fill_value: object = dtypes.NA,
+-    join: JoinOptions = "outer",
++    join: JoinOptions | CombineKwargDefault = _JOIN_DEFAULT,
+     combine_attrs: CombineAttrsOptions = "no_conflicts",
+ ) -> Dataset | DataArray:
+     """
+@@ -862,7 +914,7 @@ def combine_by_coords(
+         temperature    (y, x) float64 96B 10.98 14.3 12.06 ... 1.743 0.4044 16.65
+         precipitation  (y, x) float64 96B 0.4376 0.8918 0.9637 ... 0.4615 0.7805
+ 
+-    >>> xr.combine_by_coords([x3, x1])
++    >>> xr.combine_by_coords([x3, x1], join="outer")
+     <xarray.Dataset> Size: 464B
+     Dimensions:        (y: 4, x: 6)
+     Coordinates:
+@@ -882,7 +934,7 @@ def combine_by_coords(
+         temperature    (y, x) float64 96B 10.98 14.3 12.06 ... 18.89 10.44 8.293
+         precipitation  (y, x) float64 96B 0.4376 0.8918 0.9637 ... 0.01879 0.6176
+ 
+-    >>> xr.combine_by_coords([x1, x2, x3])
++    >>> xr.combine_by_coords([x1, x2, x3], join="outer")
+     <xarray.Dataset> Size: 464B
+     Dimensions:        (y: 4, x: 6)
+     Coordinates:
+
+diff --git a/xarray/structure/concat.py b/xarray/structure/concat.py
+index 2f1f3c2..d809dd7 100644
+--- a/xarray/structure/concat.py
++++ b/xarray/structure/concat.py
+@@ -1,7 +1,7 @@
+ from __future__ import annotations
+ 
+ from collections.abc import Hashable, Iterable
+-from typing import TYPE_CHECKING, Any, Union, overload
++from typing import TYPE_CHECKING, Any, Literal, Union, overload
+ 
+ import numpy as np
+ import pandas as pd
+@@ -11,6 +11,7 @@ from xarray.core.coordinates import Coordinates
+ from xarray.core.duck_array_ops import lazy_array_equiv
+ from xarray.core.indexes import Index, PandasIndex
+ from xarray.core.types import T_DataArray, T_Dataset, T_Variable
++from xarray.core.utils import emit_user_level_warning
+ from xarray.core.variable import Variable
+ from xarray.core.variable import concat as concat_vars
+ from xarray.structure.alignment import align, reindex_variables
+@@ -20,6 +21,13 @@ from xarray.structure.merge import (
+     merge_attrs,
+     merge_collected,
+ )
++from xarray.util.deprecation_helpers import (
++    _COMPAT_CONCAT_DEFAULT,
++    _COORDS_DEFAULT,
++    _DATA_VARS_DEFAULT,
++    _JOIN_DEFAULT,
++    CombineKwargDefault,
++)
+ 
+ if TYPE_CHECKING:
+     from xarray.core.types import (
+@@ -29,7 +37,7 @@ if TYPE_CHECKING:
+         JoinOptions,
+     )
+ 
+-    T_DataVars = Union[ConcatOptions, Iterable[Hashable]]
++    T_DataVars = Union[ConcatOptions, Iterable[Hashable], None]
+ 
+ 
+ # TODO: replace dim: Any by 1D array_likes
+@@ -37,12 +45,12 @@ if TYPE_CHECKING:
+ def concat(
+     objs: Iterable[T_Dataset],
+     dim: Hashable | T_Variable | T_DataArray | pd.Index | Any,
+-    data_vars: T_DataVars = "all",
+-    coords: ConcatOptions | list[Hashable] = "different",
+-    compat: CompatOptions = "equals",
++    data_vars: T_DataVars | CombineKwargDefault = _DATA_VARS_DEFAULT,
++    coords: ConcatOptions | Iterable[Hashable] | CombineKwargDefault = _COORDS_DEFAULT,
++    compat: CompatOptions | CombineKwargDefault = _COMPAT_CONCAT_DEFAULT,
+     positions: Iterable[Iterable[int]] | None = None,
+     fill_value: object = dtypes.NA,
+-    join: JoinOptions = "outer",
++    join: JoinOptions | CombineKwargDefault = _JOIN_DEFAULT,
+     combine_attrs: CombineAttrsOptions = "override",
+     create_index_for_new_dim: bool = True,
+ ) -> T_Dataset: ...
+@@ -52,12 +60,12 @@ def concat(
+ def concat(
+     objs: Iterable[T_DataArray],
+     dim: Hashable | T_Variable | T_DataArray | pd.Index | Any,
+-    data_vars: T_DataVars = "all",
+-    coords: ConcatOptions | list[Hashable] = "different",
+-    compat: CompatOptions = "equals",
++    data_vars: T_DataVars | CombineKwargDefault = _DATA_VARS_DEFAULT,
++    coords: ConcatOptions | Iterable[Hashable] | CombineKwargDefault = _COORDS_DEFAULT,
++    compat: CompatOptions | CombineKwargDefault = _COMPAT_CONCAT_DEFAULT,
+     positions: Iterable[Iterable[int]] | None = None,
+     fill_value: object = dtypes.NA,
+-    join: JoinOptions = "outer",
++    join: JoinOptions | CombineKwargDefault = _JOIN_DEFAULT,
+     combine_attrs: CombineAttrsOptions = "override",
+     create_index_for_new_dim: bool = True,
+ ) -> T_DataArray: ...
+@@ -66,12 +74,12 @@ def concat(
+ def concat(
+     objs,
+     dim,
+-    data_vars: T_DataVars = "all",
+-    coords="different",
+-    compat: CompatOptions = "equals",
++    data_vars: T_DataVars | CombineKwargDefault = _DATA_VARS_DEFAULT,
++    coords: ConcatOptions | Iterable[Hashable] | CombineKwargDefault = _COORDS_DEFAULT,
++    compat: CompatOptions | CombineKwargDefault = _COMPAT_CONCAT_DEFAULT,
+     positions=None,
+     fill_value=dtypes.NA,
+-    join: JoinOptions = "outer",
++    join: JoinOptions | CombineKwargDefault = _JOIN_DEFAULT,
+     combine_attrs: CombineAttrsOptions = "override",
+     create_index_for_new_dim: bool = True,
+ ):
+@@ -90,7 +98,7 @@ def concat(
+         unchanged. If dimension is provided as a Variable, DataArray or Index, its name
+         is used as the dimension to concatenate along and the values are added
+         as a coordinate.
+-    data_vars : {"minimal", "different", "all"} or list of Hashable, optional
++    data_vars : {"minimal", "different", "all", None} or list of Hashable, optional
+         These data variables will be concatenated together:
+           * "minimal": Only data variables in which the dimension already
+             appears are included.
+@@ -100,6 +108,8 @@ def concat(
+             load the data payload of data variables into memory if they are not
+             already loaded.
+           * "all": All data variables will be concatenated.
++          * None: Means ``"all"`` if ``dim`` is not present in any of the ``objs``,
++            and ``"minimal"`` if ``dim`` is present in any of ``objs``.
+           * list of dims: The listed data variables will be concatenated, in
+             addition to the "minimal" data variables.
+ 
+@@ -107,7 +117,9 @@ def concat(
+     coords : {"minimal", "different", "all"} or list of Hashable, optional
+         These coordinate variables will be concatenated together:
+           * "minimal": Only coordinates in which the dimension already appears
+-            are included.
++            are included. If concatenating over a dimension _not_
++            present in any of the objects, then all data variables will
++            be concatenated along that new dimension.
+           * "different": Coordinates which are not equal (ignoring attributes)
+             across all datasets are also concatenated (as well as all for which
+             dimension already appears). Beware: this option may load the data
+@@ -199,7 +211,7 @@ def concat(
+       * x        (x) <U1 8B 'a' 'b'
+       * y        (y) int64 24B 10 20 30
+ 
+-    >>> xr.concat([da.isel(x=0), da.isel(x=1)], "x")
++    >>> xr.concat([da.isel(x=0), da.isel(x=1)], "x", coords="minimal")
+     <xarray.DataArray (x: 2, y: 3)> Size: 48B
+     array([[0, 1, 2],
+            [3, 4, 5]])
+@@ -207,7 +219,7 @@ def concat(
+       * x        (x) <U1 8B 'a' 'b'
+       * y        (y) int64 24B 10 20 30
+ 
+-    >>> xr.concat([da.isel(x=0), da.isel(x=1)], "new_dim")
++    >>> xr.concat([da.isel(x=0), da.isel(x=1)], "new_dim", coords="all")
+     <xarray.DataArray (new_dim: 2, y: 3)> Size: 48B
+     array([[0, 1, 2],
+            [3, 4, 5]])
+@@ -216,7 +228,11 @@ def concat(
+       * y        (y) int64 24B 10 20 30
+     Dimensions without coordinates: new_dim
+ 
+-    >>> xr.concat([da.isel(x=0), da.isel(x=1)], pd.Index([-90, -100], name="new_dim"))
++    >>> xr.concat(
++    ...     [da.isel(x=0), da.isel(x=1)],
++    ...     pd.Index([-90, -100], name="new_dim"),
++    ...     coords="all",
++    ... )
+     <xarray.DataArray (new_dim: 2, y: 3)> Size: 48B
+     array([[0, 1, 2],
+            [3, 4, 5]])
+@@ -255,7 +271,9 @@ def concat(
+     except StopIteration as err:
+         raise ValueError("must supply at least one object to concatenate") from err
+ 
+-    if compat not in set(_VALID_COMPAT) - {"minimal"}:
++    if not isinstance(compat, CombineKwargDefault) and compat not in set(
++        _VALID_COMPAT
++    ) - {"minimal"}:
+         raise ValueError(
+             f"compat={compat!r} invalid: must be 'broadcast_equals', 'equals', 'identical', 'no_conflicts' or 'override'"
+         )
+@@ -320,26 +338,44 @@ def _calc_concat_dim_index(
+     return dim, index
+ 
+ 
+-def _calc_concat_over(datasets, dim, dim_names, data_vars: T_DataVars, coords, compat):
++def _calc_concat_over(
++    datasets: list[T_Dataset],
++    dim: Hashable,
++    all_dims: set[Hashable],
++    data_vars: T_DataVars | CombineKwargDefault,
++    coords: ConcatOptions | Iterable[Hashable] | CombineKwargDefault,
++    compat: CompatOptions | CombineKwargDefault,
++) -> tuple[set[Hashable], dict[Hashable, bool], list[int], set[Hashable]]:
+     """
+     Determine which dataset variables need to be concatenated in the result,
+     """
+     # variables to be concatenated
+     concat_over = set()
+     # variables checked for equality
+-    equals = {}
++    equals: dict[Hashable, bool] = {}
+     # skip merging these variables.
+     #   if concatenating over a dimension 'x' that is associated with an index over 2 variables,
+     #   'x' and 'y', then we assert join="equals" on `y` and don't need to merge it.
+     #   that assertion happens in the align step prior to this function being called
+-    skip_merge = set()
++    skip_merge: set[Hashable] = set()
+ 
+-    if dim in dim_names:
++    if dim in all_dims:
+         concat_over_existing_dim = True
+         concat_over.add(dim)
+     else:
+         concat_over_existing_dim = False
+ 
++    if data_vars == "minimal" and coords == "minimal" and not concat_over_existing_dim:
++        raise ValueError(
++            "Cannot specify both data_vars='minimal' and coords='minimal' when "
++            "concatenating over a new dimension."
++        )
++
++    if data_vars is None or (
++        isinstance(data_vars, CombineKwargDefault) and data_vars._value is None
++    ):
++        data_vars = "minimal" if concat_over_existing_dim else "all"
++
+     concat_dim_lengths = []
+     for ds in datasets:
+         if concat_over_existing_dim and dim not in ds.dims and dim in ds:
+@@ -350,17 +386,41 @@ def _calc_concat_over(datasets, dim, dim_names, data_vars: T_DataVars, coords, c
+                 skip_merge.update(idx_vars.keys())
+         concat_dim_lengths.append(ds.sizes.get(dim, 1))
+ 
+-    def process_subset_opt(opt, subset):
+-        if isinstance(opt, str):
++    def process_subset_opt(
++        opt: ConcatOptions | Iterable[Hashable] | CombineKwargDefault,
++        subset: Literal["coords", "data_vars"],
++    ) -> None:
++        original = set(concat_over)
++        compat_str = (
++            compat._value if isinstance(compat, CombineKwargDefault) else compat
++        )
++        assert compat_str is not None
++        if isinstance(opt, str | CombineKwargDefault):
+             if opt == "different":
++                if isinstance(compat, CombineKwargDefault) and compat != "override":
++                    if not isinstance(opt, CombineKwargDefault):
++                        emit_user_level_warning(
++                            compat.warning_message(
++                                "This change will result in the following ValueError: "
++                                f"Cannot specify both {subset}='different' and compat='override'.",
++                                recommend_set_options=False,
++                            ),
++                            FutureWarning,
++                        )
++
+                 if compat == "override":
+                     raise ValueError(
+                         f"Cannot specify both {subset}='different' and compat='override'."
++                        + (
++                            compat.error_message()
++                            if isinstance(compat, CombineKwargDefault)
++                            else ""
++                        )
+                     )
+                 # all nonindexes that are not the same in each dataset
+                 for k in getattr(datasets[0], subset):
+                     if k not in concat_over:
+-                        equals[k] = None
++                        equal = None
+ 
+                         variables = [
+                             ds.variables[k] for ds in datasets if k in ds.variables
+@@ -379,19 +439,19 @@ def _calc_concat_over(datasets, dim, dim_names, data_vars: T_DataVars, coords, c
+ 
+                         # first check without comparing values i.e. no computes
+                         for var in variables[1:]:
+-                            equals[k] = getattr(variables[0], compat)(
++                            equal = getattr(variables[0], compat_str)(
+                                 var, equiv=lazy_array_equiv
+                             )
+-                            if equals[k] is not True:
++                            if equal is not True:
+                                 # exit early if we know these are not equal or that
+                                 # equality cannot be determined i.e. one or all of
+                                 # the variables wraps a numpy array
+                                 break
+ 
+-                        if equals[k] is False:
++                        if equal is False:
+                             concat_over.add(k)
+ 
+-                        elif equals[k] is None:
++                        elif equal is None:
+                             # Compare the variable of all datasets vs. the one
+                             # of the first dataset. Perform the minimum amount of
+                             # loads in order to avoid multiple loads from disk
+@@ -402,7 +462,7 @@ def _calc_concat_over(datasets, dim, dim_names, data_vars: T_DataVars, coords, c
+                             for ds_rhs in datasets[1:]:
+                                 v_rhs = ds_rhs.variables[k].compute()
+                                 computed.append(v_rhs)
+-                                if not getattr(v_lhs, compat)(v_rhs):
++                                if not getattr(v_lhs, compat_str)(v_rhs):
+                                     concat_over.add(k)
+                                     equals[k] = False
+                                     # computed variables are not to be re-computed
+@@ -413,7 +473,10 @@ def _calc_concat_over(datasets, dim, dim_names, data_vars: T_DataVars, coords, c
+                                         ds.variables[k].data = v.data
+                                     break
+                             else:
+-                                equals[k] = True
++                                equal = True
++                        if TYPE_CHECKING:
++                            assert equal is not None
++                        equals[k] = equal
+ 
+             elif opt == "all":
+                 concat_over.update(
+@@ -425,6 +488,19 @@ def _calc_concat_over(datasets, dim, dim_names, data_vars: T_DataVars, coords, c
+                 pass
+             else:
+                 raise ValueError(f"unexpected value for {subset}: {opt}")
++
++            if (
++                isinstance(opt, CombineKwargDefault)
++                and opt._value is not None
++                and original != concat_over
++                and concat_over_existing_dim
++            ):
++                warnings.append(
++                    opt.warning_message(
++                        "This is likely to lead to different results when multiple datasets "
++                        "have matching variables with overlapping values.",
++                    )
++                )
+         else:
+             valid_vars = tuple(getattr(datasets[0], subset))
+             invalid_vars = [k for k in opt if k not in valid_vars]
+@@ -443,8 +519,13 @@ def _calc_concat_over(datasets, dim, dim_names, data_vars: T_DataVars, coords, c
+                     )
+             concat_over.update(opt)
+ 
++    warnings: list[str] = []
+     process_subset_opt(data_vars, "data_vars")
+     process_subset_opt(coords, "coords")
++
++    for warning in warnings:
++        emit_user_level_warning(warning, FutureWarning)
++
+     return concat_over, equals, concat_dim_lengths, skip_merge
+ 
+ 
+@@ -452,6 +533,7 @@ def _calc_concat_over(datasets, dim, dim_names, data_vars: T_DataVars, coords, c
+ def _parse_datasets(
+     datasets: list[T_Dataset],
+ ) -> tuple[
++    set[Hashable],
+     dict[Hashable, Variable],
+     dict[Hashable, int],
+     set[Hashable],
+@@ -480,20 +562,27 @@ def _parse_datasets(
+                 dim_coords[dim] = ds.coords[dim].variable
+         dims = dims | set(ds.dims)
+ 
+-    return dim_coords, dims_sizes, all_coord_names, data_vars, list(variables_order)
++    return (
++        dims,
++        dim_coords,
++        dims_sizes,
++        all_coord_names,
++        data_vars,
++        list(variables_order),
++    )
+ 
+ 
+ def _dataset_concat(
+     datasets: Iterable[T_Dataset],
+     dim: str | T_Variable | T_DataArray | pd.Index,
+-    data_vars: T_DataVars,
+-    coords: str | list[str],
+-    compat: CompatOptions,
++    data_vars: T_DataVars | CombineKwargDefault,
++    coords: ConcatOptions | Iterable[Hashable] | CombineKwargDefault,
++    compat: CompatOptions | CombineKwargDefault,
+     positions: Iterable[Iterable[int]] | None,
+-    fill_value: Any = dtypes.NA,
+-    join: JoinOptions = "outer",
+-    combine_attrs: CombineAttrsOptions = "override",
+-    create_index_for_new_dim: bool = True,
++    fill_value: Any,
++    join: JoinOptions | CombineKwargDefault,
++    combine_attrs: CombineAttrsOptions,
++    create_index_for_new_dim: bool,
+ ) -> T_Dataset:
+     """
+     Concatenate a sequence of datasets along a new or existing dimension
+@@ -525,10 +614,10 @@ def _dataset_concat(
+         )
+     )
+ 
+-    dim_coords, dims_sizes, coord_names, data_names, vars_order = _parse_datasets(
+-        datasets
++    all_dims, dim_coords, dims_sizes, coord_names, data_names, vars_order = (
++        _parse_datasets(datasets)
+     )
+-    dim_names = set(dim_coords)
++    indexed_dim_names = set(dim_coords)
+ 
+     both_data_and_coords = coord_names & data_names
+     if both_data_and_coords:
+@@ -542,15 +631,19 @@ def _dataset_concat(
+     # case where concat dimension is a coordinate or data_var but not a dimension
+     if (
+         dim_name in coord_names or dim_name in data_names
+-    ) and dim_name not in dim_names:
++    ) and dim_name not in indexed_dim_names:
+         datasets = [
+             ds.expand_dims(dim_name, create_index_for_new_dim=create_index_for_new_dim)
+             for ds in datasets
+         ]
++        all_dims.add(dim_name)
++        # This isn't being used any more, but keeping it up to date
++        # just in case we decide to use it later.
++        indexed_dim_names.add(dim_name)
+ 
+     # determine which variables to concatenate
+     concat_over, equals, concat_dim_lengths, skip_merge = _calc_concat_over(
+-        datasets, dim_name, dim_names, data_vars, coords, compat
++        datasets, dim_name, all_dims, data_vars, coords, compat
+     )
+ 
+     # determine which variables to merge, and then merge them according to compat
+@@ -725,14 +818,14 @@ def _dataset_concat(
+ def _dataarray_concat(
+     arrays: Iterable[T_DataArray],
+     dim: str | T_Variable | T_DataArray | pd.Index,
+-    data_vars: T_DataVars,
+-    coords: str | list[str],
+-    compat: CompatOptions,
++    data_vars: T_DataVars | CombineKwargDefault,
++    coords: ConcatOptions | Iterable[Hashable] | CombineKwargDefault,
++    compat: CompatOptions | CombineKwargDefault,
+     positions: Iterable[Iterable[int]] | None,
+-    fill_value: object = dtypes.NA,
+-    join: JoinOptions = "outer",
+-    combine_attrs: CombineAttrsOptions = "override",
+-    create_index_for_new_dim: bool = True,
++    fill_value: object,
++    join: JoinOptions | CombineKwargDefault,
++    combine_attrs: CombineAttrsOptions,
++    create_index_for_new_dim: bool,
+ ) -> T_DataArray:
+     from xarray.core.dataarray import DataArray
+ 
+@@ -743,7 +836,12 @@ def _dataarray_concat(
+             "The elements in the input list need to be either all 'Dataset's or all 'DataArray's"
+         )
+ 
+-    if data_vars != "all":
++    # Allow passing `all` or `None` even though we always use `data_vars='all'`
++    # when passing off to `_dataset_concat`.
++    if not isinstance(data_vars, CombineKwargDefault) and data_vars not in [
++        "all",
++        None,
++    ]:
+         raise ValueError(
+             "data_vars is not a valid argument when concatenating DataArray objects"
+         )
+@@ -761,11 +859,11 @@ def _dataarray_concat(
+ 
+     ds = _dataset_concat(
+         datasets,
+-        dim,
+-        data_vars,
+-        coords,
+-        compat,
+-        positions,
++        dim=dim,
++        data_vars="all",
++        coords=coords,
++        compat=compat,
++        positions=positions,
+         fill_value=fill_value,
+         join=join,
+         combine_attrs=combine_attrs,
+
+diff --git a/xarray/structure/merge.py b/xarray/structure/merge.py
+index 5c99807..58168dd 100644
+--- a/xarray/structure/merge.py
++++ b/xarray/structure/merge.py
+@@ -15,9 +15,20 @@ from xarray.core.indexes import (
+     filter_indexes_from_coords,
+     indexes_equal,
+ )
+-from xarray.core.utils import Frozen, compat_dict_union, dict_equiv, equivalent
++from xarray.core.utils import (
++    Frozen,
++    compat_dict_union,
++    dict_equiv,
++    emit_user_level_warning,
++    equivalent,
++)
+ from xarray.core.variable import Variable, as_variable, calculate_dimensions
+ from xarray.structure.alignment import deep_align
++from xarray.util.deprecation_helpers import (
++    _COMPAT_DEFAULT,
++    _JOIN_DEFAULT,
++    CombineKwargDefault,
++)
+ 
+ if TYPE_CHECKING:
+     from xarray.core.coordinates import Coordinates
+@@ -89,9 +100,9 @@ class MergeError(ValueError):
+ def unique_variable(
+     name: Hashable,
+     variables: list[Variable],
+-    compat: CompatOptions = "broadcast_equals",
++    compat: CompatOptions | CombineKwargDefault = "broadcast_equals",
+     equals: bool | None = None,
+-) -> Variable:
++) -> tuple[bool | None, Variable]:
+     """Return the unique variable from a list of variables or raise MergeError.
+ 
+     Parameters
+@@ -117,7 +128,7 @@ def unique_variable(
+     out = variables[0]
+ 
+     if len(variables) == 1 or compat == "override":
+-        return out
++        return equals, out
+ 
+     combine_method = None
+ 
+@@ -131,18 +142,25 @@ def unique_variable(
+     if compat == "no_conflicts":
+         combine_method = "fillna"
+ 
++    # we return the lazy equals, so we can warn about behaviour changes
++    lazy_equals = equals
+     if equals is None:
++        compat_str = (
++            compat._value if isinstance(compat, CombineKwargDefault) else compat
++        )
++        assert compat_str is not None
+         # first check without comparing values i.e. no computes
+         for var in variables[1:]:
+-            equals = getattr(out, compat)(var, equiv=lazy_array_equiv)
++            equals = getattr(out, compat_str)(var, equiv=lazy_array_equiv)
+             if equals is not True:
+                 break
+ 
++        lazy_equals = equals
+         if equals is None:
+             # now compare values with minimum number of computes
+             out = out.compute()
+             for var in variables[1:]:
+-                equals = getattr(out, compat)(var)
++                equals = getattr(out, compat_str)(var)
+                 if not equals:
+                     break
+ 
+@@ -156,11 +174,11 @@ def unique_variable(
+         for var in variables[1:]:
+             out = getattr(out, combine_method)(var)
+ 
+-    return out
++    return lazy_equals, out
+ 
+ 
+ def _assert_compat_valid(compat):
+-    if compat not in _VALID_COMPAT:
++    if not isinstance(compat, CombineKwargDefault) and compat not in _VALID_COMPAT:
+         raise ValueError(f"compat={compat!r} invalid: must be {set(_VALID_COMPAT)}")
+ 
+ 
+@@ -202,7 +220,7 @@ def _assert_prioritized_valid(
+ def merge_collected(
+     grouped: dict[Any, list[MergeElement]],
+     prioritized: Mapping[Any, MergeElement] | None = None,
+-    compat: CompatOptions = "minimal",
++    compat: CompatOptions | CombineKwargDefault = "minimal",
+     combine_attrs: CombineAttrsOptions = "override",
+     equals: dict[Any, bool] | None = None,
+ ) -> tuple[dict[Hashable, Variable], dict[Hashable, Index]]:
+@@ -258,6 +276,7 @@ def merge_collected(
+             if index is not None:
+                 merged_indexes[name] = index
+         else:
++            attrs: dict[Any, Any] = {}
+             indexed_elements = [
+                 (variable, index)
+                 for variable, index in elements_list
+@@ -288,20 +307,29 @@ def merge_collected(
+                     [var.attrs for var, _ in indexed_elements],
+                     combine_attrs=combine_attrs,
+                 )
+-                if variable.attrs or attrs:
+-                    # Make a shallow copy to so that assigning merged_vars[name].attrs
+-                    # does not affect the original input variable.
+-                    merged_vars[name] = variable.copy(deep=False)
+-                    merged_vars[name].attrs = attrs
+-                else:
+-                    merged_vars[name] = variable
++                merged_vars[name] = variable
+                 merged_indexes[name] = index
+             else:
+                 variables = [variable for variable, _ in elements_list]
+                 try:
+-                    merged_vars[name] = unique_variable(
++                    equals_this_var, merged_vars[name] = unique_variable(
+                         name, variables, compat, equals.get(name)
+                     )
++                    # This is very likely to result in false positives, but there is no way
++                    # to tell if the output will change without computing.
++                    if (
++                        isinstance(compat, CombineKwargDefault)
++                        and compat == "no_conflicts"
++                        and len(variables) > 1
++                        and not equals_this_var
++                    ):
++                        emit_user_level_warning(
++                            compat.warning_message(
++                                "This is likely to lead to different results when "
++                                "combining overlapping variables with the same name.",
++                            ),
++                            FutureWarning,
++                        )
+                 except MergeError:
+                     if compat != "minimal":
+                         # we need more than "minimal" compatibility (for which
+@@ -309,10 +337,15 @@ def merge_collected(
+                         raise
+ 
+                 if name in merged_vars:
+-                    merged_vars[name].attrs = merge_attrs(
++                    attrs = merge_attrs(
+                         [var.attrs for var in variables], combine_attrs=combine_attrs
+                     )
+ 
++            if name in merged_vars and (merged_vars[name].attrs or attrs):
++                # Ensure that assigning attrs does not affect the original input variable.
++                merged_vars[name] = merged_vars[name].copy(deep=False)
++                merged_vars[name].attrs = attrs
++
+     return merged_vars, merged_indexes
+ 
+ 
+@@ -506,7 +539,7 @@ def coerce_pandas_values(objects: Iterable[CoercibleMapping]) -> list[DatasetLik
+ def _get_priority_vars_and_indexes(
+     objects: Sequence[DatasetLike],
+     priority_arg: int | None,
+-    compat: CompatOptions = "equals",
++    compat: CompatOptions | CombineKwargDefault = "equals",
+ ) -> dict[Hashable, MergeElement]:
+     """Extract the priority variable from a list of mappings.
+ 
+@@ -638,8 +671,8 @@ class _MergeResult(NamedTuple):
+ 
+ def merge_core(
+     objects: Iterable[CoercibleMapping],
+-    compat: CompatOptions = "broadcast_equals",
+-    join: JoinOptions = "outer",
++    compat: CompatOptions | CombineKwargDefault,
++    join: JoinOptions | CombineKwargDefault,
+     combine_attrs: CombineAttrsOptions = "override",
+     priority_arg: int | None = None,
+     explicit_coords: Iterable[Hashable] | None = None,
+@@ -698,7 +731,11 @@ def merge_core(
+ 
+     coerced = coerce_pandas_values(objects)
+     aligned = deep_align(
+-        coerced, join=join, copy=False, indexes=indexes, fill_value=fill_value
++        coerced,
++        join=join,
++        copy=False,
++        indexes=indexes,
++        fill_value=fill_value,
+     )
+ 
+     for pos, obj in skip_align_objs:
+@@ -707,7 +744,10 @@ def merge_core(
+     collected = collect_variables_and_indexes(aligned, indexes=indexes)
+     prioritized = _get_priority_vars_and_indexes(aligned, priority_arg, compat=compat)
+     variables, out_indexes = merge_collected(
+-        collected, prioritized, compat=compat, combine_attrs=combine_attrs
++        collected,
++        prioritized,
++        compat=compat,
++        combine_attrs=combine_attrs,
+     )
+ 
+     dims = calculate_dimensions(variables)
+@@ -738,8 +778,8 @@ def merge_core(
+ 
+ def merge(
+     objects: Iterable[DataArray | CoercibleMapping],
+-    compat: CompatOptions = "no_conflicts",
+-    join: JoinOptions = "outer",
++    compat: CompatOptions | CombineKwargDefault = _COMPAT_DEFAULT,
++    join: JoinOptions | CombineKwargDefault = _JOIN_DEFAULT,
+     fill_value: object = dtypes.NA,
+     combine_attrs: CombineAttrsOptions = "override",
+ ) -> Dataset:
+@@ -850,7 +890,7 @@ def merge(
+       * time     (time) float64 16B 30.0 60.0
+       * lon      (lon) float64 16B 100.0 150.0
+ 
+-    >>> xr.merge([x, y, z])
++    >>> xr.merge([x, y, z], join="outer")
+     <xarray.Dataset> Size: 256B
+     Dimensions:  (lat: 3, lon: 3, time: 2)
+     Coordinates:
+@@ -862,7 +902,7 @@ def merge(
+         var2     (lat, lon) float64 72B 5.0 nan 6.0 nan nan nan 7.0 nan 8.0
+         var3     (time, lon) float64 48B 0.0 nan 3.0 4.0 nan 9.0
+ 
+-    >>> xr.merge([x, y, z], compat="identical")
++    >>> xr.merge([x, y, z], compat="identical", join="outer")
+     <xarray.Dataset> Size: 256B
+     Dimensions:  (lat: 3, lon: 3, time: 2)
+     Coordinates:
+@@ -874,7 +914,7 @@ def merge(
+         var2     (lat, lon) float64 72B 5.0 nan 6.0 nan nan nan 7.0 nan 8.0
+         var3     (time, lon) float64 48B 0.0 nan 3.0 4.0 nan 9.0
+ 
+-    >>> xr.merge([x, y, z], compat="equals")
++    >>> xr.merge([x, y, z], compat="equals", join="outer")
+     <xarray.Dataset> Size: 256B
+     Dimensions:  (lat: 3, lon: 3, time: 2)
+     Coordinates:
+@@ -886,7 +926,7 @@ def merge(
+         var2     (lat, lon) float64 72B 5.0 nan 6.0 nan nan nan 7.0 nan 8.0
+         var3     (time, lon) float64 48B 0.0 nan 3.0 4.0 nan 9.0
+ 
+-    >>> xr.merge([x, y, z], compat="equals", fill_value=-999.0)
++    >>> xr.merge([x, y, z], compat="equals", join="outer", fill_value=-999.0)
+     <xarray.Dataset> Size: 256B
+     Dimensions:  (lat: 3, lon: 3, time: 2)
+     Coordinates:
+@@ -983,8 +1023,8 @@ def merge(
+ 
+     merge_result = merge_core(
+         dict_like_objects,
+-        compat,
+-        join,
++        compat=compat,
++        join=join,
+         combine_attrs=combine_attrs,
+         fill_value=fill_value,
+     )
+@@ -995,8 +1035,8 @@ def dataset_merge_method(
+     dataset: Dataset,
+     other: CoercibleMapping,
+     overwrite_vars: Hashable | Iterable[Hashable],
+-    compat: CompatOptions,
+-    join: JoinOptions,
++    compat: CompatOptions | CombineKwargDefault,
++    join: JoinOptions | CombineKwargDefault,
+     fill_value: Any,
+     combine_attrs: CombineAttrsOptions,
+ ) -> _MergeResult:
+@@ -1029,8 +1069,8 @@ def dataset_merge_method(
+ 
+     return merge_core(
+         objs,
+-        compat,
+-        join,
++        compat=compat,
++        join=join,
+         priority_arg=priority_arg,
+         fill_value=fill_value,
+         combine_attrs=combine_attrs,
+@@ -1062,6 +1102,8 @@ def dataset_update_method(dataset: Dataset, other: CoercibleMapping) -> _MergeRe
+ 
+     return merge_core(
+         [dataset, other],
++        compat="broadcast_equals",
++        join="outer",
+         priority_arg=1,
+         indexes=dataset.xindexes,
+         combine_attrs="override",
+@@ -1083,6 +1125,7 @@ def merge_data_and_coords(data_vars: DataVars, coords) -> _MergeResult:
+         [data_vars, coords],
+         compat="broadcast_equals",
+         join="outer",
++        combine_attrs="override",
+         explicit_coords=tuple(coords),
+         indexes=coords.xindexes,
+         priority_arg=1,
+
+diff --git a/xarray/testing/strategies.py b/xarray/testing/strategies.py
+index 84f37e5..13973b9 100644
+--- a/xarray/testing/strategies.py
++++ b/xarray/testing/strategies.py
+@@ -479,6 +479,7 @@ def unique_subset_of(
+ 
+ class CFTimeStrategy(st.SearchStrategy):
+     def __init__(self, min_value, max_value):
++        super().__init__()
+         self.min_value = min_value
+         self.max_value = max_value
+ 
+@@ -495,6 +496,7 @@ class CFTimeStrategyISO8601(st.SearchStrategy):
+     def __init__(self):
+         from xarray.tests.test_coding_times import _all_cftime_date_types
+ 
++        super().__init__()
+         self.date_types = _all_cftime_date_types()
+         self.calendars = list(self.date_types)
+ 
+
+diff --git a/xarray/util/deprecation_helpers.py b/xarray/util/deprecation_helpers.py
+index 1064082..7a8ab6c 100644
+--- a/xarray/util/deprecation_helpers.py
++++ b/xarray/util/deprecation_helpers.py
+@@ -35,8 +35,9 @@ import inspect
+ import warnings
+ from collections.abc import Callable
+ from functools import wraps
+-from typing import TypeVar
++from typing import Any, Self, TypeVar
+ 
++from xarray.core.options import OPTIONS
+ from xarray.core.utils import emit_user_level_warning
+ 
+ T = TypeVar("T", bound=Callable)
+@@ -145,3 +146,76 @@ def deprecate_dims(func: T, old_name="dims") -> T:
+     # We're quite confident we're just returning `T` from this function, so it's fine to ignore typing
+     # within the function.
+     return wrapper  # type: ignore[return-value]
++
++
++class CombineKwargDefault:
++    """Object that handles deprecation cycle for kwarg default values.
++
++    Similar to ReprObject
++    """
++
++    _old: str
++    _new: str | None
++    _name: str
++
++    def __init__(self, *, name: str, old: str, new: str | None):
++        self._name = name
++        self._old = old
++        self._new = new
++
++    def __repr__(self) -> str:
++        return str(self._value)
++
++    def __eq__(self, other: Self | Any) -> bool:
++        return (
++            self._value == other._value
++            if isinstance(other, type(self))
++            else self._value == other
++        )
++
++    @property
++    def _value(self) -> str | None:
++        return self._new if OPTIONS["use_new_combine_kwarg_defaults"] else self._old
++
++    def __hash__(self) -> int:
++        return hash(self._value)
++
++    def __dask_tokenize__(self) -> object:
++        from dask.base import normalize_token
++
++        return normalize_token((type(self), self._value))
++
++    def warning_message(self, message: str, recommend_set_options: bool = True) -> str:
++        if recommend_set_options:
++            recommendation = (
++                " To opt in to new defaults and get rid of these warnings now "
++                "use `set_options(use_new_combine_kwarg_defaults=True) or "
++                f"set {self._name} explicitly."
++            )
++        else:
++            recommendation = (
++                f" The recommendation is to set {self._name} explicitly for this case."
++            )
++
++        return (
++            f"In a future version of xarray the default value for {self._name} will "
++            f"change from {self._name}={self._old!r} to {self._name}={self._new!r}. "
++            + message
++            + recommendation
++        )
++
++    def error_message(self) -> str:
++        return (
++            f" Error might be related to new default (`{self._name}={self._new!r}`). "
++            f"Previously the default was `{self._name}={self._old!r}`. "
++            f"The recommendation is to set {self._name!r} explicitly for this case."
++        )
++
++
++_DATA_VARS_DEFAULT = CombineKwargDefault(name="data_vars", old="all", new=None)
++_COORDS_DEFAULT = CombineKwargDefault(name="coords", old="different", new="minimal")
++_COMPAT_CONCAT_DEFAULT = CombineKwargDefault(
++    name="compat", old="equals", new="override"
++)
++_COMPAT_DEFAULT = CombineKwargDefault(name="compat", old="no_conflicts", new="override")
++_JOIN_DEFAULT = CombineKwargDefault(name="join", old="outer", new="exact")

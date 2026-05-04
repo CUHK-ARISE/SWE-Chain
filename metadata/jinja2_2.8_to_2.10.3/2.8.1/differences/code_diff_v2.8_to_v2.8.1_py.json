@@ -1,0 +1,213 @@
+{
+  "old_dir": ".packages/jinja2/2.8",
+  "new_dir": ".packages/jinja2/2.8.1",
+  "extracted_at": "2026-04-11T19:39:42.136944",
+  "diff_file": "confirmed/jinja2/2.8.1/differences/code_diff_v2.8_to_v2.8.1_py.diff",
+  "diff_content": "diff --git a/jinja2/__init__.py b/jinja2/__init__.py\nindex 029fb2e..b4e1448 100644\n--- a/jinja2/__init__.py\n+++ b/jinja2/__init__.py\n@@ -27,7 +27,7 @@\n     :license: BSD, see LICENSE for more details.\n \"\"\"\n __docformat__ = 'restructuredtext en'\n-__version__ = '2.8'\n+__version__ = '2.8.1'\n \n # high level interface\n from jinja2.environment import Environment, Template\n\ndiff --git a/jinja2/filters.py b/jinja2/filters.py\nindex e5c7a1a..96660a6 100644\n--- a/jinja2/filters.py\n+++ b/jinja2/filters.py\n@@ -518,9 +518,12 @@ def do_int(value, default=0, base=10):\n     can also override the default base (10) in the second\n     parameter, which handles input with prefixes such as\n     0b, 0o and 0x for bases 2, 8 and 16 respectively.\n+    The base is ignored for decimal numbers and non-string values.\n     \"\"\"\n     try:\n-        return int(value, base)\n+        if isinstance(value, string_types):\n+            return int(value, base)\n+        return int(value)\n     except (TypeError, ValueError):\n         # this quirk is necessary so that \"42.23\"|int gives 42.\n         try:\n\ndiff --git a/jinja2/nodes.py b/jinja2/nodes.py\nindex d32046c..6d4593b 100644\n--- a/jinja2/nodes.py\n+++ b/jinja2/nodes.py\n@@ -604,7 +604,7 @@ class Call(Expr):\n \n     def as_const(self, eval_ctx=None):\n         eval_ctx = get_eval_context(self, eval_ctx)\n-        if eval_ctx.volatile:\n+        if eval_ctx.volatile or eval_ctx.environment.sandboxed:\n             raise Impossible()\n         obj = self.node.as_const(eval_ctx)\n \n\ndiff --git a/jinja2/sandbox.py b/jinja2/sandbox.py\nindex 7e40ab3..c035dde 100644\n--- a/jinja2/sandbox.py\n+++ b/jinja2/sandbox.py\n@@ -14,9 +14,17 @@\n \"\"\"\n import types\n import operator\n+from collections import Mapping\n from jinja2.environment import Environment\n from jinja2.exceptions import SecurityError\n-from jinja2._compat import string_types, PY2\n+from jinja2._compat import string_types, text_type, PY2\n+from jinja2.utils import Markup\n+\n+has_format = False\n+if hasattr(text_type, 'format'):\n+    from markupsafe import EscapeFormatter\n+    from string import Formatter\n+    has_format = True\n \n \n #: maximum number of items a range may produce\n@@ -38,6 +46,12 @@ UNSAFE_METHOD_ATTRIBUTES = set(['im_class', 'im_func', 'im_self'])\n #: unsafe generator attirbutes.\n UNSAFE_GENERATOR_ATTRIBUTES = set(['gi_frame', 'gi_code'])\n \n+#: unsafe attributes on coroutines\n+UNSAFE_COROUTINE_ATTRIBUTES = set(['cr_frame', 'cr_code'])\n+\n+#: unsafe attributes on async generators\n+UNSAFE_ASYNC_GENERATOR_ATTRIBUTES = set(['ag_code', 'ag_frame'])\n+\n import warnings\n \n # make sure we don't warn in python 2.6 about stuff we don't care about\n@@ -94,6 +108,49 @@ _mutable_spec = (\n )\n \n \n+class _MagicFormatMapping(Mapping):\n+    \"\"\"This class implements a dummy wrapper to fix a bug in the Python\n+    standard library for string formatting.\n+\n+    See http://bugs.python.org/issue13598 for information about why\n+    this is necessary.\n+    \"\"\"\n+\n+    def __init__(self, args, kwargs):\n+        self._args = args\n+        self._kwargs = kwargs\n+        self._last_index = 0\n+\n+    def __getitem__(self, key):\n+        if key == '':\n+            idx = self._last_index\n+            self._last_index += 1\n+            try:\n+                return self._args[idx]\n+            except LookupError:\n+                pass\n+            key = str(idx)\n+        return self._kwargs[key]\n+\n+    def __iter__(self):\n+        return iter(self._kwargs)\n+\n+    def __len__(self):\n+        return len(self._kwargs)\n+\n+\n+def inspect_format_method(callable):\n+    if not has_format:\n+        return None\n+    if not isinstance(callable, (types.MethodType,\n+                                 types.BuiltinMethodType)) or \\\n+       callable.__name__ != 'format':\n+        return None\n+    obj = callable.__self__\n+    if isinstance(obj, string_types):\n+        return obj\n+\n+\n def safe_range(*args):\n     \"\"\"A range that can't generate ranges with a length of more than\n     MAX_RANGE items.\n@@ -145,6 +202,12 @@ def is_internal_attribute(obj, attr):\n     elif isinstance(obj, types.GeneratorType):\n         if attr in UNSAFE_GENERATOR_ATTRIBUTES:\n             return True\n+    elif hasattr(types, 'CoroutineType') and isinstance(obj, types.CoroutineType):\n+        if attr in UNSAFE_COROUTINE_ATTRIBUTES:\n+            return True\n+    elif hasattr(types, 'AsyncGeneratorType') and isinstance(obj, types.AsyncGeneratorType):\n+        if attri in UNSAFE_ASYNC_GENERATOR_ATTRIBUTES:\n+            return True\n     return attr.startswith('__')\n \n \n@@ -183,8 +246,8 @@ class SandboxedEnvironment(Environment):\n     attributes or functions are safe to access.\n \n     If the template tries to access insecure code a :exc:`SecurityError` is\n-    raised.  However also other exceptions may occour during the rendering so\n-    the caller has to ensure that all exceptions are catched.\n+    raised.  However also other exceptions may occur during the rendering so\n+    the caller has to ensure that all exceptions are caught.\n     \"\"\"\n     sandboxed = True\n \n@@ -346,8 +409,24 @@ class SandboxedEnvironment(Environment):\n             obj.__class__.__name__\n         ), name=attribute, obj=obj, exc=SecurityError)\n \n+    def format_string(self, s, args, kwargs):\n+        \"\"\"If a format call is detected, then this is routed through this\n+        method so that our safety sandbox can be used for it.\n+        \"\"\"\n+        if isinstance(s, Markup):\n+            formatter = SandboxedEscapeFormatter(self, s.escape)\n+        else:\n+            formatter = SandboxedFormatter(self)\n+        kwargs = _MagicFormatMapping(args, kwargs)\n+        rv = formatter.vformat(s, args, kwargs)\n+        return type(s)(rv)\n+\n     def call(__self, __context, __obj, *args, **kwargs):\n         \"\"\"Call an object from sandboxed code.\"\"\"\n+        fmt = inspect_format_method(__obj)\n+        if fmt is not None:\n+            return __self.format_string(fmt, args, kwargs)\n+\n         # the double prefixes are to avoid double keyword argument\n         # errors when proxying the call.\n         if not __self.is_safe_callable(__obj):\n@@ -365,3 +444,37 @@ class ImmutableSandboxedEnvironment(SandboxedEnvironment):\n         if not SandboxedEnvironment.is_safe_attribute(self, obj, attr, value):\n             return False\n         return not modifies_known_mutable(obj, attr)\n+\n+\n+if has_format:\n+    # This really is not a public API apparenlty.\n+    try:\n+        from _string import formatter_field_name_split\n+    except ImportError:\n+        def formatter_field_name_split(field_name):\n+            return field_name._formatter_field_name_split()\n+\n+    class SandboxedFormatterMixin(object):\n+\n+        def __init__(self, env):\n+            self._env = env\n+\n+        def get_field(self, field_name, args, kwargs):\n+            first, rest = formatter_field_name_split(field_name)\n+            obj = self.get_value(first, args, kwargs)\n+            for is_attr, i in rest:\n+                if is_attr:\n+                    obj = self._env.getattr(obj, i)\n+                else:\n+                    obj = self._env.getitem(obj, i)\n+            return obj, first\n+\n+    class SandboxedFormatter(SandboxedFormatterMixin, Formatter):\n+        def __init__(self, env):\n+            SandboxedFormatterMixin.__init__(self, env)\n+            Formatter.__init__(self)\n+\n+    class SandboxedEscapeFormatter(SandboxedFormatterMixin, EscapeFormatter):\n+        def __init__(self, env, escape):\n+            SandboxedFormatterMixin.__init__(self, env)\n+            EscapeFormatter.__init__(self, escape)\n\ndiff --git a/jinja2/utils.py b/jinja2/utils.py\nindex cdd4cd3..612d5c3 100644\n--- a/jinja2/utils.py\n+++ b/jinja2/utils.py\n@@ -295,7 +295,7 @@ def unicode_urlencode(obj, charset='utf-8', for_qs=False):\n         obj = text_type(obj)\n     if isinstance(obj, text_type):\n         obj = obj.encode(charset)\n-    safe = for_qs and b'' or b'/'\n+    safe = not for_qs and b'/' or b''\n     rv = text_type(url_quote(obj, safe))\n     if for_qs:\n         rv = rv.replace('%20', '+')\n\ndiff --git a/setup.py b/setup.py\nindex 0880d1a..f19b394 100644\n--- a/setup.py\n+++ b/setup.py\n@@ -40,7 +40,7 @@ from setuptools import setup\n \n setup(\n     name='Jinja2',\n-    version='2.8',\n+    version='2.8.1',\n     url='http://jinja.pocoo.org/',\n     license='BSD',\n     author='Armin Ronacher',\n",
+  "structured_diff": {
+    "jinja2/__init__.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -27,7 +27,7 @@",
+          "snippet": "     :license: BSD, see LICENSE for more details.\n \"\"\"\n __docformat__ = 'restructuredtext en'\n-__version__ = '2.8'\n+__version__ = '2.8.1'\n \n # high level interface\n from jinja2.environment import Environment, Template\n",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "jinja2/__init__.py::__version__"
+            }
+          ]
+        }
+      ]
+    },
+    "jinja2/filters.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -518,9 +518,12 @@",
+          "snippet": " def do_int(value, default=0, base=10):\n     can also override the default base (10) in the second\n     parameter, which handles input with prefixes such as\n     0b, 0o and 0x for bases 2, 8 and 16 respectively.\n+    The base is ignored for decimal numbers and non-string values.\n     \"\"\"\n     try:\n-        return int(value, base)\n+        if isinstance(value, string_types):\n+            return int(value, base)\n+        return int(value)\n     except (TypeError, ValueError):\n         # this quirk is necessary so that \"42.23\"|int gives 42.\n         try:\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "jinja2/filters.py::do_int"
+            }
+          ]
+        }
+      ]
+    },
+    "jinja2/nodes.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -604,7 +604,7 @@",
+          "snippet": " class Call(Expr):\n \n     def as_const(self, eval_ctx=None):\n         eval_ctx = get_eval_context(self, eval_ctx)\n-        if eval_ctx.volatile:\n+        if eval_ctx.volatile or eval_ctx.environment.sandboxed:\n             raise Impossible()\n         obj = self.node.as_const(eval_ctx)\n \n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "jinja2/nodes.py::Call::as_const"
+            }
+          ]
+        }
+      ]
+    },
+    "jinja2/sandbox.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -14,9 +14,17 @@",
+          "snippet": " \"\"\"\n import types\n import operator\n+from collections import Mapping\n from jinja2.environment import Environment\n from jinja2.exceptions import SecurityError\n-from jinja2._compat import string_types, PY2\n+from jinja2._compat import string_types, text_type, PY2\n+from jinja2.utils import Markup\n+\n+has_format = False\n+if hasattr(text_type, 'format'):\n+    from markupsafe import EscapeFormatter\n+    from string import Formatter\n+    has_format = True\n \n \n #: maximum number of items a range may produce",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "jinja2/sandbox.py::has_format"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -38,6 +46,12 @@",
+          "snippet": " UNSAFE_METHOD_ATTRIBUTES = set(['im_class', 'im_func', 'im_self'])\n #: unsafe generator attirbutes.\n UNSAFE_GENERATOR_ATTRIBUTES = set(['gi_frame', 'gi_code'])\n \n+#: unsafe attributes on coroutines\n+UNSAFE_COROUTINE_ATTRIBUTES = set(['cr_frame', 'cr_code'])\n+\n+#: unsafe attributes on async generators\n+UNSAFE_ASYNC_GENERATOR_ATTRIBUTES = set(['ag_code', 'ag_frame'])\n+\n import warnings\n \n # make sure we don't warn in python 2.6 about stuff we don't care about",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "jinja2/sandbox.py::UNSAFE_COROUTINE_ATTRIBUTES"
+            },
+            {
+              "kind": "variable",
+              "node": "jinja2/sandbox.py::UNSAFE_ASYNC_GENERATOR_ATTRIBUTES"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -94,6 +108,49 @@",
+          "snippet": " _mutable_spec = (\n )\n \n \n+class _MagicFormatMapping(Mapping):\n+    \"\"\"This class implements a dummy wrapper to fix a bug in the Python\n+    standard library for string formatting.\n+\n+    See http://bugs.python.org/issue13598 for information about why\n+    this is necessary.\n+    \"\"\"\n+\n+    def __init__(self, args, kwargs):\n+        self._args = args\n+        self._kwargs = kwargs\n+        self._last_index = 0\n+\n+    def __getitem__(self, key):\n+        if key == '':\n+            idx = self._last_index\n+            self._last_index += 1\n+            try:\n+                return self._args[idx]\n+            except LookupError:\n+                pass\n+            key = str(idx)\n+        return self._kwargs[key]\n+\n+    def __iter__(self):\n+        return iter(self._kwargs)\n+\n+    def __len__(self):\n+        return len(self._kwargs)\n+\n+\n+def inspect_format_method(callable):\n+    if not has_format:\n+        return None\n+    if not isinstance(callable, (types.MethodType,\n+                                 types.BuiltinMethodType)) or \\\n+       callable.__name__ != 'format':\n+        return None\n+    obj = callable.__self__\n+    if isinstance(obj, string_types):\n+        return obj\n+\n+\n def safe_range(*args):\n     \"\"\"A range that can't generate ranges with a length of more than\n     MAX_RANGE items.",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "jinja2/sandbox.py::_MagicFormatMapping"
+            },
+            {
+              "kind": "method",
+              "node": "jinja2/sandbox.py::_MagicFormatMapping::__init__"
+            },
+            {
+              "kind": "method",
+              "node": "jinja2/sandbox.py::_MagicFormatMapping::__getitem__"
+            },
+            {
+              "kind": "method",
+              "node": "jinja2/sandbox.py::_MagicFormatMapping::__iter__"
+            },
+            {
+              "kind": "method",
+              "node": "jinja2/sandbox.py::_MagicFormatMapping::__len__"
+            },
+            {
+              "kind": "function",
+              "node": "jinja2/sandbox.py::inspect_format_method"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -145,6 +202,12 @@",
+          "snippet": " def is_internal_attribute(obj, attr):\n     elif isinstance(obj, types.GeneratorType):\n         if attr in UNSAFE_GENERATOR_ATTRIBUTES:\n             return True\n+    elif hasattr(types, 'CoroutineType') and isinstance(obj, types.CoroutineType):\n+        if attr in UNSAFE_COROUTINE_ATTRIBUTES:\n+            return True\n+    elif hasattr(types, 'AsyncGeneratorType') and isinstance(obj, types.AsyncGeneratorType):\n+        if attri in UNSAFE_ASYNC_GENERATOR_ATTRIBUTES:\n+            return True\n     return attr.startswith('__')\n \n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "jinja2/sandbox.py::is_internal_attribute"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -183,8 +246,8 @@",
+          "snippet": " class SandboxedEnvironment(Environment):\n     attributes or functions are safe to access.\n \n     If the template tries to access insecure code a :exc:`SecurityError` is\n-    raised.  However also other exceptions may occour during the rendering so\n-    the caller has to ensure that all exceptions are catched.\n+    raised.  However also other exceptions may occur during the rendering so\n+    the caller has to ensure that all exceptions are caught.\n     \"\"\"\n     sandboxed = True\n ",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "jinja2/sandbox.py::SandboxedEnvironment"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -346,8 +409,24 @@",
+          "snippet": " class SandboxedEnvironment(Environment):\n             obj.__class__.__name__\n         ), name=attribute, obj=obj, exc=SecurityError)\n \n+    def format_string(self, s, args, kwargs):\n+        \"\"\"If a format call is detected, then this is routed through this\n+        method so that our safety sandbox can be used for it.\n+        \"\"\"\n+        if isinstance(s, Markup):\n+            formatter = SandboxedEscapeFormatter(self, s.escape)\n+        else:\n+            formatter = SandboxedFormatter(self)\n+        kwargs = _MagicFormatMapping(args, kwargs)\n+        rv = formatter.vformat(s, args, kwargs)\n+        return type(s)(rv)\n+\n     def call(__self, __context, __obj, *args, **kwargs):\n         \"\"\"Call an object from sandboxed code.\"\"\"\n+        fmt = inspect_format_method(__obj)\n+        if fmt is not None:\n+            return __self.format_string(fmt, args, kwargs)\n+\n         # the double prefixes are to avoid double keyword argument\n         # errors when proxying the call.\n         if not __self.is_safe_callable(__obj):",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "jinja2/sandbox.py::SandboxedEnvironment::format_string"
+            },
+            {
+              "kind": "class",
+              "node": "jinja2/sandbox.py::SandboxedEnvironment"
+            },
+            {
+              "kind": "method",
+              "node": "jinja2/sandbox.py::SandboxedEnvironment::call"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -365,3 +444,37 @@",
+          "snippet": " class ImmutableSandboxedEnvironment(SandboxedEnvironment):\n         if not SandboxedEnvironment.is_safe_attribute(self, obj, attr, value):\n             return False\n         return not modifies_known_mutable(obj, attr)\n+\n+\n+if has_format:\n+    # This really is not a public API apparenlty.\n+    try:\n+        from _string import formatter_field_name_split\n+    except ImportError:\n+        def formatter_field_name_split(field_name):\n+            return field_name._formatter_field_name_split()\n+\n+    class SandboxedFormatterMixin(object):\n+\n+        def __init__(self, env):\n+            self._env = env\n+\n+        def get_field(self, field_name, args, kwargs):\n+            first, rest = formatter_field_name_split(field_name)\n+            obj = self.get_value(first, args, kwargs)\n+            for is_attr, i in rest:\n+                if is_attr:\n+                    obj = self._env.getattr(obj, i)\n+                else:\n+                    obj = self._env.getitem(obj, i)\n+            return obj, first\n+\n+    class SandboxedFormatter(SandboxedFormatterMixin, Formatter):\n+        def __init__(self, env):\n+            SandboxedFormatterMixin.__init__(self, env)\n+            Formatter.__init__(self)\n+\n+    class SandboxedEscapeFormatter(SandboxedFormatterMixin, EscapeFormatter):\n+        def __init__(self, env, escape):\n+            SandboxedFormatterMixin.__init__(self, env)\n+            EscapeFormatter.__init__(self, escape)\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "jinja2/sandbox.py::formatter_field_name_split"
+            },
+            {
+              "kind": "class",
+              "node": "jinja2/sandbox.py::SandboxedFormatterMixin"
+            },
+            {
+              "kind": "method",
+              "node": "jinja2/sandbox.py::SandboxedFormatterMixin::__init__"
+            },
+            {
+              "kind": "method",
+              "node": "jinja2/sandbox.py::SandboxedFormatterMixin::get_field"
+            },
+            {
+              "kind": "class",
+              "node": "jinja2/sandbox.py::SandboxedFormatter"
+            },
+            {
+              "kind": "method",
+              "node": "jinja2/sandbox.py::SandboxedFormatter::__init__"
+            },
+            {
+              "kind": "class",
+              "node": "jinja2/sandbox.py::SandboxedEscapeFormatter"
+            },
+            {
+              "kind": "method",
+              "node": "jinja2/sandbox.py::SandboxedEscapeFormatter::__init__"
+            }
+          ]
+        }
+      ]
+    },
+    "jinja2/utils.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -295,7 +295,7 @@",
+          "snippet": " def unicode_urlencode(obj, charset='utf-8', for_qs=False):\n         obj = text_type(obj)\n     if isinstance(obj, text_type):\n         obj = obj.encode(charset)\n-    safe = for_qs and b'' or b'/'\n+    safe = not for_qs and b'/' or b''\n     rv = text_type(url_quote(obj, safe))\n     if for_qs:\n         rv = rv.replace('%20', '+')\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "jinja2/utils.py::unicode_urlencode"
+            }
+          ]
+        }
+      ]
+    },
+    "setup.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -40,7 +40,7 @@",
+          "snippet": " from setuptools import setup\n \n setup(\n     name='Jinja2',\n-    version='2.8',\n+    version='2.8.1',\n     url='http://jinja.pocoo.org/',\n     license='BSD',\n     author='Armin Ronacher',",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "setup.py::<module>"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

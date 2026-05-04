@@ -1,0 +1,1693 @@
+diff --git a/scripts/towncrier-draft-to-file.py b/scripts/towncrier-draft-to-file.py
+index 81507b4..1f10686 100644
+--- a/scripts/towncrier-draft-to-file.py
++++ b/scripts/towncrier-draft-to-file.py
+@@ -7,7 +7,9 @@ def main():
+     Platform agnostic wrapper script for towncrier.
+     Fixes the issue (#7251) where windows users are unable to natively run tox -e docs to build pytest docs.
+     """
+-    with open("doc/en/_changelog_towncrier_draft.rst", "w") as draft_file:
++    with open(
++        "doc/en/_changelog_towncrier_draft.rst", "w", encoding="utf-8"
++    ) as draft_file:
+         return call(("towncrier", "--draft"), stdout=draft_file)
+ 
+ 
+
+diff --git a/scripts/update-plugin-list.py b/scripts/update-plugin-list.py
+index 34d1c8b..ea7e798 100644
+--- a/scripts/update-plugin-list.py
++++ b/scripts/update-plugin-list.py
+@@ -17,7 +17,9 @@ Plugin List
+ ===========
+ 
+ PyPI projects that match "pytest-\*" are considered plugins and are listed
+-automatically. Packages classified as inactive are excluded.
++automatically together with a manually-maintained list in `the source
++code <https://github.com/pytest-dev/pytest/blob/main/scripts/update-plugin-list.py>`_.
++Packages classified as inactive are excluded.
+ 
+ .. The following conditional uses a different format for this list when
+    creating a PDF, because otherwise the table gets far too wide for the
+@@ -33,6 +35,9 @@ DEVELOPMENT_STATUS_CLASSIFIERS = (
+     "Development Status :: 6 - Mature",
+     "Development Status :: 7 - Inactive",
+ )
++ADDITIONAL_PROJECTS = {  # set of additional projects to consider as plugins
++    "logassert",
++}
+ 
+ 
+ def escape_rst(text: str) -> str:
+@@ -52,18 +57,18 @@ def iter_plugins():
+     regex = r">([\d\w-]*)</a>"
+     response = requests.get("https://pypi.org/simple")
+ 
+-    matches = list(
+-        match
+-        for match in re.finditer(regex, response.text)
+-        if match.groups()[0].startswith("pytest-")
+-    )
++    match_names = (match.groups()[0] for match in re.finditer(regex, response.text))
++    plugin_names = [
++        name
++        for name in match_names
++        if name.startswith("pytest-") or name in ADDITIONAL_PROJECTS
++    ]
+ 
+-    for match in tqdm(matches, smoothing=0):
+-        name = match.groups()[0]
++    for name in tqdm(plugin_names, smoothing=0):
+         response = requests.get(f"https://pypi.org/pypi/{name}/json")
+         if response.status_code == 404:
+-            # Some packages, like pytest-azurepipelines42, are included in https://pypi.org/simple but
+-            # return 404 on the JSON API. Skip.
++            # Some packages, like pytest-azurepipelines42, are included in https://pypi.org/simple
++            # but return 404 on the JSON API. Skip.
+             continue
+         response.raise_for_status()
+         info = response.json()["info"]
+
+diff --git a/src/_pytest/_code/code.py b/src/_pytest/_code/code.py
+index 9024cc0..9b05133 100644
+--- a/src/_pytest/_code/code.py
++++ b/src/_pytest/_code/code.py
+@@ -31,7 +31,6 @@ from typing import Type
+ from typing import TYPE_CHECKING
+ from typing import TypeVar
+ from typing import Union
+-from weakref import ref
+ 
+ import pluggy
+ 
+@@ -50,9 +49,9 @@ from _pytest.pathlib import absolutepath
+ from _pytest.pathlib import bestrelpath
+ 
+ if TYPE_CHECKING:
++    from typing_extensions import Final
+     from typing_extensions import Literal
+     from typing_extensions import SupportsIndex
+-    from weakref import ReferenceType
+ 
+     _TracebackStyle = Literal["long", "short", "line", "no", "native", "value", "auto"]
+ 
+@@ -194,25 +193,25 @@ class Frame:
+ class TracebackEntry:
+     """A single entry in a Traceback."""
+ 
+-    __slots__ = ("_rawentry", "_excinfo", "_repr_style")
++    __slots__ = ("_rawentry", "_repr_style")
+ 
+     def __init__(
+         self,
+         rawentry: TracebackType,
+-        excinfo: Optional["ReferenceType[ExceptionInfo[BaseException]]"] = None,
++        repr_style: Optional['Literal["short", "long"]'] = None,
+     ) -> None:
+-        self._rawentry = rawentry
+-        self._excinfo = excinfo
+-        self._repr_style: Optional['Literal["short", "long"]'] = None
++        self._rawentry: "Final" = rawentry
++        self._repr_style: "Final" = repr_style
++
++    def with_repr_style(
++        self, repr_style: Optional['Literal["short", "long"]']
++    ) -> "TracebackEntry":
++        return TracebackEntry(self._rawentry, repr_style)
+ 
+     @property
+     def lineno(self) -> int:
+         return self._rawentry.tb_lineno - 1
+ 
+-    def set_repr_style(self, mode: "Literal['short', 'long']") -> None:
+-        assert mode in ("short", "long")
+-        self._repr_style = mode
+-
+     @property
+     def frame(self) -> Frame:
+         return Frame(self._rawentry.tb_frame)
+@@ -272,7 +271,7 @@ class TracebackEntry:
+ 
+     source = property(getsource)
+ 
+-    def ishidden(self) -> bool:
++    def ishidden(self, excinfo: Optional["ExceptionInfo[BaseException]"]) -> bool:
+         """Return True if the current frame has a var __tracebackhide__
+         resolving to True.
+ 
+@@ -296,7 +295,7 @@ class TracebackEntry:
+             else:
+                 break
+         if tbh and callable(tbh):
+-            return tbh(None if self._excinfo is None else self._excinfo())
++            return tbh(excinfo)
+         return tbh
+ 
+     def __str__(self) -> str:
+@@ -329,16 +328,14 @@ class Traceback(List[TracebackEntry]):
+     def __init__(
+         self,
+         tb: Union[TracebackType, Iterable[TracebackEntry]],
+-        excinfo: Optional["ReferenceType[ExceptionInfo[BaseException]]"] = None,
+     ) -> None:
+         """Initialize from given python traceback object and ExceptionInfo."""
+-        self._excinfo = excinfo
+         if isinstance(tb, TracebackType):
+ 
+             def f(cur: TracebackType) -> Iterable[TracebackEntry]:
+                 cur_: Optional[TracebackType] = cur
+                 while cur_ is not None:
+-                    yield TracebackEntry(cur_, excinfo=excinfo)
++                    yield TracebackEntry(cur_)
+                     cur_ = cur_.tb_next
+ 
+             super().__init__(f(tb))
+@@ -378,7 +375,7 @@ class Traceback(List[TracebackEntry]):
+                 continue
+             if firstlineno is not None and x.frame.code.firstlineno != firstlineno:
+                 continue
+-            return Traceback(x._rawentry, self._excinfo)
++            return Traceback(x._rawentry)
+         return self
+ 
+     @overload
+@@ -398,26 +395,27 @@ class Traceback(List[TracebackEntry]):
+             return super().__getitem__(key)
+ 
+     def filter(
+-        self, fn: Callable[[TracebackEntry], bool] = lambda x: not x.ishidden()
++        self,
++        # TODO(py38): change to positional only.
++        _excinfo_or_fn: Union[
++            "ExceptionInfo[BaseException]",
++            Callable[[TracebackEntry], bool],
++        ],
+     ) -> "Traceback":
+-        """Return a Traceback instance with certain items removed
++        """Return a Traceback instance with certain items removed.
+ 
+-        fn is a function that gets a single argument, a TracebackEntry
+-        instance, and should return True when the item should be added
+-        to the Traceback, False when not.
++        If the filter is an `ExceptionInfo`, removes all the ``TracebackEntry``s
++        which are hidden (see ishidden() above).
+ 
+-        By default this removes all the TracebackEntries which are hidden
+-        (see ishidden() above).
++        Otherwise, the filter is a function that gets a single argument, a
++        ``TracebackEntry`` instance, and should return True when the item should
++        be added to the ``Traceback``, False when not.
+         """
+-        return Traceback(filter(fn, self), self._excinfo)
+-
+-    def getcrashentry(self) -> TracebackEntry:
+-        """Return last non-hidden traceback entry that lead to the exception of a traceback."""
+-        for i in range(-1, -len(self) - 1, -1):
+-            entry = self[i]
+-            if not entry.ishidden():
+-                return entry
+-        return self[-1]
++        if isinstance(_excinfo_or_fn, ExceptionInfo):
++            fn = lambda x: not x.ishidden(_excinfo_or_fn)  # noqa: E731
++        else:
++            fn = _excinfo_or_fn
++        return Traceback(filter(fn, self))
+ 
+     def recursionindex(self) -> Optional[int]:
+         """Return the index of the frame/TracebackEntry where recursion originates if
+@@ -469,22 +467,41 @@ class ExceptionInfo(Generic[E]):
+         self._traceback = traceback
+ 
+     @classmethod
+-    def from_exc_info(
++    def from_exception(
+         cls,
+-        exc_info: Tuple[Type[E], E, TracebackType],
++        # Ignoring error: "Cannot use a covariant type variable as a parameter".
++        # This is OK to ignore because this class is (conceptually) readonly.
++        # See https://github.com/python/mypy/issues/7049.
++        exception: E,  # type: ignore[misc]
+         exprinfo: Optional[str] = None,
+     ) -> "ExceptionInfo[E]":
+-        """Return an ExceptionInfo for an existing exc_info tuple.
++        """Return an ExceptionInfo for an existing exception.
+ 
+-        .. warning::
+-
+-            Experimental API
++        The exception must have a non-``None`` ``__traceback__`` attribute,
++        otherwise this function fails with an assertion error. This means that
++        the exception must have been raised, or added a traceback with the
++        :py:meth:`~BaseException.with_traceback()` method.
+ 
+         :param exprinfo:
+             A text string helping to determine if we should strip
+             ``AssertionError`` from the output. Defaults to the exception
+             message/``__str__()``.
++
++        .. versionadded:: 7.4
+         """
++        assert (
++            exception.__traceback__
++        ), "Exceptions passed to ExcInfo.from_exception(...) must have a non-None __traceback__."
++        exc_info = (type(exception), exception, exception.__traceback__)
++        return cls.from_exc_info(exc_info, exprinfo)
++
++    @classmethod
++    def from_exc_info(
++        cls,
++        exc_info: Tuple[Type[E], E, TracebackType],
++        exprinfo: Optional[str] = None,
++    ) -> "ExceptionInfo[E]":
++        """Like :func:`from_exception`, but using old-style exc_info tuple."""
+         _striptext = ""
+         if exprinfo is None and isinstance(exc_info[1], AssertionError):
+             exprinfo = getattr(exc_info[1], "msg", None)
+@@ -563,7 +580,7 @@ class ExceptionInfo(Generic[E]):
+     def traceback(self) -> Traceback:
+         """The traceback."""
+         if self._traceback is None:
+-            self._traceback = Traceback(self.tb, excinfo=ref(self))
++            self._traceback = Traceback(self.tb)
+         return self._traceback
+ 
+     @traceback.setter
+@@ -602,18 +619,25 @@ class ExceptionInfo(Generic[E]):
+         """
+         return isinstance(self.value, exc)
+ 
+-    def _getreprcrash(self) -> "ReprFileLocation":
+-        exconly = self.exconly(tryshort=True)
+-        entry = self.traceback.getcrashentry()
+-        path, lineno = entry.frame.code.raw.co_filename, entry.lineno
+-        return ReprFileLocation(path, lineno + 1, exconly)
++    def _getreprcrash(self) -> Optional["ReprFileLocation"]:
++        # Find last non-hidden traceback entry that led to the exception of the
++        # traceback, or None if all hidden.
++        for i in range(-1, -len(self.traceback) - 1, -1):
++            entry = self.traceback[i]
++            if not entry.ishidden(self):
++                path, lineno = entry.frame.code.raw.co_filename, entry.lineno
++                exconly = self.exconly(tryshort=True)
++                return ReprFileLocation(path, lineno + 1, exconly)
++        return None
+ 
+     def getrepr(
+         self,
+         showlocals: bool = False,
+         style: "_TracebackStyle" = "long",
+         abspath: bool = False,
+-        tbfilter: bool = True,
++        tbfilter: Union[
++            bool, Callable[["ExceptionInfo[BaseException]"], Traceback]
++        ] = True,
+         funcargs: bool = False,
+         truncate_locals: bool = True,
+         chain: bool = True,
+@@ -625,14 +649,20 @@ class ExceptionInfo(Generic[E]):
+             Ignored if ``style=="native"``.
+ 
+         :param str style:
+-            long|short|no|native|value traceback style.
++            long|short|line|no|native|value traceback style.
+ 
+         :param bool abspath:
+             If paths should be changed to absolute or left unchanged.
+ 
+-        :param bool tbfilter:
+-            Hide entries that contain a local variable ``__tracebackhide__==True``.
+-            Ignored if ``style=="native"``.
++        :param tbfilter:
++            A filter for traceback entries.
++
++            * If false, don't hide any entries.
++            * If true, hide internal entries and entries that contain a local
++              variable ``__tracebackhide__ = True``.
++            * If a callable, delegates the filtering to the callable.
++
++            Ignored if ``style`` is ``"native"``.
+ 
+         :param bool funcargs:
+             Show fixtures ("funcargs" for legacy purposes) per traceback entry.
+@@ -651,7 +681,9 @@ class ExceptionInfo(Generic[E]):
+             return ReprExceptionInfo(
+                 reprtraceback=ReprTracebackNative(
+                     traceback.format_exception(
+-                        self.type, self.value, self.traceback[0]._rawentry
++                        self.type,
++                        self.value,
++                        self.traceback[0]._rawentry if self.traceback else None,
+                     )
+                 ),
+                 reprcrash=self._getreprcrash(),
+@@ -695,7 +727,7 @@ class FormattedExcinfo:
+     showlocals: bool = False
+     style: "_TracebackStyle" = "long"
+     abspath: bool = True
+-    tbfilter: bool = True
++    tbfilter: Union[bool, Callable[[ExceptionInfo[BaseException]], Traceback]] = True
+     funcargs: bool = False
+     truncate_locals: bool = True
+     chain: bool = True
+@@ -807,12 +839,16 @@ class FormattedExcinfo:
+ 
+     def repr_traceback_entry(
+         self,
+-        entry: TracebackEntry,
++        entry: Optional[TracebackEntry],
+         excinfo: Optional[ExceptionInfo[BaseException]] = None,
+     ) -> "ReprEntry":
+         lines: List[str] = []
+-        style = entry._repr_style if entry._repr_style is not None else self.style
+-        if style in ("short", "long"):
++        style = (
++            entry._repr_style
++            if entry is not None and entry._repr_style is not None
++            else self.style
++        )
++        if style in ("short", "long") and entry is not None:
+             source = self._getentrysource(entry)
+             if source is None:
+                 source = Source("???")
+@@ -853,25 +889,31 @@ class FormattedExcinfo:
+ 
+     def repr_traceback(self, excinfo: ExceptionInfo[BaseException]) -> "ReprTraceback":
+         traceback = excinfo.traceback
+-        if self.tbfilter:
+-            traceback = traceback.filter()
++        if callable(self.tbfilter):
++            traceback = self.tbfilter(excinfo)
++        elif self.tbfilter:
++            traceback = traceback.filter(excinfo)
+ 
+         if isinstance(excinfo.value, RecursionError):
+             traceback, extraline = self._truncate_recursive_traceback(traceback)
+         else:
+             extraline = None
+ 
++        if not traceback:
++            if extraline is None:
++                extraline = "All traceback entries are hidden. Pass `--full-trace` to see hidden and internal frames."
++            entries = [self.repr_traceback_entry(None, excinfo)]
++            return ReprTraceback(entries, extraline, style=self.style)
++
+         last = traceback[-1]
+-        entries = []
+         if self.style == "value":
+-            reprentry = self.repr_traceback_entry(last, excinfo)
+-            entries.append(reprentry)
++            entries = [self.repr_traceback_entry(last, excinfo)]
+             return ReprTraceback(entries, None, style=self.style)
+ 
+-        for index, entry in enumerate(traceback):
+-            einfo = (last == entry) and excinfo or None
+-            reprentry = self.repr_traceback_entry(entry, einfo)
+-            entries.append(reprentry)
++        entries = [
++            self.repr_traceback_entry(entry, excinfo if last == entry else None)
++            for entry in traceback
++        ]
+         return ReprTraceback(entries, extraline, style=self.style)
+ 
+     def _truncate_recursive_traceback(
+@@ -928,6 +970,7 @@ class FormattedExcinfo:
+         seen: Set[int] = set()
+         while e is not None and id(e) not in seen:
+             seen.add(id(e))
++
+             if excinfo_:
+                 # Fall back to native traceback as a temporary workaround until
+                 # full support for exception groups added to ExceptionInfo.
+@@ -944,9 +987,7 @@ class FormattedExcinfo:
+                     )
+                 else:
+                     reprtraceback = self.repr_traceback(excinfo_)
+-                reprcrash: Optional[ReprFileLocation] = (
+-                    excinfo_._getreprcrash() if self.style != "value" else None
+-                )
++                reprcrash = excinfo_._getreprcrash()
+             else:
+                 # Fallback to native repr if the exception doesn't have a traceback:
+                 # ExceptionInfo objects require a full traceback to work.
+@@ -954,25 +995,17 @@ class FormattedExcinfo:
+                     traceback.format_exception(type(e), e, None)
+                 )
+                 reprcrash = None
+-
+             repr_chain += [(reprtraceback, reprcrash, descr)]
++
+             if e.__cause__ is not None and self.chain:
+                 e = e.__cause__
+-                excinfo_ = (
+-                    ExceptionInfo.from_exc_info((type(e), e, e.__traceback__))
+-                    if e.__traceback__
+-                    else None
+-                )
++                excinfo_ = ExceptionInfo.from_exception(e) if e.__traceback__ else None
+                 descr = "The above exception was the direct cause of the following exception:"
+             elif (
+                 e.__context__ is not None and not e.__suppress_context__ and self.chain
+             ):
+                 e = e.__context__
+-                excinfo_ = (
+-                    ExceptionInfo.from_exc_info((type(e), e, e.__traceback__))
+-                    if e.__traceback__
+-                    else None
+-                )
++                excinfo_ = ExceptionInfo.from_exception(e) if e.__traceback__ else None
+                 descr = "During handling of the above exception, another exception occurred:"
+             else:
+                 e = None
+@@ -1046,7 +1079,7 @@ class ExceptionChainRepr(ExceptionRepr):
+ @dataclasses.dataclass(eq=False)
+ class ReprExceptionInfo(ExceptionRepr):
+     reprtraceback: "ReprTraceback"
+-    reprcrash: "ReprFileLocation"
++    reprcrash: Optional["ReprFileLocation"]
+ 
+     def toterminal(self, tw: TerminalWriter) -> None:
+         self.reprtraceback.toterminal(tw)
+@@ -1151,8 +1184,8 @@ class ReprEntry(TerminalRepr):
+ 
+     def toterminal(self, tw: TerminalWriter) -> None:
+         if self.style == "short":
+-            assert self.reprfileloc is not None
+-            self.reprfileloc.toterminal(tw)
++            if self.reprfileloc:
++                self.reprfileloc.toterminal(tw)
+             self._write_entry_lines(tw)
+             if self.reprlocals:
+                 self.reprlocals.toterminal(tw, indent=" " * 8)
+
+diff --git a/src/_pytest/_version.py b/src/_pytest/_version.py
+index 4e3b520..f5d7211 100644
+--- a/src/_pytest/_version.py
++++ b/src/_pytest/_version.py
+@@ -1,4 +1,4 @@
+ # file generated by setuptools_scm
+ # don't change, don't track in version control
+-__version__ = version = '7.3.2'
+-__version_tuple__ = version_tuple = (7, 3, 2)
++__version__ = version = '7.4.0'
++__version_tuple__ = version_tuple = (7, 4, 0)
+
+diff --git a/src/_pytest/cacheprovider.py b/src/_pytest/cacheprovider.py
+index 940dc5d..855716d 100755
+--- a/src/_pytest/cacheprovider.py
++++ b/src/_pytest/cacheprovider.py
+@@ -27,7 +27,7 @@ from _pytest.deprecated import check_ispytest
+ from _pytest.fixtures import fixture
+ from _pytest.fixtures import FixtureRequest
+ from _pytest.main import Session
+-from _pytest.python import Module
++from _pytest.nodes import File
+ from _pytest.python import Package
+ from _pytest.reports import TestReport
+ 
+@@ -179,16 +179,22 @@ class Cache:
+             else:
+                 cache_dir_exists_already = self._cachedir.exists()
+                 path.parent.mkdir(exist_ok=True, parents=True)
+-        except OSError:
+-            self.warn("could not create cache path {path}", path=path, _ispytest=True)
++        except OSError as exc:
++            self.warn(
++                f"could not create cache path {path}: {exc}",
++                _ispytest=True,
++            )
+             return
+         if not cache_dir_exists_already:
+             self._ensure_supporting_files()
+         data = json.dumps(value, ensure_ascii=False, indent=2)
+         try:
+             f = path.open("w", encoding="UTF-8")
+-        except OSError:
+-            self.warn("cache could not write path {path}", path=path, _ispytest=True)
++        except OSError as exc:
++            self.warn(
++                f"cache could not write path {path}: {exc}",
++                _ispytest=True,
++            )
+         else:
+             with f:
+                 f.write(data)
+@@ -220,15 +226,23 @@ class LFPluginCollWrapper:
+             # Sort any lf-paths to the beginning.
+             lf_paths = self.lfplugin._last_failed_paths
+ 
++            # Use stable sort to priorize last failed.
++            def sort_key(node: Union[nodes.Item, nodes.Collector]) -> bool:
++                # Package.path is the __init__.py file, we need the directory.
++                if isinstance(node, Package):
++                    path = node.path.parent
++                else:
++                    path = node.path
++                return path in lf_paths
++
+             res.result = sorted(
+                 res.result,
+-                # use stable sort to priorize last failed
+-                key=lambda x: x.path in lf_paths,
++                key=sort_key,
+                 reverse=True,
+             )
+             return
+ 
+-        elif isinstance(collector, Module):
++        elif isinstance(collector, File):
+             if collector.path in self.lfplugin._last_failed_paths:
+                 out = yield
+                 res = out.get_result()
+@@ -266,10 +280,9 @@ class LFPluginCollSkipfiles:
+     def pytest_make_collect_report(
+         self, collector: nodes.Collector
+     ) -> Optional[CollectReport]:
+-        # Packages are Modules, but _last_failed_paths only contains
+-        # test-bearing paths and doesn't try to include the paths of their
+-        # packages, so don't filter them.
+-        if isinstance(collector, Module) and not isinstance(collector, Package):
++        # Packages are Files, but we only want to skip test-bearing Files,
++        # so don't filter Packages.
++        if isinstance(collector, File) and not isinstance(collector, Package):
+             if collector.path not in self.lfplugin._last_failed_paths:
+                 self.lfplugin._skipped_files += 1
+ 
+@@ -299,9 +312,14 @@ class LFPlugin:
+             )
+ 
+     def get_last_failed_paths(self) -> Set[Path]:
+-        """Return a set with all Paths()s of the previously failed nodeids."""
++        """Return a set with all Paths of the previously failed nodeids and
++        their parents."""
+         rootpath = self.config.rootpath
+-        result = {rootpath / nodeid.split("::")[0] for nodeid in self.lastfailed}
++        result = set()
++        for nodeid in self.lastfailed:
++            path = rootpath / nodeid.split("::")[0]
++            result.add(path)
++            result.update(path.parents)
+         return {x for x in result if x.exists()}
+ 
+     def pytest_report_collectionfinish(self) -> Optional[str]:
+
+diff --git a/src/_pytest/config/__init__.py b/src/_pytest/config/__init__.py
+index 74905ff..c9a4b7f 100644
+--- a/src/_pytest/config/__init__.py
++++ b/src/_pytest/config/__init__.py
+@@ -49,7 +49,7 @@ from _pytest._code import ExceptionInfo
+ from _pytest._code import filter_traceback
+ from _pytest._io import TerminalWriter
+ from _pytest.compat import final
+-from _pytest.compat import importlib_metadata
++from _pytest.compat import importlib_metadata  # type: ignore[attr-defined]
+ from _pytest.outcomes import fail
+ from _pytest.outcomes import Skipped
+ from _pytest.pathlib import absolutepath
+@@ -527,9 +527,12 @@ class PytestPluginManager(PluginManager):
+     #
+     def _set_initial_conftests(
+         self,
+-        namespace: argparse.Namespace,
++        args: Sequence[Union[str, Path]],
++        pyargs: bool,
++        noconftest: bool,
+         rootpath: Path,
+-        testpaths_ini: Sequence[str],
++        confcutdir: Optional[Path],
++        importmode: Union[ImportMode, str],
+     ) -> None:
+         """Load initial conftest files given a preparsed "namespace".
+ 
+@@ -539,17 +542,12 @@ class PytestPluginManager(PluginManager):
+         common options will not confuse our logic here.
+         """
+         current = Path.cwd()
+-        self._confcutdir = (
+-            absolutepath(current / namespace.confcutdir)
+-            if namespace.confcutdir
+-            else None
+-        )
+-        self._noconftest = namespace.noconftest
+-        self._using_pyargs = namespace.pyargs
+-        testpaths = namespace.file_or_dir + testpaths_ini
++        self._confcutdir = absolutepath(current / confcutdir) if confcutdir else None
++        self._noconftest = noconftest
++        self._using_pyargs = pyargs
+         foundanchor = False
+-        for testpath in testpaths:
+-            path = str(testpath)
++        for intitial_path in args:
++            path = str(intitial_path)
+             # remove node-id syntax
+             i = path.find("::")
+             if i != -1:
+@@ -563,10 +561,10 @@ class PytestPluginManager(PluginManager):
+             except OSError:  # pragma: no cover
+                 anchor_exists = False
+             if anchor_exists:
+-                self._try_load_conftest(anchor, namespace.importmode, rootpath)
++                self._try_load_conftest(anchor, importmode, rootpath)
+                 foundanchor = True
+         if not foundanchor:
+-            self._try_load_conftest(current, namespace.importmode, rootpath)
++            self._try_load_conftest(current, importmode, rootpath)
+ 
+     def _is_in_confcutdir(self, path: Path) -> bool:
+         """Whether a path is within the confcutdir.
+@@ -1140,10 +1138,25 @@ class Config:
+ 
+     @hookimpl(trylast=True)
+     def pytest_load_initial_conftests(self, early_config: "Config") -> None:
++        # We haven't fully parsed the command line arguments yet, so
++        # early_config.args it not set yet. But we need it for
++        # discovering the initial conftests. So "pre-run" the logic here.
++        # It will be done for real in `parse()`.
++        args, args_source = early_config._decide_args(
++            args=early_config.known_args_namespace.file_or_dir,
++            pyargs=early_config.known_args_namespace.pyargs,
++            testpaths=early_config.getini("testpaths"),
++            invocation_dir=early_config.invocation_params.dir,
++            rootpath=early_config.rootpath,
++            warn=False,
++        )
+         self.pluginmanager._set_initial_conftests(
+-            early_config.known_args_namespace,
++            args=args,
++            pyargs=early_config.known_args_namespace.pyargs,
++            noconftest=early_config.known_args_namespace.noconftest,
+             rootpath=early_config.rootpath,
+-            testpaths_ini=self.getini("testpaths"),
++            confcutdir=early_config.known_args_namespace.confcutdir,
++            importmode=early_config.known_args_namespace.importmode,
+         )
+ 
+     def _initini(self, args: Sequence[str]) -> None:
+@@ -1223,6 +1236,49 @@ class Config:
+ 
+         return args
+ 
++    def _decide_args(
++        self,
++        *,
++        args: List[str],
++        pyargs: List[str],
++        testpaths: List[str],
++        invocation_dir: Path,
++        rootpath: Path,
++        warn: bool,
++    ) -> Tuple[List[str], ArgsSource]:
++        """Decide the args (initial paths/nodeids) to use given the relevant inputs.
++
++        :param warn: Whether can issue warnings.
++        """
++        if args:
++            source = Config.ArgsSource.ARGS
++            result = args
++        else:
++            if invocation_dir == rootpath:
++                source = Config.ArgsSource.TESTPATHS
++                if pyargs:
++                    result = testpaths
++                else:
++                    result = []
++                    for path in testpaths:
++                        result.extend(sorted(glob.iglob(path, recursive=True)))
++                    if testpaths and not result:
++                        if warn:
++                            warning_text = (
++                                "No files were found in testpaths; "
++                                "consider removing or adjusting your testpaths configuration. "
++                                "Searching recursively from the current directory instead."
++                            )
++                            self.issue_config_time_warning(
++                                PytestConfigWarning(warning_text), stacklevel=3
++                            )
++            else:
++                result = []
++            if not result:
++                source = Config.ArgsSource.INCOVATION_DIR
++                result = [str(invocation_dir)]
++        return result, source
++
+     def _preparse(self, args: List[str], addopts: bool = True) -> None:
+         if addopts:
+             env_addopts = os.environ.get("PYTEST_ADDOPTS", "")
+@@ -1261,8 +1317,11 @@ class Config:
+                 _pytest.deprecated.STRICT_OPTION, stacklevel=2
+             )
+ 
+-        if self.known_args_namespace.confcutdir is None and self.inipath is not None:
+-            confcutdir = str(self.inipath.parent)
++        if self.known_args_namespace.confcutdir is None:
++            if self.inipath is not None:
++                confcutdir = str(self.inipath.parent)
++            else:
++                confcutdir = str(self.rootpath)
+             self.known_args_namespace.confcutdir = confcutdir
+         try:
+             self.hook.pytest_load_initial_conftests(
+@@ -1368,25 +1427,17 @@ class Config:
+         self.hook.pytest_cmdline_preparse(config=self, args=args)
+         self._parser.after_preparse = True  # type: ignore
+         try:
+-            source = Config.ArgsSource.ARGS
+             args = self._parser.parse_setoption(
+                 args, self.option, namespace=self.option
+             )
+-            if not args:
+-                if self.invocation_params.dir == self.rootpath:
+-                    source = Config.ArgsSource.TESTPATHS
+-                    testpaths: List[str] = self.getini("testpaths")
+-                    if self.known_args_namespace.pyargs:
+-                        args = testpaths
+-                    else:
+-                        args = []
+-                        for path in testpaths:
+-                            args.extend(sorted(glob.iglob(path, recursive=True)))
+-                if not args:
+-                    source = Config.ArgsSource.INCOVATION_DIR
+-                    args = [str(self.invocation_params.dir)]
+-            self.args = args
+-            self.args_source = source
++            self.args, self.args_source = self._decide_args(
++                args=args,
++                pyargs=self.known_args_namespace.pyargs,
++                testpaths=self.getini("testpaths"),
++                invocation_dir=self.invocation_params.dir,
++                rootpath=self.rootpath,
++                warn=True,
++            )
+         except PrintHelp:
+             pass
+ 
+
+diff --git a/src/_pytest/fixtures.py b/src/_pytest/fixtures.py
+index 007245b..0462504 100644
+--- a/src/_pytest/fixtures.py
++++ b/src/_pytest/fixtures.py
+@@ -46,6 +46,7 @@ from _pytest.compat import getimfunc
+ from _pytest.compat import getlocation
+ from _pytest.compat import is_generator
+ from _pytest.compat import NOTSET
++from _pytest.compat import NotSetType
+ from _pytest.compat import overload
+ from _pytest.compat import safe_getattr
+ from _pytest.config import _PluggyPlugin
+@@ -112,16 +113,18 @@ def pytest_sessionstart(session: "Session") -> None:
+     session._fixturemanager = FixtureManager(session)
+ 
+ 
+-def get_scope_package(node, fixturedef: "FixtureDef[object]"):
+-    import pytest
++def get_scope_package(
++    node: nodes.Item,
++    fixturedef: "FixtureDef[object]",
++) -> Optional[Union[nodes.Item, nodes.Collector]]:
++    from _pytest.python import Package
+ 
+-    cls = pytest.Package
+-    current = node
++    current: Optional[Union[nodes.Item, nodes.Collector]] = node
+     fixture_package_name = "{}/{}".format(fixturedef.baseid, "__init__.py")
+     while current and (
+-        type(current) is not cls or fixture_package_name != current.nodeid
++        not isinstance(current, Package) or fixture_package_name != current.nodeid
+     ):
+-        current = current.parent
++        current = current.parent  # type: ignore[assignment]
+     if current is None:
+         return node.session
+     return current
+@@ -434,7 +437,23 @@ class FixtureRequest:
+     @property
+     def node(self):
+         """Underlying collection node (depends on current request scope)."""
+-        return self._getscopeitem(self._scope)
++        scope = self._scope
++        if scope is Scope.Function:
++            # This might also be a non-function Item despite its attribute name.
++            node: Optional[Union[nodes.Item, nodes.Collector]] = self._pyfuncitem
++        elif scope is Scope.Package:
++            # FIXME: _fixturedef is not defined on FixtureRequest (this class),
++            # but on FixtureRequest (a subclass).
++            node = get_scope_package(self._pyfuncitem, self._fixturedef)  # type: ignore[attr-defined]
++        else:
++            node = get_scope_node(self._pyfuncitem, scope)
++        if node is None and scope is Scope.Class:
++            # Fallback to function item itself.
++            node = self._pyfuncitem
++        assert node, 'Could not obtain a node for scope "{}" for function {!r}'.format(
++            scope, self._pyfuncitem
++        )
++        return node
+ 
+     def _getnextfixturedef(self, argname: str) -> "FixtureDef[Any]":
+         fixturedefs = self._arg2fixturedefs.get(argname, None)
+@@ -518,11 +537,7 @@ class FixtureRequest:
+         """Add finalizer/teardown function to be called without arguments after
+         the last test within the requesting test context finished execution."""
+         # XXX usually this method is shadowed by fixturedef specific ones.
+-        self._addfinalizer(finalizer, scope=self.scope)
+-
+-    def _addfinalizer(self, finalizer: Callable[[], object], scope) -> None:
+-        node = self._getscopeitem(scope)
+-        node.addfinalizer(finalizer)
++        self.node.addfinalizer(finalizer)
+ 
+     def applymarker(self, marker: Union[str, MarkDecorator]) -> None:
+         """Apply a marker to a single test function invocation.
+@@ -717,28 +732,6 @@ class FixtureRequest:
+             lines.append("%s:%d:  def %s%s" % (p, lineno + 1, factory.__name__, args))
+         return lines
+ 
+-    def _getscopeitem(
+-        self, scope: Union[Scope, "_ScopeName"]
+-    ) -> Union[nodes.Item, nodes.Collector]:
+-        if isinstance(scope, str):
+-            scope = Scope(scope)
+-        if scope is Scope.Function:
+-            # This might also be a non-function Item despite its attribute name.
+-            node: Optional[Union[nodes.Item, nodes.Collector]] = self._pyfuncitem
+-        elif scope is Scope.Package:
+-            # FIXME: _fixturedef is not defined on FixtureRequest (this class),
+-            # but on FixtureRequest (a subclass).
+-            node = get_scope_package(self._pyfuncitem, self._fixturedef)  # type: ignore[attr-defined]
+-        else:
+-            node = get_scope_node(self._pyfuncitem, scope)
+-        if node is None and scope is Scope.Class:
+-            # Fallback to function item itself.
+-            node = self._pyfuncitem
+-        assert node, 'Could not obtain a node for scope "{}" for function {!r}'.format(
+-            scope, self._pyfuncitem
+-        )
+-        return node
+-
+     def __repr__(self) -> str:
+         return "<FixtureRequest for %r>" % (self.node)
+ 
+@@ -1593,13 +1586,52 @@ class FixtureManager:
+         # Separate parametrized setups.
+         items[:] = reorder_items(items)
+ 
++    @overload
+     def parsefactories(
+-        self, node_or_obj, nodeid=NOTSET, unittest: bool = False
++        self,
++        node_or_obj: nodes.Node,
++        *,
++        unittest: bool = ...,
+     ) -> None:
++        raise NotImplementedError()
++
++    @overload
++    def parsefactories(  # noqa: F811
++        self,
++        node_or_obj: object,
++        nodeid: Optional[str],
++        *,
++        unittest: bool = ...,
++    ) -> None:
++        raise NotImplementedError()
++
++    def parsefactories(  # noqa: F811
++        self,
++        node_or_obj: Union[nodes.Node, object],
++        nodeid: Union[str, NotSetType, None] = NOTSET,
++        *,
++        unittest: bool = False,
++    ) -> None:
++        """Collect fixtures from a collection node or object.
++
++        Found fixtures are parsed into `FixtureDef`s and saved.
++
++        If `node_or_object` is a collection node (with an underlying Python
++        object), the node's object is traversed and the node's nodeid is used to
++        determine the fixtures' visibilty. `nodeid` must not be specified in
++        this case.
++
++        If `node_or_object` is an object (e.g. a plugin), the object is
++        traversed and the given `nodeid` is used to determine the fixtures'
++        visibility. `nodeid` must be specified in this case; None and "" mean
++        total visibility.
++        """
+         if nodeid is not NOTSET:
+             holderobj = node_or_obj
+         else:
+-            holderobj = node_or_obj.obj
++            assert isinstance(node_or_obj, nodes.Node)
++            holderobj = cast(object, node_or_obj.obj)  # type: ignore[attr-defined]
++            assert isinstance(node_or_obj.nodeid, str)
+             nodeid = node_or_obj.nodeid
+         if holderobj in self._holderobjseen:
+             return
+
+diff --git a/src/_pytest/helpconfig.py b/src/_pytest/helpconfig.py
+index 6b6718a..4308706 100644
+--- a/src/_pytest/helpconfig.py
++++ b/src/_pytest/helpconfig.py
+@@ -105,7 +105,7 @@ def pytest_cmdline_parse():
+     if config.option.debug:
+         # --debug | --debug <file.log> was provided.
+         path = config.option.debug
+-        debugfile = open(path, "w")
++        debugfile = open(path, "w", encoding="utf-8")
+         debugfile.write(
+             "versions pytest-%s, "
+             "python-%s\ncwd=%s\nargs=%s\n\n"
+
+diff --git a/src/_pytest/hookspec.py b/src/_pytest/hookspec.py
+index 95b4265..1f7c368 100644
+--- a/src/_pytest/hookspec.py
++++ b/src/_pytest/hookspec.py
+@@ -41,6 +41,7 @@ if TYPE_CHECKING:
+     from _pytest.reports import TestReport
+     from _pytest.runner import CallInfo
+     from _pytest.terminal import TerminalReporter
++    from _pytest.terminal import TestShortLogReport
+     from _pytest.compat import LEGACY_PATH
+ 
+ 
+@@ -806,7 +807,7 @@ def pytest_report_collectionfinish(  # type:ignore[empty-body]
+ @hookspec(firstresult=True)
+ def pytest_report_teststatus(  # type:ignore[empty-body]
+     report: Union["CollectReport", "TestReport"], config: "Config"
+-) -> Tuple[str, str, Union[str, Mapping[str, bool]]]:
++) -> "TestShortLogReport | Tuple[str, str, Union[str, Tuple[str, Mapping[str, bool]]]]":
+     """Return result-category, shortletter and verbose word for status
+     reporting.
+ 
+
+diff --git a/src/_pytest/logging.py b/src/_pytest/logging.py
+index 2480a5e..8381346 100644
+--- a/src/_pytest/logging.py
++++ b/src/_pytest/logging.py
+@@ -5,7 +5,11 @@ import os
+ import re
+ from contextlib import contextmanager
+ from contextlib import nullcontext
++from datetime import datetime
++from datetime import timedelta
++from datetime import timezone
+ from io import StringIO
++from logging import LogRecord
+ from pathlib import Path
+ from typing import AbstractSet
+ from typing import Dict
+@@ -53,7 +57,25 @@ def _remove_ansi_escape_sequences(text: str) -> str:
+     return _ANSI_ESCAPE_SEQ.sub("", text)
+ 
+ 
+-class ColoredLevelFormatter(logging.Formatter):
++class DatetimeFormatter(logging.Formatter):
++    """A logging formatter which formats record with
++    :func:`datetime.datetime.strftime` formatter instead of
++    :func:`time.strftime` in case of microseconds in format string.
++    """
++
++    def formatTime(self, record: LogRecord, datefmt=None) -> str:
++        if datefmt and "%f" in datefmt:
++            ct = self.converter(record.created)
++            tz = timezone(timedelta(seconds=ct.tm_gmtoff), ct.tm_zone)
++            # Construct `datetime.datetime` object from `struct_time`
++            # and msecs information from `record`
++            dt = datetime(*ct[0:6], microsecond=round(record.msecs * 1000), tzinfo=tz)
++            return dt.strftime(datefmt)
++        # Use `logging.Formatter` for non-microsecond formats
++        return super().formatTime(record, datefmt)
++
++
++class ColoredLevelFormatter(DatetimeFormatter):
+     """A logging formatter which colorizes the %(levelname)..s part of the
+     log format passed to __init__."""
+ 
+@@ -376,11 +398,12 @@ class LogCaptureFixture:
+         self._initial_handler_level: Optional[int] = None
+         # Dict of log name -> log level.
+         self._initial_logger_levels: Dict[Optional[str], int] = {}
++        self._initial_disabled_logging_level: Optional[int] = None
+ 
+     def _finalize(self) -> None:
+         """Finalize the fixture.
+ 
+-        This restores the log levels changed by :meth:`set_level`.
++        This restores the log levels and the disabled logging levels changed by :meth:`set_level`.
+         """
+         # Restore log levels.
+         if self._initial_handler_level is not None:
+@@ -388,6 +411,10 @@ class LogCaptureFixture:
+         for logger_name, level in self._initial_logger_levels.items():
+             logger = logging.getLogger(logger_name)
+             logger.setLevel(level)
++        # Disable logging at the original disabled logging level.
++        if self._initial_disabled_logging_level is not None:
++            logging.disable(self._initial_disabled_logging_level)
++            self._initial_disabled_logging_level = None
+ 
+     @property
+     def handler(self) -> LogCaptureHandler:
+@@ -453,13 +480,51 @@ class LogCaptureFixture:
+         """Reset the list of log records and the captured log text."""
+         self.handler.clear()
+ 
++    def _force_enable_logging(
++        self, level: Union[int, str], logger_obj: logging.Logger
++    ) -> int:
++        """Enable the desired logging level if the global level was disabled via ``logging.disabled``.
++
++        Only enables logging levels greater than or equal to the requested ``level``.
++
++        Does nothing if the desired ``level`` wasn't disabled.
++
++        :param level:
++            The logger level caplog should capture.
++            All logging is enabled if a non-standard logging level string is supplied.
++            Valid level strings are in :data:`logging._nameToLevel`.
++        :param logger_obj: The logger object to check.
++
++        :return: The original disabled logging level.
++        """
++        original_disable_level: int = logger_obj.manager.disable  # type: ignore[attr-defined]
++
++        if isinstance(level, str):
++            # Try to translate the level string to an int for `logging.disable()`
++            level = logging.getLevelName(level)
++
++        if not isinstance(level, int):
++            # The level provided was not valid, so just un-disable all logging.
++            logging.disable(logging.NOTSET)
++        elif not logger_obj.isEnabledFor(level):
++            # Each level is `10` away from other levels.
++            # https://docs.python.org/3/library/logging.html#logging-levels
++            disable_level = max(level - 10, logging.NOTSET)
++            logging.disable(disable_level)
++
++        return original_disable_level
++
+     def set_level(self, level: Union[int, str], logger: Optional[str] = None) -> None:
+-        """Set the level of a logger for the duration of a test.
++        """Set the threshold level of a logger for the duration of a test.
++
++        Logging messages which are less severe than this level will not be captured.
+ 
+         .. versionchanged:: 3.4
+             The levels of the loggers changed by this function will be
+             restored to their initial values at the end of the test.
+ 
++        Will enable the requested logging level if it was disabled via :meth:`logging.disable`.
++
+         :param level: The level.
+         :param logger: The logger to update. If not given, the root logger.
+         """
+@@ -470,6 +535,9 @@ class LogCaptureFixture:
+         if self._initial_handler_level is None:
+             self._initial_handler_level = self.handler.level
+         self.handler.setLevel(level)
++        initial_disabled_logging_level = self._force_enable_logging(level, logger_obj)
++        if self._initial_disabled_logging_level is None:
++            self._initial_disabled_logging_level = initial_disabled_logging_level
+ 
+     @contextmanager
+     def at_level(
+@@ -479,6 +547,8 @@ class LogCaptureFixture:
+         the end of the 'with' statement the level is restored to its original
+         value.
+ 
++        Will enable the requested logging level if it was disabled via :meth:`logging.disable`.
++
+         :param level: The level.
+         :param logger: The logger to update. If not given, the root logger.
+         """
+@@ -487,11 +557,13 @@ class LogCaptureFixture:
+         logger_obj.setLevel(level)
+         handler_orig_level = self.handler.level
+         self.handler.setLevel(level)
++        original_disable_level = self._force_enable_logging(level, logger_obj)
+         try:
+             yield
+         finally:
+             logger_obj.setLevel(orig_level)
+             self.handler.setLevel(handler_orig_level)
++            logging.disable(original_disable_level)
+ 
+ 
+ @fixture
+@@ -577,7 +649,7 @@ class LoggingPlugin:
+             config, "log_file_date_format", "log_date_format"
+         )
+ 
+-        log_file_formatter = logging.Formatter(
++        log_file_formatter = DatetimeFormatter(
+             log_file_format, datefmt=log_file_date_format
+         )
+         self.log_file_handler.setFormatter(log_file_formatter)
+@@ -621,7 +693,7 @@ class LoggingPlugin:
+                 create_terminal_writer(self._config), log_format, log_date_format
+             )
+         else:
+-            formatter = logging.Formatter(log_format, log_date_format)
++            formatter = DatetimeFormatter(log_format, log_date_format)
+ 
+         formatter._style = PercentStyleMultiline(
+             formatter._style._fmt, auto_indent=auto_indent
+
+diff --git a/src/_pytest/main.py b/src/_pytest/main.py
+index 5f8ac46..155d430 100644
+--- a/src/_pytest/main.py
++++ b/src/_pytest/main.py
+@@ -122,11 +122,12 @@ def pytest_addoption(parser: Parser) -> None:
+     )
+     group._addoption(
+         "-c",
+-        metavar="file",
++        "--config-file",
++        metavar="FILE",
+         type=str,
+         dest="inifilename",
+-        help="Load configuration from `file` instead of trying to locate one of the "
+-        "implicit configuration files",
++        help="Load configuration from `FILE` instead of trying to locate one of the "
++        "implicit configuration files.",
+     )
+     group._addoption(
+         "--continue-on-collection-errors",
+@@ -399,6 +400,12 @@ def pytest_ignore_collect(collection_path: Path, config: Config) -> Optional[boo
+     allow_in_venv = config.getoption("collect_in_virtualenv")
+     if not allow_in_venv and _in_venv(collection_path):
+         return True
++
++    if collection_path.is_dir():
++        norecursepatterns = config.getini("norecursedirs")
++        if any(fnmatch_ex(pat, collection_path) for pat in norecursepatterns):
++            return True
++
+     return None
+ 
+ 
+@@ -562,9 +569,6 @@ class Session(nodes.FSCollector):
+         ihook = self.gethookproxy(fspath.parent)
+         if ihook.pytest_ignore_collect(collection_path=fspath, config=self.config):
+             return False
+-        norecursepatterns = self.config.getini("norecursedirs")
+-        if any(fnmatch_ex(pat, fspath) for pat in norecursepatterns):
+-            return False
+         return True
+ 
+     def _collectfile(
+@@ -685,8 +689,8 @@ class Session(nodes.FSCollector):
+         # are not collected more than once.
+         matchnodes_cache: Dict[Tuple[Type[nodes.Collector], str], CollectReport] = {}
+ 
+-        # Dirnames of pkgs with dunder-init files.
+-        pkg_roots: Dict[str, Package] = {}
++        # Directories of pkgs with dunder-init files.
++        pkg_roots: Dict[Path, Package] = {}
+ 
+         for argpath, names in self._initial_parts:
+             self.trace("processing argument", (argpath, names))
+@@ -707,7 +711,7 @@ class Session(nodes.FSCollector):
+                             col = self._collectfile(pkginit, handle_dupes=False)
+                             if col:
+                                 if isinstance(col[0], Package):
+-                                    pkg_roots[str(parent)] = col[0]
++                                    pkg_roots[parent] = col[0]
+                                 node_cache1[col[0].path] = [col[0]]
+ 
+             # If it's a directory argument, recurse and look for any Subpackages.
+@@ -716,7 +720,7 @@ class Session(nodes.FSCollector):
+                 assert not names, f"invalid arg {(argpath, names)!r}"
+ 
+                 seen_dirs: Set[Path] = set()
+-                for direntry in visit(str(argpath), self._recurse):
++                for direntry in visit(argpath, self._recurse):
+                     if not direntry.is_file():
+                         continue
+ 
+@@ -731,8 +735,8 @@ class Session(nodes.FSCollector):
+                             for x in self._collectfile(pkginit):
+                                 yield x
+                                 if isinstance(x, Package):
+-                                    pkg_roots[str(dirpath)] = x
+-                    if str(dirpath) in pkg_roots:
++                                    pkg_roots[dirpath] = x
++                    if dirpath in pkg_roots:
+                         # Do not collect packages here.
+                         continue
+ 
+@@ -749,7 +753,7 @@ class Session(nodes.FSCollector):
+                 if argpath in node_cache1:
+                     col = node_cache1[argpath]
+                 else:
+-                    collect_root = pkg_roots.get(str(argpath.parent), self)
++                    collect_root = pkg_roots.get(argpath.parent, self)
+                     col = collect_root._collectfile(argpath, handle_dupes=False)
+                     if col:
+                         node_cache1[argpath] = col
+
+diff --git a/src/_pytest/nodes.py b/src/_pytest/nodes.py
+index c74740d..dbd6b0a 100644
+--- a/src/_pytest/nodes.py
++++ b/src/_pytest/nodes.py
+@@ -22,6 +22,7 @@ import _pytest._code
+ from _pytest._code import getfslineno
+ from _pytest._code.code import ExceptionInfo
+ from _pytest._code.code import TerminalRepr
++from _pytest._code.code import Traceback
+ from _pytest.compat import cached_property
+ from _pytest.compat import LEGACY_PATH
+ from _pytest.config import Config
+@@ -432,8 +433,8 @@ class Node(metaclass=NodeMeta):
+         assert current is None or isinstance(current, cls)
+         return current
+ 
+-    def _prunetraceback(self, excinfo: ExceptionInfo[BaseException]) -> None:
+-        pass
++    def _traceback_filter(self, excinfo: ExceptionInfo[BaseException]) -> Traceback:
++        return excinfo.traceback
+ 
+     def _repr_failure_py(
+         self,
+@@ -449,13 +450,13 @@ class Node(metaclass=NodeMeta):
+                 style = "value"
+         if isinstance(excinfo.value, FixtureLookupError):
+             return excinfo.value.formatrepr()
++
++        tbfilter: Union[bool, Callable[[ExceptionInfo[BaseException]], Traceback]]
+         if self.config.getoption("fulltrace", False):
+             style = "long"
++            tbfilter = False
+         else:
+-            tb = _pytest._code.Traceback([excinfo.traceback[-1]])
+-            self._prunetraceback(excinfo)
+-            if len(excinfo.traceback) == 0:
+-                excinfo.traceback = tb
++            tbfilter = self._traceback_filter
+             if style == "auto":
+                 style = "long"
+         # XXX should excinfo.getrepr record all data and toterminal() process it?
+@@ -486,7 +487,7 @@ class Node(metaclass=NodeMeta):
+             abspath=abspath,
+             showlocals=self.config.getoption("showlocals", False),
+             style=style,
+-            tbfilter=False,  # pruned already, or in --fulltrace mode.
++            tbfilter=tbfilter,
+             truncate_locals=truncate_locals,
+         )
+ 
+@@ -557,13 +558,14 @@ class Collector(Node):
+ 
+         return self._repr_failure_py(excinfo, style=tbstyle)
+ 
+-    def _prunetraceback(self, excinfo: ExceptionInfo[BaseException]) -> None:
++    def _traceback_filter(self, excinfo: ExceptionInfo[BaseException]) -> Traceback:
+         if hasattr(self, "path"):
+             traceback = excinfo.traceback
+             ntraceback = traceback.cut(path=self.path)
+             if ntraceback == traceback:
+                 ntraceback = ntraceback.cut(excludepath=tracebackcutdir)
+-            excinfo.traceback = ntraceback.filter()
++            return excinfo.traceback.filter(excinfo)
++        return excinfo.traceback
+ 
+ 
+ def _check_initialpaths_for_relpath(session: "Session", path: Path) -> Optional[str]:
+
+diff --git a/src/_pytest/pathlib.py b/src/_pytest/pathlib.py
+index 2c9d587..70383e4 100644
+--- a/src/_pytest/pathlib.py
++++ b/src/_pytest/pathlib.py
+@@ -27,6 +27,7 @@ from typing import Callable
+ from typing import Dict
+ from typing import Iterable
+ from typing import Iterator
++from typing import List
+ from typing import Optional
+ from typing import Set
+ from typing import Tuple
+@@ -669,30 +670,38 @@ def resolve_package_path(path: Path) -> Optional[Path]:
+     return result
+ 
+ 
++def scandir(path: Union[str, "os.PathLike[str]"]) -> List["os.DirEntry[str]"]:
++    """Scan a directory recursively, in breadth-first order.
++
++    The returned entries are sorted.
++    """
++    entries = []
++    with os.scandir(path) as s:
++        # Skip entries with symlink loops and other brokenness, so the caller
++        # doesn't have to deal with it.
++        for entry in s:
++            try:
++                entry.is_file()
++            except OSError as err:
++                if _ignore_error(err):
++                    continue
++                raise
++            entries.append(entry)
++    entries.sort(key=lambda entry: entry.name)
++    return entries
++
++
+ def visit(
+     path: Union[str, "os.PathLike[str]"], recurse: Callable[["os.DirEntry[str]"], bool]
+ ) -> Iterator["os.DirEntry[str]"]:
+     """Walk a directory recursively, in breadth-first order.
+ 
++    The `recurse` predicate determines whether a directory is recursed.
++
+     Entries at each directory level are sorted.
+     """
+-
+-    # Skip entries with symlink loops and other brokenness, so the caller doesn't
+-    # have to deal with it.
+-    entries = []
+-    for entry in os.scandir(path):
+-        try:
+-            entry.is_file()
+-        except OSError as err:
+-            if _ignore_error(err):
+-                continue
+-            raise
+-        entries.append(entry)
+-
+-    entries.sort(key=lambda entry: entry.name)
+-
++    entries = scandir(path)
+     yield from entries
+-
+     for entry in entries:
+         if entry.is_dir() and recurse(entry):
+             yield from visit(entry.path, recurse)
+
+diff --git a/src/_pytest/pytester.py b/src/_pytest/pytester.py
+index a929994..3df52eb 100644
+--- a/src/_pytest/pytester.py
++++ b/src/_pytest/pytester.py
+@@ -6,6 +6,7 @@ import collections.abc
+ import contextlib
+ import gc
+ import importlib
++import locale
+ import os
+ import platform
+ import re
+@@ -129,6 +130,7 @@ class LsofFdLeakChecker:
+             stderr=subprocess.DEVNULL,
+             check=True,
+             text=True,
++            encoding=locale.getpreferredencoding(False),
+         ).stdout
+ 
+         def isopen(line: str) -> bool:
+
+diff --git a/src/_pytest/python.py b/src/_pytest/python.py
+index d04b6fa..ad847c8 100644
+--- a/src/_pytest/python.py
++++ b/src/_pytest/python.py
+@@ -35,6 +35,7 @@ from _pytest._code import filter_traceback
+ from _pytest._code import getfslineno
+ from _pytest._code.code import ExceptionInfo
+ from _pytest._code.code import TerminalRepr
++from _pytest._code.code import Traceback
+ from _pytest._io import TerminalWriter
+ from _pytest._io.saferepr import saferepr
+ from _pytest.compat import ascii_escaped
+@@ -56,7 +57,6 @@ from _pytest.config import ExitCode
+ from _pytest.config import hookimpl
+ from _pytest.config.argparsing import Parser
+ from _pytest.deprecated import check_ispytest
+-from _pytest.deprecated import FSCOLLECTOR_GETHOOKPROXY_ISINITPATH
+ from _pytest.deprecated import INSTANCE_COLLECTOR
+ from _pytest.deprecated import NOSE_SUPPORT_METHOD
+ from _pytest.fixtures import FuncFixtureInfo
+@@ -667,7 +667,7 @@ class Package(Module):
+         config=None,
+         session=None,
+         nodeid=None,
+-        path=Optional[Path],
++        path: Optional[Path] = None,
+     ) -> None:
+         # NOTE: Could be just the following, but kept as-is for compat.
+         # nodes.FSCollector.__init__(self, fspath, parent=parent)
+@@ -699,14 +699,6 @@ class Package(Module):
+             func = partial(_call_with_optional_argument, teardown_module, self.obj)
+             self.addfinalizer(func)
+ 
+-    def gethookproxy(self, fspath: "os.PathLike[str]"):
+-        warnings.warn(FSCOLLECTOR_GETHOOKPROXY_ISINITPATH, stacklevel=2)
+-        return self.session.gethookproxy(fspath)
+-
+-    def isinitpath(self, path: Union[str, "os.PathLike[str]"]) -> bool:
+-        warnings.warn(FSCOLLECTOR_GETHOOKPROXY_ISINITPATH, stacklevel=2)
+-        return self.session.isinitpath(path)
+-
+     def _recurse(self, direntry: "os.DirEntry[str]") -> bool:
+         if direntry.name == "__pycache__":
+             return False
+@@ -714,9 +706,6 @@ class Package(Module):
+         ihook = self.session.gethookproxy(fspath.parent)
+         if ihook.pytest_ignore_collect(collection_path=fspath, config=self.config):
+             return False
+-        norecursepatterns = self.config.getini("norecursedirs")
+-        if any(fnmatch_ex(pat, fspath) for pat in norecursepatterns):
+-            return False
+         return True
+ 
+     def _collectfile(
+@@ -745,11 +734,11 @@ class Package(Module):
+ 
+     def collect(self) -> Iterable[Union[nodes.Item, nodes.Collector]]:
+         this_path = self.path.parent
+-        init_module = this_path / "__init__.py"
+-        if init_module.is_file() and path_matches_patterns(
+-            init_module, self.config.getini("python_files")
+-        ):
+-            yield Module.from_parent(self, path=init_module)
++
++        # Always collect the __init__ first.
++        if path_matches_patterns(self.path, self.config.getini("python_files")):
++            yield Module.from_parent(self, path=self.path)
++
+         pkg_prefixes: Set[Path] = set()
+         for direntry in visit(str(this_path), recurse=self._recurse):
+             path = Path(direntry.path)
+@@ -1801,7 +1790,7 @@ class Function(PyobjMixin, nodes.Item):
+     def setup(self) -> None:
+         self._request._fillfixtures()
+ 
+-    def _prunetraceback(self, excinfo: ExceptionInfo[BaseException]) -> None:
++    def _traceback_filter(self, excinfo: ExceptionInfo[BaseException]) -> Traceback:
+         if hasattr(self, "_obj") and not self.config.getoption("fulltrace", False):
+             code = _pytest._code.Code.from_function(get_real_func(self.obj))
+             path, firstlineno = code.path, code.firstlineno
+@@ -1813,14 +1802,21 @@ class Function(PyobjMixin, nodes.Item):
+                     ntraceback = ntraceback.filter(filter_traceback)
+                     if not ntraceback:
+                         ntraceback = traceback
++            ntraceback = ntraceback.filter(excinfo)
+ 
+-            excinfo.traceback = ntraceback.filter()
+             # issue364: mark all but first and last frames to
+             # only show a single-line message for each frame.
+             if self.config.getoption("tbstyle", "auto") == "auto":
+-                if len(excinfo.traceback) > 2:
+-                    for entry in excinfo.traceback[1:-1]:
+-                        entry.set_repr_style("short")
++                if len(ntraceback) > 2:
++                    ntraceback = Traceback(
++                        entry
++                        if i == 0 or i == len(ntraceback) - 1
++                        else entry.with_repr_style("short")
++                        for i, entry in enumerate(ntraceback)
++                    )
++
++            return ntraceback
++        return excinfo.traceback
+ 
+     # TODO: Type ignored -- breaks Liskov Substitution.
+     def repr_failure(  # type: ignore[override]
+
+diff --git a/src/_pytest/python_api.py b/src/_pytest/python_api.py
+index b03a251..4213bd0 100644
+--- a/src/_pytest/python_api.py
++++ b/src/_pytest/python_api.py
+@@ -950,11 +950,7 @@ def raises(  # noqa: F811
+         try:
+             func(*args[1:], **kwargs)
+         except expected_exception as e:
+-            # We just caught the exception - there is a traceback.
+-            assert e.__traceback__ is not None
+-            return _pytest._code.ExceptionInfo.from_exc_info(
+-                (type(e), e, e.__traceback__)
+-            )
++            return _pytest._code.ExceptionInfo.from_exception(e)
+     fail(message)
+ 
+ 
+
+diff --git a/src/_pytest/reports.py b/src/_pytest/reports.py
+index 2e36514..74e8794 100644
+--- a/src/_pytest/reports.py
++++ b/src/_pytest/reports.py
+@@ -347,6 +347,9 @@ class TestReport(BaseReport):
+             elif isinstance(excinfo.value, skip.Exception):
+                 outcome = "skipped"
+                 r = excinfo._getreprcrash()
++                assert (
++                    r is not None
++                ), "There should always be a traceback entry for skipping a test."
+                 if excinfo.value._use_item_location:
+                     path, line = item.reportinfo()[:2]
+                     assert line is not None
+
+diff --git a/src/_pytest/terminal.py b/src/_pytest/terminal.py
+index dfc0fa9..b0cdb58 100644
+--- a/src/_pytest/terminal.py
++++ b/src/_pytest/terminal.py
+@@ -8,6 +8,7 @@ import datetime
+ import inspect
+ import platform
+ import sys
++import textwrap
+ import warnings
+ from collections import Counter
+ from functools import partial
+@@ -20,6 +21,7 @@ from typing import Dict
+ from typing import Generator
+ from typing import List
+ from typing import Mapping
++from typing import NamedTuple
+ from typing import Optional
+ from typing import Sequence
+ from typing import Set
+@@ -111,6 +113,26 @@ class MoreQuietAction(argparse.Action):
+         namespace.quiet = getattr(namespace, "quiet", 0) + 1
+ 
+ 
++class TestShortLogReport(NamedTuple):
++    """Used to store the test status result category, shortletter and verbose word.
++    For example ``"rerun", "R", ("RERUN", {"yellow": True})``.
++
++    :ivar category:
++        The class of result, for example ``“passed”``, ``“skipped”``, ``“error”``, or the empty string.
++
++    :ivar letter:
++        The short letter shown as testing progresses, for example ``"."``, ``"s"``, ``"E"``, or the empty string.
++
++    :ivar word:
++        Verbose word is shown as testing progresses in verbose mode, for example ``"PASSED"``, ``"SKIPPED"``,
++        ``"ERROR"``, or the empty string.
++    """
++
++    category: str
++    letter: str
++    word: Union[str, Tuple[str, Mapping[str, bool]]]
++
++
+ def pytest_addoption(parser: Parser) -> None:
+     group = parser.getgroup("terminal reporting", "Reporting", after="general")
+     group._addoption(
+@@ -426,6 +448,28 @@ class TerminalReporter:
+             self._tw.line()
+             self.currentfspath = None
+ 
++    def wrap_write(
++        self,
++        content: str,
++        *,
++        flush: bool = False,
++        margin: int = 8,
++        line_sep: str = "\n",
++        **markup: bool,
++    ) -> None:
++        """Wrap message with margin for progress info."""
++        width_of_current_line = self._tw.width_of_current_line
++        wrapped = line_sep.join(
++            textwrap.wrap(
++                " " * width_of_current_line + content,
++                width=self._screen_width - margin,
++                drop_whitespace=True,
++                replace_whitespace=False,
++            ),
++        )
++        wrapped = wrapped[width_of_current_line:]
++        self._tw.write(wrapped, flush=flush, **markup)
++
+     def write(self, content: str, *, flush: bool = False, **markup: bool) -> None:
+         self._tw.write(content, flush=flush, **markup)
+ 
+@@ -525,10 +569,11 @@ class TerminalReporter:
+     def pytest_runtest_logreport(self, report: TestReport) -> None:
+         self._tests_ran = True
+         rep = report
+-        res: Tuple[
+-            str, str, Union[str, Tuple[str, Mapping[str, bool]]]
+-        ] = self.config.hook.pytest_report_teststatus(report=rep, config=self.config)
+-        category, letter, word = res
++
++        res = TestShortLogReport(
++            *self.config.hook.pytest_report_teststatus(report=rep, config=self.config)
++        )
++        category, letter, word = res.category, res.letter, res.word
+         if not isinstance(word, tuple):
+             markup = None
+         else:
+@@ -572,7 +617,7 @@ class TerminalReporter:
+                         formatted_reason = f" ({reason})"
+ 
+                     if reason and formatted_reason is not None:
+-                        self._tw.write(formatted_reason)
++                        self.wrap_write(formatted_reason)
+                 if self._show_progress_info:
+                     self._write_progress_information_filling_space()
+             else:
+
+diff --git a/src/_pytest/unittest.py b/src/_pytest/unittest.py
+index c660aa7..d42a12a 100644
+--- a/src/_pytest/unittest.py
++++ b/src/_pytest/unittest.py
+@@ -334,15 +334,16 @@ class TestCaseFunction(Function):
+             finally:
+                 delattr(self._testcase, self.name)
+ 
+-    def _prunetraceback(
++    def _traceback_filter(
+         self, excinfo: _pytest._code.ExceptionInfo[BaseException]
+-    ) -> None:
+-        super()._prunetraceback(excinfo)
+-        traceback = excinfo.traceback.filter(
+-            lambda x: not x.frame.f_globals.get("__unittest")
++    ) -> _pytest._code.Traceback:
++        traceback = super()._traceback_filter(excinfo)
++        ntraceback = traceback.filter(
++            lambda x: not x.frame.f_globals.get("__unittest"),
+         )
+-        if traceback:
+-            excinfo.traceback = traceback
++        if not ntraceback:
++            ntraceback = traceback
++        return ntraceback
+ 
+ 
+ @hookimpl(tryfirst=True)
+
+diff --git a/src/pytest/__init__.py b/src/pytest/__init__.py
+index f25ecde..9c1d5d2 100644
+--- a/src/pytest/__init__.py
++++ b/src/pytest/__init__.py
+@@ -62,6 +62,7 @@ from _pytest.reports import TestReport
+ from _pytest.runner import CallInfo
+ from _pytest.stash import Stash
+ from _pytest.stash import StashKey
++from _pytest.terminal import TestShortLogReport
+ from _pytest.tmpdir import TempPathFactory
+ from _pytest.warning_types import PytestAssertRewriteWarning
+ from _pytest.warning_types import PytestCacheWarning
+@@ -152,6 +153,7 @@ __all__ = [
+     "TempPathFactory",
+     "Testdir",
+     "TestReport",
++    "TestShortLogReport",
+     "UsageError",
+     "WarningsRecorder",
+     "warns",

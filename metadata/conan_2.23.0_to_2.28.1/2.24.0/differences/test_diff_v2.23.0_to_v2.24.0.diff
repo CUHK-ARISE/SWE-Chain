@@ -1,0 +1,1441 @@
+diff --git a/test/functional/command/test_config_install.py b/test/functional/command/test_config_install.py
+index 6c10bd4..85143b5 100644
+--- a/test/functional/command/test_config_install.py
++++ b/test/functional/command/test_config_install.py
+@@ -7,8 +7,12 @@ import textwrap
+ import pytest
+ from unittest.mock import patch
+ 
+-from conan.api.model import Remote
++import yaml
++
++from conan.api.model import Remote, RecipeReference
+ from conan.internal.api.config.config_installer import _hide_password
++
++from conan.internal.cache.home_paths import HomePaths
+ from conan.internal.rest.file_downloader import FileDownloader
+ from conan.internal.paths import DEFAULT_CONAN_HOME
+ from conan.test.assets.genconanfile import GenConanfile
+@@ -589,67 +593,119 @@ class TestConfigInstall2:
+ 
+ 
+ class TestConfigInstallPkg:
+-    conanfile = textwrap.dedent("""
+-        from conan import ConanFile
+-        from conan.tools.files import copy
+-        class Conf(ConanFile):
+-            name = "myconf"
+-            version = "0.1"
+-            package_type = "configuration"
+-            def package(self):
+-                copy(self, "*.conf", src=self.build_folder, dst=self.package_folder)
+-            """)
+ 
+-    @pytest.fixture()
+-    def client(self):
+-        c = TestClient(default_server_user=True)
+-        c.save({"conanfile.py": self.conanfile,
+-                "global.conf": "user.myteam:myconf=myvalue"})
+-        c.run("export-pkg .")
++    @pytest.fixture(scope="class")
++    def servers(self):
++        conanfile = textwrap.dedent("""
++            from conan import ConanFile
++            from conan.tools.files import copy
++            class Conf(ConanFile):
++                package_type = "configuration"
++                def package(self):
++                    copy(self, "*.conf", src=self.build_folder, dst=self.package_folder)
++            """)
++        c = TestClient(default_server_user=True, light=True)
++        c.save({"conanfile.py": conanfile})
++        for pkg in ("myconf_a", "myconf_b", "myconf_c"):
++            for version in ("0.1", "0.2"):
++                c.save({"global.conf": f"user.myteam:myconf=my_{pkg}/{version}_value"})
++                c.run(f"export-pkg . --name={pkg} --version={version}")
+         c.run("upload * -r=default -c")
+         c.run("remove * -c")
+-        return c
+-
+-    def test_config_install_from_pkg(self, client):
+-        # Now install it
+-        c = client
+-        c.run("config install-pkg myconf/[*]")
+-        assert "myconf/0.1: Downloaded package revision" in c.out
+-        assert "Copying file global.conf" in c.out
+-        c.run("config show *")
+-        assert "user.myteam:myconf: myvalue" in c.out
+-
+-        # Just to make sure it doesn't crash in the update
+-        c.run("config install-pkg myconf/[*]")
+-        # Conan will not re-download fromthe server the same revision
+-        assert "myconf/0.1: Downloaded package revision" not in c.out
+-        # It doesn't re-install either
+-        assert "Copying file global.conf" not in c.out
+-        c.run("config show *")
+-        assert "user.myteam:myconf: myvalue" in c.out
+-
+-        # We can force the re-installation
+-        c.run("config install-pkg myconf/[*] --force")
+-        assert "Copying file global.conf" in c.out
+-        c.run("config show *")
+-        assert "user.myteam:myconf: myvalue" in c.out
++        return c.servers
+ 
+-    def test_update_flow(self, client):
+-        # Now try the update flow
+-        c = client
+-        c2 = TestClient(servers=c.servers, inputs=["admin", "password"])
+-        c2.save({"conanfile.py": self.conanfile,
+-                 "global.conf": "user.myteam:myconf=othervalue"})
+-        c2.run("export-pkg .")
+-        c2.run("upload * -r=default -c")
+-
+-        c.run("config install-pkg myconf/[*]")
+-        assert "myconf/0.1: Downloaded package revision" in c.out
++    @staticmethod
++    def _check_conf(c, pkg):
+         c.run("config show *")
+-        assert "user.myteam:myconf: othervalue" in c.out
++        assert f"user.myteam:myconf: my_{pkg}_value" in c.out
+ 
+-    def test_cant_use_as_dependency(self):
+-        c = TestClient()
++    @staticmethod
++    def _check_conf_file(c, refs):
++        content = json.loads(c.load_home("config_version.json"))["config_version"]
++        for a, b in zip(refs, content):
++            assert a in b
++
++    def test_install_pkg(self, servers):
++        c = TestClient(servers=servers, light=True)
++        c.run("config install-pkg myconf_a/0.1")
++        assert "Installing new or updating configuration packages" in c.out
++        self._check_conf(c, "myconf_a/0.1")
++        self._check_conf_file(c, ["myconf_a/0.1"])
++        cache_files = os.listdir(c.cache_folder)
++        assert "conaninfo.txt" not in cache_files
++        assert "conanmanifest.txt" not in cache_files
++
++        # skip reinstall
++        c.run("config install-pkg myconf_a/0.1")
++        assert ("The requested configurations are identical to the already installed ones, "
++                "skipping re-installation") in c.out
++        self._check_conf(c, "myconf_a/0.1")
++        self._check_conf_file(c, ["myconf_a/0.1"])
++
++        # forced reinstall
++        c.save_home({"global.conf": ""})
++        c.run("config install-pkg myconf_a/0.1 --force")
++        assert "forcing re-installation because --force" in c.out
++        self._check_conf(c, "myconf_a/0.1")
++        self._check_conf_file(c, ["myconf_a/0.1"])
++
++    def test_with_url(self, servers):
++        c = TestClient(servers=servers, light=True)
++        url = servers["default"].fake_url
++        c.run("remote remove default")
++        c.run(f"config install-pkg myconf_a/0.1 --url={url}")
++        assert "Installing new or updating configuration packages" in c.out
++        self._check_conf(c, "myconf_a/0.1")
++        self._check_conf_file(c, ["myconf_a/0.1"])
++
++    def test_update(self, servers):
++        c = TestClient(servers=servers, light=True)
++        c.run("config install-pkg myconf_a/0.1")
++        c.run("config install-pkg myconf_a/0.2")
++        assert "Installing new or updating configuration packages" in c.out
++        self._check_conf(c, "myconf_a/0.2")
++        self._check_conf_file(c, ["myconf_a/0.2"])
++
++    def test_addition(self, servers):
++        c = TestClient(servers=servers, light=True)
++        c.run("config install-pkg myconf_a/0.1")
++        c.run("config install-pkg myconf_b/0.1")
++        assert "Installing new or updating configuration packages" in c.out
++        self._check_conf(c, "myconf_b/0.1")
++        self._check_conf_file(c, ["myconf_a/0.1", "myconf_b/0.1"])
++
++    def test_update_first(self, servers):
++        c = TestClient(servers=servers, light=True)
++        c.run("config install-pkg myconf_a/0.1")
++        c.run("config install-pkg myconf_b/0.1")
++
++        # update of the first fail
++        c.run("config install-pkg myconf_a/[*]", assert_error=True)
++        assert "ERROR: Installing these configuration packages will break" in c.out
++        assert "use 'conan config install-pkg --force' to force" in c.out
++        assert "Use 'conan config clean' first to fully reset your configuration" in c.out
++        self._check_conf(c, "myconf_b/0.1")
++        self._check_conf_file(c, ["myconf_a/0.1", "myconf_b/0.1"])
++
++        # Now force the first
++        c.run("config install-pkg myconf_a/[*] --force")
++        assert "Forcing the installation because --force was defined" in c.out
++        self._check_conf(c, "myconf_a/0.2")
++        self._check_conf_file(c, ["myconf_b/0.1", "myconf_a/0.2"])
++
++    def test_update_second(self, servers):
++        c = TestClient(servers=servers, light=True)
++        c.run("config install-pkg myconf_a/0.1")
++        c.run("config install-pkg myconf_b/0.1")
++
++        # update of the second works without problem
++        c.run("config install-pkg myconf_b/[*]")
++        assert "Installing new or updating configuration packages" in c.out
++        self._check_conf(c, "myconf_b/0.2")
++        self._check_conf_file(c, ["myconf_a/0.1", "myconf_b/0.2"])
++
++    def test_error_cant_use_as_dependency(self):
++        c = TestClient(light=True)
+         conanfile = GenConanfile("myconf", "0.1").with_package_type("configuration")
+         c.save({"myconf/conanfile.py": conanfile,
+                 "pkg/conanfile.py": GenConanfile("pkg", "0.1").with_requires("myconf/0.1")})
+@@ -658,31 +714,13 @@ class TestConfigInstallPkg:
+         assert "ERROR: Configuration package myconf/0.1 cannot be used as requirement, " \
+                "but pkg/0.1 is requiring it" in c.out
+ 
+-    def test_cant_use_without_type(self):
+-        c = TestClient()
+-        conanfile = GenConanfile("myconf", "0.1")
+-        c.save({"myconf/conanfile.py": conanfile})
++    def test_error_cant_use_without_type(self):
++        c = TestClient(light=True)
++        c.save({"myconf/conanfile.py": GenConanfile("myconf", "0.1")})
+         c.run("create myconf")
+         c.run("config install-pkg myconf/[*]", assert_error=True)
+         assert 'ERROR: myconf/0.1 is not of package_type="configuration"' in c.out
+ 
+-    def test_lockfile(self, client):
+-        """ it should be able to install the config using a lockfile
+-        """
+-        c = client
+-        c.run("config install-pkg myconf/[*] --lockfile-out=config.lock")
+-
+-        c2 = TestClient(servers=c.servers, inputs=["admin", "password"])
+-        # Make sure we bump the version, otherwise only a package revision will be created
+-        c2.save({"conanfile.py": self.conanfile.replace("0.1", "0.2"),
+-                 "global.conf": "user.myteam:myconf=othervalue"})
+-        c2.run("export-pkg .")
+-        c2.run("upload * -r=default -c")
+-
+-        c.run("config install-pkg myconf/[*] --lockfile=config.lock")
+-        c.run("config show *")
+-        assert "user.myteam:myconf: myvalue" in c.out
+-
+     def test_create_also(self):
+         conanfile = textwrap.dedent("""
+            from conan import ConanFile
+@@ -696,36 +734,147 @@ class TestConfigInstallPkg:
+                    copy(self, "*.conf", src=self.build_folder, dst=self.package_folder)
+                """)
+ 
+-        c = TestClient(default_server_user=True)
++        c = TestClient(default_server_user=True, light=True)
+         c.save({"conanfile.py": conanfile,
+-                "global.conf": "user.myteam:myconf=myvalue"})
++                "global.conf": "user.myteam:myconf=my_myconf/0.1_value"})
+         c.run("create .")
+         c.run("upload * -r=default -c")
+         c.run("remove * -c")
+ 
+         c.run("config install-pkg myconf/[*]")
+-        c.run("config show *")
+-        assert "user.myteam:myconf: myvalue" in c.out
++        self._check_conf(c, "myconf/0.1")
++        self._check_conf_file(c, ["myconf/0.1"])
+ 
+-    def test_without_initial_remote(self):
+-        c = TestClient(default_server_user=True)
+-        c.save({"conanfile.py": self.conanfile,
+-                "global.conf": "user.myteam:myconf=myvalue"})
+-        c.run("export-pkg .")
+-        c.run("upload * -r=default -c")
+-        c.run("remove * -c")
+-        c.run("remote list --format=json")
+-        list_remotes = json.loads(c.stdout)
+-        remote_url = list_remotes[0]["url"]
+-
+-        # This uses the same server and URL, because the TestClient+TestServer
+-        # does not allow atm to test this, as it requires the remote to be defined
+-        c.run(f"config install-pkg myconf/[*] --url={remote_url}")
+-        assert "Connecting to remote 'config_install_url' with user 'admin'" in c.out
+-        assert "myconf/0.1: Downloaded package revision" in c.out
+-        assert "Copying file global.conf" in c.out
+-        c.run("config show *")
+-        assert "user.myteam:myconf: myvalue" in c.out
++    def test_lockfile(self, servers):
++        """ it should be able to install the config older version using a lockfile
++        """
++        c = TestClient(servers=servers, light=True)
++        c.run("config install-pkg myconf_a/0.1 --lockfile-out=config.lock")
++        c.run("config install-pkg myconf_a/[*] --lockfile=config.lock")
++        assert ("The requested configurations are identical to the already installed ones, "
++                "skipping re-installation") in c.out
++        self._check_conf(c, "myconf_a/0.1")
++        self._check_conf_file(c, ["myconf_a/0.1"])
++
++        # Without the lockfile, it is free to update
++        c.run("config install-pkg myconf_a/[*] --lockfile-out=config.lock")
++        assert "Installing new or updating configuration packages"
++        self._check_conf(c, "myconf_a/0.2")
++        self._check_conf_file(c, ["myconf_a/0.2"])
++        result = json.loads(c.load("config.lock"))
++        assert "myconf_a/0.2" in result["config_requires"][0]
++
++    def test_install_from_file(self, servers):
++        c = TestClient(servers=servers, light=True)
++        # To make explicit the format of the conanconfig file
++        conanconfig = textwrap.dedent("""\
++            packages:
++                - myconf_a/0.1
++                - myconf_b/0.1
++            """)
++        c.save({"conanconfig.yml": conanconfig})
++        # Admits the default location .
++        c.run("config install-pkg")
++        self._check_conf(c, "myconf_b/0.1")
++        self._check_conf_file(c, ["myconf_a/0.1", "myconf_b/0.1"])
++
++        # install same file again:
++        c.run("config install-pkg .")
++        assert ("The requested configurations are identical to the already installed ones, "
++                "skipping re-installation") in c.out
++        self._check_conf(c, "myconf_b/0.1")
++        self._check_conf_file(c, ["myconf_a/0.1", "myconf_b/0.1"])
++
++        # Forced re-install
++        c.save_home({"global.conf": ""})
++        c.run("config install-pkg . --force")
++        assert "forcing re-installation because --force" in c.out
++        self._check_conf(c, "myconf_b/0.1")
++        self._check_conf_file(c, ["myconf_a/0.1", "myconf_b/0.1"])
++
++    def test_install_from_file_with_url(self, servers):
++        c = TestClient(servers=servers, light=True)
++        c.run("remote remove default")
++        server_url = servers["default"].fake_url
++        conanconfig = yaml.dump({"packages": ["myconf_a/0.1"], "urls": [server_url]})
++        c.save({"conanconfig.yml": conanconfig})
++        c.run("config install-pkg .")
++        self._check_conf(c, "myconf_a/0.1")
++        self._check_conf_file(c, ["myconf_a/0.1"])
++
++    def test_update_with_file(self, servers):
++        c = TestClient(servers=servers, light=True)
++        conanconfig = yaml.dump({"packages": ["myconf_a/0.1", "myconf_b/0.1"]})
++        c.save({"conanconfig.yml": conanconfig})
++        c.run("config install-pkg .")
++
++        # Now installing "updates" without disrupting the order
++        c.run("config install-pkg myconf_c/0.1")
++        assert "Installing new or updating configuration packages"
++        self._check_conf(c, "myconf_c/0.1")
++        self._check_conf_file(c, ["myconf_a/0.1", "myconf_b/0.1", "myconf_c/0.1"])
++
++        # Now installing "updates" without disrupting the order
++        conanconfig = textwrap.dedent("""\
++            packages:
++                - myconf_a/0.1
++                - myconf_b/0.1
++                - myconf_c/[*]
++            """)
++        c.save({"conanconfig.yml": conanconfig})
++        c.run("config install-pkg .")
++        assert "Installing new or updating configuration packages" in c.out
++        self._check_conf(c, "myconf_c/0.2")
++        self._check_conf_file(c, ["myconf_a/0.1", "myconf_b/0.1", "myconf_c/0.2"])
++
++        # This is also an update of the existing ones, keeping the order
++        conanconfig = textwrap.dedent("""\
++            packages:
++                - myconf_a/[*]
++                - myconf_b/0.1
++                - myconf_c/[*]
++            """)
++        c.save({"conanconfig.yml": conanconfig})
++        c.run("config install-pkg .")
++        assert "Installing new or updating configuration packages" in c.out
++        self._check_conf(c, "myconf_c/0.2")
++        self._check_conf_file(c, ["myconf_a/0.2", "myconf_b/0.1", "myconf_c/0.2"])
++
++    def test_failed_update_force(self, servers):
++        c = TestClient(servers=servers, light=True)
++        conanconfig = yaml.dump({"packages": ["myconf_a/0.1", "myconf_b/0.1"]})
++        c.save({"conanconfig.yml": conanconfig})
++        c.run("config install-pkg .")
++
++        # Now installing "updates" without disrupting the order
++        conanconfig = textwrap.dedent("""\
++            packages:
++                - myconf_a/0.2
++            """)
++        c.save({"conanconfig.yml": conanconfig})
++        c.run("config install-pkg .", assert_error=True)
++        assert "use 'conan config install-pkg --force' to force" in c.out
++        assert "Use 'conan config clean' first to fully reset" in c.out
++        self._check_conf(c, "myconf_b/0.1")
++        self._check_conf_file(c, ["myconf_a/0.1", "myconf_b/0.1"])
++
++        c.run("config install-pkg . --force")
++        assert "Forcing the installation because --force was defined" in c.out
++        self._check_conf(c, "myconf_a/0.2")
++        self._check_conf_file(c, ["myconf_b/0.1", "myconf_a/0.2"])
++
++    def test_install_from_file_with_lockfile(self, servers):
++        # it should stay in version 0.1
++        c = TestClient(servers=servers)
++        c.run("config install-pkg myconf_a/0.1 --lockfile-out=conan.lock")
++        conanconfig = yaml.dump({"packages": ["myconf_a/[>=0.1 <1.0]"]})
++        c.save({"conanconfig.yml": conanconfig})
++        c.run("config install-pkg .")
++        path = HomePaths(c.cache_folder).config_version_path
++        # First are the newest installed
++        configs = json.loads(load(path))["config_version"]
++        configs = [str(RecipeReference.loads(r)) for r in configs]
++        assert configs == ["myconf_a/0.1"]
+ 
+ 
+ class TestConfigInstallPkgSettings:
+@@ -768,7 +917,7 @@ class TestConfigInstallPkgSettings:
+         c.run("config show *")
+         assert "user.myteam:myconf: mywinvalue" in c.out
+ 
+-        c.run("config install-pkg myconf/[*] -s os=Linux")
++        c.run("config install-pkg myconf/[*] -s os=Linux --force")
+         assert "myconf/0.1: Downloaded package revision" in c.out
+         assert "Copying file global.conf" in c.out
+         c.run("config show *")
+@@ -792,7 +941,7 @@ class TestConfigInstallPkgSettings:
+         c.run("config show *")
+         assert "user.myteam:myconf: mywinvalue" in c.out
+ 
+-        c.run("config install-pkg myconf/[*] -pr=nix.profile")
++        c.run("config install-pkg myconf/[*] -pr=nix.profile --force")
+         assert "myconf/0.1: Downloaded package revision" in c.out
+         assert "Copying file global.conf" in c.out
+         c.run("config show *")
+@@ -809,7 +958,7 @@ class TestConfigInstallPkgSettings:
+         assert "user.myteam:myconf: mywinvalue" in c.out
+ 
+         c.save_home({"profiles/default": "[settings]\nos=Linux"})
+-        c.run("config install-pkg myconf/[*]")
++        c.run("config install-pkg myconf/[*] --force")
+         assert "myconf/0.1: Downloaded package revision" in c.out
+         assert "Copying file global.conf" in c.out
+         c.run("config show *")
+@@ -857,7 +1006,7 @@ class TestConfigInstallPkgOptions:
+         c.run("config show *")
+         assert "user.myteam:myconf: my1value" in c.out
+ 
+-        c.run("config install-pkg myconf/[*] -o &:project=project2")
++        c.run("config install-pkg myconf/[*] -o &:project=project2 --force")
+         assert "myconf/0.1: Downloaded package revision" in c.out
+         assert "Copying file global.conf" in c.out
+         c.run("config show *")
+@@ -882,7 +1031,7 @@ class TestConfigInstallPkgOptions:
+         c.run("config show *")
+         assert "user.myteam:myconf: my1value" in c.out
+ 
+-        c.run("config install-pkg myconf/[*] -pr=nix.profile")
++        c.run("config install-pkg myconf/[*] -pr=nix.profile --force")
+         assert "myconf/0.1: Downloaded package revision" in c.out
+         assert "Copying file global.conf" in c.out
+         c.run("config show *")
+@@ -899,7 +1048,7 @@ class TestConfigInstallPkgOptions:
+         assert "user.myteam:myconf: my1value" in c.out
+ 
+         c.save_home({"profiles/default": "[options]\n&:project=project2"})
+-        c.run("config install-pkg myconf/[*]")
++        c.run("config install-pkg myconf/[*] --force")
+         assert "myconf/0.1: Downloaded package revision" in c.out
+         assert "Copying file global.conf" in c.out
+         c.run("config show *")
+
+diff --git a/test/functional/toolchains/cmake/cmakedeps2/test_cmakeconfigdeps_new.py b/test/functional/toolchains/cmake/cmakedeps2/test_cmakeconfigdeps_new.py
+index 3ca484d..d0f57d4 100644
+--- a/test/functional/toolchains/cmake/cmakedeps2/test_cmakeconfigdeps_new.py
++++ b/test/functional/toolchains/cmake/cmakedeps2/test_cmakeconfigdeps_new.py
+@@ -851,8 +851,11 @@ class TestHeaders:
+                         self.cpp_info.system_libs = ["m", "dl"]
+                         # Just to verify CMake don't break
+                     if self.settings.compiler == "gcc":
+-                        self.cpp_info.sharedlinkflags = ["-z lazy", "-s"]
+-                        self.cpp_info.exelinkflags = ["-z lazy", "-s"]
++                        # This triggers errors when not quoted and list ";" separated
++                        self.cpp_info.sharedlinkflags = ["SHELL:-z lazy", "SHELL:-u symbol1",
++                                                         "SHELL:-u symbol2", "-s"]
++                        self.cpp_info.exelinkflags = ["SHELL:-z lazy", "SHELL:-u symbol1",
++                                                      "SHELL:-u symbol2", "-s"]
+              """)
+         engine_h = textwrap.dedent("""
+             #pragma once
+
+diff --git a/test/functional/workspace/test_workspace.py b/test/functional/workspace/test_workspace.py
+index f220707..3dd3d1b 100644
+--- a/test/functional/workspace/test_workspace.py
++++ b/test/functional/workspace/test_workspace.py
+@@ -69,3 +69,29 @@ def test_new_template_and_different_folder():
+     assert "Adding project: liba" in c.out
+     assert "Adding project: libb" in c.out
+     assert "Adding project: app1" in c.out
++
++
++# The workspace CMake needs at least 3.25 for find_package to work
++@pytest.mark.tool("cmake", "3.27")
++def test_super_build_different_layouts():
++    """
++    https://github.com/conan-io/conan/issues/18875
++    """
++    c = TestClient()
++    c.run("new workspace")
++    liba_src = os.path.join(c.current_folder, "liba", "mysrc")
++    os.makedirs(liba_src)
++    shutil.move(os.path.join(c.current_folder, "liba", "CMakeLists.txt"), liba_src)
++    shutil.move(os.path.join(c.current_folder, "liba", "include"), liba_src,)
++    shutil.move(os.path.join(c.current_folder, "liba", "src"), liba_src)
++    replace_in_file(ConanFileMock(), os.path.join(c.current_folder, "liba", "conanfile.py"),
++                    "cmake_layout(self)",
++                    "cmake_layout(self, src_folder='mysrc')")
++
++    c.run("workspace super-install")
++
++    config_preset = "conan-default" if platform.system() == "Windows" else "conan-release"
++    c.run_command(f"cmake --preset {config_preset}")  # it does not fail
++    assert "Adding project: liba" in c.out
++    assert "Adding project: libb" in c.out
++    assert "Adding project: app1" in c.out
+
+diff --git a/test/integration/cache/storage_path_test.py b/test/integration/cache/storage_path_test.py
+index 851078b..2cac6d7 100644
+--- a/test/integration/cache/storage_path_test.py
++++ b/test/integration/cache/storage_path_test.py
+@@ -1,4 +1,6 @@
+ import os
++import textwrap
++from hashlib import sha256
+ 
+ from conan.test.utils.test_files import temp_folder
+ from conan.test.utils.tools import TestClient, GenConanfile
+@@ -22,3 +24,18 @@ def test_wrong_home_error():
+     client.save_home({"global.conf": "core.cache:storage_path=//"})
+     client.run("list *")
+     assert "Couldn't initialize storage in" in client.out
++
++
++def test_short_storage_path():
++    c = TestClient()
++    global_conf = textwrap.dedent("""\
++        {% set h = hashlib.new("sha256", conan_home_folder.encode(),
++                               usedforsecurity=False).hexdigest() %}
++        core.cache:storage_path=C:/conan_{{h[:6]}}
++        """)
++    c.save_home({"global.conf": global_conf})
++    c.run("config show *")
++    myhash = sha256()
++    myhash.update(c.cache_folder.replace("\\", "/").encode())
++    myhash = myhash.hexdigest()[:6]
++    assert f"core.cache:storage_path: C:/conan_{myhash}" in c.out
+
+diff --git a/test/integration/command/cache/test_cache_integrity.py b/test/integration/command/cache/test_cache_integrity.py
+index b40a2f9..a40cf81 100644
+--- a/test/integration/command/cache/test_cache_integrity.py
++++ b/test/integration/command/cache/test_cache_integrity.py
+@@ -8,7 +8,8 @@ from conan.internal.util.files import save
+ 
+ 
+ @pytest.mark.parametrize("use_pkglist", [True, False])
+-def test_cache_integrity(use_pkglist):
++@pytest.mark.parametrize("output_pkglist", [True, False])
++def test_cache_integrity(use_pkglist, output_pkglist):
+     t = TestClient()
+     t.save({"conanfile.py": GenConanfile()})
+     t.run("create . --name pkg1 --version 1.0")
+@@ -29,7 +30,14 @@ def test_cache_integrity(use_pkglist):
+         t.run("list *:*#* -f=json", redirect_stdout="pkglist.json")
+     arg = "--list=pkglist.json" if use_pkglist else "*"
+ 
+-    t.run(f"cache check-integrity {arg}", assert_error=True)
++    if output_pkglist:
++        arg += " --format=json"
++
++    t.run(
++        f"cache check-integrity {arg}",
++        assert_error=True,
++        redirect_stdout="pkglist.json" if output_pkglist else None,
++    )
+     assert "pkg1/1.0#4d670581ccb765839f2239cc8dff8fbd: Integrity check: ok" in t.out
+     assert "pkg1/1.0#4d670581ccb765839f2239cc8dff8fbd:da39a3ee5e6b4b0d3255bfef95601890afd80709" \
+            "#0ba8627bd47edc3a501e8f0eb9a79e5e: Integrity check: ok" in t.out
+@@ -40,9 +48,12 @@ def test_cache_integrity(use_pkglist):
+     assert "pkg4/4.0#4d670581ccb765839f2239cc8dff8fbd:da39a3ee5e6b4b0d3255bfef95601890afd80709" \
+            "#0ba8627bd47edc3a501e8f0eb9a79e5e: ERROR: \nManifest mismatch" in t.out
+ 
+-    t.run("remove pkg2/2.0:da39a3ee5e6b4b0d3255bfef95601890afd80709 -c")
+-    t.run("remove pkg3/3.0:da39a3ee5e6b4b0d3255bfef95601890afd80709 -c")
+-    t.run("remove pkg4/4.0:da39a3ee5e6b4b0d3255bfef95601890afd80709 -c")
++    if output_pkglist:
++        t.run("remove --list=pkglist.json -c")
++    else:
++        t.run("remove pkg2/2.0:da39a3ee5e6b4b0d3255bfef95601890afd80709 -c")
++        t.run("remove pkg3/3.0:da39a3ee5e6b4b0d3255bfef95601890afd80709 -c")
++        t.run("remove pkg4/4.0:da39a3ee5e6b4b0d3255bfef95601890afd80709 -c")
+     t.run("cache check-integrity *")
+     assert "pkg1/1.0#4d670581ccb765839f2239cc8dff8fbd: Integrity check: ok" in t.out
+     assert "pkg2/2.0#4d670581ccb765839f2239cc8dff8fbd: Integrity check: ok" in t.out
+@@ -50,7 +61,8 @@ def test_cache_integrity(use_pkglist):
+     assert "pkg4/4.0#4d670581ccb765839f2239cc8dff8fbd: Integrity check: ok" in t.out
+ 
+ 
+-def test_cache_integrity_missing_recipe_manifest():
++@pytest.mark.parametrize("output_pkglist", [True, False])
++def test_cache_integrity_missing_recipe_manifest(output_pkglist):
+     t = TestClient()
+     t.save({"conanfile.py": GenConanfile()})
+     t.run("create . --name pkg1 --version 1.0")
+@@ -60,13 +72,16 @@ def test_cache_integrity_missing_recipe_manifest():
+     os.remove(manifest)
+     t.run("create . --name pkg3 --version=3.0")
+ 
+-    t.run("cache check-integrity *", assert_error=True)
++    if output_pkglist:
++        t.run("cache check-integrity * -f json", assert_error=True, redirect_stdout="pkglist.json")
++    else:
++        t.run("cache check-integrity *", assert_error=True)
+     assert "pkg1/1.0#4d670581ccb765839f2239cc8dff8fbd: Integrity check: ok" in t.out
+     assert "pkg2/2.0#4d670581ccb765839f2239cc8dff8fbd: ERROR: Manifest missing" in t.out
+     assert "pkg3/3.0#4d670581ccb765839f2239cc8dff8fbd: Integrity check: ok" in t.out
+     assert "ERROR: There are corrupted artifacts, check the error logs" in t.out
+ 
+-    t.run("remove pkg2* -c")
++    t.run(f"remove {'--list pkglist.json' if output_pkglist else 'pkg2*'}  -c")
+     t.run("cache check-integrity *")
+     assert "pkg1/1.0#4d670581ccb765839f2239cc8dff8fbd:da39a3ee5e6b4b0d3255bfef95601890afd80709" \
+            "#0ba8627bd47edc3a501e8f0eb9a79e5e: Integrity check: ok" in t.out
+@@ -74,7 +89,8 @@ def test_cache_integrity_missing_recipe_manifest():
+     assert "Integrity check: ok" in t.out
+ 
+ 
+-def test_cache_integrity_missing_package_manifest():
++@pytest.mark.parametrize("output_pkglist", [True, False])
++def test_cache_integrity_missing_package_manifest(output_pkglist):
+     t = TestClient()
+     t.save({"conanfile.py": GenConanfile()})
+     t.run("create . --name pkg1 --version 1.0")
+@@ -84,14 +100,17 @@ def test_cache_integrity_missing_package_manifest():
+     os.remove(manifest)
+     t.run("create . --name pkg3 --version=3.0")
+ 
+-    t.run("cache check-integrity *", assert_error=True)
++    if output_pkglist:
++        t.run("cache check-integrity * -f json", assert_error=True, redirect_stdout="pkglist.json")
++    else:
++        t.run("cache check-integrity *", assert_error=True)
+     assert "pkg1/1.0#4d670581ccb765839f2239cc8dff8fbd: Integrity check: ok" in t.out
+     assert "pkg2/2.0#4d670581ccb765839f2239cc8dff8fbd:da39a3ee5e6b4b0d3255bfef95601890afd80709" \
+            "#0ba8627bd47edc3a501e8f0eb9a79e5e: ERROR: Manifest missing" in t.out
+     assert "pkg3/3.0#4d670581ccb765839f2239cc8dff8fbd: Integrity check: ok" in t.out
+     assert "ERROR: There are corrupted artifacts, check the error logs" in t.out
+ 
+-    t.run("remove pkg2* -c")
++    t.run(f"remove {'--list pkglist.json' if output_pkglist else 'pkg2*'}  -c")
+     t.run("cache check-integrity *")
+     assert "pkg1/1.0#4d670581ccb765839f2239cc8dff8fbd:da39a3ee5e6b4b0d3255bfef95601890afd80709" \
+            "#0ba8627bd47edc3a501e8f0eb9a79e5e: Integrity check: ok" in t.out
+@@ -99,7 +118,8 @@ def test_cache_integrity_missing_package_manifest():
+     assert "Integrity check: ok" in t.out
+ 
+ 
+-def test_cache_integrity_missing_package_conaninfo():
++@pytest.mark.parametrize("output_pkglist", [True, False])
++def test_cache_integrity_missing_package_conaninfo(output_pkglist):
+     t = TestClient()
+     t.save({"conanfile.py": GenConanfile()})
+     t.run("create . --name pkg1 --version 1.0")
+@@ -108,12 +128,15 @@ def test_cache_integrity_missing_package_conaninfo():
+     conaninfo = os.path.join(layout.package(), "conaninfo.txt")
+     os.remove(conaninfo)
+ 
+-    t.run("cache check-integrity *", assert_error=True)
++    if output_pkglist:
++        t.run("cache check-integrity * -f json", assert_error=True, redirect_stdout="pkglist.json")
++    else:
++        t.run("cache check-integrity *", assert_error=True)
+     assert "pkg1/1.0#4d670581ccb765839f2239cc8dff8fbd: Integrity check: ok" in t.out
+     assert "pkg2/2.0#4d670581ccb765839f2239cc8dff8fbd:da39a3ee5e6b4b0d3255bfef95601890afd80709" \
+            "#0ba8627bd47edc3a501e8f0eb9a79e5e: ERROR: \nManifest mismatch" in t.out
+ 
+-    t.run("remove pkg2* -c")
++    t.run(f"remove {'--list pkglist.json' if output_pkglist else 'pkg2*'}  -c")
+     t.run("cache check-integrity *")
+     assert "pkg1/1.0#4d670581ccb765839f2239cc8dff8fbd:da39a3ee5e6b4b0d3255bfef95601890afd80709" \
+            "#0ba8627bd47edc3a501e8f0eb9a79e5e: Integrity check: ok" in t.out
+
+diff --git a/test/integration/command/info/test_graph_info_graphical.py b/test/integration/command/info/test_graph_info_graphical.py
+index 58d681d..27aa57b 100644
+--- a/test/integration/command/info/test_graph_info_graphical.py
++++ b/test/integration/command/info/test_graph_info_graphical.py
+@@ -159,3 +159,14 @@ def test_graph_conflict_diamond():
+     c.run("graph info game --format=html", assert_error=True, redirect_stdout="graph.html")
+     # check that it doesn't crash
+     assert "ERROR: Version conflict: Conflict between math/1.0.1 and math/1.0 in the graph." in c.out
++
++
++def test_graph_missing_error():
++    c = TestClient()
++    c.save({"engine/conanfile.py": GenConanfile("engine", "1.0").with_requires("math/1.0"),
++            "game/conanfile.py": GenConanfile("game", "1.0").with_requires("engine/1.0"),
++            })
++    c.run("export engine")
++    c.run("graph info game --format=html", assert_error=True, redirect_stdout="graph.html")
++    # check that it doesn't crash, tested manually
++    assert "ERROR: Package 'math/1.0' not resolved: No remote defined" in c.out
+
+diff --git a/test/integration/command/remote/remote_test.py b/test/integration/command/remote/remote_test.py
+index 610c9b4..2a0bd2f 100644
+--- a/test/integration/command/remote/remote_test.py
++++ b/test/integration/command/remote/remote_test.py
+@@ -402,6 +402,7 @@ def test_allowed_packages_remotes():
+     assert "app/1.0: Downloaded recipe revision 04ab3bc4b945a2ee44285962c277906d" in tc.out
+     assert "liba/1.0: Downloaded recipe revision 4d670581ccb765839f2239cc8dff8fbd" not in tc.out
+     assert "ERROR: Package 'liba/1.0' not resolved: Unable to find 'liba/1.0' in remotes" in tc.out
++    assert "Required by 'app/1.0'" in tc.out
+     tc.run("remove * -c")
+ 
+     tc.run('remote update default --allowed-packages="liba/*" --allowed-packages="app/*"')
+
+diff --git a/test/integration/environment/test_buildenv_profile.py b/test/integration/environment/test_buildenv_profile.py
+index 546c688..772fd0a 100644
+--- a/test/integration/environment/test_buildenv_profile.py
++++ b/test/integration/environment/test_buildenv_profile.py
+@@ -132,3 +132,20 @@ def test_buildenv_package_patterns():
+     assert "WARN: dep ENV:Foo" in client.out
+     assert "WARN: pkg ENV:Foo2" in client.out
+     assert "WARN: None ENV:Var" in client.out
++
++
++def test_buildenv_error_unset():
++    # https://github.com/conan-io/conan/issues/19285#issuecomment-3569891282
++    c = TestClient()
++    profile = textwrap.dedent("""
++        [buildenv]
++        CLASSPATH=!
++        OTHERPATH=
++        """)
++    c.save({"conanfile.txt": "",
++            "profile": profile})
++
++    c.run("install . -pr=profile -s:a os=Linux")
++    env = c.load("conanbuildenv.sh")
++    assert "unset CLASSPATH" in env
++    assert 'export OTHERPATH=""' in env
+
+diff --git a/test/integration/graph/test_replace_requires.py b/test/integration/graph/test_replace_requires.py
+index eafa4c7..0bd7889 100644
+--- a/test/integration/graph/test_replace_requires.py
++++ b/test/integration/graph/test_replace_requires.py
+@@ -732,3 +732,29 @@ class TestReplaceRequiresTransitiveGenerators:
+         else:
+             assert "<Import Condition=\"'$(conan_zlib-ng_myzlib_props_imported)' != 'True'\"" \
+                    " Project=\"conan_zlib-ng_myzlib.props\"/>" in props
++
++
++@pytest.mark.parametrize("require, pattern, alternative, expected", [
++     # Version range as pattern
++     # PINNED REQUIRE VERSION
++     ("dep/1.0", "dep/[>=1.0 <2]", "dep/1.3", "dep/1.3"),
++     ("dep/1.0", "dep/[>=1.5 <2]", "dep/1.3", False),
++     # RANGE REQUIRE VERSION
++     ("dep/[>=1.2 <2]", "dep/[>=1.0 <2]", "dep/1.3", "dep/1.3"),
++     ("dep/[>=1.0 <1.5]", "dep/[>=1.2 <2]", "dep/1.3", "dep/1.3"),
++     ("dep/[>=1.0 <1.5]", "dep/[>=1.5 <2]", "dep/1.3", False)
++    ]
++ )
++def test_replace_requires_ranges(require, pattern, alternative, expected):
++    c = TestClient(light=True)
++    c.save({"dep/conanfile.py": GenConanfile("dep"),
++            "app/conanfile.py": GenConanfile().with_requires(require),
++            "profile": f"[replace_requires]\n{pattern}: {alternative}"})
++    c.run("create dep --version=1.0")
++    c.run("create dep --version=1.3")
++    c.run("graph info app -pr=profile")
++    if expected:
++        assert "Replaced requires" in c.out
++        assert f"{require}: {expected}" in c.out
++    else:
++        assert "Replaced requires" not in c.out
+
+diff --git a/test/integration/lockfile/test_lock_pyrequires.py b/test/integration/lockfile/test_lock_pyrequires.py
+index 7ec6198..cf1ba0d 100644
+--- a/test/integration/lockfile/test_lock_pyrequires.py
++++ b/test/integration/lockfile/test_lock_pyrequires.py
+@@ -96,7 +96,8 @@ def test_lock_pyrequires_prereleases():
+     dep_rrev = tc.exported_recipe_revision()
+     tc.run("lock create app --lockfile-out=app.lock", assert_error=True)
+     # Makes sense, prereleases are not active
+-    assert "Version range '>=0' from requirement 'dep/[>=0]' required by 'python_requires' could not be resolved"
++    assert ("Version range '>=0' from requirement 'dep/[>=0]' required by "
++            "'python_requires' could not be resolved") in tc.out
+ 
+     tc.save_home({"global.conf": "core.version_ranges:resolve_prereleases=True"})
+     # This used to crash even with the conf activated
+@@ -136,9 +137,84 @@ def test_lock_pyrequires_export_transitive():
+ def test_lock_export_transitive_pyrequire():
+     c = TestClient(light=True)
+     c.save({"dep/conanfile.py": GenConanfile("dep", "0.1").with_package_type("python-require"),
+-            "pkg/conanfile.py": GenConanfile("pkg", "0.1") .with_python_requires("dep/0.1")})
++            "pkg/conanfile.py": GenConanfile("pkg", "0.1").with_python_requires("dep/0.1")})
+     c.run("export dep")
+     c.run("export pkg --lockfile-out=conan.lock")
+     lock = json.loads(c.load("conan.lock"))
+     assert "pkg/0.1#dfd6bc1becb3915043a671111860baee" in lock["requires"][0]
+     assert "dep/0.1#5d31586a2a4355d68898875dc591009a" in lock["python_requires"][0]
++
++
++def test_pyrequires_test_package_lockfile_error():
++    # https://github.com/conan-io/conan/issues/19340
++    c = TestClient(light=True)
++    c.save({"utils/conanfile.py": GenConanfile("utils").with_package_type("python-require"),
++            "bar/conanfile.py": GenConanfile("bar", "8.0").with_python_requires("utils/[^1]"),
++            "bar/test_package/conanfile.py": GenConanfile().with_test("pass")
++                                                           .with_python_requires("utils/[^1]"),
++            "foo/conanfile.py": GenConanfile("foo", "1.0").with_requires("bar/[*]")
++                                                          .with_python_requires("utils/1.7.1")})
++
++    c.run("create utils --version=1.7.1")
++    c.run("create utils --version=1.8.0")
++    c.run("create bar --lockfile-out=bar.lock")
++    c.run("create foo", assert_error=True)
++    assert "Missing prebuilt package for 'bar/8.0'" in c.out
++
++    c.run("create foo --lockfile=bar.lock --lockfile-partial --lockfile-out=foo.lock")
++    c.assert_listed_require({"utils/1.7.1": "Cache",
++                             "utils/1.8.0": "Cache"}, python=True)
++    lock = json.loads(c.load("foo.lock"))
++    assert "utils/1.8.0" in lock["python_requires"][0]
++    assert "utils/1.7.1" in lock["python_requires"][1]
++
++    # The lockfile works, because the fixed version is an older one, and the lock can have
++    # both, the range resolves to 1.8.0, and the fixed resolves to 1.7.1
++    # This lockfile can be used with same results
++    c.run("create foo --lockfile=foo.lock")
++    c.assert_listed_require({"utils/1.7.1": "Cache",
++                             "utils/1.8.0": "Cache"}, python=True)
++
++
++def test_pyrequires_test_package_lockfile_error_forward():
++    # https://github.com/conan-io/conan/issues/19340
++    c = TestClient(light=True)
++    c.save({"utils/conanfile.py": GenConanfile("utils").with_package_type("python-require"),
++            "bar/conanfile.py": GenConanfile("bar", "8.0").with_python_requires("utils/[^1]"),
++            "bar/test_package/conanfile.py": GenConanfile().with_test("pass")
++                                                           .with_python_requires("utils/[^1]"),
++            "foo/conanfile.py": GenConanfile("foo", "1.0").with_requires("bar/[*]")
++                                                          .with_python_requires("utils/1.9.0")})
++
++    # bar binary is built with utils/1.8.0
++    c.run("create utils --version=1.8.0")
++    c.run("create bar --lockfile-out=bar.lock")
++    c.assert_listed_require({"utils/1.8.0": "Cache"}, python=True)
++    lock = json.loads(c.load("bar.lock"))
++    assert "utils/1.8.0" in lock["python_requires"][0]
++
++    # now a new utils/1.9.0 is out, so the regular consumption of bar will fail with missing binary
++    # this will happen even if foo doesn't declare python-requires
++    c.run("create utils --version=1.9.0")
++    c.run("create foo", assert_error=True)
++    assert "Missing prebuilt package for 'bar/8.0'" in c.out
++    c.assert_listed_require({"utils/1.9.0": "Cache"}, python=True)
++
++    # If we try to force bar strict dependencies with lockfile, it will fail, as expected
++    c.run("create foo --lockfile=bar.lock", assert_error=True)
++    assert "Requirement 'utils/1.9.0' not in lockfile 'python_requires'" in c.out
++
++    # we can relax the lockfile, and it will be able to resolve,
++    # but it will still fail with missing binary for bar
++    c.run("create foo --lockfile=bar.lock --lockfile-partial", assert_error=True)
++    assert "Missing prebuilt package for 'bar/8.0'" in c.out
++
++    c.run("create foo --lockfile=bar.lock --lockfile-partial --build=missing "
++          "--lockfile-out=foo.lock")
++    c.assert_listed_require({"utils/1.9.0": "Cache"}, python=True)
++    assert "utils/1.8.0" not in c.out
++
++    # This build is reproducible with this lockfile
++    c.run("create foo --lockfile=foo.lock")
++    c.assert_listed_require({"utils/1.9.0": "Cache"}, python=True)
++    assert "utils/1.8.0" not in c.out
+
+diff --git a/test/integration/lockfile/test_user_overrides.py b/test/integration/lockfile/test_user_overrides.py
+index 7facb0b..5e4f76a 100644
+--- a/test/integration/lockfile/test_user_overrides.py
++++ b/test/integration/lockfile/test_user_overrides.py
+@@ -457,3 +457,49 @@ class TestLockUpgrade:
+         assert "libb/2.0" in lock
+         assert "libd/1.0" in lock
+         assert "libc/1.0" in lock  # TODO: libc should be removed from lockfile? It is not required anymore...
++
++    def test_config_upgrade(self):
++        """ Test that it is possible to lock also config-requires
++        """
++        c = TestClient(light=True)
++
++        c.save({"config/conanfile.py": GenConanfile("config").with_package_type("configuration"),
++                "conanfile.py": GenConanfile("pkg", "1.0")})
++        c.run("create config --version=1.0")
++        c.run("create config --version=2.0")
++        c.run("config install-pkg config/1.0 --lockfile-out=conan.lock")
++
++        def _check(refs):
++            reqs = json.loads(c.load("conan.lock"))["config_requires"]
++            for a, b in zip(refs, reqs):
++                assert a in b
++
++        def _check_cache(refs):
++            reqs = json.loads(c.load_home("config_version.json"))["config_version"]
++            for a, b in zip(refs, reqs):
++                assert a in b
++
++        _check(["config/1.0"])
++        _check_cache(["config/1.0"])
++
++        c.run("lock upgrade-config --requires=config/[*] --update-config-requires=config/*")
++        _check(["config/2.0"])
++        _check_cache(["config/1.0"])
++
++        c.run("config install-pkg config/1.0 --lockfile=conan.lock", assert_error=True)
++        assert "ERROR: Requirement 'config/1.0' not in lockfile 'config_requires'" in c.out
++        c.run("config install-pkg config/2.0 --lockfile=conan.lock")
++        _check(["config/2.0"])
++        _check_cache(["config/2.0"])
++
++        # Force downgrade
++        c.run("config install-pkg config/1.0 --lockfile= --lockfile-out=conan.lock")
++        _check(["config/1.0"])
++        _check_cache(["config/1.0"])
++
++        c.save({"conanconfig.yml": "packages:\n    - config/[*]"})
++        c.run("lock upgrade-config . --update-config-requires=config/1.0")
++        _check(["config/2.0"])
++        _check_cache(["config/1.0"])
++        c.run("config install-pkg . --lockfile=conan.lock")
++        _check_cache(["config/2.0"])
+
+diff --git a/test/integration/options/options_test.py b/test/integration/options/options_test.py
+index e35c18d..813c664 100644
+--- a/test/integration/options/options_test.py
++++ b/test/integration/options/options_test.py
+@@ -505,6 +505,19 @@ class TestMultipleOptionsPatterns:
+         assert "dep3/1.0: SHARED: True!!" in c.out
+         assert "dep4/1.0: SHARED: True!!" in c.out
+ 
++    def test_pattern_version_range_warn(self):
++        c = TestClient(light=True)
++        c.save({"conanfile.py": GenConanfile("foo", "1.0")})
++        c.run("create -o=foo/[>1]:shared=True")
++        assert "WARN: risk: Pattern foo/[>1] contains a version range" in c.out
++
++    def test_pattern_version_range_wrong_split(self):
++        c = TestClient(light=True)
++        c.save({"conanfile.py": GenConanfile("foo", "1.0")})
++        c.run("create -o=foo/[>=1]:shared=True", assert_error=True)
++        # We split by the first =, so this version range we can't catch and warn before it breaks
++        assert "option 'foo/[>' doesn't exist" in c.out
++
+ 
+ class TestTransitiveOptionsShared:
+     """
+@@ -862,3 +875,14 @@ def test_get_safe_none_option_checks():
+     assert "get_safe is not None: False" in tc.out
+     assert "get_safe == None: True" in tc.out
+     assert "get_safe != None: False" in tc.out
++
++
++def test_option_apply_version_range():
++    c = TestClient(light=True)
++    c.save({"conanfile.py": GenConanfile("dep", "0.1").with_shared_option(False)})
++    c.run("create -o shared=True")
++    c.run("install --requires=dep/0.1 -o shared=True")  # This worked without problem
++    c.run("install --requires=dep/[*] -o shared=True")
++    assert "WARN: risk" not in c.out
++    # This failed because of dep/[*] not matching pattern, now it works
++    assert "Install finished successfully" in c.out
+
+diff --git a/test/integration/package_id/compatible_test.py b/test/integration/package_id/compatible_test.py
+index 64d4cea..db72231 100644
+--- a/test/integration/package_id/compatible_test.py
++++ b/test/integration/package_id/compatible_test.py
+@@ -4,7 +4,7 @@ import textwrap
+ import pytest
+ 
+ from conan.test.utils.env import environment_update
+-from conan.test.utils.tools import TestClient, GenConanfile
++from conan.test.utils.tools import TestClient, GenConanfile, TestServer
+ 
+ 
+ class TestCompatibleIDsTest:
+@@ -901,6 +901,22 @@ class TestListOnlyCompatibilityOptimization:
+         tc2.assert_listed_binary({"protobuf/1.0": ("36d978cbb4dc35906d0fd438732d5e17cd1e388d",
+                                                    origin)})
+ 
++    def test_multi_remote(self):
++        # https://github.com/conan-io/conan/issues/19342
++        c = TestClient(servers={"r1": TestServer(), "r2": TestServer()},
++                       inputs=["admin", "password"] * 2)
++
++        c.save({"conanfile.py": GenConanfile("pkg", "0.1").with_settings("compiler")})
++        c.run(f"create . -s=compiler.cppstd=14")
++
++        c.run(f"upload * -r=r1 -c")
++        c.run(f"upload * -r=r2 -c")
++        c.run("remove * -c")
++        c.run(f"install --requires=pkg/0.1 -s=compiler.cppstd=17 "
++              "-cc core.graph:compatibility_mode=optimized")
++        # It doesn't crash
++        assert "pkg/0.1: Found 1 compatible configurations in remotes" in c.out
++
+ 
+ def test_compatibility_remove_cppstd():
+     """ This test tries to reflect the following scenario:
+
+diff --git a/test/integration/package_id/test_config_package_id.py b/test/integration/package_id/test_config_package_id.py
+index cf2383b..c21848e 100644
+--- a/test/integration/package_id/test_config_package_id.py
++++ b/test/integration/package_id/test_config_package_id.py
+@@ -8,10 +8,10 @@ from conan.internal.util.files import save
+ 
+ 
+ @pytest.mark.parametrize("config_version, mode, result", [
+-    ("myconfig/1.2.3#rev1:pid1#prev1", "minor_mode", "myconfig/1.2.Z"),
+-    ("myconfig/1.2.3#rev1:pid1#prev1", "patch_mode", "myconfig/1.2.3"),
+-    ("myconfig/1.2.3#rev1:pid1#prev1", "full_mode", "myconfig/1.2.3#rev1:pid1"),
+-    ("myconfig/1.2.3#rev1:pid1#prev1", "revision_mode", "myconfig/1.2.3#rev1"),
++    ("myconfig/1.2.3#rev1", "minor_mode", "myconfig/1.2.Z"),
++    ("myconfig/1.2.3#rev1", "patch_mode", "myconfig/1.2.3"),
++    ("myconfig/1.2.3#rev1", "full_mode", "myconfig/1.2.3#rev1"),
++    ("myconfig/1.2.3#rev1", "revision_mode", "myconfig/1.2.3#rev1"),
+     ("myconfig/1.2.3", "minor_mode", "myconfig/1.2.Z")])
+ def test_config_package_id(config_version, mode, result):
+     c = TestClient()
+@@ -26,7 +26,7 @@ def test_config_package_id(config_version, mode, result):
+     rrev = info["Local Cache"]["pkg/0.1"]["revisions"]["485dad6cb11e2fa99d9afbe44a57a164"]
+     package_id = {"myconfig/1.2.Z": "c78b4d8224154390356fe04fe598d67aec930199",
+                   "myconfig/1.2.3": "60005f5b11bef3ddd686b13f5c6bf576a9b882b8",
+-                  "myconfig/1.2.3#rev1:pid1": "b1525975eb5420cef45b4ddd1544f87c29c773a5",
++                  "myconfig/1.2.3#rev1:pid1": "3e4270809028e4566b55d3958e94ae3d6f0c92a7",
+                   "myconfig/1.2.3#rev1": "aae875ae226416f177bf386a3e4ad6aaffce09e7"}
+     package_id = package_id.get(result)
+     pkg = rrev["packages"][package_id]
+@@ -43,8 +43,8 @@ def test_error_config_package_id():
+ 
+ 
+ @pytest.mark.parametrize("config_version, mode, result", [
+-    ("myconfig/1.2.3#rev1:pid1#prev1", "minor_mode", "myconfig/1.2.Z"),
+-    ("myconfig/1.2.3#rev1:pid1#prev1", "patch_mode", "myconfig/1.2.3"),
++    ("myconfig/1.2.3#rev1", "minor_mode", "myconfig/1.2.Z"),
++    ("myconfig/1.2.3#rev1", "patch_mode", "myconfig/1.2.3"),
+ ])
+ def test_config_package_id_clear(config_version, mode, result):
+     c = TestClient(light=True)
+
+diff --git a/test/integration/toolchains/cmake/cmakedeps2/test_cmakeconfigdeps_frameworks.py b/test/integration/toolchains/cmake/cmakedeps2/test_cmakeconfigdeps_frameworks.py
+index ebbd285..f21e110 100644
+--- a/test/integration/toolchains/cmake/cmakedeps2/test_cmakeconfigdeps_frameworks.py
++++ b/test/integration/toolchains/cmake/cmakedeps2/test_cmakeconfigdeps_frameworks.py
+@@ -42,3 +42,27 @@ def test_package_framework_needs_location():
+     })
+     client.run(f"create . -c tools.cmake.cmakedeps:new={new_value}", assert_error=True)
+     assert "Error in generator 'CMakeConfigDeps': cpp_info.location missing for framework MyFramework" in client.out
++
++
++def test_framework_only_component_generates_target():
++    conanfile = textwrap.dedent(f"""
++    import os
++    from conan import ConanFile
++
++    class MyFramework(ConanFile):
++        name = "frame"
++        version = "1.0"
++        settings = "os", "arch", "compiler", "build_type"
++
++        def package_info(self):
++            self.cpp_info.frameworks = ["MyFramework"]
++            self.cpp_info.libdirs = []
++            self.cpp_info.includedirs = []
++    """)
++
++    tc = TestClient()
++    tc.save({"conanfile.py": conanfile})
++    tc.run("create .")
++    tc.run(f"install --requires=frame/1.0 -g CMakeConfigDeps -c=tools.cmake.cmakedeps:new={new_value}")
++    targets = tc.load("frame-Targets-release.cmake")
++    assert "add_library(frame::frame INTERFACE IMPORTED)" in targets
+
+diff --git a/test/integration/toolchains/cmake/cmakedeps2/test_cmakedeps.py b/test/integration/toolchains/cmake/cmakedeps2/test_cmakedeps.py
+index fe5f3e6..01bd919 100644
+--- a/test/integration/toolchains/cmake/cmakedeps2/test_cmakedeps.py
++++ b/test/integration/toolchains/cmake/cmakedeps2/test_cmakedeps.py
+@@ -640,3 +640,27 @@ def test_package_info_extra_variables():
+     assert 'set(CMAKE_GENERATOR_INSTANCE "${GENERATOR_INSTANCE}/buildTools/")' in target
+     assert 'set(FOO 42)' in target
+     assert 'set(CACHE_VAR_DEFAULT_DOC "hello world" CACHE PATH "CACHE_VAR_DEFAULT_DOC")' in target
++
++
++def test_target_defines_only():
++    client = TestClient()
++    conanfile = textwrap.dedent("""
++        from conan import ConanFile
++
++        class Pkg(ConanFile):
++            name = "pkg"
++            version = "0.1"
++
++            def package_info(self):
++                self.cpp_info.components["base"].includedirs = []
++                self.cpp_info.components["base"].defines = ["FOO=1"]
++                self.cpp_info.components["comp"].includedirs = ["include"]
++                self.cpp_info.components["comp"].requires = ["base"]
++    """)
++    client.save({"conanfile.py": conanfile})
++    client.run("create .")
++
++    client.run(f"install --requires=pkg/0.1 -g CMakeDeps -c tools.cmake.cmakedeps:new={new_value}")
++    target = client.load("pkg-Targets-release.cmake")
++    assert 'add_library(pkg::base INTERFACE IMPORTED)' in target
++    assert "# Requirement pkg::base => Full link: True" in target
+
+diff --git a/test/integration/toolchains/meson/test_mesontoolchain.py b/test/integration/toolchains/meson/test_mesontoolchain.py
+index c870f88..4c5b440 100644
+--- a/test/integration/toolchains/meson/test_mesontoolchain.py
++++ b/test/integration/toolchains/meson/test_mesontoolchain.py
+@@ -903,3 +903,46 @@ def test_new_public_attributes():
+     backend = 'xcode'
+     """)
+     assert expected in content
++
++
++def test_needs_exe_wrapper():
++    """
++    Tests needs_exe_wrapper depends on `can_run()` function instead of
++    simply checking the cross_building() one.
++
++    Issue: https://github.com/conan-io/conan/issues/19217
++    """
++    host = textwrap.dedent("""
++    [settings]
++    arch=x86_64
++    build_type=Release
++    compiler=apple-clang
++    compiler.cppstd=gnu17
++    compiler.libcxx=libc++
++    compiler.version=16
++    os=Macos
++    [conf]
++    tools.apple:sdk_path=/my/sdk/path
++    tools.build.cross_building:can_run=True
++    """)
++    build = textwrap.dedent("""
++    [settings]
++    arch=armv8
++    build_type=Release
++    compiler=apple-clang
++    compiler.cppstd=gnu17
++    compiler.libcxx=libc++
++    compiler.version=16
++    os=Macos
++    """)
++    client = TestClient()
++    client.save({
++        "host": host,
++        "build": build,
++        "conanfile.py": GenConanfile("pkg", "1.0")
++                        .with_settings("os", "arch", "compiler", "build_type")
++                        .with_generator("MesonToolchain")
++    })
++    client.run("install . -pr:h host -pr:b build")
++    content = client.load(MesonToolchain.cross_filename)
++    assert "needs_exe_wrapper = false" in content
+
+diff --git a/test/integration/workspace/test_workspace.py b/test/integration/workspace/test_workspace.py
+index 44c4f78..9c50029 100644
+--- a/test/integration/workspace/test_workspace.py
++++ b/test/integration/workspace/test_workspace.py
+@@ -238,13 +238,6 @@ class TestAddRemove:
+         # For workspace, the version of the conanfile can be ignored if the
+         # workspace define a different version.
+         c = TestClient(light=True)
+-        conanfile = textwrap.dedent("""
+-            from conan import ConanFile
+-            class Lib(ConanFile):
+-                name= "pkg"
+-                version = "0.1"
+-            """)
+-
+         workspace = textwrap.dedent("""\
+             import os
+             from conan import Workspace
+@@ -255,13 +248,37 @@ class TestAddRemove:
+             """)
+ 
+         c.save({"conanws.py": workspace,
+-                "dep1/conanfile.py": conanfile})
++                "dep1/conanfile.py": GenConanfile("pkg", "0.1")})
+         c.run("workspace info --format=json")
+         info = json.loads(c.stdout)
+         assert info["packages"] == [{"ref": "pkg/1.2.3", "path": "dep1"}]
+         c.run("install --requires=pkg/1.2.3")
+         # it will not fail
+ 
++    def test_replace_requires(self):
++        c = TestClient(light=True)
++        c.save({"conanws.yml": "",
++                "pkga/conanfile.py": GenConanfile("pkga", "0.1"),
++                "pkgb/conanfile.py": GenConanfile("pkgb", "0.1").with_requires("pkga/develop"),
++                "pkgc/conanfile.py": GenConanfile("pkgc", "0.1").with_requires("pkgb/0.1",
++                                                                               "pkga/0.1"),
++                "myreplaces": "[replace_requires]\npkga/develop: pkga/0.1"})
++        c.run("workspace add pkga")
++        c.run("workspace add pkgb")
++        c.run("workspace add pkgc")
++        c.run("workspace info --format=json")
++
++        info = json.loads(c.stdout)
++        assert info["packages"] == [{'path': 'pkga', 'ref': 'pkga/0.1'},
++                                    {'path': 'pkgb', 'ref': 'pkgb/0.1'},
++                                    {'path': 'pkgc', 'ref': 'pkgc/0.1'}]
++        c.run("install --requires=pkgc/0.1", assert_error=True)
++        assert "Version conflict: Conflict between pkga/develop and pkga/0.1 in the graph" in c.out
++        # it will not fail
++        c.run("install --requires=pkgc/0.1 -pr=default -pr=myreplaces")
++        assert "pkga/0.1 - Editable" in c.out
++        assert "pkga/develop: pkga/0.1" in c.out
++
+     def test_error_uppercase(self):
+         c = TestClient(light=True)
+         c.save({"conanws.yml": "",
+@@ -421,6 +438,77 @@ class TestOpenAdd:
+         assert "pkgb/0.1: WARN: BUILD PKGB!" in c.out
+ 
+ 
++class TestComplete:
++    def test_complete_add(self):
++        c = TestClient(light=True)
++        c.save({"conanws.yml": "",
++                "pkga/conanfile.py": GenConanfile("pkga", "0.1"),
++                "pkgx/conanfile.py": GenConanfile("pkgx", "0.1"),
++                "pkgb/conanfile.py": GenConanfile("pkgb", "0.1").with_requires("pkga/0.1"),
++                "pkgc/conanfile.py": GenConanfile("pkgc", "0.1").with_requires("pkga/0.1",
++                                                                               "pkgx/0.1"),
++                "pkgd/conanfile.py": GenConanfile("pkgd", "0.1").with_requires("pkgb/0.1",
++                                                                               "pkgc/0.1")})
++
++        c.run("workspace complete")  # Does nothing, but it doesn't fail
++        assert "There are no packages in this workspace, nothing to complete" in c.out
++        c.run("workspace info")
++        assert "packages: (empty)" in c.out
++
++        for pkg in ("pkga", "pkgx", "pkgb", "pkgc", "pkgd"):
++            c.run(f"export {pkg}")
++
++        c.run("workspace add pkgd")
++        c.run("workspace complete")  # Does nothing, but it doesn't fail
++        assert "There are no intermediate packages to add to the workspace" in c.out
++        c.run("workspace info")
++        assert "pkgd/0.1" in c.out
++        assert "pkga/0.1" not in c.out
++
++        c.run("workspace add pkga")
++        c.run("workspace install --build=missing", assert_error=True)
++        assert "Workspace definition error. Package pkgb/0.1 in the Conan cache" in c.out
++        c.run("workspace info")
++        assert "pkgb/0.1" not in c.out
++        assert "pkgc/0.1" not in c.out
++
++        c.run("workspace complete")
++        c.run("workspace info")
++        assert "pkgb/0.1" in c.out
++        assert "pkgc/0.1" in c.out
++        assert "pkgx/0.1" not in c.out
++
++    def test_complete_open(self):
++        c = TestClient(light=True)
++        c.save({"pkgx/conanfile.py": GenConanfile("pkgx", "0.1"),
++                "pkgb/conanfile.py": GenConanfile("pkgb", "0.1").with_requires("pkga/0.1"),
++                "pkgc/conanfile.py": GenConanfile("pkgc", "0.1").with_requires("pkga/0.1",
++                                                                               "pkgx/0.1")})
++
++        for pkg in ("pkgx", "pkgb", "pkgc"):
++            c.run(f"export {pkg}")
++
++        c.save({"conanws.yml": "",
++                "pkga/conanfile.py": GenConanfile("pkga", "0.1"),
++                "pkgd/conanfile.py": GenConanfile("pkgd", "0.1").with_requires("pkgb/0.1",
++                                                                               "pkgc/0.1")},
++               clean_first=True)
++
++        c.run("workspace add pkgd")
++        c.run("workspace add pkga")
++        c.run("workspace install --build=missing", assert_error=True)
++        assert "Workspace definition error. Package pkgb/0.1 in the Conan cache" in c.out
++        c.run("workspace info")
++        assert "pkgb/0.1" not in c.out
++        assert "pkgc/0.1" not in c.out
++
++        c.run("workspace complete")
++        c.run("workspace info")
++        assert "pkgb/0.1" in c.out
++        assert "pkgc/0.1" in c.out
++        assert "pkgx/0.1" not in c.out
++
++
+ class TestWorkspaceBuild:
+ 
+     def test_build(self):
+@@ -503,6 +591,34 @@ class TestWorkspaceBuild:
+         c.run("workspace build")
+         assert "conanfile.py (pkga/0.1): Building pkga AND 0.1!!!" in c.out
+ 
++    def test_build_with_external_editable_python_requires(self):
++        c = TestClient(light=True)
++        c.save({"conanws.yml": "",
++                "ext/conanfile.py": GenConanfile("ext", "0.1").with_package_type("python-require"),
++                "pkga/conanfile.py": GenConanfile("pkga", "0.1").with_python_requires("ext/0.1")
++                })
++        c.run("editable add ext")
++        c.run("workspace add pkga")
++        c.run("workspace build")
++        c.assert_listed_binary({"pkga/0.1": ("8bca2eae7cd0d6b6da8d14f8c86069d89d265bd4",
++                                             "EditableBuild")})
++        c.assert_listed_require({"ext/0.1": "Editable"}, python=True)
++
++    def test_build_with_external_editable(self):
++        c = TestClient(light=True)
++        c.save({"conanws.yml": "",
++                "ext/conanfile.py": GenConanfile("ext", "0.1").with_build_msg("BUILD EXT!"),
++                "pkga/conanfile.py": GenConanfile("pkga", "0.1").with_requires("ext/0.1")
++                })
++        c.run("editable add ext")
++        c.run("workspace add pkga")
++        c.run("workspace build")
++        assert "ext/0.1: WARN: BUILD EXT!" in c.out
++        c.assert_listed_binary({"pkga/0.1": ("38f8a554b1b3c2cbb44321f0e731b3863359126c",
++                                             "EditableBuild"),
++                                "ext/0.1": ("da39a3ee5e6b4b0d3255bfef95601890afd80709",
++                                            "EditableBuild")})
++
+ 
+ class TestNew:
+     def test_new(self):
+@@ -542,7 +658,7 @@ class TestMeta:
+         c.run("workspace add libb")
+         c.run("workspace super-install -g CMakeDeps -g CMakeToolchain -of=build "
+               "--envs-generation=false")
+-        assert "Packages build order:\n    liba/0.1\n    libb/0.1" in c.out
++        assert "Packages build order:\n    liba/0.1: liba\n    libb/0.1: libb" in c.out
+         assert "Workspace conanws.py not found in the workspace folder, using default" in c.out
+         files = os.listdir(os.path.join(c.current_folder, "build"))
+         assert "conan_toolchain.cmake" in files
+@@ -825,6 +941,28 @@ class TestMeta:
+         assert "pkg" not in folders
+         assert os.path.isfile(os.path.join(deploy_folder, "dep", "1.0", "myfile.txt"))
+ 
++    def test_customize_generator_per_package(self):
++        # https://github.com/conan-io/conan/issues/19326
++        c = TestClient(light=True)
++
++        pkg = GenConanfile("pkg", "0.1")
++        workspace = textwrap.dedent("""\
++            from conan import Workspace, ConanFile
++
++            class MyWs(ConanFile):
++                pass
++
++            class Ws(Workspace):
++                def root_conanfile(self):
++                    return MyWs
++           """)
++        c.save({"pkg/conanfile.py": pkg,
++                "conanws.py": workspace})
++        c.run("workspace add pkg")
++        c.run("workspace super-install -c acme*:tools.cmake.cmaketoolchain:generator=Ninja")
++        # It no longer crashes
++        assert "Install finished successfully" in c.out
++
+ 
+ def test_workspace_with_local_recipes_index():
+     c3i_folder = temp_folder()
+
+diff --git a/test/unittests/client/toolchain/__init__.py b/test/unittests/client/toolchain/__init__.py
+deleted file mode 100644
+index e69de29..0000000
+
+diff --git a/test/unittests/client/toolchain/autotools/__init__.py b/test/unittests/client/toolchain/autotools/__init__.py
+deleted file mode 100644
+index e69de29..0000000
+
+diff --git a/test/unittests/client/tools/apple/test_xcodebuild.py b/test/unittests/tools/apple/test_xcodebuild.py
+similarity index 100%
+rename from test/unittests/client/tools/apple/test_xcodebuild.py
+rename to test/unittests/tools/apple/test_xcodebuild.py
+
+diff --git a/test/unittests/client/toolchain/autotools/autotools_test.py b/test/unittests/tools/gnu/autotools_test_old.py
+similarity index 100%
+rename from test/unittests/client/toolchain/autotools/autotools_test.py
+rename to test/unittests/tools/gnu/autotools_test_old.py
+
+diff --git a/test/unittests/client/toolchain/autotools/autotools_toolchain_test.py b/test/unittests/tools/gnu/autotools_toolchain_test.py
+similarity index 97%
+rename from test/unittests/client/toolchain/autotools/autotools_toolchain_test.py
+rename to test/unittests/tools/gnu/autotools_toolchain_test.py
+index e65baf0..8b470ed 100644
+--- a/test/unittests/client/toolchain/autotools/autotools_toolchain_test.py
++++ b/test/unittests/tools/gnu/autotools_toolchain_test.py
+@@ -531,6 +531,21 @@ def test_sysrootflag():
+     assert expected in env["LDFLAGS"]
+ 
+ 
++def test_sysrootflag_qnx():
++    """Even when no cross building it is adjusted because it could target a Mac version"""
++    conanfile = ConanFileMock()
++    conanfile.conf.define("tools.build:sysroot", "/path/to/sysroot")
++    conanfile.settings = MockSettings(
++        {"compiler": "qcc",
++         "build_type": "Debug",
++         "os": "Linux",
++         "arch": "x86_64"})
++    conanfile.settings_build = conanfile.settings
++    be = AutotoolsToolchain(conanfile)
++    expected = "-Wc,-isysroot,/path/to/sysroot"
++    assert be.sysroot_flag == expected
++
++
+ def test_custom_defines():
+     conanfile = ConanFileMock()
+     conanfile.conf.define("tools.apple:sdk_path", "/path/to/sdk")
+
+diff --git a/test/unittests/tools/gnu/test_gnutoolchain.py b/test/unittests/tools/gnu/test_gnutoolchain.py
+index badab8a..4b19e26 100644
+--- a/test/unittests/tools/gnu/test_gnutoolchain.py
++++ b/test/unittests/tools/gnu/test_gnutoolchain.py
+@@ -166,6 +166,21 @@ def test_linker_scripts():
+     assert "-T'path_to_second_linker_script'" in env["LDFLAGS"]
+ 
+ 
++def test_sysrootflag_qnx():
++    """Even when no cross building it is adjusted because it could target a Mac version"""
++    conanfile = ConanFileMock()
++    conanfile.conf.define("tools.build:sysroot", "/path/to/sysroot")
++    conanfile.settings = MockSettings(
++        {"compiler": "qcc",
++         "build_type": "Debug",
++         "os": "Linux",
++         "arch": "x86_64"})
++    conanfile.settings_build = conanfile.settings
++    be = GnuToolchain(conanfile)
++    expected = "-Wc,-isysroot,/path/to/sysroot"
++    assert be.sysroot_flag == expected
++
++
+ def test_update_or_prune_any_args(cross_building_conanfile):
+     # Issue: https://github.com/conan-io/conan/issues/12642
+     at = GnuToolchain(cross_building_conanfile)

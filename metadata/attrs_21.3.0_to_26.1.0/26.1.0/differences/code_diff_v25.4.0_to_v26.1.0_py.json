@@ -1,0 +1,303 @@
+{
+  "old_dir": ".packages/attrs/25.4.0",
+  "new_dir": ".packages/attrs/26.1.0",
+  "extracted_at": "2026-04-12T22:48:04.981267",
+  "diff_file": "confirmed/attrs/26.1.0/differences/code_diff_v25.4.0_to_v26.1.0_py.diff",
+  "diff_content": "diff --git a/bench/test_benchmarks.py b/bench/test_benchmarks.py\nindex a3ea8a0..fc462bf 100644\n--- a/bench/test_benchmarks.py\n+++ b/bench/test_benchmarks.py\n@@ -4,6 +4,9 @@ Benchmark attrs using CodSpeed.\n \n from __future__ import annotations\n \n+import functools\n+import time\n+\n import pytest\n \n import attrs\n@@ -172,3 +175,58 @@ def test_astuple_atomic():\n \n     for _ in range(ROUNDS):\n         at(c)\n+\n+\n+class TestCachedProperties:\n+    @attrs.define\n+    class Slotted:\n+        x: int = 0\n+\n+        @functools.cached_property\n+        def cached(self):\n+            time.sleep(0.1)\n+            return 42\n+\n+    @attrs.define(slots=False)\n+    class Unslotted:\n+        x: int = 0\n+\n+        @functools.cached_property\n+        def cached(self):\n+            time.sleep(0.1)\n+            return 42\n+\n+    def test_first_access(self):\n+        \"\"\"\n+        Benchmark first access to a cached property (computation + storage).\n+        \"\"\"\n+        for _ in range(ROUNDS):\n+            c = self.Slotted(42)\n+            _ = c.cached\n+\n+    def test_repeated_access(self):\n+        \"\"\"\n+        Benchmark repeated access to a cached property (should use stored\n+        value).\n+        \"\"\"\n+        c = self.Slotted(42)\n+        _ = c.cached  # Prime the cache\n+\n+        for _ in range(ROUNDS):\n+            _ = c.cached\n+\n+    def test_create_cached_property_class(self):\n+        \"\"\"\n+        Benchmark creating a class with a cached property\n+        \"\"\"\n+        for _ in range(ROUNDS):\n+\n+            @attrs.define\n+            class LocalC:\n+                x: int\n+                y: str\n+                z: dict[str, int]\n+\n+                @functools.cached_property\n+                def cached(self):\n+                    return 42\n\ndiff --git a/src/attr/_make.py b/src/attr/_make.py\nindex d24d9ba..4b32d6a 100644\n--- a/src/attr/_make.py\n+++ b/src/attr/_make.py\n@@ -463,6 +463,15 @@ def _transform_attrs(\n \n     attrs = base_attrs + own_attrs\n \n+    # Resolve default field alias before executing field_transformer, so that\n+    # the transformer receives fully populated Attribute objects with usable\n+    # alias values.\n+    for a in attrs:\n+        if not a.alias:\n+            # Evolve is very slow, so we hold our nose and do it dirty.\n+            _OBJ_SETATTR.__get__(a)(\"alias\", _default_init_alias_for(a.name))\n+            _OBJ_SETATTR.__get__(a)(\"alias_is_default\", True)\n+\n     if field_transformer is not None:\n         attrs = tuple(field_transformer(cls, attrs))\n \n@@ -480,13 +489,12 @@ def _transform_attrs(\n         if had_default is False and a.default is not NOTHING:\n             had_default = True\n \n-    # Resolve default field alias after executing field_transformer.\n-    # This allows field_transformer to differentiate between explicit vs\n-    # default aliases and supply their own defaults.\n+    # Resolve default field alias for any new attributes that the\n+    # field_transformer may have added without setting an alias.\n     for a in attrs:\n         if not a.alias:\n-            # Evolve is very slow, so we hold our nose and do it dirty.\n             _OBJ_SETATTR.__get__(a)(\"alias\", _default_init_alias_for(a.name))\n+            _OBJ_SETATTR.__get__(a)(\"alias_is_default\", True)\n \n     # Create AttrsClass *after* applying the field_transformer since it may\n     # add or remove attributes!\n@@ -569,7 +577,7 @@ def _frozen_delattrs(self, name):\n     \"\"\"\n     Attached to frozen classes as __delattr__.\n     \"\"\"\n-    if isinstance(self, BaseException) and name in (\"__notes__\",):\n+    if isinstance(self, BaseException) and name == \"__notes__\":\n         BaseException.__delattr__(self, name)\n         return\n \n@@ -1096,9 +1104,7 @@ class _ClassBuilder:\n         return self\n \n     def add_replace(self):\n-        self._cls_dict[\"__replace__\"] = self._add_method_dunders(\n-            lambda self, **changes: evolve(self, **changes)\n-        )\n+        self._cls_dict[\"__replace__\"] = self._add_method_dunders(evolve)\n         return self\n \n     def add_match_args(self):\n@@ -1884,16 +1890,16 @@ def _add_repr(cls, ns=None, attrs=None):\n \n def fields(cls):\n     \"\"\"\n-    Return the tuple of *attrs* attributes for a class.\n+    Return the tuple of *attrs* attributes for a class or instance.\n \n     The tuple also allows accessing the fields by their names (see below for\n     examples).\n \n     Args:\n-        cls (type): Class to introspect.\n+        cls (type): Class or instance to introspect.\n \n     Raises:\n-        TypeError: If *cls* is not a class.\n+        TypeError: If *cls* is neither a class nor an *attrs* instance.\n \n         attrs.exceptions.NotAnAttrsClassError:\n             If *cls* is not an *attrs* class.\n@@ -1904,12 +1910,17 @@ def fields(cls):\n     .. versionchanged:: 16.2.0 Returned tuple allows accessing the fields\n        by name.\n     .. versionchanged:: 23.1.0 Add support for generic classes.\n+    .. versionchanged:: 26.1.0 Add support for instances.\n     \"\"\"\n     generic_base = get_generic_base(cls)\n \n     if generic_base is None and not isinstance(cls, type):\n-        msg = \"Passed object must be a class.\"\n-        raise TypeError(msg)\n+        type_ = type(cls)\n+        if getattr(type_, \"__attrs_attrs__\", None) is None:\n+            msg = \"Passed object must be a class or attrs instance.\"\n+            raise TypeError(msg)\n+\n+        return fields(type_)\n \n     attrs = getattr(cls, \"__attrs_attrs__\", None)\n \n@@ -2016,7 +2027,7 @@ def _make_init_script(\n         attr_dict[a.name] = a\n \n         if a.on_setattr is not None:\n-            if frozen is True:\n+            if frozen is True and a.on_setattr is not setters.NO_OP:\n                 msg = \"Frozen classes can't use on_setattr.\"\n                 raise ValueError(msg)\n \n@@ -2429,6 +2440,8 @@ class Attribute:\n     - ``name`` (`str`): The name of the attribute.\n     - ``alias`` (`str`): The __init__ parameter name of the attribute, after\n       any explicit overrides and default private-attribute-name handling.\n+    - ``alias_is_default`` (`bool`): Whether the ``alias`` was automatically\n+      generated (``True``) or explicitly provided by the user (``False``).\n     - ``inherited`` (`bool`): Whether or not that attribute has been inherited\n       from a base class.\n     - ``eq_key`` and ``order_key`` (`typing.Callable` or `None`): The\n@@ -2454,6 +2467,7 @@ class Attribute:\n         equality checks and hashing anymore.\n     .. versionadded:: 21.1.0 *eq_key* and *order_key*\n     .. versionadded:: 22.2.0 *alias*\n+    .. versionadded:: 26.1.0 *alias_is_default*\n \n     For the full version history of the fields, see `attr.ib`.\n     \"\"\"\n@@ -2478,6 +2492,7 @@ class Attribute:\n         \"inherited\",\n         \"on_setattr\",\n         \"alias\",\n+        \"alias_is_default\",\n     )\n \n     def __init__(\n@@ -2500,6 +2515,7 @@ class Attribute:\n         order_key=None,\n         on_setattr=None,\n         alias=None,\n+        alias_is_default=None,\n     ):\n         eq, eq_key, order, order_key = _determine_attrib_eq_order(\n             cmp, eq_key or eq, order_key or order, True\n@@ -2534,6 +2550,10 @@ class Attribute:\n         bound_setattr(\"inherited\", inherited)\n         bound_setattr(\"on_setattr\", on_setattr)\n         bound_setattr(\"alias\", alias)\n+        bound_setattr(\n+            \"alias_is_default\",\n+            alias is None if alias_is_default is None else alias_is_default,\n+        )\n \n     def __setattr__(self, name, value):\n         raise FrozenInstanceError\n@@ -2569,6 +2589,7 @@ class Attribute:\n             ca.order_key,\n             ca.on_setattr,\n             ca.alias,\n+            ca.alias is None,\n         )\n \n     # Don't use attrs.evolve since fields(Attribute) doesn't work\n@@ -2587,6 +2608,20 @@ class Attribute:\n \n         new._setattrs(changes.items())\n \n+        if \"alias\" in changes and \"alias_is_default\" not in changes:\n+            # Explicit alias provided -- no longer the default.\n+            _OBJ_SETATTR.__get__(new)(\"alias_is_default\", False)\n+        elif (\n+            \"name\" in changes\n+            and \"alias\" not in changes\n+            # Don't auto-generate alias if the user picked picked the old one.\n+            and self.alias_is_default\n+        ):\n+            # Name changed, alias was auto-generated -- update it.\n+            _OBJ_SETATTR.__get__(new)(\n+                \"alias\", _default_init_alias_for(new.name)\n+            )\n+\n         return new\n \n     # Don't use _add_pickle since fields(Attribute) doesn't work\n@@ -2603,6 +2638,17 @@ class Attribute:\n         \"\"\"\n         Play nice with pickle.\n         \"\"\"\n+        if len(state) < len(self.__slots__):\n+            # Pre-26.1.0 pickle without alias_is_default -- infer it\n+            # heuristically.\n+            state_dict = dict(zip(self.__slots__, state))\n+            alias_is_default = state_dict.get(\n+                \"alias\"\n+            ) is None or state_dict.get(\"alias\") == _default_init_alias_for(\n+                state_dict[\"name\"]\n+            )\n+            state = (*state, alias_is_default)\n+\n         self._setattrs(zip(self.__slots__, state))\n \n     def _setattrs(self, name_values_pairs):\n@@ -2626,7 +2672,7 @@ _a = [\n         name=name,\n         default=NOTHING,\n         validator=None,\n-        repr=True,\n+        repr=(name != \"alias_is_default\"),\n         cmp=None,\n         eq=True,\n         order=False,\n@@ -3087,9 +3133,7 @@ class Converter:\n                 value, field\n             )\n         else:\n-            self.__call__ = lambda value, instance, field: self.converter(\n-                value, instance, field\n-            )\n+            self.__call__ = self.converter\n \n         rt = ex.get_return_type()\n         if rt is not None:\n\ndiff --git a/src/attr/exceptions.py b/src/attr/exceptions.py\nindex 3b7abb8..a207df4 100644\n--- a/src/attr/exceptions.py\n+++ b/src/attr/exceptions.py\n@@ -2,8 +2,6 @@\n \n from __future__ import annotations\n \n-from typing import ClassVar\n-\n \n class FrozenError(AttributeError):\n     \"\"\"\n@@ -16,8 +14,10 @@ class FrozenError(AttributeError):\n     .. versionadded:: 20.1.0\n     \"\"\"\n \n-    msg = \"can't set attribute\"\n-    args: ClassVar[tuple[str]] = [msg]\n+    def __init__(self):\n+        msg = \"can't set attribute\"\n+        super().__init__(msg)\n+        self.msg = msg\n \n \n class FrozenInstanceError(FrozenError):\n\ndiff --git a/src/attr/validators.py b/src/attr/validators.py\nindex 837e003..0b1a294 100644\n--- a/src/attr/validators.py\n+++ b/src/attr/validators.py\n@@ -79,12 +79,14 @@ def disabled():\n         This context manager is not thread-safe!\n \n     .. versionadded:: 21.3.0\n+    .. versionchanged:: 26.1.0 The contextmanager is nestable.\n     \"\"\"\n+    prev = get_run_validators()\n     set_run_validators(False)\n     try:\n         yield\n     finally:\n-        set_run_validators(True)\n+        set_run_validators(prev)\n \n \n @attrs(repr=False, slots=True, unsafe_hash=True)\n\ndiff --git a/typing-examples/baseline.py b/typing-examples/baseline.py\nindex 195b326..573ca99 100644\n--- a/typing-examples/baseline.py\n+++ b/typing-examples/baseline.py\n@@ -94,6 +94,15 @@ class Validated:\n     num: int = attrs.field(validator=attrs.validators.ge(0))\n \n \n+@attrs.define\n+class ValidatedOptionalOverTuple:\n+    num: int | None = attrs.field(\n+        validator=attrs.validators.optional(\n+            (attrs.validators.instance_of(int), attrs.validators.ge(0))  # ty:ignore [invalid-argument-type]\n+        )\n+    )\n+\n+\n @attrs.define\n class ValidatedInconsistentOr:\n     num: int | str = attrs.field(\n",
+  "structured_diff": {
+    "bench/test_benchmarks.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -4,6 +4,9 @@",
+          "snippet": " Benchmark attrs using CodSpeed.\n \n from __future__ import annotations\n \n+import functools\n+import time\n+\n import pytest\n \n import attrs",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "bench/test_benchmarks.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -172,3 +175,58 @@",
+          "snippet": " def test_astuple_atomic():\n \n     for _ in range(ROUNDS):\n         at(c)\n+\n+\n+class TestCachedProperties:\n+    @attrs.define\n+    class Slotted:\n+        x: int = 0\n+\n+        @functools.cached_property\n+        def cached(self):\n+            time.sleep(0.1)\n+            return 42\n+\n+    @attrs.define(slots=False)\n+    class Unslotted:\n+        x: int = 0\n+\n+        @functools.cached_property\n+        def cached(self):\n+            time.sleep(0.1)\n+            return 42\n+\n+    def test_first_access(self):\n+        \"\"\"\n+        Benchmark first access to a cached property (computation + storage).\n+        \"\"\"\n+        for _ in range(ROUNDS):\n+            c = self.Slotted(42)\n+            _ = c.cached\n+\n+    def test_repeated_access(self):\n+        \"\"\"\n+        Benchmark repeated access to a cached property (should use stored\n+        value).\n+        \"\"\"\n+        c = self.Slotted(42)\n+        _ = c.cached  # Prime the cache\n+\n+        for _ in range(ROUNDS):\n+            _ = c.cached\n+\n+    def test_create_cached_property_class(self):\n+        \"\"\"\n+        Benchmark creating a class with a cached property\n+        \"\"\"\n+        for _ in range(ROUNDS):\n+\n+            @attrs.define\n+            class LocalC:\n+                x: int\n+                y: str\n+                z: dict[str, int]\n+\n+                @functools.cached_property\n+                def cached(self):\n+                    return 42\n",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "bench/test_benchmarks.py::TestCachedProperties"
+            },
+            {
+              "kind": "class",
+              "node": "bench/test_benchmarks.py::TestCachedProperties::Slotted"
+            },
+            {
+              "kind": "attribute",
+              "node": "bench/test_benchmarks.py::TestCachedProperties::x"
+            },
+            {
+              "kind": "method",
+              "node": "bench/test_benchmarks.py::TestCachedProperties::cached"
+            },
+            {
+              "kind": "class",
+              "node": "bench/test_benchmarks.py::TestCachedProperties::Unslotted"
+            },
+            {
+              "kind": "method",
+              "node": "bench/test_benchmarks.py::TestCachedProperties::test_first_access"
+            },
+            {
+              "kind": "method",
+              "node": "bench/test_benchmarks.py::TestCachedProperties::test_repeated_access"
+            },
+            {
+              "kind": "method",
+              "node": "bench/test_benchmarks.py::TestCachedProperties::test_create_cached_property_class"
+            },
+            {
+              "kind": "class",
+              "node": "bench/test_benchmarks.py::TestCachedProperties::LocalC"
+            },
+            {
+              "kind": "attribute",
+              "node": "bench/test_benchmarks.py::TestCachedProperties::y"
+            },
+            {
+              "kind": "attribute",
+              "node": "bench/test_benchmarks.py::TestCachedProperties::z"
+            }
+          ]
+        }
+      ]
+    },
+    "src/attr/_make.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -463,6 +463,15 @@",
+          "snippet": " def _transform_attrs(\n \n     attrs = base_attrs + own_attrs\n \n+    # Resolve default field alias before executing field_transformer, so that\n+    # the transformer receives fully populated Attribute objects with usable\n+    # alias values.\n+    for a in attrs:\n+        if not a.alias:\n+            # Evolve is very slow, so we hold our nose and do it dirty.\n+            _OBJ_SETATTR.__get__(a)(\"alias\", _default_init_alias_for(a.name))\n+            _OBJ_SETATTR.__get__(a)(\"alias_is_default\", True)\n+\n     if field_transformer is not None:\n         attrs = tuple(field_transformer(cls, attrs))\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_transform_attrs"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -480,13 +489,12 @@",
+          "snippet": " def _transform_attrs(\n         if had_default is False and a.default is not NOTHING:\n             had_default = True\n \n-    # Resolve default field alias after executing field_transformer.\n-    # This allows field_transformer to differentiate between explicit vs\n-    # default aliases and supply their own defaults.\n+    # Resolve default field alias for any new attributes that the\n+    # field_transformer may have added without setting an alias.\n     for a in attrs:\n         if not a.alias:\n-            # Evolve is very slow, so we hold our nose and do it dirty.\n             _OBJ_SETATTR.__get__(a)(\"alias\", _default_init_alias_for(a.name))\n+            _OBJ_SETATTR.__get__(a)(\"alias_is_default\", True)\n \n     # Create AttrsClass *after* applying the field_transformer since it may\n     # add or remove attributes!",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_transform_attrs"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -569,7 +577,7 @@",
+          "snippet": " def _frozen_delattrs(self, name):\n     \"\"\"\n     Attached to frozen classes as __delattr__.\n     \"\"\"\n-    if isinstance(self, BaseException) and name in (\"__notes__\",):\n+    if isinstance(self, BaseException) and name == \"__notes__\":\n         BaseException.__delattr__(self, name)\n         return\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_frozen_delattrs"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1096,9 +1104,7 @@",
+          "snippet": " class _ClassBuilder:\n         return self\n \n     def add_replace(self):\n-        self._cls_dict[\"__replace__\"] = self._add_method_dunders(\n-            lambda self, **changes: evolve(self, **changes)\n-        )\n+        self._cls_dict[\"__replace__\"] = self._add_method_dunders(evolve)\n         return self\n \n     def add_match_args(self):",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::_ClassBuilder::add_replace"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1884,16 +1890,16 @@",
+          "snippet": " def _add_repr(cls, ns=None, attrs=None):\n \n def fields(cls):\n     \"\"\"\n-    Return the tuple of *attrs* attributes for a class.\n+    Return the tuple of *attrs* attributes for a class or instance.\n \n     The tuple also allows accessing the fields by their names (see below for\n     examples).\n \n     Args:\n-        cls (type): Class to introspect.\n+        cls (type): Class or instance to introspect.\n \n     Raises:\n-        TypeError: If *cls* is not a class.\n+        TypeError: If *cls* is neither a class nor an *attrs* instance.\n \n         attrs.exceptions.NotAnAttrsClassError:\n             If *cls* is not an *attrs* class.",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::fields"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1904,12 +1910,17 @@",
+          "snippet": " def fields(cls):\n     .. versionchanged:: 16.2.0 Returned tuple allows accessing the fields\n        by name.\n     .. versionchanged:: 23.1.0 Add support for generic classes.\n+    .. versionchanged:: 26.1.0 Add support for instances.\n     \"\"\"\n     generic_base = get_generic_base(cls)\n \n     if generic_base is None and not isinstance(cls, type):\n-        msg = \"Passed object must be a class.\"\n-        raise TypeError(msg)\n+        type_ = type(cls)\n+        if getattr(type_, \"__attrs_attrs__\", None) is None:\n+            msg = \"Passed object must be a class or attrs instance.\"\n+            raise TypeError(msg)\n+\n+        return fields(type_)\n \n     attrs = getattr(cls, \"__attrs_attrs__\", None)\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::fields"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2016,7 +2027,7 @@",
+          "snippet": " def _make_init_script(\n         attr_dict[a.name] = a\n \n         if a.on_setattr is not None:\n-            if frozen is True:\n+            if frozen is True and a.on_setattr is not setters.NO_OP:\n                 msg = \"Frozen classes can't use on_setattr.\"\n                 raise ValueError(msg)\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_make_init_script"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2429,6 +2440,8 @@",
+          "snippet": " class Attribute:\n     - ``name`` (`str`): The name of the attribute.\n     - ``alias`` (`str`): The __init__ parameter name of the attribute, after\n       any explicit overrides and default private-attribute-name handling.\n+    - ``alias_is_default`` (`bool`): Whether the ``alias`` was automatically\n+      generated (``True``) or explicitly provided by the user (``False``).\n     - ``inherited`` (`bool`): Whether or not that attribute has been inherited\n       from a base class.\n     - ``eq_key`` and ``order_key`` (`typing.Callable` or `None`): The",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "src/attr/_make.py::Attribute"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2454,6 +2467,7 @@",
+          "snippet": " class Attribute:\n         equality checks and hashing anymore.\n     .. versionadded:: 21.1.0 *eq_key* and *order_key*\n     .. versionadded:: 22.2.0 *alias*\n+    .. versionadded:: 26.1.0 *alias_is_default*\n \n     For the full version history of the fields, see `attr.ib`.\n     \"\"\"",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "src/attr/_make.py::Attribute"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2478,6 +2492,7 @@",
+          "snippet": " class Attribute:\n         \"inherited\",\n         \"on_setattr\",\n         \"alias\",\n+        \"alias_is_default\",\n     )\n \n     def __init__(",
+          "affect": [
+            {
+              "kind": "attribute",
+              "node": "src/attr/_make.py::Attribute::__slots__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2500,6 +2515,7 @@",
+          "snippet": " class Attribute:\n         order_key=None,\n         on_setattr=None,\n         alias=None,\n+        alias_is_default=None,\n     ):\n         eq, eq_key, order, order_key = _determine_attrib_eq_order(\n             cmp, eq_key or eq, order_key or order, True",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::Attribute::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2534,6 +2550,10 @@",
+          "snippet": " class Attribute:\n         bound_setattr(\"inherited\", inherited)\n         bound_setattr(\"on_setattr\", on_setattr)\n         bound_setattr(\"alias\", alias)\n+        bound_setattr(\n+            \"alias_is_default\",\n+            alias is None if alias_is_default is None else alias_is_default,\n+        )\n \n     def __setattr__(self, name, value):\n         raise FrozenInstanceError",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::Attribute::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2569,6 +2589,7 @@",
+          "snippet": " class Attribute:\n             ca.order_key,\n             ca.on_setattr,\n             ca.alias,\n+            ca.alias is None,\n         )\n \n     # Don't use attrs.evolve since fields(Attribute) doesn't work",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::Attribute::from_counting_attr"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2587,6 +2608,20 @@",
+          "snippet": " class Attribute:\n \n         new._setattrs(changes.items())\n \n+        if \"alias\" in changes and \"alias_is_default\" not in changes:\n+            # Explicit alias provided -- no longer the default.\n+            _OBJ_SETATTR.__get__(new)(\"alias_is_default\", False)\n+        elif (\n+            \"name\" in changes\n+            and \"alias\" not in changes\n+            # Don't auto-generate alias if the user picked picked the old one.\n+            and self.alias_is_default\n+        ):\n+            # Name changed, alias was auto-generated -- update it.\n+            _OBJ_SETATTR.__get__(new)(\n+                \"alias\", _default_init_alias_for(new.name)\n+            )\n+\n         return new\n \n     # Don't use _add_pickle since fields(Attribute) doesn't work",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::Attribute::evolve"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2603,6 +2638,17 @@",
+          "snippet": " class Attribute:\n         \"\"\"\n         Play nice with pickle.\n         \"\"\"\n+        if len(state) < len(self.__slots__):\n+            # Pre-26.1.0 pickle without alias_is_default -- infer it\n+            # heuristically.\n+            state_dict = dict(zip(self.__slots__, state))\n+            alias_is_default = state_dict.get(\n+                \"alias\"\n+            ) is None or state_dict.get(\"alias\") == _default_init_alias_for(\n+                state_dict[\"name\"]\n+            )\n+            state = (*state, alias_is_default)\n+\n         self._setattrs(zip(self.__slots__, state))\n \n     def _setattrs(self, name_values_pairs):",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::Attribute::__setstate__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2626,7 +2672,7 @@",
+          "snippet": " _a = [\n         name=name,\n         default=NOTHING,\n         validator=None,\n-        repr=True,\n+        repr=(name != \"alias_is_default\"),\n         cmp=None,\n         eq=True,\n         order=False,",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "src/attr/_make.py::_a"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -3087,9 +3133,7 @@",
+          "snippet": " class Converter:\n                 value, field\n             )\n         else:\n-            self.__call__ = lambda value, instance, field: self.converter(\n-                value, instance, field\n-            )\n+            self.__call__ = self.converter\n \n         rt = ex.get_return_type()\n         if rt is not None:\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::Converter::__init__"
+            }
+          ]
+        }
+      ]
+    },
+    "src/attr/exceptions.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -2,8 +2,6 @@",
+          "snippet": " \n from __future__ import annotations\n \n-from typing import ClassVar\n-\n \n class FrozenError(AttributeError):\n     \"\"\"",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/attr/exceptions.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -16,8 +14,10 @@",
+          "snippet": " class FrozenError(AttributeError):\n     .. versionadded:: 20.1.0\n     \"\"\"\n \n-    msg = \"can't set attribute\"\n-    args: ClassVar[tuple[str]] = [msg]\n+    def __init__(self):\n+        msg = \"can't set attribute\"\n+        super().__init__(msg)\n+        self.msg = msg\n \n \n class FrozenInstanceError(FrozenError):\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/exceptions.py::FrozenError::__init__"
+            }
+          ]
+        }
+      ]
+    },
+    "src/attr/validators.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -79,12 +79,14 @@",
+          "snippet": " def disabled():\n         This context manager is not thread-safe!\n \n     .. versionadded:: 21.3.0\n+    .. versionchanged:: 26.1.0 The contextmanager is nestable.\n     \"\"\"\n+    prev = get_run_validators()\n     set_run_validators(False)\n     try:\n         yield\n     finally:\n-        set_run_validators(True)\n+        set_run_validators(prev)\n \n \n @attrs(repr=False, slots=True, unsafe_hash=True)\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/validators.py::disabled"
+            }
+          ]
+        }
+      ]
+    },
+    "typing-examples/baseline.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -94,6 +94,15 @@",
+          "snippet": " class Validated:\n     num: int = attrs.field(validator=attrs.validators.ge(0))\n \n \n+@attrs.define\n+class ValidatedOptionalOverTuple:\n+    num: int | None = attrs.field(\n+        validator=attrs.validators.optional(\n+            (attrs.validators.instance_of(int), attrs.validators.ge(0))  # ty:ignore [invalid-argument-type]\n+        )\n+    )\n+\n+\n @attrs.define\n class ValidatedInconsistentOr:\n     num: int | str = attrs.field(",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "typing-examples/baseline.py::ValidatedOptionalOverTuple"
+            },
+            {
+              "kind": "attribute",
+              "node": "typing-examples/baseline.py::ValidatedOptionalOverTuple::num"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,1372 @@
+diff --git a/dummyserver/hypercornserver.py b/dummyserver/hypercornserver.py
+index f577a22..888f11d 100644
+--- a/dummyserver/hypercornserver.py
++++ b/dummyserver/hypercornserver.py
+@@ -5,7 +5,7 @@ import contextlib
+ import functools
+ import sys
+ import threading
+-from typing import Generator
++import typing
+ 
+ import hypercorn
+ import hypercorn.trio
+@@ -13,6 +13,8 @@ import hypercorn.typing
+ import trio
+ from quart_trio import QuartTrio
+ 
++from urllib3.util.url import parse_url
++
+ 
+ # https://github.com/pgjones/hypercorn/blob/19dfb96411575a6a647cdea63fa581b48ebb9180/src/hypercorn/utils.py#L172-L178
+ async def graceful_shutdown(shutdown_event: threading.Event) -> None:
+@@ -42,8 +44,20 @@ async def _start_server(
+ 
+ @contextlib.contextmanager
+ def run_hypercorn_in_thread(
+-    config: hypercorn.Config, app: hypercorn.typing.ASGIFramework
+-) -> Generator[None, None, None]:
++    host: str, certs: dict[str, typing.Any] | None, app: hypercorn.typing.ASGIFramework
++) -> typing.Iterator[int]:
++    config = hypercorn.Config()
++    if certs:
++        config.certfile = certs["certfile"]
++        config.keyfile = certs["keyfile"]
++        if "cert_reqs" in certs:
++            config.verify_mode = certs["cert_reqs"]
++        if "ca_certs" in certs:
++            config.ca_certs = certs["ca_certs"]
++        if "alpn_protocols" in certs:
++            config.alpn_protocols = certs["alpn_protocols"]
++    config.bind = [f"{host}:0"]
++
+     ready_event = threading.Event()
+     shutdown_event = threading.Event()
+ 
+@@ -63,7 +77,9 @@ def run_hypercorn_in_thread(
+             raise Exception("most likely failed to start server")
+ 
+         try:
+-            yield
++            port = parse_url(config.bind[0]).port
++            assert port is not None
++            yield port
+         finally:
+             shutdown_event.set()
+             future.result()
+
+diff --git a/dummyserver/socketserver.py b/dummyserver/socketserver.py
+index b8524b9..ec7d83e 100755
+--- a/dummyserver/socketserver.py
++++ b/dummyserver/socketserver.py
+@@ -168,11 +168,8 @@ def ssl_options_to_context(  # type: ignore[no-untyped-def]
+     ctx.verify_mode = cert_reqs
+     if ctx.verify_mode != cert_none:
+         ctx.load_verify_locations(cafile=ca_certs)
+-    if alpn_protocols and hasattr(ctx, "set_alpn_protocols"):
+-        try:
+-            ctx.set_alpn_protocols(alpn_protocols)
+-        except NotImplementedError:
+-            pass
++    if alpn_protocols:
++        ctx.set_alpn_protocols(alpn_protocols)
+     return ctx
+ 
+ 
+
+diff --git a/dummyserver/testcase.py b/dummyserver/testcase.py
+index 66a4360..58eac49 100644
+--- a/dummyserver/testcase.py
++++ b/dummyserver/testcase.py
+@@ -7,7 +7,6 @@ import threading
+ import typing
+ from test import LONG_TIMEOUT
+ 
+-import hypercorn
+ import pytest
+ 
+ from dummyserver.app import hypercorn_app
+@@ -16,7 +15,6 @@ from dummyserver.hypercornserver import run_hypercorn_in_thread
+ from dummyserver.socketserver import DEFAULT_CERTS, HAS_IPV6, SocketServerThread
+ from urllib3.connection import HTTPConnection
+ from urllib3.util.ssltransport import SSLTransport
+-from urllib3.util.url import parse_url
+ 
+ 
+ def consume_socket(
+@@ -207,17 +205,10 @@ class HypercornDummyServerTestCase:
+     @classmethod
+     def setup_class(cls) -> None:
+         with contextlib.ExitStack() as stack:
+-            config = hypercorn.Config()
+-            if cls.certs:
+-                config.certfile = cls.certs["certfile"]
+-                config.keyfile = cls.certs["keyfile"]
+-                config.verify_mode = cls.certs["cert_reqs"]
+-                config.ca_certs = cls.certs["ca_certs"]
+-                config.alpn_protocols = cls.certs["alpn_protocols"]
+-            config.bind = [f"{cls.host}:0"]
+-            stack.enter_context(run_hypercorn_in_thread(config, hypercorn_app))
++            cls.port = stack.enter_context(
++                run_hypercorn_in_thread(cls.host, cls.certs, hypercorn_app)
++            )
+             cls._stack = stack.pop_all()
+-            cls.port = typing.cast(int, parse_url(config.bind[0]).port)
+ 
+     @classmethod
+     def teardown_class(cls) -> None:
+@@ -263,47 +254,21 @@ class HypercornDummyProxyTestCase:
+     @classmethod
+     def setup_class(cls) -> None:
+         with contextlib.ExitStack() as stack:
+-            http_server_config = hypercorn.Config()
+-            http_server_config.bind = [f"{cls.http_host}:0"]
+-            stack.enter_context(
+-                run_hypercorn_in_thread(http_server_config, hypercorn_app)
++            cls.http_port = stack.enter_context(
++                run_hypercorn_in_thread(cls.http_host, None, hypercorn_app)
+             )
+-            cls.http_port = typing.cast(int, parse_url(http_server_config.bind[0]).port)
+-
+-            https_server_config = hypercorn.Config()
+-            https_server_config.certfile = cls.https_certs["certfile"]
+-            https_server_config.keyfile = cls.https_certs["keyfile"]
+-            https_server_config.verify_mode = cls.https_certs["cert_reqs"]
+-            https_server_config.ca_certs = cls.https_certs["ca_certs"]
+-            https_server_config.alpn_protocols = cls.https_certs["alpn_protocols"]
+-            https_server_config.bind = [f"{cls.https_host}:0"]
+-            stack.enter_context(
+-                run_hypercorn_in_thread(https_server_config, hypercorn_app)
++            cls.https_port = stack.enter_context(
++                run_hypercorn_in_thread(cls.https_host, cls.https_certs, hypercorn_app)
+             )
+-            cls.https_port = typing.cast(
+-                int, parse_url(https_server_config.bind[0]).port
++            cls.proxy_port = stack.enter_context(
++                run_hypercorn_in_thread(cls.proxy_host, None, ProxyApp())
+             )
+-
+-            http_proxy_config = hypercorn.Config()
+-            http_proxy_config.bind = [f"{cls.proxy_host}:0"]
+-            stack.enter_context(run_hypercorn_in_thread(http_proxy_config, ProxyApp()))
+-            cls.proxy_port = typing.cast(int, parse_url(http_proxy_config.bind[0]).port)
+-
+-            https_proxy_config = hypercorn.Config()
+-            https_proxy_config.certfile = cls.https_certs["certfile"]
+-            https_proxy_config.keyfile = cls.https_certs["keyfile"]
+-            https_proxy_config.verify_mode = cls.https_certs["cert_reqs"]
+-            https_proxy_config.ca_certs = cls.https_certs["ca_certs"]
+-            https_proxy_config.alpn_protocols = cls.https_certs["alpn_protocols"]
+-            https_proxy_config.bind = [f"{cls.proxy_host}:0"]
+             upstream_ca_certs = cls.https_certs.get("ca_certs")
+-            stack.enter_context(
+-                run_hypercorn_in_thread(https_proxy_config, ProxyApp(upstream_ca_certs))
++            cls.https_proxy_port = stack.enter_context(
++                run_hypercorn_in_thread(
++                    cls.proxy_host, cls.https_certs, ProxyApp(upstream_ca_certs)
++                )
+             )
+-            cls.https_proxy_port = typing.cast(
+-                int, parse_url(https_proxy_config.bind[0]).port
+-            )
+-
+             cls._stack = stack.pop_all()
+ 
+     @classmethod
+
+diff --git a/src/urllib3/_request_methods.py b/src/urllib3/_request_methods.py
+index 632042f..03186e5 100644
+--- a/src/urllib3/_request_methods.py
++++ b/src/urllib3/_request_methods.py
+@@ -97,8 +97,7 @@ class RequestMethods:
+             an iterable of :class:`str`/:class:`bytes`, or a file-like object.
+ 
+         :param fields:
+-            Data to encode and send in the request body.  Values are processed
+-            by :func:`urllib.parse.urlencode`.
++            Data to encode and send in the URL or request body, depending on ``method``.
+ 
+         :param headers:
+             Dictionary of custom headers to send, such as User-Agent,
+@@ -164,7 +163,7 @@ class RequestMethods:
+             The URL to perform the request on.
+ 
+         :param fields:
+-            Data to encode and send in the request body.
++            Data to encode and send in the URL.
+ 
+         :param headers:
+             Dictionary of custom headers to send, such as User-Agent,
+
+diff --git a/src/urllib3/_version.py b/src/urllib3/_version.py
+index 7442f2b..eb8b5c2 100644
+--- a/src/urllib3/_version.py
++++ b/src/urllib3/_version.py
+@@ -1,4 +1,16 @@
+-# This file is protected via CODEOWNERS
+-from __future__ import annotations
++# file generated by setuptools_scm
++# don't change, don't track in version control
++TYPE_CHECKING = False
++if TYPE_CHECKING:
++    from typing import Tuple, Union
++    VERSION_TUPLE = Tuple[Union[int, str], ...]
++else:
++    VERSION_TUPLE = object
+ 
+-__version__ = "2.2.2"
++version: str
++__version__: str
++__version_tuple__: VERSION_TUPLE
++version_tuple: VERSION_TUPLE
++
++__version__ = version = '2.2.3'
++__version_tuple__ = version_tuple = (2, 2, 3)
+
+diff --git a/src/urllib3/connection.py b/src/urllib3/connection.py
+index 1b16279..7cbef7d 100644
+--- a/src/urllib3/connection.py
++++ b/src/urllib3/connection.py
+@@ -1,11 +1,13 @@
+ from __future__ import annotations
+ 
+ import datetime
++import http.client
+ import logging
+ import os
+ import re
+ import socket
+ import sys
++import threading
+ import typing
+ import warnings
+ from http.client import HTTPConnection as _HTTPConnection
+@@ -19,6 +21,7 @@ if typing.TYPE_CHECKING:
+     from .util.ssltransport import SSLTransport
+ 
+ from ._collections import HTTPHeaderDict
++from .http2 import probe as http2_probe
+ from .util.response import assert_header_parsing
+ from .util.timeout import _DEFAULT_TIMEOUT, _TYPE_TIMEOUT, Timeout
+ from .util.util import to_str
+@@ -232,6 +235,46 @@ class HTTPConnection(_HTTPConnection):
+         super().set_tunnel(host, port=port, headers=headers)
+         self._tunnel_scheme = scheme
+ 
++    if sys.version_info < (3, 11, 4):
++
++        def _tunnel(self) -> None:
++            _MAXLINE = http.client._MAXLINE  # type: ignore[attr-defined]
++            connect = b"CONNECT %s:%d HTTP/1.0\r\n" % (  # type: ignore[str-format]
++                self._tunnel_host.encode("ascii"),  # type: ignore[union-attr]
++                self._tunnel_port,
++            )
++            headers = [connect]
++            for header, value in self._tunnel_headers.items():  # type: ignore[attr-defined]
++                headers.append(f"{header}: {value}\r\n".encode("latin-1"))
++            headers.append(b"\r\n")
++            # Making a single send() call instead of one per line encourages
++            # the host OS to use a more optimal packet size instead of
++            # potentially emitting a series of small packets.
++            self.send(b"".join(headers))
++            del headers
++
++            response = self.response_class(self.sock, method=self._method)  # type: ignore[attr-defined]
++            try:
++                (version, code, message) = response._read_status()  # type: ignore[attr-defined]
++
++                if code != http.HTTPStatus.OK:
++                    self.close()
++                    raise OSError(f"Tunnel connection failed: {code} {message.strip()}")
++                while True:
++                    line = response.fp.readline(_MAXLINE + 1)
++                    if len(line) > _MAXLINE:
++                        raise http.client.LineTooLong("header line")
++                    if not line:
++                        # for sites which EOF without sending a trailer
++                        break
++                    if line in (b"\r\n", b"\n", b""):
++                        break
++
++                    if self.debuglevel > 0:
++                        print("header:", line.decode())
++            finally:
++                response.close()
++
+     def connect(self) -> None:
+         self.sock = self._new_conn()
+         if self._tunnel_host:
+@@ -239,7 +282,7 @@ class HTTPConnection(_HTTPConnection):
+             self._has_connected_to_proxy = True
+ 
+             # TODO: Fix tunnel so it doesn't depend on self.sock state.
+-            self._tunnel()  # type: ignore[attr-defined]
++            self._tunnel()
+ 
+         # If there's a proxy to be connected to we are fully connected.
+         # This is set twice (once above and here) due to forwarding proxies
+@@ -508,6 +551,7 @@ class HTTPSConnection(HTTPConnection):
+     ssl_minimum_version: int | None = None
+     ssl_maximum_version: int | None = None
+     assert_fingerprint: str | None = None
++    _connect_callback: typing.Callable[..., None] | None = None
+ 
+     def __init__(
+         self,
+@@ -568,6 +612,7 @@ class HTTPSConnection(HTTPConnection):
+             else:
+                 cert_reqs = resolve_cert_reqs(None)
+         self.cert_reqs = cert_reqs
++        self._connect_callback = None
+ 
+     def set_cert(
+         self,
+@@ -611,63 +656,122 @@ class HTTPSConnection(HTTPConnection):
+         self.ca_cert_data = ca_cert_data
+ 
+     def connect(self) -> None:
+-        sock: socket.socket | ssl.SSLSocket
+-        self.sock = sock = self._new_conn()
+-        server_hostname: str = self.host
+-        tls_in_tls = False
+-
+-        # Do we need to establish a tunnel?
+-        if self._tunnel_host is not None:
+-            # We're tunneling to an HTTPS origin so need to do TLS-in-TLS.
+-            if self._tunnel_scheme == "https":
+-                # _connect_tls_proxy will verify and assign proxy_is_verified
+-                self.sock = sock = self._connect_tls_proxy(self.host, sock)
+-                tls_in_tls = True
+-            elif self._tunnel_scheme == "http":
+-                self.proxy_is_verified = False
++        # Today we don't need to be doing this step before the /actual/ socket
++        # connection, however in the future we'll need to decide whether to
++        # create a new socket or re-use an existing "shared" socket as a part
++        # of the HTTP/2 handshake dance.
++        if self._tunnel_host is not None and self._tunnel_port is not None:
++            probe_http2_host = self._tunnel_host
++            probe_http2_port = self._tunnel_port
++        else:
++            probe_http2_host = self.host
++            probe_http2_port = self.port
++
++        # Check if the target origin supports HTTP/2.
++        # If the value comes back as 'None' it means that the current thread
++        # is probing for HTTP/2 support. Otherwise, we're waiting for another
++        # probe to complete, or we get a value right away.
++        target_supports_http2: bool | None
++        if "h2" in ssl_.ALPN_PROTOCOLS:
++            target_supports_http2 = http2_probe.acquire_and_get(
++                host=probe_http2_host, port=probe_http2_port
++            )
++        else:
++            # If HTTP/2 isn't going to be offered it doesn't matter if
++            # the target supports HTTP/2. Don't want to make a probe.
++            target_supports_http2 = False
++
++        if self._connect_callback is not None:
++            self._connect_callback(
++                "before connect",
++                thread_id=threading.get_ident(),
++                target_supports_http2=target_supports_http2,
++            )
+ 
+-            # If we're tunneling it means we're connected to our proxy.
+-            self._has_connected_to_proxy = True
++        try:
++            sock: socket.socket | ssl.SSLSocket
++            self.sock = sock = self._new_conn()
++            server_hostname: str = self.host
++            tls_in_tls = False
++
++            # Do we need to establish a tunnel?
++            if self._tunnel_host is not None:
++                # We're tunneling to an HTTPS origin so need to do TLS-in-TLS.
++                if self._tunnel_scheme == "https":
++                    # _connect_tls_proxy will verify and assign proxy_is_verified
++                    self.sock = sock = self._connect_tls_proxy(self.host, sock)
++                    tls_in_tls = True
++                elif self._tunnel_scheme == "http":
++                    self.proxy_is_verified = False
++
++                # If we're tunneling it means we're connected to our proxy.
++                self._has_connected_to_proxy = True
++
++                self._tunnel()
++                # Override the host with the one we're requesting data from.
++                server_hostname = self._tunnel_host
++
++            if self.server_hostname is not None:
++                server_hostname = self.server_hostname
++
++            is_time_off = datetime.date.today() < RECENT_DATE
++            if is_time_off:
++                warnings.warn(
++                    (
++                        f"System time is way off (before {RECENT_DATE}). This will probably "
++                        "lead to SSL verification errors"
++                    ),
++                    SystemTimeWarning,
++                )
+ 
+-            self._tunnel()  # type: ignore[attr-defined]
+-            # Override the host with the one we're requesting data from.
+-            server_hostname = self._tunnel_host
+-
+-        if self.server_hostname is not None:
+-            server_hostname = self.server_hostname
+-
+-        is_time_off = datetime.date.today() < RECENT_DATE
+-        if is_time_off:
+-            warnings.warn(
+-                (
+-                    f"System time is way off (before {RECENT_DATE}). This will probably "
+-                    "lead to SSL verification errors"
+-                ),
+-                SystemTimeWarning,
++            # Remove trailing '.' from fqdn hostnames to allow certificate validation
++            server_hostname_rm_dot = server_hostname.rstrip(".")
++
++            sock_and_verified = _ssl_wrap_socket_and_match_hostname(
++                sock=sock,
++                cert_reqs=self.cert_reqs,
++                ssl_version=self.ssl_version,
++                ssl_minimum_version=self.ssl_minimum_version,
++                ssl_maximum_version=self.ssl_maximum_version,
++                ca_certs=self.ca_certs,
++                ca_cert_dir=self.ca_cert_dir,
++                ca_cert_data=self.ca_cert_data,
++                cert_file=self.cert_file,
++                key_file=self.key_file,
++                key_password=self.key_password,
++                server_hostname=server_hostname_rm_dot,
++                ssl_context=self.ssl_context,
++                tls_in_tls=tls_in_tls,
++                assert_hostname=self.assert_hostname,
++                assert_fingerprint=self.assert_fingerprint,
+             )
++            self.sock = sock_and_verified.socket
++
++        # If an error occurs during connection/handshake we may need to release
++        # our lock so another connection can probe the origin.
++        except BaseException:
++            if self._connect_callback is not None:
++                self._connect_callback(
++                    "after connect failure",
++                    thread_id=threading.get_ident(),
++                    target_supports_http2=target_supports_http2,
++                )
+ 
+-        # Remove trailing '.' from fqdn hostnames to allow certificate validation
+-        server_hostname_rm_dot = server_hostname.rstrip(".")
+-
+-        sock_and_verified = _ssl_wrap_socket_and_match_hostname(
+-            sock=sock,
+-            cert_reqs=self.cert_reqs,
+-            ssl_version=self.ssl_version,
+-            ssl_minimum_version=self.ssl_minimum_version,
+-            ssl_maximum_version=self.ssl_maximum_version,
+-            ca_certs=self.ca_certs,
+-            ca_cert_dir=self.ca_cert_dir,
+-            ca_cert_data=self.ca_cert_data,
+-            cert_file=self.cert_file,
+-            key_file=self.key_file,
+-            key_password=self.key_password,
+-            server_hostname=server_hostname_rm_dot,
+-            ssl_context=self.ssl_context,
+-            tls_in_tls=tls_in_tls,
+-            assert_hostname=self.assert_hostname,
+-            assert_fingerprint=self.assert_fingerprint,
+-        )
+-        self.sock = sock_and_verified.socket
++            if target_supports_http2 is None:
++                http2_probe.set_and_release(
++                    host=probe_http2_host, port=probe_http2_port, supports_http2=None
++                )
++            raise
++
++        # If this connection doesn't know if the origin supports HTTP/2
++        # we report back to the HTTP/2 probe our result.
++        if target_supports_http2 is None:
++            supports_http2 = sock_and_verified.socket.selected_alpn_protocol() == "h2"
++            http2_probe.set_and_release(
++                host=probe_http2_host,
++                port=probe_http2_port,
++                supports_http2=supports_http2,
++            )
+ 
+         # Forwarding proxies can never have a verified target since
+         # the proxy is the one doing the verification. Should instead
+
+diff --git a/src/urllib3/contrib/pyopenssl.py b/src/urllib3/contrib/pyopenssl.py
+index b89a6da..c12cb31 100644
+--- a/src/urllib3/contrib/pyopenssl.py
++++ b/src/urllib3/contrib/pyopenssl.py
+@@ -400,6 +400,10 @@ class WrappedSocket:
+     def version(self) -> str:
+         return self.connection.get_protocol_version_name()  # type: ignore[no-any-return]
+ 
++    def selected_alpn_protocol(self) -> str | None:
++        alpn_proto = self.connection.get_alpn_proto_negotiated()
++        return alpn_proto.decode() if alpn_proto else None
++
+ 
+ WrappedSocket.makefile = socket_cls.makefile  # type: ignore[attr-defined]
+ 
+
+diff --git a/src/urllib3/http2/__init__.py b/src/urllib3/http2/__init__.py
+new file mode 100644
+index 0000000..133e1d8
+--- /dev/null
++++ b/src/urllib3/http2/__init__.py
+@@ -0,0 +1,53 @@
++from __future__ import annotations
++
++from importlib.metadata import version
++
++__all__ = [
++    "inject_into_urllib3",
++    "extract_from_urllib3",
++]
++
++import typing
++
++orig_HTTPSConnection: typing.Any = None
++
++
++def inject_into_urllib3() -> None:
++    # First check if h2 version is valid
++    h2_version = version("h2")
++    if not h2_version.startswith("4."):
++        raise ImportError(
++            "urllib3 v2 supports h2 version 4.x.x, currently "
++            f"the 'h2' module is compiled with {h2_version!r}. "
++            "See: https://github.com/urllib3/urllib3/issues/3290"
++        )
++
++    # Import here to avoid circular dependencies.
++    from .. import connection as urllib3_connection
++    from .. import util as urllib3_util
++    from ..connectionpool import HTTPSConnectionPool
++    from ..util import ssl_ as urllib3_util_ssl
++    from .connection import HTTP2Connection
++
++    global orig_HTTPSConnection
++    orig_HTTPSConnection = urllib3_connection.HTTPSConnection
++
++    HTTPSConnectionPool.ConnectionCls = HTTP2Connection
++    urllib3_connection.HTTPSConnection = HTTP2Connection  # type: ignore[misc]
++
++    # TODO: Offer 'http/1.1' as well, but for testing purposes this is handy.
++    urllib3_util.ALPN_PROTOCOLS = ["h2"]
++    urllib3_util_ssl.ALPN_PROTOCOLS = ["h2"]
++
++
++def extract_from_urllib3() -> None:
++    from .. import connection as urllib3_connection
++    from .. import util as urllib3_util
++    from ..connectionpool import HTTPSConnectionPool
++    from ..util import ssl_ as urllib3_util_ssl
++
++    HTTPSConnectionPool.ConnectionCls = orig_HTTPSConnection
++    urllib3_connection.HTTPSConnection = orig_HTTPSConnection  # type: ignore[misc]
++
++    urllib3_util.ALPN_PROTOCOLS = ["http/1.1"]
++    urllib3_util_ssl.ALPN_PROTOCOLS = ["http/1.1"]
+
+diff --git a/src/urllib3/http2/connection.py b/src/urllib3/http2/connection.py
+new file mode 100644
+index 0000000..f486145
+--- /dev/null
++++ b/src/urllib3/http2/connection.py
+@@ -0,0 +1,356 @@
++from __future__ import annotations
++
++import logging
++import re
++import threading
++import types
++import typing
++
++import h2.config  # type: ignore[import-untyped]
++import h2.connection  # type: ignore[import-untyped]
++import h2.events  # type: ignore[import-untyped]
++
++from .._base_connection import _TYPE_BODY
++from .._collections import HTTPHeaderDict
++from ..connection import HTTPSConnection, _get_default_user_agent
++from ..exceptions import ConnectionError
++from ..response import BaseHTTPResponse
++
++orig_HTTPSConnection = HTTPSConnection
++
++T = typing.TypeVar("T")
++
++log = logging.getLogger(__name__)
++
++RE_IS_LEGAL_HEADER_NAME = re.compile(rb"^[!#$%&'*+\-.^_`|~0-9a-z]+$")
++RE_IS_ILLEGAL_HEADER_VALUE = re.compile(rb"[\0\x00\x0a\x0d\r\n]|^[ \r\n\t]|[ \r\n\t]$")
++
++
++def _is_legal_header_name(name: bytes) -> bool:
++    """
++    "An implementation that validates fields according to the definitions in Sections
++    5.1 and 5.5 of [HTTP] only needs an additional check that field names do not
++    include uppercase characters." (https://httpwg.org/specs/rfc9113.html#n-field-validity)
++
++    `http.client._is_legal_header_name` does not validate the field name according to the
++    HTTP 1.1 spec, so we do that here, in addition to checking for uppercase characters.
++
++    This does not allow for the `:` character in the header name, so should not
++    be used to validate pseudo-headers.
++    """
++    return bool(RE_IS_LEGAL_HEADER_NAME.match(name))
++
++
++def _is_illegal_header_value(value: bytes) -> bool:
++    """
++    "A field value MUST NOT contain the zero value (ASCII NUL, 0x00), line feed
++    (ASCII LF, 0x0a), or carriage return (ASCII CR, 0x0d) at any position. A field
++    value MUST NOT start or end with an ASCII whitespace character (ASCII SP or HTAB,
++    0x20 or 0x09)." (https://httpwg.org/specs/rfc9113.html#n-field-validity)
++    """
++    return bool(RE_IS_ILLEGAL_HEADER_VALUE.search(value))
++
++
++class _LockedObject(typing.Generic[T]):
++    """
++    A wrapper class that hides a specific object behind a lock.
++    The goal here is to provide a simple way to protect access to an object
++    that cannot safely be simultaneously accessed from multiple threads. The
++    intended use of this class is simple: take hold of it with a context
++    manager, which returns the protected object.
++    """
++
++    __slots__ = (
++        "lock",
++        "_obj",
++    )
++
++    def __init__(self, obj: T):
++        self.lock = threading.RLock()
++        self._obj = obj
++
++    def __enter__(self) -> T:
++        self.lock.acquire()
++        return self._obj
++
++    def __exit__(
++        self,
++        exc_type: type[BaseException] | None,
++        exc_val: BaseException | None,
++        exc_tb: types.TracebackType | None,
++    ) -> None:
++        self.lock.release()
++
++
++class HTTP2Connection(HTTPSConnection):
++    def __init__(
++        self, host: str, port: int | None = None, **kwargs: typing.Any
++    ) -> None:
++        self._h2_conn = self._new_h2_conn()
++        self._h2_stream: int | None = None
++        self._headers: list[tuple[bytes, bytes]] = []
++
++        if "proxy" in kwargs or "proxy_config" in kwargs:  # Defensive:
++            raise NotImplementedError("Proxies aren't supported with HTTP/2")
++
++        super().__init__(host, port, **kwargs)
++
++        if self._tunnel_host is not None:
++            raise NotImplementedError("Tunneling isn't supported with HTTP/2")
++
++    def _new_h2_conn(self) -> _LockedObject[h2.connection.H2Connection]:
++        config = h2.config.H2Configuration(client_side=True)
++        return _LockedObject(h2.connection.H2Connection(config=config))
++
++    def connect(self) -> None:
++        super().connect()
++        with self._h2_conn as conn:
++            conn.initiate_connection()
++            if data_to_send := conn.data_to_send():
++                self.sock.sendall(data_to_send)
++
++    def putrequest(  # type: ignore[override]
++        self,
++        method: str,
++        url: str,
++        **kwargs: typing.Any,
++    ) -> None:
++        """putrequest
++        This deviates from the HTTPConnection method signature since we never need to override
++        sending accept-encoding headers or the host header.
++        """
++        if "skip_host" in kwargs:
++            raise NotImplementedError("`skip_host` isn't supported")
++        if "skip_accept_encoding" in kwargs:
++            raise NotImplementedError("`skip_accept_encoding` isn't supported")
++
++        self._request_url = url or "/"
++        self._validate_path(url)  # type: ignore[attr-defined]
++
++        if ":" in self.host:
++            authority = f"[{self.host}]:{self.port or 443}"
++        else:
++            authority = f"{self.host}:{self.port or 443}"
++
++        self._headers.append((b":scheme", b"https"))
++        self._headers.append((b":method", method.encode()))
++        self._headers.append((b":authority", authority.encode()))
++        self._headers.append((b":path", url.encode()))
++
++        with self._h2_conn as conn:
++            self._h2_stream = conn.get_next_available_stream_id()
++
++    def putheader(self, header: str | bytes, *values: str | bytes) -> None:
++        # TODO SKIPPABLE_HEADERS from urllib3 are ignored.
++        header = header.encode() if isinstance(header, str) else header
++        header = header.lower()  # A lot of upstream code uses capitalized headers.
++        if not _is_legal_header_name(header):
++            raise ValueError(f"Illegal header name {str(header)}")
++
++        for value in values:
++            value = value.encode() if isinstance(value, str) else value
++            if _is_illegal_header_value(value):
++                raise ValueError(f"Illegal header value {str(value)}")
++            self._headers.append((header, value))
++
++    def endheaders(self, message_body: typing.Any = None) -> None:  # type: ignore[override]
++        if self._h2_stream is None:
++            raise ConnectionError("Must call `putrequest` first.")
++
++        with self._h2_conn as conn:
++            conn.send_headers(
++                stream_id=self._h2_stream,
++                headers=self._headers,
++                end_stream=(message_body is None),
++            )
++            if data_to_send := conn.data_to_send():
++                self.sock.sendall(data_to_send)
++        self._headers = []  # Reset headers for the next request.
++
++    def send(self, data: typing.Any) -> None:
++        """Send data to the server.
++        `data` can be: `str`, `bytes`, an iterable, or file-like objects
++        that support a .read() method.
++        """
++        if self._h2_stream is None:
++            raise ConnectionError("Must call `putrequest` first.")
++
++        with self._h2_conn as conn:
++            if data_to_send := conn.data_to_send():
++                self.sock.sendall(data_to_send)
++
++            if hasattr(data, "read"):  # file-like objects
++                while True:
++                    chunk = data.read(self.blocksize)
++                    if not chunk:
++                        break
++                    if isinstance(chunk, str):
++                        chunk = chunk.encode()  # pragma: no cover
++                    conn.send_data(self._h2_stream, chunk, end_stream=False)
++                    if data_to_send := conn.data_to_send():
++                        self.sock.sendall(data_to_send)
++                conn.end_stream(self._h2_stream)
++                return
++
++            if isinstance(data, str):  # str -> bytes
++                data = data.encode()
++
++            try:
++                if isinstance(data, bytes):
++                    conn.send_data(self._h2_stream, data, end_stream=True)
++                    if data_to_send := conn.data_to_send():
++                        self.sock.sendall(data_to_send)
++                else:
++                    for chunk in data:
++                        conn.send_data(self._h2_stream, chunk, end_stream=False)
++                        if data_to_send := conn.data_to_send():
++                            self.sock.sendall(data_to_send)
++                    conn.end_stream(self._h2_stream)
++            except TypeError:
++                raise TypeError(
++                    "`data` should be str, bytes, iterable, or file. got %r"
++                    % type(data)
++                )
++
++    def set_tunnel(
++        self,
++        host: str,
++        port: int | None = None,
++        headers: typing.Mapping[str, str] | None = None,
++        scheme: str = "http",
++    ) -> None:
++        raise NotImplementedError(
++            "HTTP/2 does not support setting up a tunnel through a proxy"
++        )
++
++    def getresponse(  # type: ignore[override]
++        self,
++    ) -> HTTP2Response:
++        status = None
++        data = bytearray()
++        with self._h2_conn as conn:
++            end_stream = False
++            while not end_stream:
++                # TODO: Arbitrary read value.
++                if received_data := self.sock.recv(65535):
++                    events = conn.receive_data(received_data)
++                    for event in events:
++                        if isinstance(event, h2.events.ResponseReceived):
++                            headers = HTTPHeaderDict()
++                            for header, value in event.headers:
++                                if header == b":status":
++                                    status = int(value.decode())
++                                else:
++                                    headers.add(
++                                        header.decode("ascii"), value.decode("ascii")
++                                    )
++
++                        elif isinstance(event, h2.events.DataReceived):
++                            data += event.data
++                            conn.acknowledge_received_data(
++                                event.flow_controlled_length, event.stream_id
++                            )
++
++                        elif isinstance(event, h2.events.StreamEnded):
++                            end_stream = True
++
++                if data_to_send := conn.data_to_send():
++                    self.sock.sendall(data_to_send)
++
++        assert status is not None
++        return HTTP2Response(
++            status=status,
++            headers=headers,
++            request_url=self._request_url,
++            data=bytes(data),
++        )
++
++    def request(  # type: ignore[override]
++        self,
++        method: str,
++        url: str,
++        body: _TYPE_BODY | None = None,
++        headers: typing.Mapping[str, str] | None = None,
++        *,
++        preload_content: bool = True,
++        decode_content: bool = True,
++        enforce_content_length: bool = True,
++        **kwargs: typing.Any,
++    ) -> None:
++        """Send an HTTP/2 request"""
++        if "chunked" in kwargs:
++            # TODO this is often present from upstream.
++            # raise NotImplementedError("`chunked` isn't supported with HTTP/2")
++            pass
++
++        if self.sock is not None:
++            self.sock.settimeout(self.timeout)
++
++        self.putrequest(method, url)
++
++        headers = headers or {}
++        for k, v in headers.items():
++            if k.lower() == "transfer-encoding" and v == "chunked":
++                continue
++            else:
++                self.putheader(k, v)
++
++        if b"user-agent" not in dict(self._headers):
++            self.putheader(b"user-agent", _get_default_user_agent())
++
++        if body:
++            self.endheaders(message_body=body)
++            self.send(body)
++        else:
++            self.endheaders()
++
++    def close(self) -> None:
++        with self._h2_conn as conn:
++            try:
++                conn.close_connection()
++                if data := conn.data_to_send():
++                    self.sock.sendall(data)
++            except Exception:
++                pass
++
++        # Reset all our HTTP/2 connection state.
++        self._h2_conn = self._new_h2_conn()
++        self._h2_stream = None
++        self._headers = []
++
++        super().close()
++
++
++class HTTP2Response(BaseHTTPResponse):
++    # TODO: This is a woefully incomplete response object, but works for non-streaming.
++    def __init__(
++        self,
++        status: int,
++        headers: HTTPHeaderDict,
++        request_url: str,
++        data: bytes,
++        decode_content: bool = False,  # TODO: support decoding
++    ) -> None:
++        super().__init__(
++            status=status,
++            headers=headers,
++            # Following CPython, we map HTTP versions to major * 10 + minor integers
++            version=20,
++            version_string="HTTP/2",
++            # No reason phrase in HTTP/2
++            reason=None,
++            decode_content=decode_content,
++            request_url=request_url,
++        )
++        self._data = data
++        self.length_remaining = 0
++
++    @property
++    def data(self) -> bytes:
++        return self._data
++
++    def get_redirect_location(self) -> None:
++        return None
++
++    def close(self) -> None:
++        pass
+
+diff --git a/src/urllib3/http2/probe.py b/src/urllib3/http2/probe.py
+new file mode 100644
+index 0000000..9ea9007
+--- /dev/null
++++ b/src/urllib3/http2/probe.py
+@@ -0,0 +1,87 @@
++from __future__ import annotations
++
++import threading
++
++
++class _HTTP2ProbeCache:
++    __slots__ = (
++        "_lock",
++        "_cache_locks",
++        "_cache_values",
++    )
++
++    def __init__(self) -> None:
++        self._lock = threading.Lock()
++        self._cache_locks: dict[tuple[str, int], threading.RLock] = {}
++        self._cache_values: dict[tuple[str, int], bool | None] = {}
++
++    def acquire_and_get(self, host: str, port: int) -> bool | None:
++        # By the end of this block we know that
++        # _cache_[values,locks] is available.
++        value = None
++        with self._lock:
++            key = (host, port)
++            try:
++                value = self._cache_values[key]
++                # If it's a known value we return right away.
++                if value is not None:
++                    return value
++            except KeyError:
++                self._cache_locks[key] = threading.RLock()
++                self._cache_values[key] = None
++
++        # If the value is unknown, we acquire the lock to signal
++        # to the requesting thread that the probe is in progress
++        # or that the current thread needs to return their findings.
++        key_lock = self._cache_locks[key]
++        key_lock.acquire()
++        try:
++            # If the by the time we get the lock the value has been
++            # updated we want to return the updated value.
++            value = self._cache_values[key]
++
++        # In case an exception like KeyboardInterrupt is raised here.
++        except BaseException as e:  # Defensive:
++            assert not isinstance(e, KeyError)  # KeyError shouldn't be possible.
++            key_lock.release()
++            raise
++
++        return value
++
++    def set_and_release(
++        self, host: str, port: int, supports_http2: bool | None
++    ) -> None:
++        key = (host, port)
++        key_lock = self._cache_locks[key]
++        with key_lock:  # Uses an RLock, so can be locked again from same thread.
++            if supports_http2 is None and self._cache_values[key] is not None:
++                raise ValueError(
++                    "Cannot reset HTTP/2 support for origin after value has been set."
++                )  # Defensive: not expected in normal usage
++
++        self._cache_values[key] = supports_http2
++        key_lock.release()
++
++    def _values(self) -> dict[tuple[str, int], bool | None]:
++        """This function is for testing purposes only. Gets the current state of the probe cache"""
++        with self._lock:
++            return {k: v for k, v in self._cache_values.items()}
++
++    def _reset(self) -> None:
++        """This function is for testing purposes only. Reset the cache values"""
++        with self._lock:
++            self._cache_locks = {}
++            self._cache_values = {}
++
++
++_HTTP2_PROBE_CACHE = _HTTP2ProbeCache()
++
++set_and_release = _HTTP2_PROBE_CACHE.set_and_release
++acquire_and_get = _HTTP2_PROBE_CACHE.acquire_and_get
++_values = _HTTP2_PROBE_CACHE._values
++_reset = _HTTP2_PROBE_CACHE._reset
++
++__all__ = [
++    "set_and_release",
++    "acquire_and_get",
++]
+
+diff --git a/src/urllib3/http2.py b/src/urllib3/http2.py
+deleted file mode 100644
+index ceb4060..0000000
+--- a/src/urllib3/http2.py
++++ /dev/null
+@@ -1,230 +0,0 @@
+-from __future__ import annotations
+-
+-import threading
+-import types
+-import typing
+-
+-import h2.config  # type: ignore[import-untyped]
+-import h2.connection  # type: ignore[import-untyped]
+-import h2.events  # type: ignore[import-untyped]
+-
+-import urllib3.connection
+-import urllib3.util.ssl_
+-from urllib3.response import BaseHTTPResponse
+-
+-from ._collections import HTTPHeaderDict
+-from .connection import HTTPSConnection
+-from .connectionpool import HTTPSConnectionPool
+-
+-orig_HTTPSConnection = HTTPSConnection
+-
+-T = typing.TypeVar("T")
+-
+-
+-class _LockedObject(typing.Generic[T]):
+-    """
+-    A wrapper class that hides a specific object behind a lock.
+-
+-    The goal here is to provide a simple way to protect access to an object
+-    that cannot safely be simultaneously accessed from multiple threads. The
+-    intended use of this class is simple: take hold of it with a context
+-    manager, which returns the protected object.
+-    """
+-
+-    def __init__(self, obj: T):
+-        self.lock = threading.RLock()
+-        self._obj = obj
+-
+-    def __enter__(self) -> T:
+-        self.lock.acquire()
+-        return self._obj
+-
+-    def __exit__(
+-        self,
+-        exc_type: type[BaseException] | None,
+-        exc_val: BaseException | None,
+-        exc_tb: types.TracebackType | None,
+-    ) -> None:
+-        self.lock.release()
+-
+-
+-class HTTP2Connection(HTTPSConnection):
+-    def __init__(
+-        self, host: str, port: int | None = None, **kwargs: typing.Any
+-    ) -> None:
+-        self._h2_conn = self._new_h2_conn()
+-        self._h2_stream: int | None = None
+-        self._h2_headers: list[tuple[bytes, bytes]] = []
+-
+-        if "proxy" in kwargs or "proxy_config" in kwargs:  # Defensive:
+-            raise NotImplementedError("Proxies aren't supported with HTTP/2")
+-
+-        super().__init__(host, port, **kwargs)
+-
+-    def _new_h2_conn(self) -> _LockedObject[h2.connection.H2Connection]:
+-        config = h2.config.H2Configuration(client_side=True)
+-        return _LockedObject(h2.connection.H2Connection(config=config))
+-
+-    def connect(self) -> None:
+-        super().connect()
+-
+-        with self._h2_conn as h2_conn:
+-            h2_conn.initiate_connection()
+-            self.sock.sendall(h2_conn.data_to_send())
+-
+-    def putrequest(
+-        self,
+-        method: str,
+-        url: str,
+-        skip_host: bool = False,
+-        skip_accept_encoding: bool = False,
+-    ) -> None:
+-        with self._h2_conn as h2_conn:
+-            self._request_url = url
+-            self._h2_stream = h2_conn.get_next_available_stream_id()
+-
+-            if ":" in self.host:
+-                authority = f"[{self.host}]:{self.port or 443}"
+-            else:
+-                authority = f"{self.host}:{self.port or 443}"
+-
+-            self._h2_headers.extend(
+-                (
+-                    (b":scheme", b"https"),
+-                    (b":method", method.encode()),
+-                    (b":authority", authority.encode()),
+-                    (b":path", url.encode()),
+-                )
+-            )
+-
+-    def putheader(self, header: str, *values: str) -> None:  # type: ignore[override]
+-        for value in values:
+-            self._h2_headers.append(
+-                (header.encode("utf-8").lower(), value.encode("utf-8"))
+-            )
+-
+-    def endheaders(self) -> None:  # type: ignore[override]
+-        with self._h2_conn as h2_conn:
+-            h2_conn.send_headers(
+-                stream_id=self._h2_stream,
+-                headers=self._h2_headers,
+-                end_stream=True,
+-            )
+-            if data_to_send := h2_conn.data_to_send():
+-                self.sock.sendall(data_to_send)
+-
+-    def send(self, data: bytes) -> None:  # type: ignore[override]  # Defensive:
+-        if not data:
+-            return
+-        raise NotImplementedError("Sending data isn't supported yet")
+-
+-    def getresponse(  # type: ignore[override]
+-        self,
+-    ) -> HTTP2Response:
+-        status = None
+-        data = bytearray()
+-        with self._h2_conn as h2_conn:
+-            end_stream = False
+-            while not end_stream:
+-                # TODO: Arbitrary read value.
+-                if received_data := self.sock.recv(65535):
+-                    events = h2_conn.receive_data(received_data)
+-                    for event in events:
+-                        if isinstance(event, h2.events.ResponseReceived):
+-                            headers = HTTPHeaderDict()
+-                            for header, value in event.headers:
+-                                if header == b":status":
+-                                    status = int(value.decode())
+-                                else:
+-                                    headers.add(
+-                                        header.decode("ascii"), value.decode("ascii")
+-                                    )
+-
+-                        elif isinstance(event, h2.events.DataReceived):
+-                            data += event.data
+-                            h2_conn.acknowledge_received_data(
+-                                event.flow_controlled_length, event.stream_id
+-                            )
+-
+-                        elif isinstance(event, h2.events.StreamEnded):
+-                            end_stream = True
+-
+-                if data_to_send := h2_conn.data_to_send():
+-                    self.sock.sendall(data_to_send)
+-
+-        # We always close to not have to handle connection management.
+-        self.close()
+-
+-        assert status is not None
+-        return HTTP2Response(
+-            status=status,
+-            headers=headers,
+-            request_url=self._request_url,
+-            data=bytes(data),
+-        )
+-
+-    def close(self) -> None:
+-        with self._h2_conn as h2_conn:
+-            try:
+-                h2_conn.close_connection()
+-                if data := h2_conn.data_to_send():
+-                    self.sock.sendall(data)
+-            except Exception:
+-                pass
+-
+-        # Reset all our HTTP/2 connection state.
+-        self._h2_conn = self._new_h2_conn()
+-        self._h2_stream = None
+-        self._h2_headers = []
+-
+-        super().close()
+-
+-
+-class HTTP2Response(BaseHTTPResponse):
+-    # TODO: This is a woefully incomplete response object, but works for non-streaming.
+-    def __init__(
+-        self,
+-        status: int,
+-        headers: HTTPHeaderDict,
+-        request_url: str,
+-        data: bytes,
+-        decode_content: bool = False,  # TODO: support decoding
+-    ) -> None:
+-        super().__init__(
+-            status=status,
+-            headers=headers,
+-            # Following CPython, we map HTTP versions to major * 10 + minor integers
+-            version=20,
+-            version_string="HTTP/2",
+-            # No reason phrase in HTTP/2
+-            reason=None,
+-            decode_content=decode_content,
+-            request_url=request_url,
+-        )
+-        self._data = data
+-        self.length_remaining = 0
+-
+-    @property
+-    def data(self) -> bytes:
+-        return self._data
+-
+-    def get_redirect_location(self) -> None:
+-        return None
+-
+-    def close(self) -> None:
+-        pass
+-
+-
+-def inject_into_urllib3() -> None:
+-    HTTPSConnectionPool.ConnectionCls = HTTP2Connection
+-    urllib3.connection.HTTPSConnection = HTTP2Connection  # type: ignore[misc]
+-
+-    # TODO: Offer 'http/1.1' as well, but for testing purposes this is handy.
+-    urllib3.util.ssl_.ALPN_PROTOCOLS = ["h2"]
+-
+-
+-def extract_from_urllib3() -> None:
+-    HTTPSConnectionPool.ConnectionCls = orig_HTTPSConnection
+-    urllib3.connection.HTTPSConnection = orig_HTTPSConnection  # type: ignore[misc]
+-
+-    urllib3.util.ssl_.ALPN_PROTOCOLS = ["http/1.1"]
+
+diff --git a/src/urllib3/util/connection.py b/src/urllib3/util/connection.py
+index 5c7da73..89bd189 100644
+--- a/src/urllib3/util/connection.py
++++ b/src/urllib3/util/connection.py
+@@ -6,7 +6,7 @@ import typing
+ from ..exceptions import LocationParseError
+ from .timeout import _DEFAULT_TIMEOUT, _TYPE_TIMEOUT
+ 
+-_TYPE_SOCKET_OPTIONS = typing.Sequence[typing.Tuple[int, int, typing.Union[int, bytes]]]
++_TYPE_SOCKET_OPTIONS = typing.List[typing.Tuple[int, int, typing.Union[int, bytes]]]
+ 
+ if typing.TYPE_CHECKING:
+     from .._base_connection import BaseHTTPConnection
+
+diff --git a/src/urllib3/util/request.py b/src/urllib3/util/request.py
+index 859597e..82454a0 100644
+--- a/src/urllib3/util/request.py
++++ b/src/urllib3/util/request.py
+@@ -227,7 +227,7 @@ def body_to_chunks(
+                 if not datablock:
+                     break
+                 if encode:
+-                    datablock = datablock.encode("iso-8859-1")
++                    datablock = datablock.encode("utf-8")
+                 yield datablock
+ 
+         chunks = chunk_readable()
+
+diff --git a/src/urllib3/util/ssl_.py b/src/urllib3/util/ssl_.py
+index c46dd83..5e93be9 100644
+--- a/src/urllib3/util/ssl_.py
++++ b/src/urllib3/util/ssl_.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import hashlib
+ import hmac
+ import os
+ import socket
+@@ -7,7 +8,6 @@ import sys
+ import typing
+ import warnings
+ from binascii import unhexlify
+-from hashlib import md5, sha1, sha256
+ 
+ from ..exceptions import ProxySchemeUnsupported, SSLError
+ from .url import _BRACELESS_IPV6_ADDRZ_RE, _IPV4_RE
+@@ -21,7 +21,10 @@ ALPN_PROTOCOLS = ["http/1.1"]
+ _TYPE_VERSION_INFO = typing.Tuple[int, int, int, str, int]
+ 
+ # Maps the length of a digest to a possible hash function producing this digest
+-HASHFUNC_MAP = {32: md5, 40: sha1, 64: sha256}
++HASHFUNC_MAP = {
++    length: getattr(hashlib, algorithm, None)
++    for length, algorithm in ((32, "md5"), (40, "sha1"), (64, "sha256"))
++}
+ 
+ 
+ def _is_bpo_43522_fixed(
+@@ -159,9 +162,13 @@ def assert_fingerprint(cert: bytes | None, fingerprint: str) -> None:
+ 
+     fingerprint = fingerprint.replace(":", "").lower()
+     digest_length = len(fingerprint)
+-    hashfunc = HASHFUNC_MAP.get(digest_length)
+-    if not hashfunc:
++    if digest_length not in HASHFUNC_MAP:
+         raise SSLError(f"Fingerprint of invalid length: {fingerprint}")
++    hashfunc = HASHFUNC_MAP.get(digest_length)
++    if hashfunc is None:
++        raise SSLError(
++            f"Hash function implementation unavailable for fingerprint length: {digest_length}"
++        )
+ 
+     # We need encode() here for py32; works on py2 and p33.
+     fingerprint_bytes = unhexlify(fingerprint.encode())
+@@ -457,10 +464,7 @@ def ssl_wrap_socket(
+         else:
+             context.load_cert_chain(certfile, keyfile, key_password)
+ 
+-    try:
+-        context.set_alpn_protocols(ALPN_PROTOCOLS)
+-    except NotImplementedError:  # Defensive: in CI, we always have set_alpn_protocols
+-        pass
++    context.set_alpn_protocols(ALPN_PROTOCOLS)
+ 
+     ssl_sock = _ssl_wrap_socket_impl(sock, context, tls_in_tls, server_hostname)
+     return ssl_sock
+
+diff --git a/src/urllib3/util/ssltransport.py b/src/urllib3/util/ssltransport.py
+index b52c477..d69ccb3 100644
+--- a/src/urllib3/util/ssltransport.py
++++ b/src/urllib3/util/ssltransport.py
+@@ -193,9 +193,6 @@ class SSLTransport:
+     def selected_alpn_protocol(self) -> str | None:
+         return self.sslobj.selected_alpn_protocol()
+ 
+-    def selected_npn_protocol(self) -> str | None:
+-        return self.sslobj.selected_npn_protocol()
+-
+     def shared_ciphers(self) -> list[tuple[str, str, int]] | None:
+         return self.sslobj.shared_ciphers()
+ 

@@ -1,0 +1,1319 @@
+{
+  "old_dir": ".packages/xarray/2025.11.0",
+  "new_dir": ".packages/xarray/2025.12.0",
+  "extracted_at": "2026-03-26T21:25:13.632236",
+  "diff_file": "metadata/xarray_upgrade/v2025.11.0_v2025.12.0/code_diff_v2025.11.0_to_v2025.12.0_py.diff",
+  "diff_content": "diff --git a/doc/conf.py b/doc/conf.py\nindex 4a0cca2..1de49fc 100644\n--- a/doc/conf.py\n+++ b/doc/conf.py\n@@ -20,14 +20,6 @@ allowed_failures = set()\n \n print(\"python exec:\", sys.executable)\n print(\"sys.path:\", sys.path)\n-\n-if \"CONDA_DEFAULT_ENV\" in os.environ or \"conda\" in sys.executable:\n-    print(\"conda environment:\")\n-    subprocess.run([os.environ.get(\"CONDA_EXE\", \"conda\"), \"list\"])\n-else:\n-    print(\"pip environment:\")\n-    subprocess.run([sys.executable, \"-m\", \"pip\", \"list\"])\n-\n print(f\"xarray: {xarray.__version__}, {xarray.__file__}\")\n \n with suppress(ImportError):\n@@ -71,6 +63,7 @@ extensions = [\n     \"sphinx_design\",\n     \"sphinx_inline_tabs\",\n     \"sphinx_remove_toctrees\",\n+    \"sphinx_llms_txt\",\n ]\n \n \n\ndiff --git a/properties/test_index_manipulation.py b/properties/test_index_manipulation.py\nindex e04db83..7058bc2 100644\n--- a/properties/test_index_manipulation.py\n+++ b/properties/test_index_manipulation.py\n@@ -24,21 +24,9 @@ from hypothesis.stateful import (\n \n import xarray.testing.strategies as xrst\n \n-\n-@st.composite\n-def unique(draw, strategy):\n-    # https://stackoverflow.com/questions/73737073/create-hypothesis-strategy-that-returns-unique-values\n-    seen = draw(st.shared(st.builds(set), key=\"key-for-unique-elems\"))\n-    return draw(\n-        strategy.filter(lambda x: x not in seen).map(lambda x: seen.add(x) or x)\n-    )\n-\n-\n-# Share to ensure we get unique names on each draw,\n-# so we don't try to add two variables with the same name\n-# or stack to a dimension with a name that already exists in the Dataset.\n-UNIQUE_NAME = unique(strategy=xrst.names())\n-DIM_NAME = xrst.dimension_names(name_strategy=UNIQUE_NAME, min_dims=1, max_dims=1)\n+# Strategy for generating names - uniqueness is enforced by the state machine\n+NAME_STRATEGY = xrst.names()\n+DIM_NAME = xrst.dimension_names(name_strategy=NAME_STRATEGY, min_dims=1, max_dims=1)\n index_variables = st.builds(\n     xr.Variable,\n     data=npst.arrays(\n@@ -75,25 +63,45 @@ class DatasetStateMachine(RuleBasedStateMachine):\n         self.indexed_dims = []\n         self.multi_indexed_dims = []\n \n-    @initialize(var=index_variables)\n-    def init_ds(self, var):\n+        # Track all used names to ensure uniqueness (avoids flaky Hypothesis tests)\n+        self.used_names: set[str] = set()\n+\n+    def _draw_unique_name(self, data) -> str:\n+        \"\"\"Draw a name that hasn't been used yet in this test case.\"\"\"\n+        name = data.draw(NAME_STRATEGY.filter(lambda x: x not in self.used_names))\n+        self.used_names.add(name)\n+        return name\n+\n+    def _draw_unique_var(self, data) -> xr.Variable:\n+        \"\"\"Draw an index variable with a unique dimension name.\"\"\"\n+        var = data.draw(index_variables)\n+        # Replace with a guaranteed unique name\n+        new_name = self._draw_unique_name(data)\n+        return xr.Variable(dims=(new_name,), data=var.data, attrs=var.attrs)\n+\n+    @initialize(data=st.data())\n+    def init_ds(self, data):\n         \"\"\"Initialize the Dataset so that at least one rule will always fire.\"\"\"\n+        var = self._draw_unique_var(data)\n         (name,) = var.dims\n+        note(f\"initializing with dimension coordinate {name}\")\n         add_dim_coord_and_data_var(self.dataset, var)\n \n         self.indexed_dims.append(name)\n \n     # TODO: stacking with a timedelta64 index and unstacking converts it to object\n-    @rule(var=index_variables)\n-    def add_dim_coord(self, var):\n+    @rule(data=st.data())\n+    def add_dim_coord(self, data):\n+        var = self._draw_unique_var(data)\n         (name,) = var.dims\n         note(f\"adding dimension coordinate {name}\")\n         add_dim_coord_and_data_var(self.dataset, var)\n \n         self.indexed_dims.append(name)\n \n-    @rule(var=index_variables)\n-    def assign_coords(self, var):\n+    @rule(data=st.data())\n+    def assign_coords(self, data):\n+        var = self._draw_unique_var(data)\n         (name,) = var.dims\n         note(f\"assign_coords: {name}\")\n         self.dataset = self.dataset.assign_coords({name: var})\n@@ -117,9 +125,10 @@ class DatasetStateMachine(RuleBasedStateMachine):\n         elif dim in self.multi_indexed_dims:\n             del self.multi_indexed_dims[self.multi_indexed_dims.index(dim)]\n \n-    @rule(newname=UNIQUE_NAME, data=st.data(), create_index=st.booleans())\n+    @rule(data=st.data(), create_index=st.booleans())\n     @precondition(lambda self: bool(self.indexed_dims))\n-    def stack(self, newname, data, create_index):\n+    def stack(self, data, create_index):\n+        newname = self._draw_unique_name(data)\n         oldnames = data.draw(\n             st.lists(\n                 st.sampled_from(self.indexed_dims),\n@@ -158,9 +167,10 @@ class DatasetStateMachine(RuleBasedStateMachine):\n             # TODO: fix this\n             pass\n \n-    @rule(newname=UNIQUE_NAME, data=st.data())\n+    @rule(data=st.data())\n     @precondition(lambda self: bool(self.dataset.variables))\n-    def rename_vars(self, newname, data):\n+    def rename_vars(self, data):\n+        newname = self._draw_unique_name(data)\n         dim = data.draw(st.sampled_from(sorted(self.dataset.variables)))\n         # benbovy: \"skip the default indexes invariant test when the name of an\n         # existing dimension coordinate is passed as input kwarg or dict key\n\ndiff --git a/properties/test_pandas_roundtrip.py b/properties/test_pandas_roundtrip.py\nindex 78499a2..ce55567 100644\n--- a/properties/test_pandas_roundtrip.py\n+++ b/properties/test_pandas_roundtrip.py\n@@ -3,12 +3,14 @@ Property-based tests for roundtripping between xarray and pandas objects.\n \"\"\"\n \n from functools import partial\n+from typing import cast\n \n import numpy as np\n import pandas as pd\n import pytest\n \n import xarray as xr\n+from xarray.core.dataset import Dataset\n \n pytest.importorskip(\"hypothesis\")\n import hypothesis.extra.numpy as npst  # isort:skip\n@@ -88,10 +90,10 @@ def test_roundtrip_dataarray(data, arr) -> None:\n \n \n @given(datasets_1d_vars())\n-def test_roundtrip_dataset(dataset) -> None:\n+def test_roundtrip_dataset(dataset: Dataset) -> None:\n     df = dataset.to_dataframe()\n     assert isinstance(df, pd.DataFrame)\n-    roundtripped = xr.Dataset(df)\n+    roundtripped = xr.Dataset.from_dataframe(df)\n     xr.testing.assert_identical(dataset, roundtripped)\n \n \n@@ -101,7 +103,7 @@ def test_roundtrip_pandas_series(ser, ix_name) -> None:\n     ser.index.name = ix_name\n     arr = xr.DataArray(ser)\n     roundtripped = arr.to_pandas()\n-    pd.testing.assert_series_equal(ser, roundtripped)\n+    pd.testing.assert_series_equal(ser, roundtripped)  # type: ignore[arg-type]\n     xr.testing.assert_identical(arr, roundtripped.to_xarray())\n \n \n@@ -119,7 +121,7 @@ def test_roundtrip_pandas_dataframe(df) -> None:\n     df.columns.name = \"cols\"\n     arr = xr.DataArray(df)\n     roundtripped = arr.to_pandas()\n-    pd.testing.assert_frame_equal(df, roundtripped)\n+    pd.testing.assert_frame_equal(df, cast(pd.DataFrame, roundtripped))\n     xr.testing.assert_identical(arr, roundtripped.to_xarray())\n \n \n@@ -143,8 +145,8 @@ def test_roundtrip_pandas_dataframe_datetime(df) -> None:\n         pd.arrays.IntervalArray(\n             [pd.Interval(0, 1), pd.Interval(1, 5), pd.Interval(2, 6)]\n         ),\n-        pd.arrays.TimedeltaArray._from_sequence(pd.TimedeltaIndex([\"1h\", \"2h\", \"3h\"])),\n-        pd.arrays.DatetimeArray._from_sequence(\n+        pd.arrays.TimedeltaArray._from_sequence(pd.TimedeltaIndex([\"1h\", \"2h\", \"3h\"])),  # type: ignore[attr-defined]\n+        pd.arrays.DatetimeArray._from_sequence(  # type: ignore[attr-defined]\n             pd.DatetimeIndex([\"2023-01-01\", \"2023-01-02\", \"2023-01-03\"], freq=\"D\")\n         ),\n         np.array([1, 2, 3], dtype=\"int64\"),\n\ndiff --git a/xarray/backends/common.py b/xarray/backends/common.py\nindex 92694c1..cb5fca0 100644\n--- a/xarray/backends/common.py\n+++ b/xarray/backends/common.py\n@@ -849,3 +849,37 @@ class BackendEntrypoint:\n \n # mapping of engine name to (module name, BackendEntrypoint Class)\n BACKEND_ENTRYPOINTS: dict[str, tuple[str | None, type[BackendEntrypoint]]] = {}\n+\n+\n+def _is_likely_dap_url(url: str) -> bool:\n+    \"\"\"\n+    Determines if a URL is likely an OPeNDAP (DAP) endpoint based on\n+    known protocols, server software path patterns, and file extensions.\n+\n+    Parameters\n+    ----------\n+    url : str\n+\n+    Returns\n+    -------\n+        True if the URL matches common DAP patterns, False otherwise.\n+    \"\"\"\n+    if not url:\n+        return False\n+\n+    url_lower = url.lower()\n+\n+    # For remote URIs, check for DAP server software path patterns\n+    if is_remote_uri(url_lower):\n+        dap_path_patterns = (\n+            \"/dodsc/\",  # THREDDS Data Server (TDS) DAP endpoint (case-insensitive)\n+            \"/dods/\",  # GrADS Data Server (GDS) DAP endpoint\n+            \"/opendap/\",  # Generic OPeNDAP/Hyrax server\n+            \"/erddap/\",  # ERDDAP data server\n+            \"/dap2/\",  # Explicit DAP2 version in path\n+            \"/dap4/\",  # Explicit DAP4 version in path\n+            \"/dap/\",\n+        )\n+        return any(pattern in url_lower for pattern in dap_path_patterns)\n+\n+    return False\n\ndiff --git a/xarray/backends/netCDF4_.py b/xarray/backends/netCDF4_.py\nindex 2c68695..bb511f9 100644\n--- a/xarray/backends/netCDF4_.py\n+++ b/xarray/backends/netCDF4_.py\n@@ -715,10 +715,19 @@ class NetCDF4BackendEntrypoint(BackendEntrypoint):\n             _, ext = os.path.splitext(path)\n             return ext in {\".nc\", \".nc4\", \".cdf\"}\n \n-        if isinstance(filename_or_obj, str) and is_remote_uri(filename_or_obj):\n-            # For remote URIs, check extension (accounting for query params/fragments)\n-            # Remote netcdf-c can handle both regular URLs and DAP URLs\n-            return _has_netcdf_ext(filename_or_obj, is_remote=True)\n+        if isinstance(filename_or_obj, str):\n+            if is_remote_uri(filename_or_obj):\n+                # For remote URIs, check extension (accounting for query params/fragments)\n+                # Remote netcdf-c can handle both regular URLs and DAP URLs\n+                if _has_netcdf_ext(filename_or_obj, is_remote=True):\n+                    return True\n+                elif \"zarr\" in filename_or_obj.lower():\n+                    return False\n+                # return true for non-zarr URLs so we don't have a breaking change for people relying on this\n+                # netcdf backend guessing true for all remote sources.\n+                # TODO: emit a warning here about deprecation of this behavior\n+                # https://github.com/pydata/xarray/pull/10931\n+                return True\n \n         if isinstance(filename_or_obj, str | os.PathLike):\n             # For local paths, check magic number first, then extension\n\ndiff --git a/xarray/backends/pydap_.py b/xarray/backends/pydap_.py\nindex b6114e3..2578a5b 100644\n--- a/xarray/backends/pydap_.py\n+++ b/xarray/backends/pydap_.py\n@@ -12,6 +12,7 @@ from xarray.backends.common import (\n     BackendArray,\n     BackendEntrypoint,\n     T_PathFileOrDataStore,\n+    _is_likely_dap_url,\n     _normalize_path,\n     datatree_from_dict_with_io_cleanup,\n     robust_getitem,\n@@ -22,7 +23,6 @@ from xarray.core.utils import (\n     Frozen,\n     FrozenDict,\n     close_on_error,\n-    is_remote_uri,\n )\n from xarray.core.variable import Variable\n from xarray.namedarray.pycompat import integer_types\n@@ -36,7 +36,7 @@ if TYPE_CHECKING:\n \n \n class PydapArrayWrapper(BackendArray):\n-    def __init__(self, array):\n+    def __init__(self, array, checksums=True):\n         self.array = array\n \n     @property\n@@ -54,12 +54,10 @@ class PydapArrayWrapper(BackendArray):\n \n     def _getitem(self, key):\n         result = robust_getitem(self.array, key, catch=ValueError)\n-        # in some cases, pydap doesn't squeeze axes automatically like numpy\n-        result = np.asarray(result)\n+        result = np.asarray(result.data)\n         axis = tuple(n for n, k in enumerate(key) if isinstance(k, integer_types))\n         if result.ndim + len(axis) != self.array.ndim and axis:\n             result = np.squeeze(result, axis)\n-\n         return result\n \n \n@@ -82,7 +80,14 @@ class PydapDataStore(AbstractDataStore):\n     be useful if the netCDF4 library is not available.\n     \"\"\"\n \n-    def __init__(self, dataset, group=None):\n+    def __init__(\n+        self,\n+        dataset,\n+        group=None,\n+        session=None,\n+        protocol=None,\n+        checksums=True,\n+    ):\n         \"\"\"\n         Parameters\n         ----------\n@@ -92,6 +97,8 @@ class PydapDataStore(AbstractDataStore):\n         \"\"\"\n         self.dataset = dataset\n         self.group = group\n+        self._protocol = protocol\n+        self._checksums = checksums  # true by default\n \n     @classmethod\n     def open(\n@@ -104,6 +111,7 @@ class PydapDataStore(AbstractDataStore):\n         timeout=None,\n         verify=None,\n         user_charset=None,\n+        checksums=True,\n     ):\n         from pydap.client import open_url\n         from pydap.net import DEFAULT_TIMEOUT\n@@ -118,6 +126,7 @@ class PydapDataStore(AbstractDataStore):\n                 DeprecationWarning,\n             )\n             output_grid = False  # new default behavior\n+\n         kwargs = {\n             \"url\": url,\n             \"application\": application,\n@@ -133,22 +142,37 @@ class PydapDataStore(AbstractDataStore):\n         elif hasattr(url, \"ds\"):\n             # pydap dataset\n             dataset = url.ds\n-        args = {\"dataset\": dataset}\n+        args = {\"dataset\": dataset, \"checksums\": checksums}\n         if group:\n-            # only then, change the default\n             args[\"group\"] = group\n+        if url.startswith((\"http\", \"dap2\")):\n+            args[\"protocol\"] = \"dap2\"\n+        elif url.startswith(\"dap4\"):\n+            args[\"protocol\"] = \"dap4\"\n         return cls(**args)\n \n     def open_store_variable(self, var):\n-        data = indexing.LazilyIndexedArray(PydapArrayWrapper(var))\n-        try:\n+        if hasattr(var, \"dims\"):\n             dimensions = [\n                 dim.split(\"/\")[-1] if dim.startswith(\"/\") else dim for dim in var.dims\n             ]\n-        except AttributeError:\n+        else:\n             # GridType does not have a dims attribute - instead get `dimensions`\n             # see https://github.com/pydap/pydap/issues/485\n             dimensions = var.dimensions\n+        if (\n+            self._protocol == \"dap4\"\n+            and var.name in dimensions\n+            and hasattr(var, \"dataset\")  # only True for pydap>3.5.5\n+        ):\n+            var.dataset.enable_batch_mode()\n+            data_array = self._get_data_array(var)\n+            data = indexing.LazilyIndexedArray(data_array)\n+            var.dataset.disable_batch_mode()\n+        else:\n+            # all non-dimension variables\n+            data = indexing.LazilyIndexedArray(PydapArrayWrapper(var))\n+\n         return Variable(dimensions, data, var.attributes)\n \n     def get_variables(self):\n@@ -166,6 +190,7 @@ class PydapDataStore(AbstractDataStore):\n                 # check the key is not a BaseType or GridType\n                 if not isinstance(self.ds[var], GroupType)\n             ]\n+\n         return FrozenDict((k, self.open_store_variable(self.ds[k])) for k in _vars)\n \n     def get_attrs(self):\n@@ -177,18 +202,33 @@ class PydapDataStore(AbstractDataStore):\n             \"libdap\",\n             \"invocation\",\n             \"dimensions\",\n+            \"path\",\n+            \"Maps\",\n         )\n-        attrs = self.ds.attributes\n-        list(map(attrs.pop, opendap_attrs, [None] * 6))\n+        attrs = dict(self.ds.attributes)\n+        list(map(attrs.pop, opendap_attrs, [None] * len(opendap_attrs)))\n         return Frozen(attrs)\n \n     def get_dimensions(self):\n-        return Frozen(self.ds.dimensions)\n+        return Frozen(sorted(self.ds.dimensions))\n \n     @property\n     def ds(self):\n         return get_group(self.dataset, self.group)\n \n+    def _get_data_array(self, var):\n+        \"\"\"gets dimension data all at once, storing the numpy\n+        arrays within a cached dictionary\n+        \"\"\"\n+        from pydap.client import get_batch_data\n+\n+        if not var._is_data_loaded():\n+            # data has not been deserialized yet\n+            # runs only once per store/hierarchy\n+            get_batch_data(var, checksums=self._checksums)\n+\n+        return self.dataset[var.id].data\n+\n \n class PydapBackendEntrypoint(BackendEntrypoint):\n     \"\"\"\n@@ -212,23 +252,7 @@ class PydapBackendEntrypoint(BackendEntrypoint):\n     def guess_can_open(self, filename_or_obj: T_PathFileOrDataStore) -> bool:\n         if not isinstance(filename_or_obj, str):\n             return False\n-\n-        # Check for explicit DAP protocol indicators:\n-        # 1. DAP scheme: dap2:// or dap4:// (case-insensitive, may not be recognized by is_remote_uri)\n-        # 2. Remote URI with /dap2/ or /dap4/ in URL path (case-insensitive)\n-        # Note: We intentionally do NOT check for .dap suffix as that would match\n-        # file extensions like .dap which trigger downloads of binary data\n-        url_lower = filename_or_obj.lower()\n-        if url_lower.startswith((\"dap2://\", \"dap4://\")):\n-            return True\n-\n-        # For standard remote URIs, check for DAP indicators in path\n-        if is_remote_uri(filename_or_obj):\n-            return (\n-                \"/dap2/\" in url_lower or \"/dap4/\" in url_lower or \"/dodsC/\" in url_lower\n-            )\n-\n-        return False\n+        return _is_likely_dap_url(filename_or_obj)\n \n     def open_dataset(\n         self,\n@@ -250,6 +274,7 @@ class PydapBackendEntrypoint(BackendEntrypoint):\n         timeout=None,\n         verify=None,\n         user_charset=None,\n+        checksums=True,\n     ) -> Dataset:\n         store = PydapDataStore.open(\n             url=filename_or_obj,\n@@ -260,6 +285,7 @@ class PydapBackendEntrypoint(BackendEntrypoint):\n             timeout=timeout,\n             verify=verify,\n             user_charset=user_charset,\n+            checksums=checksums,\n         )\n         store_entrypoint = StoreBackendEntrypoint()\n         with close_on_error(store):\n@@ -292,6 +318,7 @@ class PydapBackendEntrypoint(BackendEntrypoint):\n         timeout=None,\n         verify=None,\n         user_charset=None,\n+        checksums=True,\n     ) -> DataTree:\n         groups_dict = self.open_groups_as_dict(\n             filename_or_obj,\n@@ -303,11 +330,12 @@ class PydapBackendEntrypoint(BackendEntrypoint):\n             use_cftime=use_cftime,\n             decode_timedelta=decode_timedelta,\n             group=group,\n-            application=None,\n-            session=None,\n-            timeout=None,\n-            verify=None,\n-            user_charset=None,\n+            application=application,\n+            session=session,\n+            timeout=timeout,\n+            verify=verify,\n+            user_charset=user_charset,\n+            checksums=checksums,\n         )\n \n         return datatree_from_dict_with_io_cleanup(groups_dict)\n@@ -329,6 +357,7 @@ class PydapBackendEntrypoint(BackendEntrypoint):\n         timeout=None,\n         verify=None,\n         user_charset=None,\n+        checksums=True,\n     ) -> dict[str, Dataset]:\n         from xarray.core.treenode import NodePath\n \n@@ -340,6 +369,7 @@ class PydapBackendEntrypoint(BackendEntrypoint):\n             timeout=timeout,\n             verify=verify,\n             user_charset=user_charset,\n+            checksums=checksums,\n         )\n \n         # Check for a group and make it a parent if it exists\n\ndiff --git a/xarray/coding/times.py b/xarray/coding/times.py\nindex f10b9b8..d45e8e4 100644\n--- a/xarray/coding/times.py\n+++ b/xarray/coding/times.py\n@@ -98,6 +98,8 @@ _INVALID_LITERAL_TIMEDELTA64_ENCODING_KEYS = [\n     \"scale_factor\",\n ]\n \n+_ORDERED_PANDAS_TIME_RESOLUTIONS: list[PDDatetimeUnitOptions] = [\"s\", \"ms\", \"us\", \"ns\"]\n+\n \n def _is_standard_calendar(calendar: str) -> bool:\n     return calendar.lower() in _STANDARD_CALENDARS\n@@ -293,6 +295,21 @@ def _maybe_strip_tz_from_timestamp(date: pd.Timestamp) -> pd.Timestamp:\n     return date\n \n \n+def _cast_timestamp_to_coarsest_resolution(timestamp: pd.Timestamp) -> pd.Timestamp:\n+    # Cast timestamp to the coarsest resolution that can be used without\n+    # changing its value. If provided a string, the pandas.Timestamp\n+    # constructor used to automatically infer this from the resolution of the\n+    # string, but this behavior was changed in pandas-dev/pandas#62801. This\n+    # function allows us to approximately restore the old behavior in a way\n+    # that is perhaps more consistent with how we infer the resolution of the\n+    # data values themselves.\n+    for unit in _ORDERED_PANDAS_TIME_RESOLUTIONS:\n+        coarsest_timestamp = timestamp.as_unit(unit)\n+        if coarsest_timestamp == timestamp:\n+            return coarsest_timestamp\n+    return timestamp\n+\n+\n def _unpack_time_unit_and_ref_date(\n     units: str,\n ) -> tuple[NPDatetimeUnitOptions, pd.Timestamp]:\n@@ -301,6 +318,7 @@ def _unpack_time_unit_and_ref_date(\n     time_unit, _ref_date = _unpack_netcdf_time_units(units)\n     time_unit = _netcdf_to_numpy_timeunit(time_unit)\n     ref_date = pd.Timestamp(_ref_date)\n+    ref_date = _cast_timestamp_to_coarsest_resolution(ref_date)\n     ref_date = _maybe_strip_tz_from_timestamp(ref_date)\n     return time_unit, ref_date\n \n@@ -442,8 +460,8 @@ def _check_higher_resolution(\n     time_unit: PDDatetimeUnitOptions,\n ) -> tuple[np.ndarray, PDDatetimeUnitOptions]:\n     \"\"\"Iterate until fitting resolution found.\"\"\"\n-    res: list[PDDatetimeUnitOptions] = [\"s\", \"ms\", \"us\", \"ns\"]\n-    new_units = res[res.index(time_unit) :]\n+    index = _ORDERED_PANDAS_TIME_RESOLUTIONS.index(time_unit)\n+    new_units = _ORDERED_PANDAS_TIME_RESOLUTIONS[index:]\n     for new_time_unit in new_units:\n         if not ((np.unique(flat_num_dates % 1) > 0).any() and new_time_unit != \"ns\"):\n             break\n@@ -608,6 +626,8 @@ def _numbers_to_timedelta(\n         nan = np.asarray(np.isnan(flat_num))\n     elif flat_num.dtype.kind == \"i\":\n         nan = np.asarray(flat_num == np.iinfo(np.int64).min)\n+    elif flat_num.dtype.kind == \"u\":\n+        nan = np.broadcast_to(np.asarray(False), flat_num.shape)\n \n     # in case we need to change the unit, we fix the numbers here\n     # this should be safe, as errors would have been raised above\n@@ -1361,9 +1381,9 @@ class CFDatetimeCoder(VariableCoder):\n         self.time_unit = time_unit\n \n     def encode(self, variable: Variable, name: T_Name = None) -> Variable:\n-        if np.issubdtype(\n-            variable.data.dtype, np.datetime64\n-        ) or contains_cftime_datetimes(variable):\n+        if np.issubdtype(variable.dtype, np.datetime64) or contains_cftime_datetimes(\n+            variable\n+        ):\n             dims, data, attrs, encoding = unpack_for_encoding(variable)\n \n             units = encoding.pop(\"units\", None)\n@@ -1465,7 +1485,7 @@ class CFTimedeltaCoder(VariableCoder):\n         units attribute, e.g. \"seconds\". Defaults to True, but in the future\n         will default to False.\n     decode_via_dtype : bool\n-        Whether to decode timedeltas based on the presence of a np.timedelta64\n+        Whether to decode timedeltas based on the presence of an np.timedelta64\n         dtype attribute, e.g. \"timedelta64[s]\". Defaults to True.\n     \"\"\"\n \n@@ -1481,7 +1501,7 @@ class CFTimedeltaCoder(VariableCoder):\n         self._emit_decode_timedelta_future_warning = False\n \n     def encode(self, variable: Variable, name: T_Name = None) -> Variable:\n-        if np.issubdtype(variable.data.dtype, np.timedelta64):\n+        if np.issubdtype(variable.dtype, np.timedelta64):\n             dims, data, attrs, encoding = unpack_for_encoding(variable)\n             dtype = encoding.get(\"dtype\", None)\n             units = encoding.pop(\"units\", None)\n\ndiff --git a/xarray/compat/npcompat.py b/xarray/compat/npcompat.py\nindex 571ebbb..05cb4dc 100644\n--- a/xarray/compat/npcompat.py\n+++ b/xarray/compat/npcompat.py\n@@ -51,7 +51,7 @@ except ImportError:\n         \"numeric\": np.number,\n     }\n \n-    def isdtype(\n+    def isdtype(  # type: ignore[misc]\n         dtype: np.dtype[Any] | type[Any], kind: DTypeLike | tuple[DTypeLike, ...]\n     ) -> bool:\n         kinds = kind if isinstance(kind, tuple) else (kind,)\n\ndiff --git a/xarray/computation/apply_ufunc.py b/xarray/computation/apply_ufunc.py\nindex a3900cf..1054d93 100644\n--- a/xarray/computation/apply_ufunc.py\n+++ b/xarray/computation/apply_ufunc.py\n@@ -713,7 +713,7 @@ def apply_variable_ufunc(\n     keep_attrs=\"override\",\n     dask_gufunc_kwargs=None,\n ) -> Variable | tuple[Variable, ...]:\n-    \"\"\"Apply a ndarray level function over Variable and/or ndarray objects.\"\"\"\n+    \"\"\"Apply an ndarray level function over Variable and/or ndarray objects.\"\"\"\n     from xarray.core.formatting import short_array_repr\n     from xarray.core.variable import as_compatible_data\n \n@@ -869,7 +869,7 @@ def apply_variable_ufunc(\n \n \n def apply_array_ufunc(func, *args, dask=\"forbidden\"):\n-    \"\"\"Apply a ndarray level function over ndarray objects.\"\"\"\n+    \"\"\"Apply an ndarray level function over ndarray objects.\"\"\"\n     if any(is_chunked_array(arg) for arg in args):\n         if dask == \"forbidden\":\n             raise ValueError(\n\ndiff --git a/xarray/computation/rolling.py b/xarray/computation/rolling.py\nindex adb8a5e..39cb7a8 100644\n--- a/xarray/computation/rolling.py\n+++ b/xarray/computation/rolling.py\n@@ -168,7 +168,7 @@ class Rolling(Generic[T_Xarray]):\n \n         bottleneck_move_func = getattr(bottleneck, \"move_\" + name, None)\n         if module_available(\"numbagg\"):\n-            import numbagg\n+            import numbagg  # type: ignore[import-not-found, unused-ignore]\n \n             numbagg_move_func = getattr(numbagg, \"move_\" + name, None)\n         else:\n@@ -491,7 +491,7 @@ class DataArrayRolling(Rolling[\"DataArray\"]):\n         func : callable\n             Function which can be called in the form\n             `func(x, **kwargs)` to return the result of collapsing an\n-            np.ndarray over an the rolling dimension.\n+            np.ndarray over the rolling dimension.\n         keep_attrs : bool, default: None\n             If True, the attributes (``attrs``) will be copied from the original\n             object to the new one. If False, the new object will be returned\n@@ -860,7 +860,7 @@ class DatasetRolling(Rolling[\"Dataset\"]):\n         func : callable\n             Function which can be called in the form\n             `func(x, **kwargs)` to return the result of collapsing an\n-            np.ndarray over an the rolling dimension.\n+            np.ndarray over the rolling dimension.\n         keep_attrs : bool, default: None\n             If True, the attributes (``attrs``) will be copied from the original\n             object to the new one. If False, the new object will be returned\n\ndiff --git a/xarray/computation/rolling_exp.py b/xarray/computation/rolling_exp.py\nindex 010cf1f..100742d 100644\n--- a/xarray/computation/rolling_exp.py\n+++ b/xarray/computation/rolling_exp.py\n@@ -111,7 +111,7 @@ class RollingExp(Generic[T_DataWithCoords]):\n         Dimensions without coordinates: x\n         \"\"\"\n \n-        import numbagg\n+        import numbagg  # type: ignore[import-not-found, unused-ignore]\n \n         if keep_attrs is None:\n             keep_attrs = _get_keep_attrs(default=True)\n\ndiff --git a/xarray/core/coordinates.py b/xarray/core/coordinates.py\nindex ab5bf74..9aa64a5 100644\n--- a/xarray/core/coordinates.py\n+++ b/xarray/core/coordinates.py\n@@ -1265,7 +1265,7 @@ def create_coords_with_default_indexes(\n             variables.update(idx_vars)\n             all_variables.update(idx_vars)\n         else:\n-            variables[name] = variable\n+            variables[name] = variable.to_base_variable()\n \n     new_coords = Coordinates._construct_direct(coords=variables, indexes=indexes)\n \n\ndiff --git a/xarray/core/dataarray.py b/xarray/core/dataarray.py\nindex 6c8d061..71d427d 100644\n--- a/xarray/core/dataarray.py\n+++ b/xarray/core/dataarray.py\n@@ -1516,7 +1516,7 @@ class DataArray(\n         indexers : dict, optional\n             A dict with keys matching dimensions and values given\n             by integers, slice objects or arrays.\n-            indexer can be a integer, slice, array-like or DataArray.\n+            indexer can be an integer, slice, array-like or DataArray.\n             If DataArrays are passed as indexers, xarray-style indexing will be\n             carried out. See :ref:`indexing` for the details.\n             One of indexers or indexers_kwargs must be provided.\n@@ -4662,14 +4662,14 @@ class DataArray(\n         return result\n \n     def to_iris(self) -> iris_Cube:\n-        \"\"\"Convert this array into a iris.cube.Cube\"\"\"\n+        \"\"\"Convert this array into an iris.cube.Cube\"\"\"\n         from xarray.convert import to_iris\n \n         return to_iris(self)\n \n     @classmethod\n     def from_iris(cls, cube: iris_Cube) -> Self:\n-        \"\"\"Convert a iris.cube.Cube into an xarray.DataArray\"\"\"\n+        \"\"\"Convert an iris.cube.Cube into an xarray.DataArray\"\"\"\n         from xarray.convert import from_iris\n \n         return from_iris(cube)\n\ndiff --git a/xarray/core/dataset.py b/xarray/core/dataset.py\nindex 9c2c2f6..bce0480 100644\n--- a/xarray/core/dataset.py\n+++ b/xarray/core/dataset.py\n@@ -10475,7 +10475,7 @@ class Dataset(\n         for var in self.variables:\n             # variables don't have a `._replace` method, so we copy and then remove\n             # attrs. If we added a `._replace` method, we could use that instead.\n-            if var not in self.indexes:\n+            if var not in self.xindexes:\n                 self[var] = self[var].copy()\n                 self[var].attrs = {}\n \n\ndiff --git a/xarray/core/dataset_variables.py b/xarray/core/dataset_variables.py\nindex 6521da6..705c6a7 100644\n--- a/xarray/core/dataset_variables.py\n+++ b/xarray/core/dataset_variables.py\n@@ -1,6 +1,5 @@\n import typing\n from collections.abc import Hashable, Iterator, Mapping\n-from typing import Any\n \n import numpy as np\n \n@@ -13,7 +12,7 @@ if typing.TYPE_CHECKING:\n     from xarray.core.dataset import Dataset\n \n \n-class DataVariables(Mapping[Any, \"DataArray\"]):\n+class DataVariables(Mapping[Hashable, \"DataArray\"]):\n     __slots__ = (\"_dataset\",)\n \n     def __init__(self, dataset: \"Dataset\"):\n\ndiff --git a/xarray/core/datatree.py b/xarray/core/datatree.py\nindex 6fb387e..e079332 100644\n--- a/xarray/core/datatree.py\n+++ b/xarray/core/datatree.py\n@@ -2252,7 +2252,7 @@ class DataTree(\n         indexers : dict, optional\n             A dict with keys matching dimensions and values given\n             by integers, slice objects or arrays.\n-            indexer can be a integer, slice, array-like or DataArray.\n+            indexer can be an integer, slice, array-like or DataArray.\n             If DataArrays are passed as indexers, xarray-style indexing will be\n             carried out. See :ref:`indexing` for the details.\n             One of indexers or indexers_kwargs must be provided.\n\ndiff --git a/xarray/core/dtypes.py b/xarray/core/dtypes.py\nindex 6ddae75..40334d5 100644\n--- a/xarray/core/dtypes.py\n+++ b/xarray/core/dtypes.py\n@@ -1,15 +1,20 @@\n from __future__ import annotations\n \n import functools\n-from typing import Any\n+from collections.abc import Iterable\n+from typing import TYPE_CHECKING, TypeVar, cast\n \n import numpy as np\n-import pandas as pd\n+from pandas.api.extensions import ExtensionDtype\n \n from xarray.compat import array_api_compat, npcompat\n from xarray.compat.npcompat import HAS_STRING_DTYPE\n from xarray.core import utils\n \n+if TYPE_CHECKING:\n+    from typing import Any\n+\n+\n # Use as a sentinel value to indicate a dtype appropriate NA value.\n NA = utils.ReprObject(\"<NA>\")\n \n@@ -47,8 +52,10 @@ PROMOTE_TO_OBJECT: tuple[tuple[type[np.generic], type[np.generic]], ...] = (\n     (np.bytes_, np.str_),  # numpy promotes to unicode\n )\n \n+T_dtype = TypeVar(\"T_dtype\", np.dtype, ExtensionDtype)\n \n-def maybe_promote(dtype: np.dtype) -> tuple[np.dtype, Any]:\n+\n+def maybe_promote(dtype: T_dtype) -> tuple[T_dtype, Any]:\n     \"\"\"Simpler equivalent of pandas.core.common._maybe_promote\n \n     Parameters\n@@ -63,7 +70,13 @@ def maybe_promote(dtype: np.dtype) -> tuple[np.dtype, Any]:\n     # N.B. these casting rules should match pandas\n     dtype_: np.typing.DTypeLike\n     fill_value: Any\n-    if HAS_STRING_DTYPE and np.issubdtype(dtype, np.dtypes.StringDType()):\n+    if utils.is_allowed_extension_array_dtype(dtype):\n+        return dtype, cast(ExtensionDtype, dtype).na_value  # type: ignore[redundant-cast]\n+    if not isinstance(dtype, np.dtype):\n+        raise TypeError(\n+            f\"dtype {dtype} must be one of an extension array dtype or numpy dtype\"\n+        )\n+    elif HAS_STRING_DTYPE and np.issubdtype(dtype, np.dtypes.StringDType()):\n         # for now, we always promote string dtypes to object for consistency with existing behavior\n         # TODO: refactor this once we have a better way to handle numpy vlen-string dtypes\n         dtype_ = object\n@@ -213,7 +226,7 @@ def isdtype(dtype, kind: str | tuple[str, ...], xp=None) -> bool:\n \n     if isinstance(dtype, np.dtype):\n         return npcompat.isdtype(dtype, kind)\n-    elif pd.api.types.is_extension_array_dtype(dtype):  # noqa: TID251\n+    elif utils.is_allowed_extension_array_dtype(dtype):\n         # we never want to match pandas extension array dtypes\n         return False\n     else:\n@@ -222,23 +235,67 @@ def isdtype(dtype, kind: str | tuple[str, ...], xp=None) -> bool:\n         return xp.isdtype(dtype, kind)\n \n \n-def preprocess_types(t):\n-    if isinstance(t, str | bytes):\n-        return type(t)\n-    elif isinstance(dtype := getattr(t, \"dtype\", t), np.dtype) and (\n-        np.issubdtype(dtype, np.str_) or np.issubdtype(dtype, np.bytes_)\n-    ):\n+def maybe_promote_to_variable_width(\n+    array_or_dtype: np.typing.ArrayLike\n+    | np.typing.DTypeLike\n+    | ExtensionDtype\n+    | str\n+    | bytes,\n+    *,\n+    should_return_str_or_bytes: bool = False,\n+) -> np.typing.ArrayLike | np.typing.DTypeLike | ExtensionDtype:\n+    if isinstance(array_or_dtype, str | bytes):\n+        if should_return_str_or_bytes:\n+            return array_or_dtype\n+        return type(array_or_dtype)\n+    elif isinstance(\n+        dtype := getattr(array_or_dtype, \"dtype\", array_or_dtype), np.dtype\n+    ) and (np.issubdtype(dtype, np.str_) or np.issubdtype(dtype, np.bytes_)):\n         # drop the length from numpy's fixed-width string dtypes, it is better to\n         # recalculate\n         # TODO(keewis): remove once the minimum version of `numpy.result_type` does this\n         # for us\n         return dtype.type\n     else:\n-        return t\n+        return array_or_dtype\n+\n+\n+def should_promote_to_object(\n+    arrays_and_dtypes: Iterable[\n+        np.typing.ArrayLike | np.typing.DTypeLike | ExtensionDtype\n+    ],\n+    xp,\n+) -> bool:\n+    \"\"\"\n+    Test whether the given arrays_and_dtypes, when evaluated individually, match the\n+    type promotion rules found in PROMOTE_TO_OBJECT.\n+    \"\"\"\n+    np_result_types = set()\n+    for arr_or_dtype in arrays_and_dtypes:\n+        try:\n+            result_type = array_api_compat.result_type(\n+                maybe_promote_to_variable_width(arr_or_dtype), xp=xp\n+            )\n+            if isinstance(result_type, np.dtype):\n+                np_result_types.add(result_type)\n+        except TypeError:\n+            # passing individual objects to xp.result_type (i.e., what `array_api_compat.result_type` calls) means NEP-18 implementations won't have\n+            # a chance to intercept special values (such as NA) that numpy core cannot handle.\n+            # Thus they are considered as types that don't need promotion i.e., the `arr_or_dtype` that rose the `TypeError` will not contribute to `np_result_types`.\n+            pass\n+\n+    if np_result_types:\n+        for left, right in PROMOTE_TO_OBJECT:\n+            if any(np.issubdtype(t, left) for t in np_result_types) and any(\n+                np.issubdtype(t, right) for t in np_result_types\n+            ):\n+                return True\n+\n+    return False\n \n \n def result_type(\n-    *arrays_and_dtypes: np.typing.ArrayLike | np.typing.DTypeLike | None,\n+    *arrays_and_dtypes: np.typing.ArrayLike | np.typing.DTypeLike | ExtensionDtype,\n     xp=None,\n ) -> np.dtype:\n     \"\"\"Like np.result_type, but with type promotion rules matching pandas.\n@@ -263,19 +320,13 @@ def result_type(\n     if xp is None:\n         xp = get_array_namespace(arrays_and_dtypes)\n \n-    types = {\n-        array_api_compat.result_type(preprocess_types(t), xp=xp)\n-        for t in arrays_and_dtypes\n-    }\n-    if any(isinstance(t, np.dtype) for t in types):\n-        # only check if there's numpy dtypes – the array API does not\n-        # define the types we're checking for\n-        for left, right in PROMOTE_TO_OBJECT:\n-            if any(np.issubdtype(t, left) for t in types) and any(\n-                np.issubdtype(t, right) for t in types\n-            ):\n-                return np.dtype(object)\n-\n-    return array_api_compat.result_type(\n-        *map(preprocess_types, arrays_and_dtypes), xp=xp\n+    if should_promote_to_object(arrays_and_dtypes, xp):\n+        return np.dtype(object)\n+    maybe_promote = functools.partial(\n+        maybe_promote_to_variable_width,\n+        # let extension arrays handle their own str/bytes\n+        should_return_str_or_bytes=any(\n+            map(utils.is_allowed_extension_array_dtype, arrays_and_dtypes)\n+        ),\n     )\n+    return array_api_compat.result_type(*map(maybe_promote, arrays_and_dtypes), xp=xp)\n\ndiff --git a/xarray/core/duck_array_ops.py b/xarray/core/duck_array_ops.py\nindex b8a4011..2bf9d25 100644\n--- a/xarray/core/duck_array_ops.py\n+++ b/xarray/core/duck_array_ops.py\n@@ -27,9 +27,17 @@ from numpy import (\n from xarray.compat import dask_array_compat, dask_array_ops\n from xarray.compat.array_api_compat import get_array_namespace\n from xarray.core import dtypes, nputils\n-from xarray.core.extension_array import PandasExtensionArray\n+from xarray.core.extension_array import (\n+    PandasExtensionArray,\n+    as_extension_array,\n+)\n from xarray.core.options import OPTIONS\n-from xarray.core.utils import is_duck_array, is_duck_dask_array, module_available\n+from xarray.core.utils import (\n+    is_allowed_extension_array_dtype,\n+    is_duck_array,\n+    is_duck_dask_array,\n+    module_available,\n+)\n from xarray.namedarray.parallelcompat import get_chunked_array_type\n from xarray.namedarray.pycompat import array_type, is_chunked_array\n \n@@ -252,7 +260,14 @@ def astype(data, dtype, *, xp=None, **kwargs):\n \n \n def asarray(data, xp=np, dtype=None):\n-    converted = data if is_duck_array(data) else xp.asarray(data)\n+    if is_duck_array(data):\n+        converted = data\n+    elif is_allowed_extension_array_dtype(dtype):\n+        # data may or may not be an ExtensionArray, so we can't rely on\n+        # np.asarray to call our NEP-18 handler; gotta hook it ourselves\n+        converted = PandasExtensionArray(as_extension_array(data, dtype))\n+    else:\n+        converted = xp.asarray(data)\n \n     if dtype is None or converted.dtype == dtype:\n         return converted\n@@ -264,29 +279,7 @@ def asarray(data, xp=np, dtype=None):\n \n \n def as_shared_dtype(scalars_or_arrays, xp=None):\n-    \"\"\"Cast arrays to a shared dtype using xarray's type promotion rules.\"\"\"\n-    extension_array_types = [\n-        x.dtype\n-        for x in scalars_or_arrays\n-        if pd.api.types.is_extension_array_dtype(x)  # noqa: TID251\n-    ]\n-    if len(extension_array_types) >= 1:\n-        non_nans = [x for x in scalars_or_arrays if not isna(x)]\n-        if len(extension_array_types) == len(non_nans) and all(\n-            isinstance(x, type(extension_array_types[0])) for x in extension_array_types\n-        ):\n-            return [\n-                x\n-                if not isna(x)\n-                else PandasExtensionArray(\n-                    type(non_nans[0].array)._from_sequence([x], dtype=non_nans[0].dtype)\n-                )\n-                for x in scalars_or_arrays\n-            ]\n-        raise ValueError(\n-            f\"Cannot cast values to shared type, found values: {scalars_or_arrays}\"\n-        )\n-\n+    \"\"\"Cast a arrays to a shared dtype using xarray's type promotion rules.\"\"\"\n     # Avoid calling array_type(\"cupy\") repeatidely in the any check\n     array_type_cupy = array_type(\"cupy\")\n     if any(isinstance(x, array_type_cupy) for x in scalars_or_arrays):\n@@ -295,7 +288,12 @@ def as_shared_dtype(scalars_or_arrays, xp=None):\n         xp = cp\n     elif xp is None:\n         xp = get_array_namespace(scalars_or_arrays)\n-\n+    scalars_or_arrays = [\n+        PandasExtensionArray(s_or_a)\n+        if isinstance(s_or_a, pd.api.extensions.ExtensionArray)\n+        else s_or_a\n+        for s_or_a in scalars_or_arrays\n+    ]\n     # Pass arrays directly instead of dtypes to result_type so scalars\n     # get handled properly.\n     # Note that result_type() safely gets the dtype from dask arrays without\n@@ -406,7 +404,9 @@ def where(condition, x, y):\n     else:\n         condition = astype(condition, dtype=dtype, xp=xp)\n \n-    return xp.where(condition, *as_shared_dtype([x, y], xp=xp))\n+    promoted_x, promoted_y = as_shared_dtype([x, y], xp=xp)\n+\n+    return xp.where(condition, promoted_x, promoted_y)\n \n \n def where_method(data, cond, other=dtypes.NA):\n@@ -861,7 +861,7 @@ def _push(array, n: int | None = None, axis: int = -1):\n             \" Call `xr.set_options(use_bottleneck=True)` or `xr.set_options(use_numbagg=True)` to enable one.\"\n         )\n     if OPTIONS[\"use_numbagg\"] and module_available(\"numbagg\"):\n-        import numbagg\n+        import numbagg  # type: ignore[import-not-found, unused-ignore]\n \n         return numbagg.ffill(array, limit=n, axis=axis)\n \n\ndiff --git a/xarray/core/extension_array.py b/xarray/core/extension_array.py\nindex 8a80975..5841a69 100644\n--- a/xarray/core/extension_array.py\n+++ b/xarray/core/extension_array.py\n@@ -3,23 +3,50 @@ from __future__ import annotations\n import copy\n from collections.abc import Callable, Sequence\n from dataclasses import dataclass\n-from typing import Any, Generic, cast\n+from typing import TYPE_CHECKING, Generic, cast\n \n import numpy as np\n import pandas as pd\n from packaging.version import Version\n+from pandas.api.extensions import ExtensionArray, ExtensionDtype\n+from pandas.api.types import is_scalar as pd_is_scalar\n \n from xarray.core.types import DTypeLikeSave, T_ExtensionArray\n-from xarray.core.utils import NDArrayMixin, is_allowed_extension_array\n+from xarray.core.utils import (\n+    NDArrayMixin,\n+    is_allowed_extension_array,\n+    is_allowed_extension_array_dtype,\n+)\n \n HANDLED_EXTENSION_ARRAY_FUNCTIONS: dict[Callable, Callable] = {}\n \n \n-def implements(numpy_function):\n-    \"\"\"Register an __array_function__ implementation for MyArray objects.\"\"\"\n+if TYPE_CHECKING:\n+    from typing import Any\n+\n+    from pandas._typing import DtypeObj, Scalar\n+\n+\n+def is_scalar(value: object) -> bool:\n+    \"\"\"Workaround: pandas is_scalar doesn't recognize Categorical nulls for some reason.\"\"\"\n+    return value is pd.CategoricalDtype.na_value or pd_is_scalar(value)\n+\n+\n+def implements(numpy_function_or_name: Callable | str) -> Callable:\n+    \"\"\"Register an __array_function__ implementation.\n+\n+    Pass a function directly if it's guaranteed to exist in all supported numpy versions, or a\n+    string to first check for its existence.\n+    \"\"\"\n \n     def decorator(func):\n-        HANDLED_EXTENSION_ARRAY_FUNCTIONS[numpy_function] = func\n+        if isinstance(numpy_function_or_name, str):\n+            numpy_function = getattr(np, numpy_function_or_name, None)\n+        else:\n+            numpy_function = numpy_function_or_name\n+\n+        if numpy_function:\n+            HANDLED_EXTENSION_ARRAY_FUNCTIONS[numpy_function] = func\n         return func\n \n     return decorator\n@@ -32,6 +59,111 @@ def __extension_duck_array__issubdtype(\n     return False  # never want a function to think a pandas extension dtype is a subtype of numpy\n \n \n+@implements(\"astype\")  # np.astype was added in 2.1.0, but we only require >=1.24\n+def __extension_duck_array__astype(\n+    array_or_scalar: T_ExtensionArray,\n+    dtype: DTypeLikeSave,\n+    order: str = \"K\",\n+    casting: str = \"unsafe\",\n+    subok: bool = True,\n+    copy: bool = True,\n+    device: str | None = None,\n+) -> ExtensionArray:\n+    if (\n+        not (\n+            is_allowed_extension_array(array_or_scalar)\n+            or is_allowed_extension_array_dtype(dtype)\n+        )\n+        or casting != \"unsafe\"\n+        or not subok\n+        or order != \"K\"\n+    ):\n+        return NotImplemented\n+\n+    return as_extension_array(array_or_scalar, dtype, copy=copy)\n+\n+\n+@implements(np.asarray)\n+def __extension_duck_array__asarray(\n+    array_or_scalar: np.typing.ArrayLike | T_ExtensionArray,\n+    dtype: DTypeLikeSave | None = None,\n+) -> ExtensionArray:\n+    if not is_allowed_extension_array(dtype):\n+        return NotImplemented\n+\n+    return as_extension_array(array_or_scalar, dtype)\n+\n+\n+def as_extension_array(\n+    array_or_scalar: np.typing.ArrayLike | T_ExtensionArray,\n+    dtype: ExtensionDtype | DTypeLikeSave | None,\n+    copy: bool = False,\n+) -> ExtensionArray:\n+    if is_scalar(array_or_scalar):\n+        return dtype.construct_array_type()._from_sequence(  # type: ignore[union-attr]\n+            [array_or_scalar], dtype=dtype\n+        )\n+    else:\n+        return array_or_scalar.astype(dtype, copy=copy)  # type: ignore[union-attr]\n+\n+\n+@implements(np.result_type)\n+def __extension_duck_array__result_type(\n+    *arrays_and_dtypes: list[\n+        np.typing.ArrayLike | np.typing.DTypeLike | ExtensionDtype | ExtensionArray\n+    ],\n+) -> DtypeObj:\n+    extension_arrays_and_dtypes: list[ExtensionDtype | ExtensionArray] = [\n+        cast(ExtensionDtype | ExtensionArray, x)\n+        for x in arrays_and_dtypes\n+        if is_allowed_extension_array(x) or is_allowed_extension_array_dtype(x)\n+    ]\n+    if not extension_arrays_and_dtypes:\n+        return NotImplemented\n+\n+    ea_dtypes: list[ExtensionDtype] = [\n+        getattr(x, \"dtype\", cast(ExtensionDtype, x))\n+        for x in extension_arrays_and_dtypes\n+    ]\n+    scalars = [\n+        x for x in arrays_and_dtypes if is_scalar(x) and x not in {pd.NA, np.nan}\n+    ]\n+    # other_stuff could include:\n+    # - arrays such as pd.ABCSeries, np.ndarray, or other array-api duck arrays\n+    # - dtypes such as pd.DtypeObj, np.dtype, or other array-api duck dtypes\n+    other_stuff = [\n+        x\n+        for x in arrays_and_dtypes\n+        if not is_allowed_extension_array_dtype(x) and not is_scalar(x)\n+    ]\n+    # We implement one special case: when possible, preserve Categoricals (avoid promoting\n+    # to object) by merging the categories of all given Categoricals + scalars + NA.\n+    # Ideally this could be upstreamed into pandas find_result_type / find_common_type.\n+    if not other_stuff and all(\n+        isinstance(x, pd.CategoricalDtype) and not x.ordered for x in ea_dtypes\n+    ):\n+        return union_unordered_categorical_and_scalar(\n+            cast(list[pd.CategoricalDtype], ea_dtypes),\n+            scalars,  # type: ignore[arg-type]\n+        )\n+    if not other_stuff and all(\n+        isinstance(x, type(ea_type := ea_dtypes[0])) for x in ea_dtypes\n+    ):\n+        return ea_type\n+    raise ValueError(\n+        f\"Cannot cast values to shared type, found values: {arrays_and_dtypes}\"\n+    )\n+\n+\n+def union_unordered_categorical_and_scalar(\n+    categorical_dtypes: list[pd.CategoricalDtype], scalars: list[Scalar]\n+) -> pd.CategoricalDtype:\n+    scalars = [x for x in scalars if x is not pd.CategoricalDtype.na_value]\n+    all_categories = set().union(*(x.categories for x in categorical_dtypes))\n+    all_categories = all_categories.union(scalars)\n+    return pd.CategoricalDtype(categories=list(all_categories))\n+\n+\n @implements(np.broadcast_to)\n def __extension_duck_array__broadcast(arr: T_ExtensionArray, shape: tuple):\n     if shape[0] == len(arr) and len(shape) == 1:\n@@ -53,16 +185,34 @@ def __extension_duck_array__concatenate(\n \n @implements(np.where)\n def __extension_duck_array__where(\n-    condition: np.ndarray, x: T_ExtensionArray, y: T_ExtensionArray\n+    condition: T_ExtensionArray | np.typing.ArrayLike,\n+    x: T_ExtensionArray,\n+    y: T_ExtensionArray | np.typing.ArrayLike,\n ) -> T_ExtensionArray:\n-    if (\n-        isinstance(x, pd.Categorical)\n-        and isinstance(y, pd.Categorical)\n-        and x.dtype != y.dtype\n-    ):\n-        x = x.add_categories(set(y.categories).difference(set(x.categories)))  # type: ignore[assignment]\n-        y = y.add_categories(set(x.categories).difference(set(y.categories)))  # type: ignore[assignment]\n-    return cast(T_ExtensionArray, pd.Series(x).where(condition, pd.Series(y)).array)\n+    # pd.where won't broadcast 0-dim arrays across a scalar-like series; scalar y's must be preserved\n+    if hasattr(y, \"shape\") and len(y.shape) == 1 and y.shape[0] == 1:\n+        y = y[0]  # type: ignore[index]\n+    return cast(T_ExtensionArray, pd.Series(x).where(condition, y).array)  # type: ignore[arg-type]\n+\n+\n+def _replace_duck(args, replacer: Callable[[PandasExtensionArray], list]) -> list:\n+    args_as_list = list(args)\n+    for index, value in enumerate(args_as_list):\n+        if isinstance(value, PandasExtensionArray):\n+            args_as_list[index] = replacer(value)\n+        elif isinstance(value, tuple):  # should handle more than just tuple? iterable?\n+            args_as_list[index] = tuple(_replace_duck(value, replacer))\n+        elif isinstance(value, list):\n+            args_as_list[index] = _replace_duck(value, replacer)\n+    return args_as_list\n+\n+\n+def replace_duck_with_extension_array(args) -> tuple:\n+    return tuple(_replace_duck(args, lambda duck: duck.array))\n+\n+\n+def replace_duck_with_series(args) -> tuple:\n+    return tuple(_replace_duck(args, lambda duck: pd.Series(duck.array)))\n \n \n @implements(np.ndim)\n@@ -96,7 +246,7 @@ class PandasExtensionArray(NDArrayMixin, Generic[T_ExtensionArray]):\n \n     def __post_init__(self):\n         if not isinstance(self.array, pd.api.extensions.ExtensionArray):\n-            raise TypeError(f\"{self.array} is not an pandas ExtensionArray.\")\n+            raise TypeError(f\"{self.array} is not a pandas ExtensionArray.\")\n         # This does not use the UNSUPPORTED_EXTENSION_ARRAY_TYPES whitelist because\n         # we do support extension arrays from datetime, for example, that need\n         # duck array support internally via this class.  These can appear from `DatetimeIndex`\n@@ -107,26 +257,11 @@ class PandasExtensionArray(NDArrayMixin, Generic[T_ExtensionArray]):\n             )\n \n     def __array_function__(self, func, types, args, kwargs):\n-        def replace_duck_with_extension_array(args) -> list:\n-            args_as_list = list(args)\n-            for index, value in enumerate(args_as_list):\n-                if isinstance(value, PandasExtensionArray):\n-                    args_as_list[index] = value.array\n-                elif isinstance(\n-                    value, tuple\n-                ):  # should handle more than just tuple? iterable?\n-                    args_as_list[index] = tuple(\n-                        replace_duck_with_extension_array(value)\n-                    )\n-                elif isinstance(value, list):\n-                    args_as_list[index] = replace_duck_with_extension_array(value)\n-            return args_as_list\n-\n-        args = tuple(replace_duck_with_extension_array(args))\n         if func not in HANDLED_EXTENSION_ARRAY_FUNCTIONS:\n             raise KeyError(\"Function not registered for pandas extension arrays.\")\n+        args = replace_duck_with_extension_array(args)\n         res = HANDLED_EXTENSION_ARRAY_FUNCTIONS[func](*args, **kwargs)\n-        if is_allowed_extension_array(res):\n+        if isinstance(res, ExtensionArray):\n             return PandasExtensionArray(res)\n         return res\n \n@@ -134,16 +269,23 @@ class PandasExtensionArray(NDArrayMixin, Generic[T_ExtensionArray]):\n         return ufunc(*inputs, **kwargs)\n \n     def __getitem__(self, key) -> PandasExtensionArray[T_ExtensionArray]:\n+        if (\n+            isinstance(key, tuple) and len(key) == 1\n+        ):  # pyarrow type arrays can't handle single-length tuples\n+            (key,) = key\n         item = self.array[key]\n         if is_allowed_extension_array(item):\n             return PandasExtensionArray(item)\n-        if np.isscalar(item) or isinstance(key, int):\n+        if is_scalar(item) or isinstance(key, int):\n             return PandasExtensionArray(type(self.array)._from_sequence([item]))  # type: ignore[call-arg,attr-defined,unused-ignore]\n         return PandasExtensionArray(item)\n \n     def __setitem__(self, key, val):\n         self.array[key] = val\n \n+    def __len__(self):\n+        return len(self.array)\n+\n     def __eq__(self, other):\n         if isinstance(other, PandasExtensionArray):\n             return self.array == other.array\n@@ -152,9 +294,6 @@ class PandasExtensionArray(NDArrayMixin, Generic[T_ExtensionArray]):\n     def __ne__(self, other):\n         return ~(self == other)\n \n-    def __len__(self):\n-        return len(self.array)\n-\n     @property\n     def ndim(self) -> int:\n         return 1\n\ndiff --git a/xarray/core/indexes.py b/xarray/core/indexes.py\nindex 72d8db4..c4f0914 100644\n--- a/xarray/core/indexes.py\n+++ b/xarray/core/indexes.py\n@@ -809,7 +809,7 @@ class PandasIndex(Index):\n         indxr = indexers[self.dim]\n         if isinstance(indxr, Variable):\n             if indxr.dims != (self.dim,):\n-                # can't preserve a index if result has new dimensions\n+                # can't preserve an index if result has new dimensions\n                 return None\n             else:\n                 indxr = indxr.data\n\ndiff --git a/xarray/core/indexing.py b/xarray/core/indexing.py\nindex 5d022d0..eead0a1 100644\n--- a/xarray/core/indexing.py\n+++ b/xarray/core/indexing.py\n@@ -355,6 +355,17 @@ def slice_slice_by_array(\n     return new_indexer\n \n \n+def normalize_indexer(indexer, size):\n+    if isinstance(indexer, slice):\n+        return normalize_slice(indexer, size)\n+    elif isinstance(indexer, np.ndarray):\n+        return normalize_array(indexer, size)\n+    else:\n+        if indexer < 0:\n+            return size + indexer\n+        return indexer\n+\n+\n def _index_indexer_1d(\n     old_indexer: OuterIndexerType,\n     applied_indexer: OuterIndexerType,\n@@ -365,7 +376,7 @@ def _index_indexer_1d(\n         return old_indexer\n     if is_full_slice(old_indexer):\n         # shortcut for full slices\n-        return applied_indexer\n+        return normalize_indexer(applied_indexer, size)\n \n     indexer: OuterIndexerType\n     if isinstance(old_indexer, slice):\n@@ -1640,7 +1651,7 @@ def posify_mask_indexer(indexer: ExplicitIndexer) -> ExplicitIndexer:\n \n \n def is_fancy_indexer(indexer: Any) -> bool:\n-    \"\"\"Return False if indexer is a int, slice, a 1-dimensional list, or a 0 or\n+    \"\"\"Return False if indexer is an int, slice, a 1-dimensional list, or a 0 or\n     1-dimensional ndarray; in all other cases return True\n     \"\"\"\n     if isinstance(indexer, int | slice) and not isinstance(indexer, bool):\n\ndiff --git a/xarray/core/nputils.py b/xarray/core/nputils.py\nindex b517c67..5c3742f 100644\n--- a/xarray/core/nputils.py\n+++ b/xarray/core/nputils.py\n@@ -156,7 +156,7 @@ def _advanced_indexer_subspaces(key):\n \n \n class NumpyVIndexAdapter:\n-    \"\"\"Object that implements indexing like vindex on a np.ndarray.\n+    \"\"\"Object that implements indexing like vindex on an np.ndarray.\n \n     This is a pure Python implementation of (some of) the logic in this NumPy\n     proposal: https://github.com/numpy/numpy/pull/6256\n@@ -208,7 +208,7 @@ def _create_method(name, npmodule=np) -> Callable:\n                 )\n             )\n         ):\n-            import numbagg\n+            import numbagg  # type: ignore[import-not-found, unused-ignore]\n \n             nba_func = getattr(numbagg, name, None)\n             if nba_func is not None:\n\ndiff --git a/xarray/core/variable.py b/xarray/core/variable.py\nindex 12bea89..7848d64 100644\n--- a/xarray/core/variable.py\n+++ b/xarray/core/variable.py\n@@ -972,7 +972,7 @@ class Variable(NamedArray, AbstractArray, VariableArithmetic):\n         if dims is _default:\n             dims = copy.copy(self._dims)\n         if data is _default:\n-            data = copy.copy(self.data)\n+            data = copy.copy(self._data)\n         if attrs is _default:\n             attrs = copy.copy(self._attrs)\n         if encoding is _default:\n@@ -1228,7 +1228,7 @@ class Variable(NamedArray, AbstractArray, VariableArithmetic):\n         if fill_with_shape:\n             return [\n                 pad_option.get(d, (n, n))\n-                for d, n in zip(self.dims, self.data.shape, strict=True)\n+                for d, n in zip(self.dims, self.shape, strict=True)\n             ]\n         return [pad_option.get(d, (0, 0)) for d in self.dims]\n \n@@ -1304,7 +1304,7 @@ class Variable(NamedArray, AbstractArray, VariableArithmetic):\n \n         # workaround for bug in Dask's default value of stat_length https://github.com/dask/dask/issues/5303\n         if stat_length is None and mode in [\"maximum\", \"mean\", \"median\", \"minimum\"]:\n-            stat_length = [(n, n) for n in self.data.shape]  # type: ignore[assignment]\n+            stat_length = [(n, n) for n in self.shape]  # type: ignore[assignment]\n \n         pad_width_by_index = self._pad_options_dim_to_index(pad_width)\n \n@@ -1469,7 +1469,7 @@ class Variable(NamedArray, AbstractArray, VariableArithmetic):\n         if self.dims == expanded_dims:\n             # don't use broadcast_to unless necessary so the result remains\n             # writeable if possible\n-            expanded_data = self.data\n+            expanded_data = self._data\n         elif shape is None or all(\n             s == 1 for s, e in zip(shape, dim, strict=True) if e not in self_dims\n         ):\n@@ -1477,6 +1477,7 @@ class Variable(NamedArray, AbstractArray, VariableArithmetic):\n             # This is typically easier for duck arrays to implement\n             # than the full \"broadcast_to\" semantics\n             indexer = (None,) * (len(expanded_dims) - self.ndim) + (...,)\n+            # TODO: switch this to ._data once we teach ExplicitlyIndexed arrays to handle indexers with None.\n             expanded_data = self.data[indexer]\n         else:  # elif shape is not None:\n             dims_map = dict(zip(dim, shape, strict=True))\n\ndiff --git a/xarray/indexes/nd_point_index.py b/xarray/indexes/nd_point_index.py\nindex b4b533e..8d2637a 100644\n--- a/xarray/indexes/nd_point_index.py\n+++ b/xarray/indexes/nd_point_index.py\n@@ -135,7 +135,7 @@ class NDPointIndex(Index, Generic[T_TreeAdapter]):\n     Data variables:\n         *empty*\n \n-    Creation of a NDPointIndex from the \"xx\" and \"yy\" coordinate variables:\n+    Creation of an NDPointIndex from the \"xx\" and \"yy\" coordinate variables:\n \n     >>> ds = ds.set_xindex((\"xx\", \"yy\"), xr.indexes.NDPointIndex)\n     >>> ds\n\ndiff --git a/xarray/plot/dataarray_plot.py b/xarray/plot/dataarray_plot.py\nindex 921f3dc..3a140ad 100644\n--- a/xarray/plot/dataarray_plot.py\n+++ b/xarray/plot/dataarray_plot.py\n@@ -1000,7 +1000,7 @@ artist :\n                 ckw = {vv: cmap_params[vv] for vv in (\"vmin\", \"vmax\", \"norm\", \"cmap\")}\n                 cmap_params_subset.update(**ckw)\n \n-        with plt.rc_context(_styles):\n+        with plt.rc_context(_styles):  # type: ignore[arg-type, unused-ignore]\n             if z is not None:\n                 import mpl_toolkits\n \n\ndiff --git a/xarray/plot/utils.py b/xarray/plot/utils.py\nindex 177c2de..de3c458 100644\n--- a/xarray/plot/utils.py\n+++ b/xarray/plot/utils.py\n@@ -509,7 +509,7 @@ def _maybe_gca(**subplot_kws: Any) -> Axes:\n \n \n def _get_units_from_attrs(da: DataArray) -> str:\n-    \"\"\"Extracts and formats the unit/units from a attributes.\"\"\"\n+    \"\"\"Extracts and formats the unit/units from their attributes.\"\"\"\n     pint_array_type = DuckArrayModule(\"pint\").type\n     units = \" [{}]\"\n     if isinstance(da.data, pint_array_type):\n\ndiff --git a/xarray/structure/combine.py b/xarray/structure/combine.py\nindex 4ff8354..b5546e6 100644\n--- a/xarray/structure/combine.py\n+++ b/xarray/structure/combine.py\n@@ -2,13 +2,14 @@ from __future__ import annotations\n \n from collections import Counter, defaultdict\n from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence\n-from typing import TYPE_CHECKING, Literal, TypeVar, Union, cast\n+from typing import TYPE_CHECKING, Literal, TypeAlias, TypeVar, cast, overload\n \n import pandas as pd\n \n from xarray.core import dtypes\n from xarray.core.dataarray import DataArray\n from xarray.core.dataset import Dataset\n+from xarray.core.datatree import DataTree\n from xarray.core.utils import iterate_nested\n from xarray.structure.alignment import AlignmentError\n from xarray.structure.concat import concat\n@@ -43,7 +44,7 @@ def _infer_tile_ids_from_nested_list(\n     entry: NestedSequence[T], current_pos: tuple[int, ...]\n ) -> Iterator[tuple[tuple[int, ...], T]]:\n     \"\"\"\n-    Given a list of lists (of lists...) of objects, returns a iterator\n+    Given a list of lists (of lists...) of objects, returns an iterator\n     which returns a tuple containing the index of each object in the nested\n     list structure as the key, and the object. This can then be called by the\n     dict constructor to create a dictionary of the objects organised by their\n@@ -96,9 +97,9 @@ def _ensure_same_types(series, dim):\n             raise TypeError(error_msg)\n \n \n-def _infer_concat_order_from_coords(datasets):\n+def _infer_concat_order_from_coords(datasets: list[Dataset] | list[DataTree]):\n     concat_dims = []\n-    tile_ids = [() for ds in datasets]\n+    tile_ids: list[tuple[int, ...]] = [() for ds in datasets]\n \n     # All datasets have same variables because they've been grouped as such\n     ds0 = datasets[0]\n@@ -106,17 +107,18 @@ def _infer_concat_order_from_coords(datasets):\n         # Check if dim is a coordinate dimension\n         if dim in ds0:\n             # Need to read coordinate values to do ordering\n-            indexes = [ds._indexes.get(dim) for ds in datasets]\n-            if any(index is None for index in indexes):\n-                error_msg = (\n-                    f\"Every dimension requires a corresponding 1D coordinate \"\n-                    f\"and index for inferring concatenation order but the \"\n-                    f\"coordinate '{dim}' has no corresponding index\"\n-                )\n-                raise ValueError(error_msg)\n-\n-            # TODO (benbovy, flexible indexes): support flexible indexes?\n-            indexes = [index.to_pandas_index() for index in indexes]\n+            indexes: list[pd.Index] = []\n+            for ds in datasets:\n+                index = ds._indexes.get(dim)\n+                if index is None:\n+                    error_msg = (\n+                        f\"Every dimension requires a corresponding 1D coordinate \"\n+                        f\"and index for inferring concatenation order but the \"\n+                        f\"coordinate '{dim}' has no corresponding index\"\n+                    )\n+                    raise ValueError(error_msg)\n+                # TODO (benbovy, flexible indexes): support flexible indexes?\n+                indexes.append(index.to_pandas_index())\n \n             # If dimension coordinate values are same on every dataset then\n             # should be leaving this dimension alone (it's just a \"bystander\")\n@@ -153,7 +155,7 @@ def _infer_concat_order_from_coords(datasets):\n                 rank = series.rank(\n                     method=\"dense\", ascending=ascending, numeric_only=False\n                 )\n-                order = rank.astype(int).values - 1\n+                order = (rank.astype(int).values - 1).tolist()\n \n                 # Append positions along extra dimension to structure which\n                 # encodes the multi-dimensional concatenation order\n@@ -163,10 +165,16 @@ def _infer_concat_order_from_coords(datasets):\n                 ]\n \n     if len(datasets) > 1 and not concat_dims:\n-        raise ValueError(\n-            \"Could not find any dimension coordinates to use to \"\n-            \"order the datasets for concatenation\"\n-        )\n+        if any(isinstance(data, DataTree) for data in datasets):\n+            raise ValueError(\n+                \"Did not find any dimension coordinates at root nodes \"\n+                \"to order the DataTree objects for concatenation\"\n+            )\n+        else:\n+            raise ValueError(\n+                \"Could not find any dimension coordinates to use to \"\n+                \"order the Dataset objects for concatenation\"\n+            )\n \n     combined_ids = dict(zip(tile_ids, datasets, strict=True))\n \n@@ -224,7 +232,7 @@ def _combine_nd(\n \n     Parameters\n     ----------\n-    combined_ids : Dict[Tuple[int, ...]], xarray.Dataset]\n+    combined_ids : Dict[Tuple[int, ...]], xarray.Dataset | xarray.DataTree]\n         Structure containing all datasets to be concatenated with \"tile_IDs\" as\n         keys, which specify position within the desired final combined result.\n     concat_dims : sequence of str\n@@ -235,7 +243,7 @@ def _combine_nd(\n \n     Returns\n     -------\n-    combined_ds : xarray.Dataset\n+    combined_ds : xarray.Dataset | xarray.DataTree\n     \"\"\"\n \n     example_tile_id = next(iter(combined_ids.keys()))\n@@ -399,20 +407,74 @@ def _nested_combine(\n     return combined\n \n \n-# Define type for arbitrarily-nested list of lists recursively:\n-DATASET_HYPERCUBE = Union[Dataset, Iterable[\"DATASET_HYPERCUBE\"]]\n+# Define types for arbitrarily-nested list of lists.\n+# Mypy doesn't seem to handle overloads properly with recursive types, so we\n+# explicitly expand the first handful of levels of recursion.\n+DatasetLike: TypeAlias = DataArray | Dataset\n+DatasetHyperCube: TypeAlias = (\n+    DatasetLike\n+    | Sequence[DatasetLike]\n+    | Sequence[Sequence[DatasetLike]]\n+    | Sequence[Sequence[Sequence[DatasetLike]]]\n+    | Sequence[Sequence[Sequence[Sequence[DatasetLike]]]]\n+)\n+DataTreeHyperCube: TypeAlias = (\n+    DataTree\n+    | Sequence[DataTree]\n+    | Sequence[Sequence[DataTree]]\n+    | Sequence[Sequence[Sequence[DataTree]]]\n+    | Sequence[Sequence[Sequence[Sequence[DataTree]]]]\n+)\n+\n+\n+@overload\n+def combine_nested(\n+    datasets: DatasetHyperCube,\n+    concat_dim: str\n+    | DataArray\n+    | list[str]\n+    | Sequence[str | DataArray | pd.Index | None]\n+    | None,\n+    compat: str | CombineKwargDefault = ...,\n+    data_vars: str | CombineKwargDefault = ...,\n+    coords: str | CombineKwargDefault = ...,\n+    fill_value: object = ...,\n+    join: JoinOptions | CombineKwargDefault = ...,\n+    combine_attrs: CombineAttrsOptions = ...,\n+) -> Dataset: ...\n+\n+\n+@overload\n+def combine_nested(\n+    datasets: DataTreeHyperCube,\n+    concat_dim: str\n+    | DataArray\n+    | list[str]\n+    | Sequence[str | DataArray | pd.Index | None]\n+    | None,\n+    compat: str | CombineKwargDefault = ...,\n+    data_vars: str | CombineKwargDefault = ...,\n+    coords: str | CombineKwargDefault = ...,\n+    fill_value: object = ...,\n+    join: JoinOptions | CombineKwargDefault = ...,\n+    combine_attrs: CombineAttrsOptions = ...,\n+) -> DataTree: ...\n \n \n def combine_nested(\n-    datasets: DATASET_HYPERCUBE,\n-    concat_dim: str | DataArray | Sequence[str | DataArray | pd.Index | None] | None,\n+    datasets: DatasetHyperCube | DataTreeHyperCube,\n+    concat_dim: str\n+    | DataArray\n+    | list[str]\n+    | Sequence[str | DataArray | pd.Index | None]\n+    | None,\n     compat: str | CombineKwargDefault = _COMPAT_DEFAULT,\n     data_vars: str | CombineKwargDefault = _DATA_VARS_DEFAULT,\n     coords: str | CombineKwargDefault = _COORDS_DEFAULT,\n     fill_value: object = dtypes.NA,\n     join: JoinOptions | CombineKwargDefault = _JOIN_DEFAULT,\n     combine_attrs: CombineAttrsOptions = \"drop\",\n-) -> Dataset:\n+) -> Dataset | DataTree:\n     \"\"\"\n     Explicitly combine an N-dimensional grid of datasets into one by using a\n     succession of concat and merge operations along each dimension of the grid.\n@@ -433,7 +495,7 @@ def combine_nested(\n \n     Parameters\n     ----------\n-    datasets : list or nested list of Dataset\n+    datasets : list or nested list of Dataset, DataArray or DataTree\n         Dataset objects to combine.\n         If concatenation or merging along more than one dimension is desired,\n         then datasets must be supplied in a nested list-of-lists.\n@@ -527,7 +589,7 @@ def combine_nested(\n \n     Returns\n     -------\n-    combined : xarray.Dataset\n+    combined : xarray.Dataset or xarray.DataTree\n \n     Examples\n     --------\n@@ -621,22 +683,29 @@ def combine_nested(\n     concat\n     merge\n     \"\"\"\n-    mixed_datasets_and_arrays = any(\n-        isinstance(obj, Dataset) for obj in iterate_nested(datasets)\n-    ) and any(\n+    any_datasets = any(isinstance(obj, Dataset) for obj in iterate_nested(datasets))\n+    any_unnamed_arrays = any(\n         isinstance(obj, DataArray) and obj.name is None\n         for obj in iterate_nested(datasets)\n     )\n-    if mixed_datasets_and_arrays:\n+    if any_datasets and any_unnamed_arrays:\n         raise ValueError(\"Can't combine datasets with unnamed arrays.\")\n \n-    if isinstance(concat_dim, str | DataArray) or concat_dim is None:\n-        concat_dim = [concat_dim]\n+    any_datatrees = any(isinstance(obj, DataTree) for obj in iterate_nested(datasets))\n+    all_datatrees = all(isinstance(obj, DataTree) for obj in iterate_nested(datasets))\n+    if any_datatrees and not all_datatrees:\n+        raise ValueError(\"Can't combine a mix of DataTree and non-DataTree objects.\")\n+\n+    concat_dims = (\n+        [concat_dim]\n+        if isinstance(concat_dim, str | DataArray) or concat_dim is None\n+        else concat_dim\n+    )\n \n     # The IDs argument tells _nested_combine that datasets aren't yet sorted\n     return _nested_combine(\n         datasets,\n-        concat_dims=concat_dim,\n+        concat_dims=concat_dims,\n         compat=compat,\n         data_vars=data_vars,\n         coords=coords,\n@@ -988,6 +1057,10 @@ def combine_by_coords(\n     Finally, if you attempt to combine a mix of unnamed DataArrays with either named\n     DataArrays or Datasets, a ValueError will be raised (as this is an ambiguous operation).\n     \"\"\"\n+    if any(isinstance(data_object, DataTree) for data_object in data_objects):\n+        raise NotImplementedError(\n+            \"combine_by_coords() does not yet support DataTree objects.\"\n+        )\n \n     if not data_objects:\n         return Dataset()\n@@ -1018,7 +1091,7 @@ def combine_by_coords(\n             # Must be a mix of unnamed dataarrays with either named dataarrays or with datasets\n             # Can't combine these as we wouldn't know whether to merge or concatenate the arrays\n             raise ValueError(\n-                \"Can't automatically combine unnamed DataArrays with either named DataArrays or Datasets.\"\n+                \"Can't automatically combine unnamed DataArrays with named DataArrays or Datasets.\"\n             )\n     else:\n         # Promote any named DataArrays to single-variable Datasets to simplify combining\n\ndiff --git a/xarray/structure/merge.py b/xarray/structure/merge.py\nindex e5f3c09..d398a37 100644\n--- a/xarray/structure/merge.py\n+++ b/xarray/structure/merge.py\n@@ -22,7 +22,12 @@ from xarray.core.utils import (\n     emit_user_level_warning,\n     equivalent,\n )\n-from xarray.core.variable import Variable, as_variable, calculate_dimensions\n+from xarray.core.variable import (\n+    IndexVariable,\n+    Variable,\n+    as_variable,\n+    calculate_dimensions,\n+)\n from xarray.structure.alignment import deep_align\n from xarray.util.deprecation_helpers import (\n     _COMPAT_DEFAULT,\n@@ -1206,7 +1211,11 @@ def dataset_update_method(dataset: Dataset, other: CoercibleMapping) -> _MergeRe\n                     if c not in value.dims and c in dataset.coords\n                 ]\n                 if coord_names:\n-                    other[key] = value.drop_vars(coord_names)\n+                    value = value.drop_vars(coord_names)\n+                if isinstance(value.variable, IndexVariable):\n+                    variable = value.variable.to_base_variable()\n+                    value = value._replace(variable=variable)\n+                other[key] = value\n \n     return merge_core(\n         [dataset, other],\n\ndiff --git a/xarray/testing/assertions.py b/xarray/testing/assertions.py\nindex 39e6da6..7a5c652 100644\n--- a/xarray/testing/assertions.py\n+++ b/xarray/testing/assertions.py\n@@ -3,6 +3,7 @@\n import functools\n import warnings\n from collections.abc import Hashable\n+from typing import Any\n \n import numpy as np\n import pandas as pd\n@@ -362,6 +363,17 @@ def _assert_indexes_invariants_checks(\n             if isinstance(v, IndexVariable)\n         }\n         assert indexes.keys() <= index_vars, (set(indexes), index_vars)\n+        assert all(\n+            k in index_vars\n+            for k, v in possible_coord_variables.items()\n+            if v.dims == (k,)\n+        ), {k: type(v) for k, v in possible_coord_variables.items()}\n+\n+    assert not any(\n+        isinstance(v, IndexVariable)\n+        for k, v in possible_coord_variables.items()\n+        if k not in indexes.keys()\n+    ), {k: type(v) for k, v in possible_coord_variables.items()}\n \n     # check pandas index wrappers vs. coordinate data adapters\n     for k, index in indexes.items():\n@@ -401,11 +413,17 @@ def _assert_indexes_invariants_checks(\n         )\n \n \n-def _assert_variable_invariants(var: Variable, name: Hashable = None):\n+def _assert_variable_invariants(\n+    var: Variable | Any,\n+    name: Hashable = None,\n+) -> None:\n     if name is None:\n         name_or_empty: tuple = ()\n     else:\n         name_or_empty = (name,)\n+\n+    assert isinstance(var, Variable), {name: type(var)}\n+\n     assert isinstance(var._dims, tuple), name_or_empty + (var._dims,)\n     assert len(var._dims) == len(var._data.shape), name_or_empty + (\n         var._dims,\n@@ -418,35 +436,28 @@ def _assert_variable_invariants(var: Variable, name: Hashable = None):\n \n \n def _assert_dataarray_invariants(da: DataArray, check_default_indexes: bool):\n-    assert isinstance(da._variable, Variable), da._variable\n     _assert_variable_invariants(da._variable)\n \n     assert isinstance(da._coords, dict), da._coords\n-    assert all(isinstance(v, Variable) for v in da._coords.values()), da._coords\n \n     if check_default_indexes:\n         assert all(set(v.dims) <= set(da.dims) for v in da._coords.values()), (\n             da.dims,\n             {k: v.dims for k, v in da._coords.items()},\n         )\n-        assert all(\n-            isinstance(v, IndexVariable)\n-            for (k, v) in da._coords.items()\n-            if v.dims == (k,)\n-        ), {k: type(v) for k, v in da._coords.items()}\n \n     for k, v in da._coords.items():\n         _assert_variable_invariants(v, k)\n \n-    if da._indexes is not None:\n-        _assert_indexes_invariants_checks(\n-            da._indexes, da._coords, da.dims, check_default=check_default_indexes\n-        )\n+    assert da._indexes is not None\n+    _assert_indexes_invariants_checks(\n+        da._indexes, da._coords, da.dims, check_default=check_default_indexes\n+    )\n \n \n def _assert_dataset_invariants(ds: Dataset, check_default_indexes: bool):\n     assert isinstance(ds._variables, dict), type(ds._variables)\n-    assert all(isinstance(v, Variable) for v in ds._variables.values()), ds._variables\n+\n     for k, v in ds._variables.items():\n         _assert_variable_invariants(v, k)\n \n@@ -466,17 +477,10 @@ def _assert_dataset_invariants(ds: Dataset, check_default_indexes: bool):\n         ds._dims[k] == v.sizes[k] for v in ds._variables.values() for k in v.sizes\n     ), (ds._dims, {k: v.sizes for k, v in ds._variables.items()})\n \n-    if check_default_indexes:\n-        assert all(\n-            isinstance(v, IndexVariable)\n-            for (k, v) in ds._variables.items()\n-            if v.dims == (k,)\n-        ), {k: type(v) for k, v in ds._variables.items() if v.dims == (k,)}\n-\n-    if ds._indexes is not None:\n-        _assert_indexes_invariants_checks(\n-            ds._indexes, ds._variables, ds._dims, check_default=check_default_indexes\n-        )\n+    assert ds._indexes is not None\n+    _assert_indexes_invariants_checks(\n+        ds._indexes, ds._variables, ds._dims, check_default=check_default_indexes\n+    )\n \n     assert isinstance(ds._encoding, type(None) | dict)\n     assert isinstance(ds._attrs, type(None) | dict)\n",
+  "structured_diff": {
+    "doc/conf.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -20,14 +20,6 @@",
+          "snippet": " allowed_failures = set()\n \n print(\"python exec:\", sys.executable)\n print(\"sys.path:\", sys.path)\n-\n-if \"CONDA_DEFAULT_ENV\" in os.environ or \"conda\" in sys.executable:\n-    print(\"conda environment:\")\n-    subprocess.run([os.environ.get(\"CONDA_EXE\", \"conda\"), \"list\"])\n-else:\n-    print(\"pip environment:\")\n-    subprocess.run([sys.executable, \"-m\", \"pip\", \"list\"])\n-\n print(f\"xarray: {xarray.__version__}, {xarray.__file__}\")\n \n with suppress(ImportError):",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "doc/conf.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -71,6 +63,7 @@",
+          "snippet": " extensions = [\n     \"sphinx_design\",\n     \"sphinx_inline_tabs\",\n     \"sphinx_remove_toctrees\",\n+    \"sphinx_llms_txt\",\n ]\n \n \n",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "doc/conf.py::extensions"
+            }
+          ]
+        }
+      ]
+    },
+    "properties/test_index_manipulation.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -24,21 +24,9 @@",
+          "snippet": " from hypothesis.stateful import (\n \n import xarray.testing.strategies as xrst\n \n-\n-@st.composite\n-def unique(draw, strategy):\n-    # https://stackoverflow.com/questions/73737073/create-hypothesis-strategy-that-returns-unique-values\n-    seen = draw(st.shared(st.builds(set), key=\"key-for-unique-elems\"))\n-    return draw(\n-        strategy.filter(lambda x: x not in seen).map(lambda x: seen.add(x) or x)\n-    )\n-\n-\n-# Share to ensure we get unique names on each draw,\n-# so we don't try to add two variables with the same name\n-# or stack to a dimension with a name that already exists in the Dataset.\n-UNIQUE_NAME = unique(strategy=xrst.names())\n-DIM_NAME = xrst.dimension_names(name_strategy=UNIQUE_NAME, min_dims=1, max_dims=1)\n+# Strategy for generating names - uniqueness is enforced by the state machine\n+NAME_STRATEGY = xrst.names()\n+DIM_NAME = xrst.dimension_names(name_strategy=NAME_STRATEGY, min_dims=1, max_dims=1)\n index_variables = st.builds(\n     xr.Variable,\n     data=npst.arrays(",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "properties/test_index_manipulation.py::NAME_STRATEGY"
+            },
+            {
+              "kind": "variable",
+              "node": "properties/test_index_manipulation.py::DIM_NAME"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -75,25 +63,45 @@",
+          "snippet": " class DatasetStateMachine(RuleBasedStateMachine):\n         self.indexed_dims = []\n         self.multi_indexed_dims = []\n \n-    @initialize(var=index_variables)\n-    def init_ds(self, var):\n+        # Track all used names to ensure uniqueness (avoids flaky Hypothesis tests)\n+        self.used_names: set[str] = set()\n+\n+    def _draw_unique_name(self, data) -> str:\n+        \"\"\"Draw a name that hasn't been used yet in this test case.\"\"\"\n+        name = data.draw(NAME_STRATEGY.filter(lambda x: x not in self.used_names))\n+        self.used_names.add(name)\n+        return name\n+\n+    def _draw_unique_var(self, data) -> xr.Variable:\n+        \"\"\"Draw an index variable with a unique dimension name.\"\"\"\n+        var = data.draw(index_variables)\n+        # Replace with a guaranteed unique name\n+        new_name = self._draw_unique_name(data)\n+        return xr.Variable(dims=(new_name,), data=var.data, attrs=var.attrs)\n+\n+    @initialize(data=st.data())\n+    def init_ds(self, data):\n         \"\"\"Initialize the Dataset so that at least one rule will always fire.\"\"\"\n+        var = self._draw_unique_var(data)\n         (name,) = var.dims\n+        note(f\"initializing with dimension coordinate {name}\")\n         add_dim_coord_and_data_var(self.dataset, var)\n \n         self.indexed_dims.append(name)\n \n     # TODO: stacking with a timedelta64 index and unstacking converts it to object\n-    @rule(var=index_variables)\n-    def add_dim_coord(self, var):\n+    @rule(data=st.data())\n+    def add_dim_coord(self, data):\n+        var = self._draw_unique_var(data)\n         (name,) = var.dims\n         note(f\"adding dimension coordinate {name}\")\n         add_dim_coord_and_data_var(self.dataset, var)\n \n         self.indexed_dims.append(name)\n \n-    @rule(var=index_variables)\n-    def assign_coords(self, var):\n+    @rule(data=st.data())\n+    def assign_coords(self, data):\n+        var = self._draw_unique_var(data)\n         (name,) = var.dims\n         note(f\"assign_coords: {name}\")\n         self.dataset = self.dataset.assign_coords({name: var})",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "properties/test_index_manipulation.py::DatasetStateMachine::__init__"
+            },
+            {
+              "kind": "class",
+              "node": "properties/test_index_manipulation.py::DatasetStateMachine"
+            },
+            {
+              "kind": "method",
+              "node": "properties/test_index_manipulation.py::DatasetStateMachine::_draw_unique_name"
+            },
+            {
+              "kind": "method",
+              "node": "properties/test_index_manipulation.py::DatasetStateMachine::_draw_unique_var"
+            },
+            {
+              "kind": "method",
+              "node": "properties/test_index_manipulation.py::DatasetStateMachine::init_ds"
+            },
+            {
+              "kind": "method",
+              "node": "properties/test_index_manipulation.py::DatasetStateMachine::add_dim_coord"
+            },
+            {
+              "kind": "method",
+              "node": "properties/test_index_manipulation.py::DatasetStateMachine::assign_coords"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -117,9 +125,10 @@",
+          "snippet": " class DatasetStateMachine(RuleBasedStateMachine):\n         elif dim in self.multi_indexed_dims:\n             del self.multi_indexed_dims[self.multi_indexed_dims.index(dim)]\n \n-    @rule(newname=UNIQUE_NAME, data=st.data(), create_index=st.booleans())\n+    @rule(data=st.data(), create_index=st.booleans())\n     @precondition(lambda self: bool(self.indexed_dims))\n-    def stack(self, newname, data, create_index):\n+    def stack(self, data, create_index):\n+        newname = self._draw_unique_name(data)\n         oldnames = data.draw(\n             st.lists(\n                 st.sampled_from(self.indexed_dims),",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "properties/test_index_manipulation.py::DatasetStateMachine"
+            },
+            {
+              "kind": "method",
+              "node": "properties/test_index_manipulation.py::DatasetStateMachine::stack"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -158,9 +167,10 @@",
+          "snippet": " class DatasetStateMachine(RuleBasedStateMachine):\n             # TODO: fix this\n             pass\n \n-    @rule(newname=UNIQUE_NAME, data=st.data())\n+    @rule(data=st.data())\n     @precondition(lambda self: bool(self.dataset.variables))\n-    def rename_vars(self, newname, data):\n+    def rename_vars(self, data):\n+        newname = self._draw_unique_name(data)\n         dim = data.draw(st.sampled_from(sorted(self.dataset.variables)))\n         # benbovy: \"skip the default indexes invariant test when the name of an\n         # existing dimension coordinate is passed as input kwarg or dict key\n",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "properties/test_index_manipulation.py::DatasetStateMachine"
+            },
+            {
+              "kind": "method",
+              "node": "properties/test_index_manipulation.py::DatasetStateMachine::rename_vars"
+            }
+          ]
+        }
+      ]
+    },
+    "properties/test_pandas_roundtrip.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -3,12 +3,14 @@",
+          "snippet": " Property-based tests for roundtripping between xarray and pandas objects.\n \"\"\"\n \n from functools import partial\n+from typing import cast\n \n import numpy as np\n import pandas as pd\n import pytest\n \n import xarray as xr\n+from xarray.core.dataset import Dataset\n \n pytest.importorskip(\"hypothesis\")\n import hypothesis.extra.numpy as npst  # isort:skip",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "properties/test_pandas_roundtrip.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -88,10 +90,10 @@",
+          "snippet": " def test_roundtrip_dataarray(data, arr) -> None:\n \n \n @given(datasets_1d_vars())\n-def test_roundtrip_dataset(dataset) -> None:\n+def test_roundtrip_dataset(dataset: Dataset) -> None:\n     df = dataset.to_dataframe()\n     assert isinstance(df, pd.DataFrame)\n-    roundtripped = xr.Dataset(df)\n+    roundtripped = xr.Dataset.from_dataframe(df)\n     xr.testing.assert_identical(dataset, roundtripped)\n \n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "properties/test_pandas_roundtrip.py::test_roundtrip_dataset"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -101,7 +103,7 @@",
+          "snippet": " def test_roundtrip_pandas_series(ser, ix_name) -> None:\n     ser.index.name = ix_name\n     arr = xr.DataArray(ser)\n     roundtripped = arr.to_pandas()\n-    pd.testing.assert_series_equal(ser, roundtripped)\n+    pd.testing.assert_series_equal(ser, roundtripped)  # type: ignore[arg-type]\n     xr.testing.assert_identical(arr, roundtripped.to_xarray())\n \n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "properties/test_pandas_roundtrip.py::test_roundtrip_pandas_series"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -119,7 +121,7 @@",
+          "snippet": " def test_roundtrip_pandas_dataframe(df) -> None:\n     df.columns.name = \"cols\"\n     arr = xr.DataArray(df)\n     roundtripped = arr.to_pandas()\n-    pd.testing.assert_frame_equal(df, roundtripped)\n+    pd.testing.assert_frame_equal(df, cast(pd.DataFrame, roundtripped))\n     xr.testing.assert_identical(arr, roundtripped.to_xarray())\n \n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "properties/test_pandas_roundtrip.py::test_roundtrip_pandas_dataframe"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -143,8 +145,8 @@",
+          "snippet": " def test_roundtrip_pandas_dataframe_datetime(df) -> None:\n         pd.arrays.IntervalArray(\n             [pd.Interval(0, 1), pd.Interval(1, 5), pd.Interval(2, 6)]\n         ),\n-        pd.arrays.TimedeltaArray._from_sequence(pd.TimedeltaIndex([\"1h\", \"2h\", \"3h\"])),\n-        pd.arrays.DatetimeArray._from_sequence(\n+        pd.arrays.TimedeltaArray._from_sequence(pd.TimedeltaIndex([\"1h\", \"2h\", \"3h\"])),  # type: ignore[attr-defined]\n+        pd.arrays.DatetimeArray._from_sequence(  # type: ignore[attr-defined]\n             pd.DatetimeIndex([\"2023-01-01\", \"2023-01-02\", \"2023-01-03\"], freq=\"D\")\n         ),\n         np.array([1, 2, 3], dtype=\"int64\"),\n",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "properties/test_pandas_roundtrip.py::<module>"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/backends/common.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -849,3 +849,37 @@",
+          "snippet": " class BackendEntrypoint:\n \n # mapping of engine name to (module name, BackendEntrypoint Class)\n BACKEND_ENTRYPOINTS: dict[str, tuple[str | None, type[BackendEntrypoint]]] = {}\n+\n+\n+def _is_likely_dap_url(url: str) -> bool:\n+    \"\"\"\n+    Determines if a URL is likely an OPeNDAP (DAP) endpoint based on\n+    known protocols, server software path patterns, and file extensions.\n+\n+    Parameters\n+    ----------\n+    url : str\n+\n+    Returns\n+    -------\n+        True if the URL matches common DAP patterns, False otherwise.\n+    \"\"\"\n+    if not url:\n+        return False\n+\n+    url_lower = url.lower()\n+\n+    # For remote URIs, check for DAP server software path patterns\n+    if is_remote_uri(url_lower):\n+        dap_path_patterns = (\n+            \"/dodsc/\",  # THREDDS Data Server (TDS) DAP endpoint (case-insensitive)\n+            \"/dods/\",  # GrADS Data Server (GDS) DAP endpoint\n+            \"/opendap/\",  # Generic OPeNDAP/Hyrax server\n+            \"/erddap/\",  # ERDDAP data server\n+            \"/dap2/\",  # Explicit DAP2 version in path\n+            \"/dap4/\",  # Explicit DAP4 version in path\n+            \"/dap/\",\n+        )\n+        return any(pattern in url_lower for pattern in dap_path_patterns)\n+\n+    return False\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/backends/common.py::_is_likely_dap_url"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/backends/netCDF4_.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -715,10 +715,19 @@",
+          "snippet": " class NetCDF4BackendEntrypoint(BackendEntrypoint):\n             _, ext = os.path.splitext(path)\n             return ext in {\".nc\", \".nc4\", \".cdf\"}\n \n-        if isinstance(filename_or_obj, str) and is_remote_uri(filename_or_obj):\n-            # For remote URIs, check extension (accounting for query params/fragments)\n-            # Remote netcdf-c can handle both regular URLs and DAP URLs\n-            return _has_netcdf_ext(filename_or_obj, is_remote=True)\n+        if isinstance(filename_or_obj, str):\n+            if is_remote_uri(filename_or_obj):\n+                # For remote URIs, check extension (accounting for query params/fragments)\n+                # Remote netcdf-c can handle both regular URLs and DAP URLs\n+                if _has_netcdf_ext(filename_or_obj, is_remote=True):\n+                    return True\n+                elif \"zarr\" in filename_or_obj.lower():\n+                    return False\n+                # return true for non-zarr URLs so we don't have a breaking change for people relying on this\n+                # netcdf backend guessing true for all remote sources.\n+                # TODO: emit a warning here about deprecation of this behavior\n+                # https://github.com/pydata/xarray/pull/10931\n+                return True\n \n         if isinstance(filename_or_obj, str | os.PathLike):\n             # For local paths, check magic number first, then extension\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/netCDF4_.py::NetCDF4BackendEntrypoint::guess_can_open"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/backends/pydap_.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -12,6 +12,7 @@",
+          "snippet": " from xarray.backends.common import (\n     BackendArray,\n     BackendEntrypoint,\n     T_PathFileOrDataStore,\n+    _is_likely_dap_url,\n     _normalize_path,\n     datatree_from_dict_with_io_cleanup,\n     robust_getitem,",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/backends/pydap_.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -22,7 +23,6 @@",
+          "snippet": " from xarray.core.utils import (\n     Frozen,\n     FrozenDict,\n     close_on_error,\n-    is_remote_uri,\n )\n from xarray.core.variable import Variable\n from xarray.namedarray.pycompat import integer_types",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/backends/pydap_.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -36,7 +36,7 @@",
+          "snippet": " if TYPE_CHECKING:\n \n \n class PydapArrayWrapper(BackendArray):\n-    def __init__(self, array):\n+    def __init__(self, array, checksums=True):\n         self.array = array\n \n     @property",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapArrayWrapper::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -54,12 +54,10 @@",
+          "snippet": " class PydapArrayWrapper(BackendArray):\n \n     def _getitem(self, key):\n         result = robust_getitem(self.array, key, catch=ValueError)\n-        # in some cases, pydap doesn't squeeze axes automatically like numpy\n-        result = np.asarray(result)\n+        result = np.asarray(result.data)\n         axis = tuple(n for n, k in enumerate(key) if isinstance(k, integer_types))\n         if result.ndim + len(axis) != self.array.ndim and axis:\n             result = np.squeeze(result, axis)\n-\n         return result\n \n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapArrayWrapper::_getitem"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -82,7 +80,14 @@",
+          "snippet": " class PydapDataStore(AbstractDataStore):\n     be useful if the netCDF4 library is not available.\n     \"\"\"\n \n-    def __init__(self, dataset, group=None):\n+    def __init__(\n+        self,\n+        dataset,\n+        group=None,\n+        session=None,\n+        protocol=None,\n+        checksums=True,\n+    ):\n         \"\"\"\n         Parameters\n         ----------",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapDataStore::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -92,6 +97,8 @@",
+          "snippet": " class PydapDataStore(AbstractDataStore):\n         \"\"\"\n         self.dataset = dataset\n         self.group = group\n+        self._protocol = protocol\n+        self._checksums = checksums  # true by default\n \n     @classmethod\n     def open(",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapDataStore::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -104,6 +111,7 @@",
+          "snippet": " class PydapDataStore(AbstractDataStore):\n         timeout=None,\n         verify=None,\n         user_charset=None,\n+        checksums=True,\n     ):\n         from pydap.client import open_url\n         from pydap.net import DEFAULT_TIMEOUT",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapDataStore::open"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -118,6 +126,7 @@",
+          "snippet": " class PydapDataStore(AbstractDataStore):\n                 DeprecationWarning,\n             )\n             output_grid = False  # new default behavior\n+\n         kwargs = {\n             \"url\": url,\n             \"application\": application,",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapDataStore::open"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -133,22 +142,37 @@",
+          "snippet": " class PydapDataStore(AbstractDataStore):\n         elif hasattr(url, \"ds\"):\n             # pydap dataset\n             dataset = url.ds\n-        args = {\"dataset\": dataset}\n+        args = {\"dataset\": dataset, \"checksums\": checksums}\n         if group:\n-            # only then, change the default\n             args[\"group\"] = group\n+        if url.startswith((\"http\", \"dap2\")):\n+            args[\"protocol\"] = \"dap2\"\n+        elif url.startswith(\"dap4\"):\n+            args[\"protocol\"] = \"dap4\"\n         return cls(**args)\n \n     def open_store_variable(self, var):\n-        data = indexing.LazilyIndexedArray(PydapArrayWrapper(var))\n-        try:\n+        if hasattr(var, \"dims\"):\n             dimensions = [\n                 dim.split(\"/\")[-1] if dim.startswith(\"/\") else dim for dim in var.dims\n             ]\n-        except AttributeError:\n+        else:\n             # GridType does not have a dims attribute - instead get `dimensions`\n             # see https://github.com/pydap/pydap/issues/485\n             dimensions = var.dimensions\n+        if (\n+            self._protocol == \"dap4\"\n+            and var.name in dimensions\n+            and hasattr(var, \"dataset\")  # only True for pydap>3.5.5\n+        ):\n+            var.dataset.enable_batch_mode()\n+            data_array = self._get_data_array(var)\n+            data = indexing.LazilyIndexedArray(data_array)\n+            var.dataset.disable_batch_mode()\n+        else:\n+            # all non-dimension variables\n+            data = indexing.LazilyIndexedArray(PydapArrayWrapper(var))\n+\n         return Variable(dimensions, data, var.attributes)\n \n     def get_variables(self):",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapDataStore::open"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapDataStore::open_store_variable"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -166,6 +190,7 @@",
+          "snippet": " class PydapDataStore(AbstractDataStore):\n                 # check the key is not a BaseType or GridType\n                 if not isinstance(self.ds[var], GroupType)\n             ]\n+\n         return FrozenDict((k, self.open_store_variable(self.ds[k])) for k in _vars)\n \n     def get_attrs(self):",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapDataStore::get_variables"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -177,18 +202,33 @@",
+          "snippet": " class PydapDataStore(AbstractDataStore):\n             \"libdap\",\n             \"invocation\",\n             \"dimensions\",\n+            \"path\",\n+            \"Maps\",\n         )\n-        attrs = self.ds.attributes\n-        list(map(attrs.pop, opendap_attrs, [None] * 6))\n+        attrs = dict(self.ds.attributes)\n+        list(map(attrs.pop, opendap_attrs, [None] * len(opendap_attrs)))\n         return Frozen(attrs)\n \n     def get_dimensions(self):\n-        return Frozen(self.ds.dimensions)\n+        return Frozen(sorted(self.ds.dimensions))\n \n     @property\n     def ds(self):\n         return get_group(self.dataset, self.group)\n \n+    def _get_data_array(self, var):\n+        \"\"\"gets dimension data all at once, storing the numpy\n+        arrays within a cached dictionary\n+        \"\"\"\n+        from pydap.client import get_batch_data\n+\n+        if not var._is_data_loaded():\n+            # data has not been deserialized yet\n+            # runs only once per store/hierarchy\n+            get_batch_data(var, checksums=self._checksums)\n+\n+        return self.dataset[var.id].data\n+\n \n class PydapBackendEntrypoint(BackendEntrypoint):\n     \"\"\"",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapDataStore::get_attrs"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapDataStore::get_dimensions"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapDataStore::_get_data_array"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -212,23 +252,7 @@",
+          "snippet": " class PydapBackendEntrypoint(BackendEntrypoint):\n     def guess_can_open(self, filename_or_obj: T_PathFileOrDataStore) -> bool:\n         if not isinstance(filename_or_obj, str):\n             return False\n-\n-        # Check for explicit DAP protocol indicators:\n-        # 1. DAP scheme: dap2:// or dap4:// (case-insensitive, may not be recognized by is_remote_uri)\n-        # 2. Remote URI with /dap2/ or /dap4/ in URL path (case-insensitive)\n-        # Note: We intentionally do NOT check for .dap suffix as that would match\n-        # file extensions like .dap which trigger downloads of binary data\n-        url_lower = filename_or_obj.lower()\n-        if url_lower.startswith((\"dap2://\", \"dap4://\")):\n-            return True\n-\n-        # For standard remote URIs, check for DAP indicators in path\n-        if is_remote_uri(filename_or_obj):\n-            return (\n-                \"/dap2/\" in url_lower or \"/dap4/\" in url_lower or \"/dodsC/\" in url_lower\n-            )\n-\n-        return False\n+        return _is_likely_dap_url(filename_or_obj)\n \n     def open_dataset(\n         self,",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapBackendEntrypoint::guess_can_open"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -250,6 +274,7 @@",
+          "snippet": " class PydapBackendEntrypoint(BackendEntrypoint):\n         timeout=None,\n         verify=None,\n         user_charset=None,\n+        checksums=True,\n     ) -> Dataset:\n         store = PydapDataStore.open(\n             url=filename_or_obj,",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapBackendEntrypoint::open_dataset"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -260,6 +285,7 @@",
+          "snippet": " class PydapBackendEntrypoint(BackendEntrypoint):\n             timeout=timeout,\n             verify=verify,\n             user_charset=user_charset,\n+            checksums=checksums,\n         )\n         store_entrypoint = StoreBackendEntrypoint()\n         with close_on_error(store):",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapBackendEntrypoint::open_dataset"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -292,6 +318,7 @@",
+          "snippet": " class PydapBackendEntrypoint(BackendEntrypoint):\n         timeout=None,\n         verify=None,\n         user_charset=None,\n+        checksums=True,\n     ) -> DataTree:\n         groups_dict = self.open_groups_as_dict(\n             filename_or_obj,",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapBackendEntrypoint::open_datatree"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -303,11 +330,12 @@",
+          "snippet": " class PydapBackendEntrypoint(BackendEntrypoint):\n             use_cftime=use_cftime,\n             decode_timedelta=decode_timedelta,\n             group=group,\n-            application=None,\n-            session=None,\n-            timeout=None,\n-            verify=None,\n-            user_charset=None,\n+            application=application,\n+            session=session,\n+            timeout=timeout,\n+            verify=verify,\n+            user_charset=user_charset,\n+            checksums=checksums,\n         )\n \n         return datatree_from_dict_with_io_cleanup(groups_dict)",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapBackendEntrypoint::open_datatree"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -329,6 +357,7 @@",
+          "snippet": " class PydapBackendEntrypoint(BackendEntrypoint):\n         timeout=None,\n         verify=None,\n         user_charset=None,\n+        checksums=True,\n     ) -> dict[str, Dataset]:\n         from xarray.core.treenode import NodePath\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapBackendEntrypoint::open_groups_as_dict"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -340,6 +369,7 @@",
+          "snippet": " class PydapBackendEntrypoint(BackendEntrypoint):\n             timeout=timeout,\n             verify=verify,\n             user_charset=user_charset,\n+            checksums=checksums,\n         )\n \n         # Check for a group and make it a parent if it exists\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/backends/pydap_.py::PydapBackendEntrypoint::open_groups_as_dict"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/coding/times.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -98,6 +98,8 @@",
+          "snippet": " _INVALID_LITERAL_TIMEDELTA64_ENCODING_KEYS = [\n     \"scale_factor\",\n ]\n \n+_ORDERED_PANDAS_TIME_RESOLUTIONS: list[PDDatetimeUnitOptions] = [\"s\", \"ms\", \"us\", \"ns\"]\n+\n \n def _is_standard_calendar(calendar: str) -> bool:\n     return calendar.lower() in _STANDARD_CALENDARS",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "xarray/coding/times.py::_ORDERED_PANDAS_TIME_RESOLUTIONS"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -293,6 +295,21 @@",
+          "snippet": " def _maybe_strip_tz_from_timestamp(date: pd.Timestamp) -> pd.Timestamp:\n     return date\n \n \n+def _cast_timestamp_to_coarsest_resolution(timestamp: pd.Timestamp) -> pd.Timestamp:\n+    # Cast timestamp to the coarsest resolution that can be used without\n+    # changing its value. If provided a string, the pandas.Timestamp\n+    # constructor used to automatically infer this from the resolution of the\n+    # string, but this behavior was changed in pandas-dev/pandas#62801. This\n+    # function allows us to approximately restore the old behavior in a way\n+    # that is perhaps more consistent with how we infer the resolution of the\n+    # data values themselves.\n+    for unit in _ORDERED_PANDAS_TIME_RESOLUTIONS:\n+        coarsest_timestamp = timestamp.as_unit(unit)\n+        if coarsest_timestamp == timestamp:\n+            return coarsest_timestamp\n+    return timestamp\n+\n+\n def _unpack_time_unit_and_ref_date(\n     units: str,\n ) -> tuple[NPDatetimeUnitOptions, pd.Timestamp]:",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/coding/times.py::_cast_timestamp_to_coarsest_resolution"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -301,6 +318,7 @@",
+          "snippet": " def _unpack_time_unit_and_ref_date(\n     time_unit, _ref_date = _unpack_netcdf_time_units(units)\n     time_unit = _netcdf_to_numpy_timeunit(time_unit)\n     ref_date = pd.Timestamp(_ref_date)\n+    ref_date = _cast_timestamp_to_coarsest_resolution(ref_date)\n     ref_date = _maybe_strip_tz_from_timestamp(ref_date)\n     return time_unit, ref_date\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/coding/times.py::_unpack_time_unit_and_ref_date"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -442,8 +460,8 @@",
+          "snippet": " def _check_higher_resolution(\n     time_unit: PDDatetimeUnitOptions,\n ) -> tuple[np.ndarray, PDDatetimeUnitOptions]:\n     \"\"\"Iterate until fitting resolution found.\"\"\"\n-    res: list[PDDatetimeUnitOptions] = [\"s\", \"ms\", \"us\", \"ns\"]\n-    new_units = res[res.index(time_unit) :]\n+    index = _ORDERED_PANDAS_TIME_RESOLUTIONS.index(time_unit)\n+    new_units = _ORDERED_PANDAS_TIME_RESOLUTIONS[index:]\n     for new_time_unit in new_units:\n         if not ((np.unique(flat_num_dates % 1) > 0).any() and new_time_unit != \"ns\"):\n             break",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/coding/times.py::_check_higher_resolution"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -608,6 +626,8 @@",
+          "snippet": " def _numbers_to_timedelta(\n         nan = np.asarray(np.isnan(flat_num))\n     elif flat_num.dtype.kind == \"i\":\n         nan = np.asarray(flat_num == np.iinfo(np.int64).min)\n+    elif flat_num.dtype.kind == \"u\":\n+        nan = np.broadcast_to(np.asarray(False), flat_num.shape)\n \n     # in case we need to change the unit, we fix the numbers here\n     # this should be safe, as errors would have been raised above",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/coding/times.py::_numbers_to_timedelta"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1361,9 +1381,9 @@",
+          "snippet": " class CFDatetimeCoder(VariableCoder):\n         self.time_unit = time_unit\n \n     def encode(self, variable: Variable, name: T_Name = None) -> Variable:\n-        if np.issubdtype(\n-            variable.data.dtype, np.datetime64\n-        ) or contains_cftime_datetimes(variable):\n+        if np.issubdtype(variable.dtype, np.datetime64) or contains_cftime_datetimes(\n+            variable\n+        ):\n             dims, data, attrs, encoding = unpack_for_encoding(variable)\n \n             units = encoding.pop(\"units\", None)",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/coding/times.py::CFDatetimeCoder::encode"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1465,7 +1485,7 @@",
+          "snippet": " class CFTimedeltaCoder(VariableCoder):\n         units attribute, e.g. \"seconds\". Defaults to True, but in the future\n         will default to False.\n     decode_via_dtype : bool\n-        Whether to decode timedeltas based on the presence of a np.timedelta64\n+        Whether to decode timedeltas based on the presence of an np.timedelta64\n         dtype attribute, e.g. \"timedelta64[s]\". Defaults to True.\n     \"\"\"\n ",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "xarray/coding/times.py::CFTimedeltaCoder"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1481,7 +1501,7 @@",
+          "snippet": " class CFTimedeltaCoder(VariableCoder):\n         self._emit_decode_timedelta_future_warning = False\n \n     def encode(self, variable: Variable, name: T_Name = None) -> Variable:\n-        if np.issubdtype(variable.data.dtype, np.timedelta64):\n+        if np.issubdtype(variable.dtype, np.timedelta64):\n             dims, data, attrs, encoding = unpack_for_encoding(variable)\n             dtype = encoding.get(\"dtype\", None)\n             units = encoding.pop(\"units\", None)\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/coding/times.py::CFTimedeltaCoder::encode"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/compat/npcompat.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -51,7 +51,7 @@",
+          "snippet": " except ImportError:\n         \"numeric\": np.number,\n     }\n \n-    def isdtype(\n+    def isdtype(  # type: ignore[misc]\n         dtype: np.dtype[Any] | type[Any], kind: DTypeLike | tuple[DTypeLike, ...]\n     ) -> bool:\n         kinds = kind if isinstance(kind, tuple) else (kind,)\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/compat/npcompat.py::isdtype"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/computation/apply_ufunc.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -713,7 +713,7 @@",
+          "snippet": " def apply_variable_ufunc(\n     keep_attrs=\"override\",\n     dask_gufunc_kwargs=None,\n ) -> Variable | tuple[Variable, ...]:\n-    \"\"\"Apply a ndarray level function over Variable and/or ndarray objects.\"\"\"\n+    \"\"\"Apply an ndarray level function over Variable and/or ndarray objects.\"\"\"\n     from xarray.core.formatting import short_array_repr\n     from xarray.core.variable import as_compatible_data\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/computation/apply_ufunc.py::apply_variable_ufunc"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -869,7 +869,7 @@",
+          "snippet": " def apply_variable_ufunc(\n \n \n def apply_array_ufunc(func, *args, dask=\"forbidden\"):\n-    \"\"\"Apply a ndarray level function over ndarray objects.\"\"\"\n+    \"\"\"Apply an ndarray level function over ndarray objects.\"\"\"\n     if any(is_chunked_array(arg) for arg in args):\n         if dask == \"forbidden\":\n             raise ValueError(\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/computation/apply_ufunc.py::apply_array_ufunc"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/computation/rolling.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -168,7 +168,7 @@",
+          "snippet": " class Rolling(Generic[T_Xarray]):\n \n         bottleneck_move_func = getattr(bottleneck, \"move_\" + name, None)\n         if module_available(\"numbagg\"):\n-            import numbagg\n+            import numbagg  # type: ignore[import-not-found, unused-ignore]\n \n             numbagg_move_func = getattr(numbagg, \"move_\" + name, None)\n         else:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/computation/rolling.py::Rolling::_reduce_method"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -491,7 +491,7 @@",
+          "snippet": " class DataArrayRolling(Rolling[\"DataArray\"]):\n         func : callable\n             Function which can be called in the form\n             `func(x, **kwargs)` to return the result of collapsing an\n-            np.ndarray over an the rolling dimension.\n+            np.ndarray over the rolling dimension.\n         keep_attrs : bool, default: None\n             If True, the attributes (``attrs``) will be copied from the original\n             object to the new one. If False, the new object will be returned",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/computation/rolling.py::DataArrayRolling::reduce"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -860,7 +860,7 @@",
+          "snippet": " class DatasetRolling(Rolling[\"Dataset\"]):\n         func : callable\n             Function which can be called in the form\n             `func(x, **kwargs)` to return the result of collapsing an\n-            np.ndarray over an the rolling dimension.\n+            np.ndarray over the rolling dimension.\n         keep_attrs : bool, default: None\n             If True, the attributes (``attrs``) will be copied from the original\n             object to the new one. If False, the new object will be returned\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/computation/rolling.py::DatasetRolling::reduce"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/computation/rolling_exp.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -111,7 +111,7 @@",
+          "snippet": " class RollingExp(Generic[T_DataWithCoords]):\n         Dimensions without coordinates: x\n         \"\"\"\n \n-        import numbagg\n+        import numbagg  # type: ignore[import-not-found, unused-ignore]\n \n         if keep_attrs is None:\n             keep_attrs = _get_keep_attrs(default=True)\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/computation/rolling_exp.py::RollingExp::mean"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/coordinates.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1265,7 +1265,7 @@",
+          "snippet": " def create_coords_with_default_indexes(\n             variables.update(idx_vars)\n             all_variables.update(idx_vars)\n         else:\n-            variables[name] = variable\n+            variables[name] = variable.to_base_variable()\n \n     new_coords = Coordinates._construct_direct(coords=variables, indexes=indexes)\n \n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/coordinates.py::create_coords_with_default_indexes"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/dataarray.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1516,7 +1516,7 @@",
+          "snippet": " class DataArray(\n         indexers : dict, optional\n             A dict with keys matching dimensions and values given\n             by integers, slice objects or arrays.\n-            indexer can be a integer, slice, array-like or DataArray.\n+            indexer can be an integer, slice, array-like or DataArray.\n             If DataArrays are passed as indexers, xarray-style indexing will be\n             carried out. See :ref:`indexing` for the details.\n             One of indexers or indexers_kwargs must be provided.",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/dataarray.py::DataArray::isel"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -4662,14 +4662,14 @@",
+          "snippet": " class DataArray(\n         return result\n \n     def to_iris(self) -> iris_Cube:\n-        \"\"\"Convert this array into a iris.cube.Cube\"\"\"\n+        \"\"\"Convert this array into an iris.cube.Cube\"\"\"\n         from xarray.convert import to_iris\n \n         return to_iris(self)\n \n     @classmethod\n     def from_iris(cls, cube: iris_Cube) -> Self:\n-        \"\"\"Convert a iris.cube.Cube into an xarray.DataArray\"\"\"\n+        \"\"\"Convert an iris.cube.Cube into an xarray.DataArray\"\"\"\n         from xarray.convert import from_iris\n \n         return from_iris(cube)\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/dataarray.py::DataArray::to_iris"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/core/dataarray.py::DataArray::from_iris"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/dataset.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -10475,7 +10475,7 @@",
+          "snippet": " class Dataset(\n         for var in self.variables:\n             # variables don't have a `._replace` method, so we copy and then remove\n             # attrs. If we added a `._replace` method, we could use that instead.\n-            if var not in self.indexes:\n+            if var not in self.xindexes:\n                 self[var] = self[var].copy()\n                 self[var].attrs = {}\n \n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/dataset.py::Dataset::drop_attrs"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/dataset_variables.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,6 +1,5 @@",
+          "snippet": " import typing\n from collections.abc import Hashable, Iterator, Mapping\n-from typing import Any\n \n import numpy as np\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/core/dataset_variables.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -13,7 +12,7 @@",
+          "snippet": " if typing.TYPE_CHECKING:\n     from xarray.core.dataset import Dataset\n \n \n-class DataVariables(Mapping[Any, \"DataArray\"]):\n+class DataVariables(Mapping[Hashable, \"DataArray\"]):\n     __slots__ = (\"_dataset\",)\n \n     def __init__(self, dataset: \"Dataset\"):\n",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "xarray/core/dataset_variables.py::DataVariables"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/datatree.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -2252,7 +2252,7 @@",
+          "snippet": " class DataTree(\n         indexers : dict, optional\n             A dict with keys matching dimensions and values given\n             by integers, slice objects or arrays.\n-            indexer can be a integer, slice, array-like or DataArray.\n+            indexer can be an integer, slice, array-like or DataArray.\n             If DataArrays are passed as indexers, xarray-style indexing will be\n             carried out. See :ref:`indexing` for the details.\n             One of indexers or indexers_kwargs must be provided.\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/datatree.py::DataTree::isel"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/dtypes.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,15 +1,20 @@",
+          "snippet": " from __future__ import annotations\n \n import functools\n-from typing import Any\n+from collections.abc import Iterable\n+from typing import TYPE_CHECKING, TypeVar, cast\n \n import numpy as np\n-import pandas as pd\n+from pandas.api.extensions import ExtensionDtype\n \n from xarray.compat import array_api_compat, npcompat\n from xarray.compat.npcompat import HAS_STRING_DTYPE\n from xarray.core import utils\n \n+if TYPE_CHECKING:\n+    from typing import Any\n+\n+\n # Use as a sentinel value to indicate a dtype appropriate NA value.\n NA = utils.ReprObject(\"<NA>\")\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/core/dtypes.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -47,8 +52,10 @@",
+          "snippet": " PROMOTE_TO_OBJECT: tuple[tuple[type[np.generic], type[np.generic]], ...] = (\n     (np.bytes_, np.str_),  # numpy promotes to unicode\n )\n \n+T_dtype = TypeVar(\"T_dtype\", np.dtype, ExtensionDtype)\n \n-def maybe_promote(dtype: np.dtype) -> tuple[np.dtype, Any]:\n+\n+def maybe_promote(dtype: T_dtype) -> tuple[T_dtype, Any]:\n     \"\"\"Simpler equivalent of pandas.core.common._maybe_promote\n \n     Parameters",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "xarray/core/dtypes.py::T_dtype"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/core/dtypes.py::maybe_promote"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -63,7 +70,13 @@",
+          "snippet": " def maybe_promote(dtype: np.dtype) -> tuple[np.dtype, Any]:\n     # N.B. these casting rules should match pandas\n     dtype_: np.typing.DTypeLike\n     fill_value: Any\n-    if HAS_STRING_DTYPE and np.issubdtype(dtype, np.dtypes.StringDType()):\n+    if utils.is_allowed_extension_array_dtype(dtype):\n+        return dtype, cast(ExtensionDtype, dtype).na_value  # type: ignore[redundant-cast]\n+    if not isinstance(dtype, np.dtype):\n+        raise TypeError(\n+            f\"dtype {dtype} must be one of an extension array dtype or numpy dtype\"\n+        )\n+    elif HAS_STRING_DTYPE and np.issubdtype(dtype, np.dtypes.StringDType()):\n         # for now, we always promote string dtypes to object for consistency with existing behavior\n         # TODO: refactor this once we have a better way to handle numpy vlen-string dtypes\n         dtype_ = object",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/dtypes.py::maybe_promote"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -213,7 +226,7 @@",
+          "snippet": " def isdtype(dtype, kind: str | tuple[str, ...], xp=None) -> bool:\n \n     if isinstance(dtype, np.dtype):\n         return npcompat.isdtype(dtype, kind)\n-    elif pd.api.types.is_extension_array_dtype(dtype):  # noqa: TID251\n+    elif utils.is_allowed_extension_array_dtype(dtype):\n         # we never want to match pandas extension array dtypes\n         return False\n     else:",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/dtypes.py::isdtype"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -222,23 +235,67 @@",
+          "snippet": " def isdtype(dtype, kind: str | tuple[str, ...], xp=None) -> bool:\n         return xp.isdtype(dtype, kind)\n \n \n-def preprocess_types(t):\n-    if isinstance(t, str | bytes):\n-        return type(t)\n-    elif isinstance(dtype := getattr(t, \"dtype\", t), np.dtype) and (\n-        np.issubdtype(dtype, np.str_) or np.issubdtype(dtype, np.bytes_)\n-    ):\n+def maybe_promote_to_variable_width(\n+    array_or_dtype: np.typing.ArrayLike\n+    | np.typing.DTypeLike\n+    | ExtensionDtype\n+    | str\n+    | bytes,\n+    *,\n+    should_return_str_or_bytes: bool = False,\n+) -> np.typing.ArrayLike | np.typing.DTypeLike | ExtensionDtype:\n+    if isinstance(array_or_dtype, str | bytes):\n+        if should_return_str_or_bytes:\n+            return array_or_dtype\n+        return type(array_or_dtype)\n+    elif isinstance(\n+        dtype := getattr(array_or_dtype, \"dtype\", array_or_dtype), np.dtype\n+    ) and (np.issubdtype(dtype, np.str_) or np.issubdtype(dtype, np.bytes_)):\n         # drop the length from numpy's fixed-width string dtypes, it is better to\n         # recalculate\n         # TODO(keewis): remove once the minimum version of `numpy.result_type` does this\n         # for us\n         return dtype.type\n     else:\n-        return t\n+        return array_or_dtype\n+\n+\n+def should_promote_to_object(\n+    arrays_and_dtypes: Iterable[\n+        np.typing.ArrayLike | np.typing.DTypeLike | ExtensionDtype\n+    ],\n+    xp,\n+) -> bool:\n+    \"\"\"\n+    Test whether the given arrays_and_dtypes, when evaluated individually, match the\n+    type promotion rules found in PROMOTE_TO_OBJECT.\n+    \"\"\"\n+    np_result_types = set()\n+    for arr_or_dtype in arrays_and_dtypes:\n+        try:\n+            result_type = array_api_compat.result_type(\n+                maybe_promote_to_variable_width(arr_or_dtype), xp=xp\n+            )\n+            if isinstance(result_type, np.dtype):\n+                np_result_types.add(result_type)\n+        except TypeError:\n+            # passing individual objects to xp.result_type (i.e., what `array_api_compat.result_type` calls) means NEP-18 implementations won't have\n+            # a chance to intercept special values (such as NA) that numpy core cannot handle.\n+            # Thus they are considered as types that don't need promotion i.e., the `arr_or_dtype` that rose the `TypeError` will not contribute to `np_result_types`.\n+            pass\n+\n+    if np_result_types:\n+        for left, right in PROMOTE_TO_OBJECT:\n+            if any(np.issubdtype(t, left) for t in np_result_types) and any(\n+                np.issubdtype(t, right) for t in np_result_types\n+            ):\n+                return True\n+\n+    return False\n \n \n def result_type(\n-    *arrays_and_dtypes: np.typing.ArrayLike | np.typing.DTypeLike | None,\n+    *arrays_and_dtypes: np.typing.ArrayLike | np.typing.DTypeLike | ExtensionDtype,\n     xp=None,\n ) -> np.dtype:\n     \"\"\"Like np.result_type, but with type promotion rules matching pandas.",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/dtypes.py::maybe_promote_to_variable_width"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/core/dtypes.py::should_promote_to_object"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/core/dtypes.py::result_type"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -263,19 +320,13 @@",
+          "snippet": " def result_type(\n     if xp is None:\n         xp = get_array_namespace(arrays_and_dtypes)\n \n-    types = {\n-        array_api_compat.result_type(preprocess_types(t), xp=xp)\n-        for t in arrays_and_dtypes\n-    }\n-    if any(isinstance(t, np.dtype) for t in types):\n-        # only check if there's numpy dtypes – the array API does not\n-        # define the types we're checking for\n-        for left, right in PROMOTE_TO_OBJECT:\n-            if any(np.issubdtype(t, left) for t in types) and any(\n-                np.issubdtype(t, right) for t in types\n-            ):\n-                return np.dtype(object)\n-\n-    return array_api_compat.result_type(\n-        *map(preprocess_types, arrays_and_dtypes), xp=xp\n+    if should_promote_to_object(arrays_and_dtypes, xp):\n+        return np.dtype(object)\n+    maybe_promote = functools.partial(\n+        maybe_promote_to_variable_width,\n+        # let extension arrays handle their own str/bytes\n+        should_return_str_or_bytes=any(\n+            map(utils.is_allowed_extension_array_dtype, arrays_and_dtypes)\n+        ),\n     )\n+    return array_api_compat.result_type(*map(maybe_promote, arrays_and_dtypes), xp=xp)\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/dtypes.py::result_type"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/duck_array_ops.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -27,9 +27,17 @@",
+          "snippet": " from numpy import (\n from xarray.compat import dask_array_compat, dask_array_ops\n from xarray.compat.array_api_compat import get_array_namespace\n from xarray.core import dtypes, nputils\n-from xarray.core.extension_array import PandasExtensionArray\n+from xarray.core.extension_array import (\n+    PandasExtensionArray,\n+    as_extension_array,\n+)\n from xarray.core.options import OPTIONS\n-from xarray.core.utils import is_duck_array, is_duck_dask_array, module_available\n+from xarray.core.utils import (\n+    is_allowed_extension_array_dtype,\n+    is_duck_array,\n+    is_duck_dask_array,\n+    module_available,\n+)\n from xarray.namedarray.parallelcompat import get_chunked_array_type\n from xarray.namedarray.pycompat import array_type, is_chunked_array\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/core/duck_array_ops.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -252,7 +260,14 @@",
+          "snippet": " def astype(data, dtype, *, xp=None, **kwargs):\n \n \n def asarray(data, xp=np, dtype=None):\n-    converted = data if is_duck_array(data) else xp.asarray(data)\n+    if is_duck_array(data):\n+        converted = data\n+    elif is_allowed_extension_array_dtype(dtype):\n+        # data may or may not be an ExtensionArray, so we can't rely on\n+        # np.asarray to call our NEP-18 handler; gotta hook it ourselves\n+        converted = PandasExtensionArray(as_extension_array(data, dtype))\n+    else:\n+        converted = xp.asarray(data)\n \n     if dtype is None or converted.dtype == dtype:\n         return converted",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/duck_array_ops.py::asarray"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -264,29 +279,7 @@",
+          "snippet": " def asarray(data, xp=np, dtype=None):\n \n \n def as_shared_dtype(scalars_or_arrays, xp=None):\n-    \"\"\"Cast arrays to a shared dtype using xarray's type promotion rules.\"\"\"\n-    extension_array_types = [\n-        x.dtype\n-        for x in scalars_or_arrays\n-        if pd.api.types.is_extension_array_dtype(x)  # noqa: TID251\n-    ]\n-    if len(extension_array_types) >= 1:\n-        non_nans = [x for x in scalars_or_arrays if not isna(x)]\n-        if len(extension_array_types) == len(non_nans) and all(\n-            isinstance(x, type(extension_array_types[0])) for x in extension_array_types\n-        ):\n-            return [\n-                x\n-                if not isna(x)\n-                else PandasExtensionArray(\n-                    type(non_nans[0].array)._from_sequence([x], dtype=non_nans[0].dtype)\n-                )\n-                for x in scalars_or_arrays\n-            ]\n-        raise ValueError(\n-            f\"Cannot cast values to shared type, found values: {scalars_or_arrays}\"\n-        )\n-\n+    \"\"\"Cast a arrays to a shared dtype using xarray's type promotion rules.\"\"\"\n     # Avoid calling array_type(\"cupy\") repeatidely in the any check\n     array_type_cupy = array_type(\"cupy\")\n     if any(isinstance(x, array_type_cupy) for x in scalars_or_arrays):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/duck_array_ops.py::as_shared_dtype"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -295,7 +288,12 @@",
+          "snippet": " def as_shared_dtype(scalars_or_arrays, xp=None):\n         xp = cp\n     elif xp is None:\n         xp = get_array_namespace(scalars_or_arrays)\n-\n+    scalars_or_arrays = [\n+        PandasExtensionArray(s_or_a)\n+        if isinstance(s_or_a, pd.api.extensions.ExtensionArray)\n+        else s_or_a\n+        for s_or_a in scalars_or_arrays\n+    ]\n     # Pass arrays directly instead of dtypes to result_type so scalars\n     # get handled properly.\n     # Note that result_type() safely gets the dtype from dask arrays without",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/duck_array_ops.py::as_shared_dtype"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -406,7 +404,9 @@",
+          "snippet": " def where(condition, x, y):\n     else:\n         condition = astype(condition, dtype=dtype, xp=xp)\n \n-    return xp.where(condition, *as_shared_dtype([x, y], xp=xp))\n+    promoted_x, promoted_y = as_shared_dtype([x, y], xp=xp)\n+\n+    return xp.where(condition, promoted_x, promoted_y)\n \n \n def where_method(data, cond, other=dtypes.NA):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/duck_array_ops.py::where"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -861,7 +861,7 @@",
+          "snippet": " def _push(array, n: int | None = None, axis: int = -1):\n             \" Call `xr.set_options(use_bottleneck=True)` or `xr.set_options(use_numbagg=True)` to enable one.\"\n         )\n     if OPTIONS[\"use_numbagg\"] and module_available(\"numbagg\"):\n-        import numbagg\n+        import numbagg  # type: ignore[import-not-found, unused-ignore]\n \n         return numbagg.ffill(array, limit=n, axis=axis)\n \n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/duck_array_ops.py::_push"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/extension_array.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -3,23 +3,50 @@",
+          "snippet": " from __future__ import annotations\n import copy\n from collections.abc import Callable, Sequence\n from dataclasses import dataclass\n-from typing import Any, Generic, cast\n+from typing import TYPE_CHECKING, Generic, cast\n \n import numpy as np\n import pandas as pd\n from packaging.version import Version\n+from pandas.api.extensions import ExtensionArray, ExtensionDtype\n+from pandas.api.types import is_scalar as pd_is_scalar\n \n from xarray.core.types import DTypeLikeSave, T_ExtensionArray\n-from xarray.core.utils import NDArrayMixin, is_allowed_extension_array\n+from xarray.core.utils import (\n+    NDArrayMixin,\n+    is_allowed_extension_array,\n+    is_allowed_extension_array_dtype,\n+)\n \n HANDLED_EXTENSION_ARRAY_FUNCTIONS: dict[Callable, Callable] = {}\n \n \n-def implements(numpy_function):\n-    \"\"\"Register an __array_function__ implementation for MyArray objects.\"\"\"\n+if TYPE_CHECKING:\n+    from typing import Any\n+\n+    from pandas._typing import DtypeObj, Scalar\n+\n+\n+def is_scalar(value: object) -> bool:\n+    \"\"\"Workaround: pandas is_scalar doesn't recognize Categorical nulls for some reason.\"\"\"\n+    return value is pd.CategoricalDtype.na_value or pd_is_scalar(value)\n+\n+\n+def implements(numpy_function_or_name: Callable | str) -> Callable:\n+    \"\"\"Register an __array_function__ implementation.\n+\n+    Pass a function directly if it's guaranteed to exist in all supported numpy versions, or a\n+    string to first check for its existence.\n+    \"\"\"\n \n     def decorator(func):\n-        HANDLED_EXTENSION_ARRAY_FUNCTIONS[numpy_function] = func\n+        if isinstance(numpy_function_or_name, str):\n+            numpy_function = getattr(np, numpy_function_or_name, None)\n+        else:\n+            numpy_function = numpy_function_or_name\n+\n+        if numpy_function:\n+            HANDLED_EXTENSION_ARRAY_FUNCTIONS[numpy_function] = func\n         return func\n \n     return decorator",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/extension_array.py::is_scalar"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/core/extension_array.py::implements"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/core/extension_array.py::decorator"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -32,6 +59,111 @@",
+          "snippet": " def __extension_duck_array__issubdtype(\n     return False  # never want a function to think a pandas extension dtype is a subtype of numpy\n \n \n+@implements(\"astype\")  # np.astype was added in 2.1.0, but we only require >=1.24\n+def __extension_duck_array__astype(\n+    array_or_scalar: T_ExtensionArray,\n+    dtype: DTypeLikeSave,\n+    order: str = \"K\",\n+    casting: str = \"unsafe\",\n+    subok: bool = True,\n+    copy: bool = True,\n+    device: str | None = None,\n+) -> ExtensionArray:\n+    if (\n+        not (\n+            is_allowed_extension_array(array_or_scalar)\n+            or is_allowed_extension_array_dtype(dtype)\n+        )\n+        or casting != \"unsafe\"\n+        or not subok\n+        or order != \"K\"\n+    ):\n+        return NotImplemented\n+\n+    return as_extension_array(array_or_scalar, dtype, copy=copy)\n+\n+\n+@implements(np.asarray)\n+def __extension_duck_array__asarray(\n+    array_or_scalar: np.typing.ArrayLike | T_ExtensionArray,\n+    dtype: DTypeLikeSave | None = None,\n+) -> ExtensionArray:\n+    if not is_allowed_extension_array(dtype):\n+        return NotImplemented\n+\n+    return as_extension_array(array_or_scalar, dtype)\n+\n+\n+def as_extension_array(\n+    array_or_scalar: np.typing.ArrayLike | T_ExtensionArray,\n+    dtype: ExtensionDtype | DTypeLikeSave | None,\n+    copy: bool = False,\n+) -> ExtensionArray:\n+    if is_scalar(array_or_scalar):\n+        return dtype.construct_array_type()._from_sequence(  # type: ignore[union-attr]\n+            [array_or_scalar], dtype=dtype\n+        )\n+    else:\n+        return array_or_scalar.astype(dtype, copy=copy)  # type: ignore[union-attr]\n+\n+\n+@implements(np.result_type)\n+def __extension_duck_array__result_type(\n+    *arrays_and_dtypes: list[\n+        np.typing.ArrayLike | np.typing.DTypeLike | ExtensionDtype | ExtensionArray\n+    ],\n+) -> DtypeObj:\n+    extension_arrays_and_dtypes: list[ExtensionDtype | ExtensionArray] = [\n+        cast(ExtensionDtype | ExtensionArray, x)\n+        for x in arrays_and_dtypes\n+        if is_allowed_extension_array(x) or is_allowed_extension_array_dtype(x)\n+    ]\n+    if not extension_arrays_and_dtypes:\n+        return NotImplemented\n+\n+    ea_dtypes: list[ExtensionDtype] = [\n+        getattr(x, \"dtype\", cast(ExtensionDtype, x))\n+        for x in extension_arrays_and_dtypes\n+    ]\n+    scalars = [\n+        x for x in arrays_and_dtypes if is_scalar(x) and x not in {pd.NA, np.nan}\n+    ]\n+    # other_stuff could include:\n+    # - arrays such as pd.ABCSeries, np.ndarray, or other array-api duck arrays\n+    # - dtypes such as pd.DtypeObj, np.dtype, or other array-api duck dtypes\n+    other_stuff = [\n+        x\n+        for x in arrays_and_dtypes\n+        if not is_allowed_extension_array_dtype(x) and not is_scalar(x)\n+    ]\n+    # We implement one special case: when possible, preserve Categoricals (avoid promoting\n+    # to object) by merging the categories of all given Categoricals + scalars + NA.\n+    # Ideally this could be upstreamed into pandas find_result_type / find_common_type.\n+    if not other_stuff and all(\n+        isinstance(x, pd.CategoricalDtype) and not x.ordered for x in ea_dtypes\n+    ):\n+        return union_unordered_categorical_and_scalar(\n+            cast(list[pd.CategoricalDtype], ea_dtypes),\n+            scalars,  # type: ignore[arg-type]\n+        )\n+    if not other_stuff and all(\n+        isinstance(x, type(ea_type := ea_dtypes[0])) for x in ea_dtypes\n+    ):\n+        return ea_type\n+    raise ValueError(\n+        f\"Cannot cast values to shared type, found values: {arrays_and_dtypes}\"\n+    )\n+\n+\n+def union_unordered_categorical_and_scalar(\n+    categorical_dtypes: list[pd.CategoricalDtype], scalars: list[Scalar]\n+) -> pd.CategoricalDtype:\n+    scalars = [x for x in scalars if x is not pd.CategoricalDtype.na_value]\n+    all_categories = set().union(*(x.categories for x in categorical_dtypes))\n+    all_categories = all_categories.union(scalars)\n+    return pd.CategoricalDtype(categories=list(all_categories))\n+\n+\n @implements(np.broadcast_to)\n def __extension_duck_array__broadcast(arr: T_ExtensionArray, shape: tuple):\n     if shape[0] == len(arr) and len(shape) == 1:",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/extension_array.py::__extension_duck_array__astype"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/core/extension_array.py::__extension_duck_array__asarray"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/core/extension_array.py::as_extension_array"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/core/extension_array.py::__extension_duck_array__result_type"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/core/extension_array.py::union_unordered_categorical_and_scalar"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -53,16 +185,34 @@",
+          "snippet": " def __extension_duck_array__concatenate(\n \n @implements(np.where)\n def __extension_duck_array__where(\n-    condition: np.ndarray, x: T_ExtensionArray, y: T_ExtensionArray\n+    condition: T_ExtensionArray | np.typing.ArrayLike,\n+    x: T_ExtensionArray,\n+    y: T_ExtensionArray | np.typing.ArrayLike,\n ) -> T_ExtensionArray:\n-    if (\n-        isinstance(x, pd.Categorical)\n-        and isinstance(y, pd.Categorical)\n-        and x.dtype != y.dtype\n-    ):\n-        x = x.add_categories(set(y.categories).difference(set(x.categories)))  # type: ignore[assignment]\n-        y = y.add_categories(set(x.categories).difference(set(y.categories)))  # type: ignore[assignment]\n-    return cast(T_ExtensionArray, pd.Series(x).where(condition, pd.Series(y)).array)\n+    # pd.where won't broadcast 0-dim arrays across a scalar-like series; scalar y's must be preserved\n+    if hasattr(y, \"shape\") and len(y.shape) == 1 and y.shape[0] == 1:\n+        y = y[0]  # type: ignore[index]\n+    return cast(T_ExtensionArray, pd.Series(x).where(condition, y).array)  # type: ignore[arg-type]\n+\n+\n+def _replace_duck(args, replacer: Callable[[PandasExtensionArray], list]) -> list:\n+    args_as_list = list(args)\n+    for index, value in enumerate(args_as_list):\n+        if isinstance(value, PandasExtensionArray):\n+            args_as_list[index] = replacer(value)\n+        elif isinstance(value, tuple):  # should handle more than just tuple? iterable?\n+            args_as_list[index] = tuple(_replace_duck(value, replacer))\n+        elif isinstance(value, list):\n+            args_as_list[index] = _replace_duck(value, replacer)\n+    return args_as_list\n+\n+\n+def replace_duck_with_extension_array(args) -> tuple:\n+    return tuple(_replace_duck(args, lambda duck: duck.array))\n+\n+\n+def replace_duck_with_series(args) -> tuple:\n+    return tuple(_replace_duck(args, lambda duck: pd.Series(duck.array)))\n \n \n @implements(np.ndim)",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/extension_array.py::__extension_duck_array__where"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/core/extension_array.py::_replace_duck"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/core/extension_array.py::replace_duck_with_extension_array"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/core/extension_array.py::replace_duck_with_series"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -96,7 +246,7 @@",
+          "snippet": " class PandasExtensionArray(NDArrayMixin, Generic[T_ExtensionArray]):\n \n     def __post_init__(self):\n         if not isinstance(self.array, pd.api.extensions.ExtensionArray):\n-            raise TypeError(f\"{self.array} is not an pandas ExtensionArray.\")\n+            raise TypeError(f\"{self.array} is not a pandas ExtensionArray.\")\n         # This does not use the UNSUPPORTED_EXTENSION_ARRAY_TYPES whitelist because\n         # we do support extension arrays from datetime, for example, that need\n         # duck array support internally via this class.  These can appear from `DatetimeIndex`",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/extension_array.py::PandasExtensionArray::__post_init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -107,26 +257,11 @@",
+          "snippet": " class PandasExtensionArray(NDArrayMixin, Generic[T_ExtensionArray]):\n             )\n \n     def __array_function__(self, func, types, args, kwargs):\n-        def replace_duck_with_extension_array(args) -> list:\n-            args_as_list = list(args)\n-            for index, value in enumerate(args_as_list):\n-                if isinstance(value, PandasExtensionArray):\n-                    args_as_list[index] = value.array\n-                elif isinstance(\n-                    value, tuple\n-                ):  # should handle more than just tuple? iterable?\n-                    args_as_list[index] = tuple(\n-                        replace_duck_with_extension_array(value)\n-                    )\n-                elif isinstance(value, list):\n-                    args_as_list[index] = replace_duck_with_extension_array(value)\n-            return args_as_list\n-\n-        args = tuple(replace_duck_with_extension_array(args))\n         if func not in HANDLED_EXTENSION_ARRAY_FUNCTIONS:\n             raise KeyError(\"Function not registered for pandas extension arrays.\")\n+        args = replace_duck_with_extension_array(args)\n         res = HANDLED_EXTENSION_ARRAY_FUNCTIONS[func](*args, **kwargs)\n-        if is_allowed_extension_array(res):\n+        if isinstance(res, ExtensionArray):\n             return PandasExtensionArray(res)\n         return res\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/extension_array.py::PandasExtensionArray::__array_function__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -134,16 +269,23 @@",
+          "snippet": " class PandasExtensionArray(NDArrayMixin, Generic[T_ExtensionArray]):\n         return ufunc(*inputs, **kwargs)\n \n     def __getitem__(self, key) -> PandasExtensionArray[T_ExtensionArray]:\n+        if (\n+            isinstance(key, tuple) and len(key) == 1\n+        ):  # pyarrow type arrays can't handle single-length tuples\n+            (key,) = key\n         item = self.array[key]\n         if is_allowed_extension_array(item):\n             return PandasExtensionArray(item)\n-        if np.isscalar(item) or isinstance(key, int):\n+        if is_scalar(item) or isinstance(key, int):\n             return PandasExtensionArray(type(self.array)._from_sequence([item]))  # type: ignore[call-arg,attr-defined,unused-ignore]\n         return PandasExtensionArray(item)\n \n     def __setitem__(self, key, val):\n         self.array[key] = val\n \n+    def __len__(self):\n+        return len(self.array)\n+\n     def __eq__(self, other):\n         if isinstance(other, PandasExtensionArray):\n             return self.array == other.array",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/extension_array.py::PandasExtensionArray::__getitem__"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/core/extension_array.py::PandasExtensionArray::__len__"
+            },
+            {
+              "kind": "class",
+              "node": "xarray/core/extension_array.py::PandasExtensionArray"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -152,9 +294,6 @@",
+          "snippet": " class PandasExtensionArray(NDArrayMixin, Generic[T_ExtensionArray]):\n     def __ne__(self, other):\n         return ~(self == other)\n \n-    def __len__(self):\n-        return len(self.array)\n-\n     @property\n     def ndim(self) -> int:\n         return 1\n",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "xarray/core/extension_array.py::PandasExtensionArray"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/indexes.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -809,7 +809,7 @@",
+          "snippet": " class PandasIndex(Index):\n         indxr = indexers[self.dim]\n         if isinstance(indxr, Variable):\n             if indxr.dims != (self.dim,):\n-                # can't preserve a index if result has new dimensions\n+                # can't preserve an index if result has new dimensions\n                 return None\n             else:\n                 indxr = indxr.data\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/indexes.py::PandasIndex::isel"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/indexing.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -355,6 +355,17 @@",
+          "snippet": " def slice_slice_by_array(\n     return new_indexer\n \n \n+def normalize_indexer(indexer, size):\n+    if isinstance(indexer, slice):\n+        return normalize_slice(indexer, size)\n+    elif isinstance(indexer, np.ndarray):\n+        return normalize_array(indexer, size)\n+    else:\n+        if indexer < 0:\n+            return size + indexer\n+        return indexer\n+\n+\n def _index_indexer_1d(\n     old_indexer: OuterIndexerType,\n     applied_indexer: OuterIndexerType,",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/indexing.py::normalize_indexer"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -365,7 +376,7 @@",
+          "snippet": " def _index_indexer_1d(\n         return old_indexer\n     if is_full_slice(old_indexer):\n         # shortcut for full slices\n-        return applied_indexer\n+        return normalize_indexer(applied_indexer, size)\n \n     indexer: OuterIndexerType\n     if isinstance(old_indexer, slice):",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/indexing.py::_index_indexer_1d"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1640,7 +1651,7 @@",
+          "snippet": " def posify_mask_indexer(indexer: ExplicitIndexer) -> ExplicitIndexer:\n \n \n def is_fancy_indexer(indexer: Any) -> bool:\n-    \"\"\"Return False if indexer is a int, slice, a 1-dimensional list, or a 0 or\n+    \"\"\"Return False if indexer is an int, slice, a 1-dimensional list, or a 0 or\n     1-dimensional ndarray; in all other cases return True\n     \"\"\"\n     if isinstance(indexer, int | slice) and not isinstance(indexer, bool):\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/indexing.py::is_fancy_indexer"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/nputils.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -156,7 +156,7 @@",
+          "snippet": " def _advanced_indexer_subspaces(key):\n \n \n class NumpyVIndexAdapter:\n-    \"\"\"Object that implements indexing like vindex on a np.ndarray.\n+    \"\"\"Object that implements indexing like vindex on an np.ndarray.\n \n     This is a pure Python implementation of (some of) the logic in this NumPy\n     proposal: https://github.com/numpy/numpy/pull/6256",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "xarray/core/nputils.py::NumpyVIndexAdapter"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -208,7 +208,7 @@",
+          "snippet": " def _create_method(name, npmodule=np) -> Callable:\n                 )\n             )\n         ):\n-            import numbagg\n+            import numbagg  # type: ignore[import-not-found, unused-ignore]\n \n             nba_func = getattr(numbagg, name, None)\n             if nba_func is not None:\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/core/nputils.py::f"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/core/variable.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -972,7 +972,7 @@",
+          "snippet": " class Variable(NamedArray, AbstractArray, VariableArithmetic):\n         if dims is _default:\n             dims = copy.copy(self._dims)\n         if data is _default:\n-            data = copy.copy(self.data)\n+            data = copy.copy(self._data)\n         if attrs is _default:\n             attrs = copy.copy(self._attrs)\n         if encoding is _default:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/variable.py::Variable::_replace"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1228,7 +1228,7 @@",
+          "snippet": " class Variable(NamedArray, AbstractArray, VariableArithmetic):\n         if fill_with_shape:\n             return [\n                 pad_option.get(d, (n, n))\n-                for d, n in zip(self.dims, self.data.shape, strict=True)\n+                for d, n in zip(self.dims, self.shape, strict=True)\n             ]\n         return [pad_option.get(d, (0, 0)) for d in self.dims]\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/variable.py::Variable::_pad_options_dim_to_index"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1304,7 +1304,7 @@",
+          "snippet": " class Variable(NamedArray, AbstractArray, VariableArithmetic):\n \n         # workaround for bug in Dask's default value of stat_length https://github.com/dask/dask/issues/5303\n         if stat_length is None and mode in [\"maximum\", \"mean\", \"median\", \"minimum\"]:\n-            stat_length = [(n, n) for n in self.data.shape]  # type: ignore[assignment]\n+            stat_length = [(n, n) for n in self.shape]  # type: ignore[assignment]\n \n         pad_width_by_index = self._pad_options_dim_to_index(pad_width)\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/variable.py::Variable::pad"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1469,7 +1469,7 @@",
+          "snippet": " class Variable(NamedArray, AbstractArray, VariableArithmetic):\n         if self.dims == expanded_dims:\n             # don't use broadcast_to unless necessary so the result remains\n             # writeable if possible\n-            expanded_data = self.data\n+            expanded_data = self._data\n         elif shape is None or all(\n             s == 1 for s, e in zip(shape, dim, strict=True) if e not in self_dims\n         ):",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/variable.py::Variable::set_dims"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1477,6 +1477,7 @@",
+          "snippet": " class Variable(NamedArray, AbstractArray, VariableArithmetic):\n             # This is typically easier for duck arrays to implement\n             # than the full \"broadcast_to\" semantics\n             indexer = (None,) * (len(expanded_dims) - self.ndim) + (...,)\n+            # TODO: switch this to ._data once we teach ExplicitlyIndexed arrays to handle indexers with None.\n             expanded_data = self.data[indexer]\n         else:  # elif shape is not None:\n             dims_map = dict(zip(dim, shape, strict=True))\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/core/variable.py::Variable::set_dims"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/indexes/nd_point_index.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -135,7 +135,7 @@",
+          "snippet": " class NDPointIndex(Index, Generic[T_TreeAdapter]):\n     Data variables:\n         *empty*\n \n-    Creation of a NDPointIndex from the \"xx\" and \"yy\" coordinate variables:\n+    Creation of an NDPointIndex from the \"xx\" and \"yy\" coordinate variables:\n \n     >>> ds = ds.set_xindex((\"xx\", \"yy\"), xr.indexes.NDPointIndex)\n     >>> ds\n",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "xarray/indexes/nd_point_index.py::NDPointIndex"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/plot/dataarray_plot.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1000,7 +1000,7 @@",
+          "snippet": " artist :\n                 ckw = {vv: cmap_params[vv] for vv in (\"vmin\", \"vmax\", \"norm\", \"cmap\")}\n                 cmap_params_subset.update(**ckw)\n \n-        with plt.rc_context(_styles):\n+        with plt.rc_context(_styles):  # type: ignore[arg-type, unused-ignore]\n             if z is not None:\n                 import mpl_toolkits\n \n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/plot/dataarray_plot.py::newplotfunc"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/plot/utils.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -509,7 +509,7 @@",
+          "snippet": " def _maybe_gca(**subplot_kws: Any) -> Axes:\n \n \n def _get_units_from_attrs(da: DataArray) -> str:\n-    \"\"\"Extracts and formats the unit/units from a attributes.\"\"\"\n+    \"\"\"Extracts and formats the unit/units from their attributes.\"\"\"\n     pint_array_type = DuckArrayModule(\"pint\").type\n     units = \" [{}]\"\n     if isinstance(da.data, pint_array_type):\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/plot/utils.py::_get_units_from_attrs"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/structure/combine.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -2,13 +2,14 @@",
+          "snippet": " from __future__ import annotations\n \n from collections import Counter, defaultdict\n from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence\n-from typing import TYPE_CHECKING, Literal, TypeVar, Union, cast\n+from typing import TYPE_CHECKING, Literal, TypeAlias, TypeVar, cast, overload\n \n import pandas as pd\n \n from xarray.core import dtypes\n from xarray.core.dataarray import DataArray\n from xarray.core.dataset import Dataset\n+from xarray.core.datatree import DataTree\n from xarray.core.utils import iterate_nested\n from xarray.structure.alignment import AlignmentError\n from xarray.structure.concat import concat",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/structure/combine.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -43,7 +44,7 @@",
+          "snippet": " def _infer_tile_ids_from_nested_list(\n     entry: NestedSequence[T], current_pos: tuple[int, ...]\n ) -> Iterator[tuple[tuple[int, ...], T]]:\n     \"\"\"\n-    Given a list of lists (of lists...) of objects, returns a iterator\n+    Given a list of lists (of lists...) of objects, returns an iterator\n     which returns a tuple containing the index of each object in the nested\n     list structure as the key, and the object. This can then be called by the\n     dict constructor to create a dictionary of the objects organised by their",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/structure/combine.py::_infer_tile_ids_from_nested_list"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -96,9 +97,9 @@",
+          "snippet": " def _ensure_same_types(series, dim):\n             raise TypeError(error_msg)\n \n \n-def _infer_concat_order_from_coords(datasets):\n+def _infer_concat_order_from_coords(datasets: list[Dataset] | list[DataTree]):\n     concat_dims = []\n-    tile_ids = [() for ds in datasets]\n+    tile_ids: list[tuple[int, ...]] = [() for ds in datasets]\n \n     # All datasets have same variables because they've been grouped as such\n     ds0 = datasets[0]",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/structure/combine.py::_infer_concat_order_from_coords"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -106,17 +107,18 @@",
+          "snippet": " def _infer_concat_order_from_coords(datasets):\n         # Check if dim is a coordinate dimension\n         if dim in ds0:\n             # Need to read coordinate values to do ordering\n-            indexes = [ds._indexes.get(dim) for ds in datasets]\n-            if any(index is None for index in indexes):\n-                error_msg = (\n-                    f\"Every dimension requires a corresponding 1D coordinate \"\n-                    f\"and index for inferring concatenation order but the \"\n-                    f\"coordinate '{dim}' has no corresponding index\"\n-                )\n-                raise ValueError(error_msg)\n-\n-            # TODO (benbovy, flexible indexes): support flexible indexes?\n-            indexes = [index.to_pandas_index() for index in indexes]\n+            indexes: list[pd.Index] = []\n+            for ds in datasets:\n+                index = ds._indexes.get(dim)\n+                if index is None:\n+                    error_msg = (\n+                        f\"Every dimension requires a corresponding 1D coordinate \"\n+                        f\"and index for inferring concatenation order but the \"\n+                        f\"coordinate '{dim}' has no corresponding index\"\n+                    )\n+                    raise ValueError(error_msg)\n+                # TODO (benbovy, flexible indexes): support flexible indexes?\n+                indexes.append(index.to_pandas_index())\n \n             # If dimension coordinate values are same on every dataset then\n             # should be leaving this dimension alone (it's just a \"bystander\")",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/structure/combine.py::_infer_concat_order_from_coords"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -153,7 +155,7 @@",
+          "snippet": " def _infer_concat_order_from_coords(datasets):\n                 rank = series.rank(\n                     method=\"dense\", ascending=ascending, numeric_only=False\n                 )\n-                order = rank.astype(int).values - 1\n+                order = (rank.astype(int).values - 1).tolist()\n \n                 # Append positions along extra dimension to structure which\n                 # encodes the multi-dimensional concatenation order",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/structure/combine.py::_infer_concat_order_from_coords"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -163,10 +165,16 @@",
+          "snippet": " def _infer_concat_order_from_coords(datasets):\n                 ]\n \n     if len(datasets) > 1 and not concat_dims:\n-        raise ValueError(\n-            \"Could not find any dimension coordinates to use to \"\n-            \"order the datasets for concatenation\"\n-        )\n+        if any(isinstance(data, DataTree) for data in datasets):\n+            raise ValueError(\n+                \"Did not find any dimension coordinates at root nodes \"\n+                \"to order the DataTree objects for concatenation\"\n+            )\n+        else:\n+            raise ValueError(\n+                \"Could not find any dimension coordinates to use to \"\n+                \"order the Dataset objects for concatenation\"\n+            )\n \n     combined_ids = dict(zip(tile_ids, datasets, strict=True))\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/structure/combine.py::_infer_concat_order_from_coords"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -224,7 +232,7 @@",
+          "snippet": " def _combine_nd(\n \n     Parameters\n     ----------\n-    combined_ids : Dict[Tuple[int, ...]], xarray.Dataset]\n+    combined_ids : Dict[Tuple[int, ...]], xarray.Dataset | xarray.DataTree]\n         Structure containing all datasets to be concatenated with \"tile_IDs\" as\n         keys, which specify position within the desired final combined result.\n     concat_dims : sequence of str",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/structure/combine.py::_combine_nd"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -235,7 +243,7 @@",
+          "snippet": " def _combine_nd(\n \n     Returns\n     -------\n-    combined_ds : xarray.Dataset\n+    combined_ds : xarray.Dataset | xarray.DataTree\n     \"\"\"\n \n     example_tile_id = next(iter(combined_ids.keys()))",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/structure/combine.py::_combine_nd"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -399,20 +407,74 @@",
+          "snippet": " def _nested_combine(\n     return combined\n \n \n-# Define type for arbitrarily-nested list of lists recursively:\n-DATASET_HYPERCUBE = Union[Dataset, Iterable[\"DATASET_HYPERCUBE\"]]\n+# Define types for arbitrarily-nested list of lists.\n+# Mypy doesn't seem to handle overloads properly with recursive types, so we\n+# explicitly expand the first handful of levels of recursion.\n+DatasetLike: TypeAlias = DataArray | Dataset\n+DatasetHyperCube: TypeAlias = (\n+    DatasetLike\n+    | Sequence[DatasetLike]\n+    | Sequence[Sequence[DatasetLike]]\n+    | Sequence[Sequence[Sequence[DatasetLike]]]\n+    | Sequence[Sequence[Sequence[Sequence[DatasetLike]]]]\n+)\n+DataTreeHyperCube: TypeAlias = (\n+    DataTree\n+    | Sequence[DataTree]\n+    | Sequence[Sequence[DataTree]]\n+    | Sequence[Sequence[Sequence[DataTree]]]\n+    | Sequence[Sequence[Sequence[Sequence[DataTree]]]]\n+)\n+\n+\n+@overload\n+def combine_nested(\n+    datasets: DatasetHyperCube,\n+    concat_dim: str\n+    | DataArray\n+    | list[str]\n+    | Sequence[str | DataArray | pd.Index | None]\n+    | None,\n+    compat: str | CombineKwargDefault = ...,\n+    data_vars: str | CombineKwargDefault = ...,\n+    coords: str | CombineKwargDefault = ...,\n+    fill_value: object = ...,\n+    join: JoinOptions | CombineKwargDefault = ...,\n+    combine_attrs: CombineAttrsOptions = ...,\n+) -> Dataset: ...\n+\n+\n+@overload\n+def combine_nested(\n+    datasets: DataTreeHyperCube,\n+    concat_dim: str\n+    | DataArray\n+    | list[str]\n+    | Sequence[str | DataArray | pd.Index | None]\n+    | None,\n+    compat: str | CombineKwargDefault = ...,\n+    data_vars: str | CombineKwargDefault = ...,\n+    coords: str | CombineKwargDefault = ...,\n+    fill_value: object = ...,\n+    join: JoinOptions | CombineKwargDefault = ...,\n+    combine_attrs: CombineAttrsOptions = ...,\n+) -> DataTree: ...\n \n \n def combine_nested(\n-    datasets: DATASET_HYPERCUBE,\n-    concat_dim: str | DataArray | Sequence[str | DataArray | pd.Index | None] | None,\n+    datasets: DatasetHyperCube | DataTreeHyperCube,\n+    concat_dim: str\n+    | DataArray\n+    | list[str]\n+    | Sequence[str | DataArray | pd.Index | None]\n+    | None,\n     compat: str | CombineKwargDefault = _COMPAT_DEFAULT,\n     data_vars: str | CombineKwargDefault = _DATA_VARS_DEFAULT,\n     coords: str | CombineKwargDefault = _COORDS_DEFAULT,\n     fill_value: object = dtypes.NA,\n     join: JoinOptions | CombineKwargDefault = _JOIN_DEFAULT,\n     combine_attrs: CombineAttrsOptions = \"drop\",\n-) -> Dataset:\n+) -> Dataset | DataTree:\n     \"\"\"\n     Explicitly combine an N-dimensional grid of datasets into one by using a\n     succession of concat and merge operations along each dimension of the grid.",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "xarray/structure/combine.py::DatasetLike"
+            },
+            {
+              "kind": "variable",
+              "node": "xarray/structure/combine.py::DatasetHyperCube"
+            },
+            {
+              "kind": "variable",
+              "node": "xarray/structure/combine.py::DataTreeHyperCube"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/structure/combine.py::combine_nested"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -433,7 +495,7 @@",
+          "snippet": " def combine_nested(\n \n     Parameters\n     ----------\n-    datasets : list or nested list of Dataset\n+    datasets : list or nested list of Dataset, DataArray or DataTree\n         Dataset objects to combine.\n         If concatenation or merging along more than one dimension is desired,\n         then datasets must be supplied in a nested list-of-lists.",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/structure/combine.py::combine_nested"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -527,7 +589,7 @@",
+          "snippet": " def combine_nested(\n \n     Returns\n     -------\n-    combined : xarray.Dataset\n+    combined : xarray.Dataset or xarray.DataTree\n \n     Examples\n     --------",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/structure/combine.py::combine_nested"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -621,22 +683,29 @@",
+          "snippet": " def combine_nested(\n     concat\n     merge\n     \"\"\"\n-    mixed_datasets_and_arrays = any(\n-        isinstance(obj, Dataset) for obj in iterate_nested(datasets)\n-    ) and any(\n+    any_datasets = any(isinstance(obj, Dataset) for obj in iterate_nested(datasets))\n+    any_unnamed_arrays = any(\n         isinstance(obj, DataArray) and obj.name is None\n         for obj in iterate_nested(datasets)\n     )\n-    if mixed_datasets_and_arrays:\n+    if any_datasets and any_unnamed_arrays:\n         raise ValueError(\"Can't combine datasets with unnamed arrays.\")\n \n-    if isinstance(concat_dim, str | DataArray) or concat_dim is None:\n-        concat_dim = [concat_dim]\n+    any_datatrees = any(isinstance(obj, DataTree) for obj in iterate_nested(datasets))\n+    all_datatrees = all(isinstance(obj, DataTree) for obj in iterate_nested(datasets))\n+    if any_datatrees and not all_datatrees:\n+        raise ValueError(\"Can't combine a mix of DataTree and non-DataTree objects.\")\n+\n+    concat_dims = (\n+        [concat_dim]\n+        if isinstance(concat_dim, str | DataArray) or concat_dim is None\n+        else concat_dim\n+    )\n \n     # The IDs argument tells _nested_combine that datasets aren't yet sorted\n     return _nested_combine(\n         datasets,\n-        concat_dims=concat_dim,\n+        concat_dims=concat_dims,\n         compat=compat,\n         data_vars=data_vars,\n         coords=coords,",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/structure/combine.py::combine_nested"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -988,6 +1057,10 @@",
+          "snippet": " def combine_by_coords(\n     Finally, if you attempt to combine a mix of unnamed DataArrays with either named\n     DataArrays or Datasets, a ValueError will be raised (as this is an ambiguous operation).\n     \"\"\"\n+    if any(isinstance(data_object, DataTree) for data_object in data_objects):\n+        raise NotImplementedError(\n+            \"combine_by_coords() does not yet support DataTree objects.\"\n+        )\n \n     if not data_objects:\n         return Dataset()",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/structure/combine.py::combine_by_coords"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1018,7 +1091,7 @@",
+          "snippet": " def combine_by_coords(\n             # Must be a mix of unnamed dataarrays with either named dataarrays or with datasets\n             # Can't combine these as we wouldn't know whether to merge or concatenate the arrays\n             raise ValueError(\n-                \"Can't automatically combine unnamed DataArrays with either named DataArrays or Datasets.\"\n+                \"Can't automatically combine unnamed DataArrays with named DataArrays or Datasets.\"\n             )\n     else:\n         # Promote any named DataArrays to single-variable Datasets to simplify combining\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/structure/combine.py::combine_by_coords"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/structure/merge.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -22,7 +22,12 @@",
+          "snippet": " from xarray.core.utils import (\n     emit_user_level_warning,\n     equivalent,\n )\n-from xarray.core.variable import Variable, as_variable, calculate_dimensions\n+from xarray.core.variable import (\n+    IndexVariable,\n+    Variable,\n+    as_variable,\n+    calculate_dimensions,\n+)\n from xarray.structure.alignment import deep_align\n from xarray.util.deprecation_helpers import (\n     _COMPAT_DEFAULT,",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/structure/merge.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1206,7 +1211,11 @@",
+          "snippet": " def dataset_update_method(dataset: Dataset, other: CoercibleMapping) -> _MergeRe\n                     if c not in value.dims and c in dataset.coords\n                 ]\n                 if coord_names:\n-                    other[key] = value.drop_vars(coord_names)\n+                    value = value.drop_vars(coord_names)\n+                if isinstance(value.variable, IndexVariable):\n+                    variable = value.variable.to_base_variable()\n+                    value = value._replace(variable=variable)\n+                other[key] = value\n \n     return merge_core(\n         [dataset, other],\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/structure/merge.py::dataset_update_method"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/testing/assertions.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -3,6 +3,7 @@",
+          "snippet": " import functools\n import warnings\n from collections.abc import Hashable\n+from typing import Any\n \n import numpy as np\n import pandas as pd",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/testing/assertions.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -362,6 +363,17 @@",
+          "snippet": " def _assert_indexes_invariants_checks(\n             if isinstance(v, IndexVariable)\n         }\n         assert indexes.keys() <= index_vars, (set(indexes), index_vars)\n+        assert all(\n+            k in index_vars\n+            for k, v in possible_coord_variables.items()\n+            if v.dims == (k,)\n+        ), {k: type(v) for k, v in possible_coord_variables.items()}\n+\n+    assert not any(\n+        isinstance(v, IndexVariable)\n+        for k, v in possible_coord_variables.items()\n+        if k not in indexes.keys()\n+    ), {k: type(v) for k, v in possible_coord_variables.items()}\n \n     # check pandas index wrappers vs. coordinate data adapters\n     for k, index in indexes.items():",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/testing/assertions.py::_assert_indexes_invariants_checks"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -401,11 +413,17 @@",
+          "snippet": " def _assert_indexes_invariants_checks(\n         )\n \n \n-def _assert_variable_invariants(var: Variable, name: Hashable = None):\n+def _assert_variable_invariants(\n+    var: Variable | Any,\n+    name: Hashable = None,\n+) -> None:\n     if name is None:\n         name_or_empty: tuple = ()\n     else:\n         name_or_empty = (name,)\n+\n+    assert isinstance(var, Variable), {name: type(var)}\n+\n     assert isinstance(var._dims, tuple), name_or_empty + (var._dims,)\n     assert len(var._dims) == len(var._data.shape), name_or_empty + (\n         var._dims,",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/testing/assertions.py::_assert_variable_invariants"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -418,35 +436,28 @@",
+          "snippet": " def _assert_variable_invariants(var: Variable, name: Hashable = None):\n \n \n def _assert_dataarray_invariants(da: DataArray, check_default_indexes: bool):\n-    assert isinstance(da._variable, Variable), da._variable\n     _assert_variable_invariants(da._variable)\n \n     assert isinstance(da._coords, dict), da._coords\n-    assert all(isinstance(v, Variable) for v in da._coords.values()), da._coords\n \n     if check_default_indexes:\n         assert all(set(v.dims) <= set(da.dims) for v in da._coords.values()), (\n             da.dims,\n             {k: v.dims for k, v in da._coords.items()},\n         )\n-        assert all(\n-            isinstance(v, IndexVariable)\n-            for (k, v) in da._coords.items()\n-            if v.dims == (k,)\n-        ), {k: type(v) for k, v in da._coords.items()}\n \n     for k, v in da._coords.items():\n         _assert_variable_invariants(v, k)\n \n-    if da._indexes is not None:\n-        _assert_indexes_invariants_checks(\n-            da._indexes, da._coords, da.dims, check_default=check_default_indexes\n-        )\n+    assert da._indexes is not None\n+    _assert_indexes_invariants_checks(\n+        da._indexes, da._coords, da.dims, check_default=check_default_indexes\n+    )\n \n \n def _assert_dataset_invariants(ds: Dataset, check_default_indexes: bool):\n     assert isinstance(ds._variables, dict), type(ds._variables)\n-    assert all(isinstance(v, Variable) for v in ds._variables.values()), ds._variables\n+\n     for k, v in ds._variables.items():\n         _assert_variable_invariants(v, k)\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/testing/assertions.py::_assert_dataarray_invariants"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/testing/assertions.py::_assert_dataset_invariants"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -466,17 +477,10 @@",
+          "snippet": " def _assert_dataset_invariants(ds: Dataset, check_default_indexes: bool):\n         ds._dims[k] == v.sizes[k] for v in ds._variables.values() for k in v.sizes\n     ), (ds._dims, {k: v.sizes for k, v in ds._variables.items()})\n \n-    if check_default_indexes:\n-        assert all(\n-            isinstance(v, IndexVariable)\n-            for (k, v) in ds._variables.items()\n-            if v.dims == (k,)\n-        ), {k: type(v) for k, v in ds._variables.items() if v.dims == (k,)}\n-\n-    if ds._indexes is not None:\n-        _assert_indexes_invariants_checks(\n-            ds._indexes, ds._variables, ds._dims, check_default=check_default_indexes\n-        )\n+    assert ds._indexes is not None\n+    _assert_indexes_invariants_checks(\n+        ds._indexes, ds._variables, ds._dims, check_default=check_default_indexes\n+    )\n \n     assert isinstance(ds._encoding, type(None) | dict)\n     assert isinstance(ds._attrs, type(None) | dict)",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/testing/assertions.py::_assert_dataset_invariants"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

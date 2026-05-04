@@ -1,0 +1,421 @@
+diff --git a/dummyserver/asgi_proxy.py b/dummyserver/asgi_proxy.py
+index 107c5e0..00c0a1b 100755
+--- a/dummyserver/asgi_proxy.py
++++ b/dummyserver/asgi_proxy.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import ssl
+ import typing
+ 
+ import httpx
+@@ -29,7 +30,10 @@ async def _read_body(receive: ASGIReceiveCallable) -> bytes:
+ 
+ class ProxyApp:
+     def __init__(self, upstream_ca_certs: str | None = None):
+-        self.upstream_ca_certs = upstream_ca_certs
++        self.ssl_context = None
++        if upstream_ca_certs:
++            self.ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
++            self.ssl_context.load_verify_locations(cafile=upstream_ca_certs)
+ 
+     async def __call__(
+         self, scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable
+@@ -48,7 +52,7 @@ class ProxyApp:
+         receive: ASGIReceiveCallable,
+         send: ASGISendCallable,
+     ) -> None:
+-        async with httpx.AsyncClient(verify=self.upstream_ca_certs or True) as client:
++        async with httpx.AsyncClient(verify=self.ssl_context or True) as client:
+             client_response = await client.request(
+                 method=scope["method"],
+                 url=scope["path"],
+
+diff --git a/dummyserver/hypercornserver.py b/dummyserver/hypercornserver.py
+index 5863033..f90f4e3 100644
+--- a/dummyserver/hypercornserver.py
++++ b/dummyserver/hypercornserver.py
+@@ -1,15 +1,14 @@
+ from __future__ import annotations
+ 
+-import concurrent.futures
+ import contextlib
+ import errno
+ import functools
+ import socket
+ import sys
+-import threading
+-import traceback
+ import typing
+ 
++import anyio.abc
++import anyio.to_thread
+ import hypercorn
+ import hypercorn.config
+ import hypercorn.trio
+@@ -80,37 +79,25 @@ class Config(hypercorn.Config):
+         return sockets
+ 
+ 
+-# https://github.com/pgjones/hypercorn/blob/19dfb96411575a6a647cdea63fa581b48ebb9180/src/hypercorn/utils.py#L172-L178
+-async def graceful_shutdown(shutdown_event: threading.Event) -> None:
+-    while True:
+-        if shutdown_event.is_set():
+-            return
+-        await trio.sleep(0.1)
+-
+-
+ async def _start_server(
+     config: Config,
+     app: QuartTrio,
+-    ready_event: threading.Event,
+-    shutdown_event: threading.Event,
++    shutdown_event: trio.Event,
++    *,
++    task_status: anyio.abc.TaskStatus[list[str]] = anyio.TASK_STATUS_IGNORED,
+ ) -> None:
+     async with trio.open_nursery() as nursery:
+-        try:
+-            config.bind = await nursery.start(
++        with trio.fail_after(5):
++            config_bind: list[str]
++            config_bind = await nursery.start(
+                 functools.partial(
+                     hypercorn.trio.serve,
+                     app,
+                     config,
+-                    shutdown_trigger=functools.partial(
+-                        graceful_shutdown, shutdown_event
+-                    ),
++                    shutdown_trigger=shutdown_event.wait,
+                 )
+             )
+-            ready_event.set()
+-        except Exception:
+-            print("Starting server failed", file=sys.stderr)
+-            traceback.print_exc()
+-            raise
++        task_status.started(config_bind)
+ 
+ 
+ @contextlib.contextmanager
+@@ -129,30 +116,18 @@ def run_hypercorn_in_thread(
+             config.alpn_protocols = certs["alpn_protocols"]
+     config.bind = [f"{host}:0"]
+ 
+-    ready_event = threading.Event()
+-    shutdown_event = threading.Event()
+-
+-    with concurrent.futures.ThreadPoolExecutor(
+-        1, thread_name_prefix="hypercorn dummyserver"
+-    ) as executor:
+-        future = executor.submit(
+-            trio.run,
+-            _start_server,
+-            config,
+-            app,
+-            ready_event,
+-            shutdown_event,
+-        )
+-        ready_event.wait(5)
+-        if not ready_event.is_set():
+-            raise Exception("most likely failed to start server")
++    shutdown_event = trio.Event()
+ 
++    with anyio.from_thread.start_blocking_portal(backend="trio") as portal:
++        future, config_bind = portal.start_task(
++            _start_server, config, app, shutdown_event
++        )
+         try:
+-            port = parse_url(config.bind[0]).port
++            port = parse_url(config_bind[0]).port
+             assert port is not None
+             yield port
+         finally:
+-            shutdown_event.set()
++            portal.call(shutdown_event.set)
+             future.result()
+ 
+ 
+@@ -162,9 +137,8 @@ def main() -> int:
+ 
+     config = Config()
+     config.bind = ["localhost:0"]
+-    ready_event = threading.Event()
+-    shutdown_event = threading.Event()
+-    trio.run(_start_server, config, hypercorn_app, ready_event, shutdown_event)
++    shutdown_event = trio.Event()
++    trio.run(_start_server, config, hypercorn_app, shutdown_event)
+     return 0
+ 
+ 
+
+diff --git a/src/urllib3/_version.py b/src/urllib3/_version.py
+index af6144b..1a3a320 100644
+--- a/src/urllib3/_version.py
++++ b/src/urllib3/_version.py
+@@ -1,8 +1,13 @@
+-# file generated by setuptools_scm
++# file generated by setuptools-scm
+ # don't change, don't track in version control
++
++__all__ = ["__version__", "__version_tuple__", "version", "version_tuple"]
++
+ TYPE_CHECKING = False
+ if TYPE_CHECKING:
+-    from typing import Tuple, Union
++    from typing import Tuple
++    from typing import Union
++
+     VERSION_TUPLE = Tuple[Union[int, str], ...]
+ else:
+     VERSION_TUPLE = object
+@@ -12,5 +17,5 @@ __version__: str
+ __version_tuple__: VERSION_TUPLE
+ version_tuple: VERSION_TUPLE
+ 
+-__version__ = version = '2.3.0'
+-__version_tuple__ = version_tuple = (2, 3, 0)
++__version__ = version = '2.4.0'
++__version_tuple__ = version_tuple = (2, 4, 0)
+
+diff --git a/src/urllib3/contrib/emscripten/response.py b/src/urllib3/contrib/emscripten/response.py
+index b32b402..cb1088a 100644
+--- a/src/urllib3/contrib/emscripten/response.py
++++ b/src/urllib3/contrib/emscripten/response.py
+@@ -160,26 +160,18 @@ class EmscriptenHttpResponseWrapper(BaseHTTPResponse):
+                 # don't cache partial content
+                 cache_content = False
+                 data = self._response.body.read(amt)
+-                if self.length_remaining is not None:
+-                    self.length_remaining = max(self.length_remaining - len(data), 0)
+-                if (self.length_is_certain and self.length_remaining == 0) or len(
+-                    data
+-                ) < amt:
+-                    # definitely finished reading, close response stream
+-                    self._response.body.close()
+-                return typing.cast(bytes, data)
+             else:  # read all we can (and cache it)
+                 data = self._response.body.read()
+                 if cache_content:
+                     self._body = data
+-                if self.length_remaining is not None:
+-                    self.length_remaining = max(self.length_remaining - len(data), 0)
+-                if len(data) == 0 or (
+-                    self.length_is_certain and self.length_remaining == 0
+-                ):
+-                    # definitely finished reading, close response stream
+-                    self._response.body.close()
+-                return typing.cast(bytes, data)
++            if self.length_remaining is not None:
++                self.length_remaining = max(self.length_remaining - len(data), 0)
++            if len(data) == 0 or (
++                self.length_is_certain and self.length_remaining == 0
++            ):
++                # definitely finished reading, close response stream
++                self._response.body.close()
++            return typing.cast(bytes, data)
+ 
+     def read_chunked(
+         self,
+
+diff --git a/src/urllib3/contrib/pyopenssl.py b/src/urllib3/contrib/pyopenssl.py
+index ed65430..3714500 100644
+--- a/src/urllib3/contrib/pyopenssl.py
++++ b/src/urllib3/contrib/pyopenssl.py
+@@ -424,6 +424,7 @@ class PyOpenSSLContext:
+         self.check_hostname = False
+         self._minimum_version: int = ssl.TLSVersion.MINIMUM_SUPPORTED
+         self._maximum_version: int = ssl.TLSVersion.MAXIMUM_SUPPORTED
++        self._verify_flags: int = ssl.VERIFY_X509_TRUSTED_FIRST
+ 
+     @property
+     def options(self) -> int:
+@@ -434,6 +435,15 @@ class PyOpenSSLContext:
+         self._options = value
+         self._set_ctx_options()
+ 
++    @property
++    def verify_flags(self) -> int:
++        return self._verify_flags
++
++    @verify_flags.setter
++    def verify_flags(self, value: int) -> None:
++        self._verify_flags = value
++        self._ctx.get_cert_store().set_flags(self._verify_flags)
++
+     @property
+     def verify_mode(self) -> int:
+         return _openssl_to_stdlib_verify[self._ctx.get_verify_mode()]
+
+diff --git a/src/urllib3/exceptions.py b/src/urllib3/exceptions.py
+index 0394578..a0de9d6 100644
+--- a/src/urllib3/exceptions.py
++++ b/src/urllib3/exceptions.py
+@@ -31,11 +31,12 @@ class PoolError(HTTPError):
+ 
+     def __init__(self, pool: ConnectionPool, message: str) -> None:
+         self.pool = pool
++        self._message = message
+         super().__init__(f"{pool}: {message}")
+ 
+     def __reduce__(self) -> _TYPE_REDUCE_RESULT:
+         # For pickling purposes.
+-        return self.__class__, (None, None)
++        return self.__class__, (None, self._message)
+ 
+ 
+ class RequestError(PoolError):
+@@ -47,7 +48,7 @@ class RequestError(PoolError):
+ 
+     def __reduce__(self) -> _TYPE_REDUCE_RESULT:
+         # For pickling purposes.
+-        return self.__class__, (None, self.url, None)
++        return self.__class__, (None, self.url, self._message)
+ 
+ 
+ class SSLError(HTTPError):
+@@ -100,6 +101,10 @@ class MaxRetryError(RequestError):
+ 
+         super().__init__(pool, url, message)
+ 
++    def __reduce__(self) -> _TYPE_REDUCE_RESULT:
++        # For pickling purposes.
++        return self.__class__, (None, self.url, self.reason)
++
+ 
+ class HostChangedError(RequestError):
+     """Raised when an existing pool gets a request for a foreign host."""
+@@ -139,11 +144,12 @@ class NewConnectionError(ConnectTimeoutError, HTTPError):
+ 
+     def __init__(self, conn: HTTPConnection, message: str) -> None:
+         self.conn = conn
++        self._message = message
+         super().__init__(f"{conn}: {message}")
+ 
+     def __reduce__(self) -> _TYPE_REDUCE_RESULT:
+         # For pickling purposes.
+-        return self.__class__, (None, None)
++        return self.__class__, (None, self._message)
+ 
+     @property
+     def pool(self) -> HTTPConnection:
+@@ -162,11 +168,13 @@ class NameResolutionError(NewConnectionError):
+ 
+     def __init__(self, host: str, conn: HTTPConnection, reason: socket.gaierror):
+         message = f"Failed to resolve '{host}' ({reason})"
++        self._host = host
++        self._reason = reason
+         super().__init__(conn, message)
+ 
+     def __reduce__(self) -> _TYPE_REDUCE_RESULT:
+         # For pickling purposes.
+-        return self.__class__, (None, None, None)
++        return self.__class__, (self._host, None, self._reason)
+ 
+ 
+ class EmptyPoolError(PoolError):
+
+diff --git a/src/urllib3/http2/connection.py b/src/urllib3/http2/connection.py
+index f486145..d082239 100644
+--- a/src/urllib3/http2/connection.py
++++ b/src/urllib3/http2/connection.py
+@@ -140,7 +140,7 @@ class HTTP2Connection(HTTPSConnection):
+         with self._h2_conn as conn:
+             self._h2_stream = conn.get_next_available_stream_id()
+ 
+-    def putheader(self, header: str | bytes, *values: str | bytes) -> None:
++    def putheader(self, header: str | bytes, *values: str | bytes) -> None:  # type: ignore[override]
+         # TODO SKIPPABLE_HEADERS from urllib3 are ignored.
+         header = header.encode() if isinstance(header, str) else header
+         header = header.lower()  # A lot of upstream code uses capitalized headers.
+
+diff --git a/src/urllib3/util/ssl_.py b/src/urllib3/util/ssl_.py
+index 278128e..e43bd8f 100644
+--- a/src/urllib3/util/ssl_.py
++++ b/src/urllib3/util/ssl_.py
+@@ -101,6 +101,7 @@ try:  # Do we have ssl at all?
+         OPENSSL_VERSION_NUMBER,
+         PROTOCOL_TLS,
+         PROTOCOL_TLS_CLIENT,
++        VERIFY_X509_STRICT,
+         OP_NO_SSLv2,
+         OP_NO_SSLv3,
+         SSLContext,
+@@ -109,6 +110,9 @@ try:  # Do we have ssl at all?
+ 
+     PROTOCOL_SSLv23 = PROTOCOL_TLS
+ 
++    # Needed for Python 3.9 which does not define this
++    VERIFY_X509_PARTIAL_CHAIN = getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0x80000)
++
+     # Setting SSLContext.hostname_checks_common_name = False didn't work before CPython
+     # 3.9.3, and 3.10 (but OK on PyPy) or OpenSSL 1.1.1l+
+     if HAS_NEVER_CHECK_COMMON_NAME and not _is_has_never_check_common_name_reliable(
+@@ -117,7 +121,7 @@ try:  # Do we have ssl at all?
+         sys.implementation.name,
+         sys.version_info,
+         sys.pypy_version_info if sys.implementation.name == "pypy" else None,  # type: ignore[attr-defined]
+-    ):
++    ):  # Defensive: for Python < 3.9.3
+         HAS_NEVER_CHECK_COMMON_NAME = False
+ 
+     # Need to be careful here in case old TLS versions get
+@@ -138,6 +142,8 @@ except ImportError:
+     OP_NO_SSLv3 = 0x2000000  # type: ignore[assignment]
+     PROTOCOL_SSLv23 = PROTOCOL_TLS = 2  # type: ignore[assignment]
+     PROTOCOL_TLS_CLIENT = 16  # type: ignore[assignment]
++    VERIFY_X509_PARTIAL_CHAIN = 0x80000
++    VERIFY_X509_STRICT = 0x20  # type: ignore[assignment]
+ 
+ 
+ _TYPE_PEER_CERT_RET = typing.Union["_TYPE_PEER_CERT_RET_DICT", bytes, None]
+@@ -223,6 +229,7 @@ def create_urllib3_context(
+     ciphers: str | None = None,
+     ssl_minimum_version: int | None = None,
+     ssl_maximum_version: int | None = None,
++    verify_flags: int | None = None,
+ ) -> ssl.SSLContext:
+     """Creates and configures an :class:`ssl.SSLContext` instance for use with urllib3.
+ 
+@@ -247,6 +254,9 @@ def create_urllib3_context(
+     :param ciphers:
+         Which cipher suites to allow the server to select. Defaults to either system configured
+         ciphers if OpenSSL 1.1.1+, otherwise uses a secure default set of ciphers.
++    :param verify_flags:
++        The flags for certificate verification operations. These default to
++        ``ssl.VERIFY_X509_PARTIAL_CHAIN`` and ``ssl.VERIFY_X509_STRICT`` for Python 3.13+.
+     :returns:
+         Constructed SSLContext object with specified options
+     :rtype: SSLContext
+@@ -320,6 +330,16 @@ def create_urllib3_context(
+ 
+     context.options |= options
+ 
++    if verify_flags is None:
++        verify_flags = 0
++        # In Python 3.13+ ssl.create_default_context() sets VERIFY_X509_PARTIAL_CHAIN
++        # and VERIFY_X509_STRICT so we do the same
++        if sys.version_info >= (3, 13):
++            verify_flags |= VERIFY_X509_PARTIAL_CHAIN
++            verify_flags |= VERIFY_X509_STRICT
++
++    context.verify_flags |= verify_flags
++
+     # Enable post-handshake authentication for TLS 1.3, see GH #1634. PHA is
+     # necessary for conditional client cert authentication with TLS 1.3.
+     # The attribute is None for OpenSSL <= 1.1.0 or does not exist when using
+
+diff --git a/src/urllib3/util/ssl_match_hostname.py b/src/urllib3/util/ssl_match_hostname.py
+index 453cfd4..25d9100 100644
+--- a/src/urllib3/util/ssl_match_hostname.py
++++ b/src/urllib3/util/ssl_match_hostname.py
+@@ -146,7 +146,7 @@ def match_hostname(
+                 if key == "commonName":
+                     if _dnsname_match(value, hostname):
+                         return
+-                    dnsnames.append(value)
++                    dnsnames.append(value)  # Defensive: for Python < 3.9.3
+ 
+     if len(dnsnames) > 1:
+         raise CertificateError(

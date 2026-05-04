@@ -1,0 +1,196 @@
+diff --git a/scripts/prepare-release-pr.py b/scripts/prepare-release-pr.py
+index a0e5e4d..8ffa669 100644
+--- a/scripts/prepare-release-pr.py
++++ b/scripts/prepare-release-pr.py
+@@ -31,16 +31,22 @@ class InvalidFeatureRelease(Exception):
+ SLUG = "pytest-dev/pytest"
+ 
+ PR_BODY = """\
+-Created by the [prepare release pr](https://github.com/pytest-dev/pytest/actions/workflows/prepare-release-pr.yml)
+-workflow.
++Created by the [prepare release pr]\
++(https://github.com/pytest-dev/pytest/actions/workflows/prepare-release-pr.yml) workflow.
+ 
+-Once all builds pass and it has been **approved** by one or more maintainers,
+-start the [deploy](https://github.com/pytest-dev/pytest/actions/workflows/deploy.yml) workflow, using these parameters:
++Once all builds pass and it has been **approved** by one or more maintainers, start the \
++[deploy](https://github.com/pytest-dev/pytest/actions/workflows/deploy.yml) workflow, using these parameters:
+ 
+ * `Use workflow from`: `release-{version}`.
+ * `Release version`: `{version}`.
+ 
+-After the `deploy` workflow has been approved by a core maintainer, the package will be uploaded to PyPI automatically.
++Or execute on the command line:
++
++```console
++gh workflow run deploy.yml -r release-{version} -f version={version}
++```
++
++After the workflow has been approved by a core maintainer, the package will be uploaded to PyPI automatically.
+ """
+ 
+ 
+
+diff --git a/src/_pytest/_version.py b/src/_pytest/_version.py
+index d530ef4..458d065 100644
+--- a/src/_pytest/_version.py
++++ b/src/_pytest/_version.py
+@@ -12,5 +12,5 @@ __version__: str
+ __version_tuple__: VERSION_TUPLE
+ version_tuple: VERSION_TUPLE
+ 
+-__version__ = version = '7.4.3'
+-__version_tuple__ = version_tuple = (7, 4, 3)
++__version__ = version = '7.4.4'
++__version_tuple__ = version_tuple = (7, 4, 4)
+
+diff --git a/src/_pytest/assertion/rewrite.py b/src/_pytest/assertion/rewrite.py
+index fd23552..d1974bb 100644
+--- a/src/_pytest/assertion/rewrite.py
++++ b/src/_pytest/assertion/rewrite.py
+@@ -604,6 +604,13 @@ def _get_assertion_exprs(src: bytes) -> Dict[int, str]:
+     return ret
+ 
+ 
++def _get_ast_constant_value(value: astStr) -> object:
++    if sys.version_info >= (3, 8):
++        return value.value
++    else:
++        return value.s
++
++
+ class AssertionRewriter(ast.NodeVisitor):
+     """Assertion rewriting implementation.
+ 
+@@ -700,11 +707,10 @@ class AssertionRewriter(ast.NodeVisitor):
+                 expect_docstring
+                 and isinstance(item, ast.Expr)
+                 and isinstance(item.value, astStr)
++                and isinstance(_get_ast_constant_value(item.value), str)
+             ):
+-                if sys.version_info >= (3, 8):
+-                    doc = item.value.value
+-                else:
+-                    doc = item.value.s
++                doc = _get_ast_constant_value(item.value)
++                assert isinstance(doc, str)
+                 if self.is_rewrite_disabled(doc):
+                     return
+                 expect_docstring = False
+
+diff --git a/src/_pytest/assertion/util.py b/src/_pytest/assertion/util.py
+index fc5dfdb..39ca540 100644
+--- a/src/_pytest/assertion/util.py
++++ b/src/_pytest/assertion/util.py
+@@ -132,7 +132,7 @@ def isiterable(obj: Any) -> bool:
+     try:
+         iter(obj)
+         return not istext(obj)
+-    except TypeError:
++    except Exception:
+         return False
+ 
+ 
+
+diff --git a/src/_pytest/faulthandler.py b/src/_pytest/faulthandler.py
+index 36040bf..d8c7e9f 100644
+--- a/src/_pytest/faulthandler.py
++++ b/src/_pytest/faulthandler.py
+@@ -9,8 +9,8 @@ from _pytest.nodes import Item
+ from _pytest.stash import StashKey
+ 
+ 
++fault_handler_original_stderr_fd_key = StashKey[int]()
+ fault_handler_stderr_fd_key = StashKey[int]()
+-fault_handler_originally_enabled_key = StashKey[bool]()
+ 
+ 
+ def pytest_addoption(parser: Parser) -> None:
+@@ -24,8 +24,15 @@ def pytest_addoption(parser: Parser) -> None:
+ def pytest_configure(config: Config) -> None:
+     import faulthandler
+ 
+-    config.stash[fault_handler_stderr_fd_key] = os.dup(get_stderr_fileno())
+-    config.stash[fault_handler_originally_enabled_key] = faulthandler.is_enabled()
++    # at teardown we want to restore the original faulthandler fileno
++    # but faulthandler has no api to return the original fileno
++    # so here we stash the stderr fileno to be used at teardown
++    # sys.stderr and sys.__stderr__ may be closed or patched during the session
++    # so we can't rely on their values being good at that point (#11572).
++    stderr_fileno = get_stderr_fileno()
++    if faulthandler.is_enabled():
++        config.stash[fault_handler_original_stderr_fd_key] = stderr_fileno
++    config.stash[fault_handler_stderr_fd_key] = os.dup(stderr_fileno)
+     faulthandler.enable(file=config.stash[fault_handler_stderr_fd_key])
+ 
+ 
+@@ -37,9 +44,10 @@ def pytest_unconfigure(config: Config) -> None:
+     if fault_handler_stderr_fd_key in config.stash:
+         os.close(config.stash[fault_handler_stderr_fd_key])
+         del config.stash[fault_handler_stderr_fd_key]
+-    if config.stash.get(fault_handler_originally_enabled_key, False):
+-        # Re-enable the faulthandler if it was originally enabled.
+-        faulthandler.enable(file=get_stderr_fileno())
++    # Re-enable the faulthandler if it was originally enabled.
++    if fault_handler_original_stderr_fd_key in config.stash:
++        faulthandler.enable(config.stash[fault_handler_original_stderr_fd_key])
++        del config.stash[fault_handler_original_stderr_fd_key]
+ 
+ 
+ def get_stderr_fileno() -> int:
+
+diff --git a/src/_pytest/junitxml.py b/src/_pytest/junitxml.py
+index ed259e4..9ee35b8 100644
+--- a/src/_pytest/junitxml.py
++++ b/src/_pytest/junitxml.py
+@@ -369,7 +369,7 @@ def record_testsuite_property(request: FixtureRequest) -> Callable[[str, object]
+     __tracebackhide__ = True
+ 
+     def record_func(name: str, value: object) -> None:
+-        """No-op function in case --junitxml was not passed in the command-line."""
++        """No-op function in case --junit-xml was not passed in the command-line."""
+         __tracebackhide__ = True
+         _check_record_param_type("name", name)
+ 
+
+diff --git a/src/_pytest/nodes.py b/src/_pytest/nodes.py
+index 667a02b..a5313cb 100644
+--- a/src/_pytest/nodes.py
++++ b/src/_pytest/nodes.py
+@@ -567,7 +567,7 @@ class Collector(Node):
+             ntraceback = traceback.cut(path=self.path)
+             if ntraceback == traceback:
+                 ntraceback = ntraceback.cut(excludepath=tracebackcutdir)
+-            return excinfo.traceback.filter(excinfo)
++            return ntraceback.filter(excinfo)
+         return excinfo.traceback
+ 
+ 
+
+diff --git a/src/_pytest/outcomes.py b/src/_pytest/outcomes.py
+index 1be97dd..53c3e15 100644
+--- a/src/_pytest/outcomes.py
++++ b/src/_pytest/outcomes.py
+@@ -123,7 +123,7 @@ def exit(
+         only because `msg` is deprecated.
+ 
+     :param returncode:
+-        Return code to be used when exiting pytest.
++        Return code to be used when exiting pytest. None means the same as ``0`` (no error), same as :func:`sys.exit`.
+ 
+     :param msg:
+         Same as ``reason``, but deprecated. Will be removed in a future version, use ``reason`` instead.
+
+diff --git a/src/_pytest/pytester.py b/src/_pytest/pytester.py
+index cdfc2c0..0771065 100644
+--- a/src/_pytest/pytester.py
++++ b/src/_pytest/pytester.py
+@@ -1074,7 +1074,7 @@ class Pytester:
+         return self.inline_run(*values)
+ 
+     def inline_genitems(self, *args) -> Tuple[List[Item], HookRecorder]:
+-        """Run ``pytest.main(['--collectonly'])`` in-process.
++        """Run ``pytest.main(['--collect-only'])`` in-process.
+ 
+         Runs the :py:func:`pytest.main` function to run all of pytest inside
+         the test process itself like :py:meth:`inline_run`, but returns a

@@ -1,0 +1,291 @@
+{
+  "old_dir": ".packages/poetry/1.8.1",
+  "new_dir": ".packages/poetry/1.8.2",
+  "extracted_at": "2026-04-24T01:19:34.808848",
+  "diff_file": "confirmed/poetry_1.5.0_to_1.8.5/1.8.2/differences/test_diff_v1.8.1_to_v1.8.2.diff",
+  "diff_content": "diff --git a/tests/conftest.py b/tests/conftest.py\nindex 796df5f..5955c81 100644\n--- a/tests/conftest.py\n+++ b/tests/conftest.py\n@@ -37,6 +37,7 @@ from tests.helpers import MOCK_DEFAULT_GIT_REVISION\n from tests.helpers import TestLocker\n from tests.helpers import TestRepository\n from tests.helpers import get_package\n+from tests.helpers import http_setup_redirect\n from tests.helpers import isolated_environment\n from tests.helpers import mock_clone\n from tests.helpers import mock_download\n@@ -321,6 +322,11 @@ def http() -> Iterator[type[httpretty.httpretty]]:\n         yield httpretty\n \n \n+@pytest.fixture\n+def http_redirector(http: type[httpretty.httpretty]) -> None:\n+    http_setup_redirect(http, http.HEAD, http.GET, http.PUT, http.POST)\n+\n+\n @pytest.fixture\n def project_root() -> Path:\n     return Path(__file__).parent.parent\n@@ -513,3 +519,9 @@ def venv_flags_default() -> dict[str, bool]:\n         \"no-pip\": False,\n         \"no-setuptools\": False,\n     }\n+\n+\n+@pytest.fixture(autouse=(os.name == \"nt\"))\n+def httpretty_windows_mock_urllib3_wait_for_socket(mocker: MockerFixture) -> None:\n+    # this is a workaround for https://github.com/gabrielfalcao/HTTPretty/issues/442\n+    mocker.patch(\"urllib3.util.wait.select_wait_for_socket\", returns=True)\n\ndiff --git a/tests/console/commands/test_add.py b/tests/console/commands/test_add.py\nindex f334f58..503848d 100644\n--- a/tests/console/commands/test_add.py\n+++ b/tests/console/commands/test_add.py\n@@ -101,6 +101,29 @@ Writing lock file\n     assert content[\"dependencies\"][\"cachy\"] == \"^0.2.0\"\n \n \n+def test_add_non_package_mode_no_name(\n+    repo: TestRepository,\n+    project_factory: ProjectFactory,\n+    command_tester_factory: CommandTesterFactory,\n+) -> None:\n+    repo.add_package(get_package(\"cachy\", \"0.2.0\"))\n+\n+    poetry = project_factory(\n+        name=\"foobar\", pyproject_content=\"[tool.poetry]\\npackage-mode = false\\n\"\n+    )\n+    tester = command_tester_factory(\"add\", poetry=poetry)\n+    tester.execute(\"cachy\")\n+\n+    assert isinstance(tester.command, InstallerCommand)\n+    assert tester.command.installer.executor.installations_count == 1\n+\n+    pyproject: dict[str, Any] = poetry.file.read()\n+    content = pyproject[\"tool\"][\"poetry\"]\n+\n+    assert \"cachy\" in content[\"dependencies\"]\n+    assert content[\"dependencies\"][\"cachy\"] == \"^0.2.0\"\n+\n+\n def test_add_replace_by_constraint(\n     app: PoetryTestApplication, repo: TestRepository, tester: CommandTester\n ) -> None:\n\ndiff --git a/tests/helpers.py b/tests/helpers.py\nindex c7f9576..d222a7b 100644\n--- a/tests/helpers.py\n+++ b/tests/helpers.py\n@@ -29,6 +29,9 @@ if TYPE_CHECKING:\n     from typing import Any\n     from typing import Mapping\n \n+    import httpretty\n+\n+    from httpretty.core import HTTPrettyRequest\n     from poetry.core.constraints.version import Version\n     from poetry.core.packages.dependency import Dependency\n     from pytest_mock import MockerFixture\n@@ -38,6 +41,7 @@ if TYPE_CHECKING:\n     from poetry.installation.operations.operation import Operation\n     from poetry.poetry import Poetry\n     from poetry.utils.authenticator import Authenticator\n+    from tests.types import HTTPrettyResponse\n \n FIXTURE_PATH = Path(__file__).parent / \"fixtures\"\n \n@@ -321,3 +325,25 @@ def flatten_dict(obj: Mapping[str, Any], delimiter: str = \".\") -> Mapping[str, A\n             yield ([], obj)\n \n     return {delimiter.join(path): value for path, value in recurse_keys(obj)}\n+\n+\n+def http_setup_redirect(\n+    http: type[httpretty.httpretty], *methods: str, status_code: int = 301\n+) -> None:\n+    redirect_uri_regex = re.compile(\"^(?P<protocol>https?)://redirect.(?P<uri>.*)$\")\n+\n+    def redirect_request_callback(\n+        request: HTTPrettyRequest, uri: str, headers: dict[str, Any]\n+    ) -> HTTPrettyResponse:\n+        redirect_uri_match = redirect_uri_regex.match(uri)\n+        assert redirect_uri_match is not None\n+        redirect_uri = f\"{redirect_uri_match.group('protocol')}://{redirect_uri_match.group('uri')}\"\n+        return status_code, {\"Location\": redirect_uri}, b\"\"\n+\n+    for method in methods:\n+        http.register_uri(\n+            method,\n+            redirect_uri_regex,\n+            status=status_code,\n+            body=redirect_request_callback,\n+        )\n\ndiff --git a/tests/inspection/test_lazy_wheel.py b/tests/inspection/test_lazy_wheel.py\nindex 0d22fcc..db149fb 100644\n--- a/tests/inspection/test_lazy_wheel.py\n+++ b/tests/inspection/test_lazy_wheel.py\n@@ -2,36 +2,36 @@ from __future__ import annotations\n \n import re\n \n+from enum import IntEnum\n from pathlib import Path\n from typing import TYPE_CHECKING\n from typing import Any\n-from typing import Dict\n from typing import Protocol\n-from typing import Tuple\n from urllib.parse import urlparse\n \n-import httpretty\n import pytest\n import requests\n \n from requests import codes\n \n+from poetry.inspection.lazy_wheel import HTTPRangeRequestNotRespected\n from poetry.inspection.lazy_wheel import HTTPRangeRequestUnsupported\n from poetry.inspection.lazy_wheel import InvalidWheel\n+from poetry.inspection.lazy_wheel import LazyWheelUnsupportedError\n from poetry.inspection.lazy_wheel import metadata_from_wheel_url\n+from tests.helpers import http_setup_redirect\n \n \n if TYPE_CHECKING:\n-    from collections.abc import Callable\n+    import httpretty\n \n     from httpretty.core import HTTPrettyRequest\n+    from pytest_mock import MockerFixture\n \n     from tests.types import FixtureDirGetter\n-\n-    HTTPrettyResponse = Tuple[int, Dict[str, Any], bytes]  # status code, headers, body\n-    HTTPrettyRequestCallback = Callable[\n-        [HTTPrettyRequest, str, Dict[str, Any]], HTTPrettyResponse\n-    ]\n+    from tests.types import HTTPPrettyRequestCallbackWrapper\n+    from tests.types import HTTPrettyRequestCallback\n+    from tests.types import HTTPrettyResponse\n \n     class RequestCallbackFactory(Protocol):\n         def __call__(\n@@ -39,10 +39,25 @@ if TYPE_CHECKING:\n             *,\n             accept_ranges: str | None = \"bytes\",\n             negative_offset_error: tuple[int, bytes] | None = None,\n+            ignore_accept_ranges: bool = False,\n         ) -> HTTPrettyRequestCallback: ...\n \n+    class AssertMetadataFromWheelUrl(Protocol):\n+        def __call__(\n+            self,\n+            *,\n+            accept_ranges: str | None = \"bytes\",\n+            negative_offset_error: tuple[int, bytes] | None = None,\n+            expected_requests: int = 3,\n+            request_callback_wrapper: HTTPPrettyRequestCallbackWrapper | None = None,\n+            redirect: bool = True,\n+        ) -> None: ...\n+\n \n-NEGATIVE_OFFSET_AS_POSITIVE = -1\n+class NegativeOffsetFailure(IntEnum):\n+    # numbers must be negative to avoid conflicts with HTTP status codes\n+    as_positive = -1  # JFrog Artifactory bug (RTDEV-38572)\n+    one_more = -2  # JFrog Artifactory bug (one more byte than requested)\n \n \n def build_head_response(\n@@ -59,7 +74,7 @@ def build_partial_response(\n     wheel_bytes: bytes,\n     response_headers: dict[str, Any],\n     *,\n-    negative_offset_as_positive: bool = False,\n+    negative_offset_failure: NegativeOffsetFailure | None = None,\n ) -> HTTPrettyResponse:\n     status_code = 206\n     response_headers[\"Accept-Ranges\"] = \"bytes\"\n@@ -67,11 +82,18 @@ def build_partial_response(\n     if rng.startswith(\"-\"):\n         # negative offset\n         offset = int(rng)\n-        if negative_offset_as_positive:\n+        if negative_offset_failure == NegativeOffsetFailure.as_positive:\n             # some servers interpret a negative offset like \"-10\" as \"0-10\"\n             start = 0\n             end = min(-offset, total_length - 1)\n             body = wheel_bytes[start : end + 1]\n+        elif negative_offset_failure == NegativeOffsetFailure.one_more:\n+            # https://github.com/python-poetry/poetry/issues/9056#issuecomment-1973273721\n+            offset -= 1  # one more byte\n+            start = total_length + offset  # negative start of content range possible!\n+            end = total_length - 1\n+            body = wheel_bytes[offset:]\n+            response_headers[\"Content-Length\"] = -offset  # just wrong...\n         else:\n             start = total_length + offset\n             if start < 0:\n@@ -93,6 +115,7 @@ def handle_request_factory(fixture_dir: FixtureDirGetter) -> RequestCallbackFact\n         *,\n         accept_ranges: str | None = \"bytes\",\n         negative_offset_error: tuple[int, bytes] | None = None,\n+        ignore_accept_ranges: bool = False,\n     ) -> HTTPrettyRequestCallback:\n         def handle_request(\n             request: HTTPrettyRequest, uri: str, response_headers: dict[str, Any]\n@@ -122,24 +145,26 @@ def handle_request_factory(fixture_dir: FixtureDirGetter) -> RequestCallbackFact\n \n             rng = request.headers.get(\"Range\", \"=\").split(\"=\")[1]\n \n-            negative_offset_as_positive = False\n+            negative_offset_failure = None\n             if negative_offset_error and rng.startswith(\"-\"):\n                 if negative_offset_error[0] == codes.requested_range_not_satisfiable:\n                     response_headers[\"Content-Range\"] = f\"bytes */{len(wheel_bytes)}\"\n-                if negative_offset_error[0] == NEGATIVE_OFFSET_AS_POSITIVE:\n-                    negative_offset_as_positive = True\n+                if negative_offset_error[0] == NegativeOffsetFailure.as_positive:\n+                    negative_offset_failure = NegativeOffsetFailure.as_positive\n+                elif negative_offset_error[0] == NegativeOffsetFailure.one_more:\n+                    negative_offset_failure = NegativeOffsetFailure.one_more\n                 else:\n                     return (\n                         negative_offset_error[0],\n                         response_headers,\n                         negative_offset_error[1],\n                     )\n-            if accept_ranges == \"bytes\" and rng:\n+            if accept_ranges == \"bytes\" and rng and not ignore_accept_ranges:\n                 return build_partial_response(\n                     rng,\n                     wheel_bytes,\n                     response_headers,\n-                    negative_offset_as_positive=negative_offset_as_positive,\n+                    negative_offset_failure=negative_offset_failure,\n                 )\n \n             status_code = 200\n@@ -152,6 +177,55 @@ def handle_request_factory(fixture_dir: FixtureDirGetter) -> RequestCallbackFact\n     return _factory\n \n \n+@pytest.fixture\n+def assert_metadata_from_wheel_url(\n+    http: type[httpretty.httpretty],\n+    handle_request_factory: RequestCallbackFactory,\n+) -> AssertMetadataFromWheelUrl:\n+    def _assertion(\n+        *,\n+        accept_ranges: str | None = \"bytes\",\n+        negative_offset_error: tuple[int, bytes] | None = None,\n+        expected_requests: int = 3,\n+        request_callback_wrapper: HTTPPrettyRequestCallbackWrapper | None = None,\n+        redirect: bool = False,\n+    ) -> None:\n+        latest_requests = http.latest_requests()\n+        latest_requests.clear()\n+\n+        domain = (\n+            f\"lazy-wheel-{negative_offset_error[0] if negative_offset_error else 0}.com\"\n+        )\n+        uri_regex = re.compile(f\"^https://{domain}/.*$\")\n+        request_callback = handle_request_factory(\n+            accept_ranges=accept_ranges, negative_offset_error=negative_offset_error\n+        )\n+        if request_callback_wrapper is not None:\n+            request_callback = request_callback_wrapper(request_callback)\n+\n+        http.register_uri(http.GET, uri_regex, body=request_callback)\n+        http.register_uri(http.HEAD, uri_regex, body=request_callback)\n+\n+        if redirect:\n+            http_setup_redirect(http, http.GET, http.HEAD)\n+\n+        url_prefix = \"redirect.\" if redirect else \"\"\n+        url = f\"https://{url_prefix}{domain}/poetry_core-1.5.0-py3-none-any.whl\"\n+\n+        metadata = metadata_from_wheel_url(\"poetry-core\", url, requests.Session())\n+\n+        assert metadata[\"name\"] == \"poetry-core\"\n+        assert metadata[\"version\"] == \"1.5.0\"\n+        assert metadata[\"author\"] == \"Sébastien Eustace\"\n+        assert metadata[\"requires_dist\"] == [\n+            'importlib-metadata (>=1.7.0) ; python_version < \"3.8\"'\n+        ]\n+\n+        assert len(latest_requests) == expected_requests\n+\n+    return _assertion\n+\n+\n @pytest.mark.parametrize(\n     \"negative_offset_error\",\n     [\n@@ -161,35 +235,14 @@ def handle_request_factory(fixture_dir: FixtureDirGetter) -> RequestCallbackFact\n         (codes.requested_range_not_satisfiable, b\"Requested range not satisfiable\"),\n         (codes.internal_server_error, b\"Internal server error\"),  # GAR\n         (codes.not_implemented, b\"Unsupported client range\"),  # PyPI\n-        (NEGATIVE_OFFSET_AS_POSITIVE, b\"handle negative offset as positive\"),\n+        (NegativeOffsetFailure.as_positive, b\"handle negative offset as positive\"),\n+        (NegativeOffsetFailure.one_more, b\"one more byte than requested\"),\n     ],\n )\n def test_metadata_from_wheel_url(\n-    http: type[httpretty.httpretty],\n-    handle_request_factory: RequestCallbackFactory,\n+    assert_metadata_from_wheel_url: AssertMetadataFromWheelUrl,\n     negative_offset_error: tuple[int, bytes] | None,\n ) -> None:\n-    domain = (\n-        f\"lazy-wheel-{negative_offset_error[0] if negative_offset_error else 0}.com\"\n-    )\n-    uri_regex = re.compile(f\"^https://{domain}/.*$\")\n-    request_callback = handle_request_factory(\n-        negative_offset_error=negative_offset_error\n-    )\n-    http.register_uri(http.GET, uri_regex, body=request_callback)\n-    http.register_uri(http.HEAD, uri_regex, body=request_callback)\n-\n-    url = f\"https://{domain}/poetry_core-1.5.0-py3-none-any.whl\"\n-\n-    metadata = metadata_from_wheel_url(\"poetry-core\", url, requests.Session())\n-\n-    assert metadata[\"name\"] == \"poetry-core\"\n-    assert metadata[\"version\"] == \"1.5.0\"\n-    assert metadata[\"author\"] == \"Sébastien Eustace\"\n-    assert metadata[\"requires_dist\"] == [\n-        'importlib-metadata (>=1.7.0) ; python_version < \"3.8\"'\n-    ]\n-\n     # negative offsets supported:\n     # 1. end of central directory\n     # 2. whole central directory\n@@ -200,35 +253,99 @@ def test_metadata_from_wheel_url(\n     # 3.-5. see negative offsets 1.-3.\n     expected_requests = 3\n     if negative_offset_error:\n-        if negative_offset_error[0] in (\n+        if negative_offset_error[0] in {\n             codes.requested_range_not_satisfiable,\n-            NEGATIVE_OFFSET_AS_POSITIVE,\n-        ):\n+            NegativeOffsetFailure.as_positive,\n+            NegativeOffsetFailure.one_more,\n+        }:\n             expected_requests += 1\n         else:\n             expected_requests += 2\n-    latest_requests = http.latest_requests()\n-    assert len(latest_requests) == expected_requests\n+\n+    assert_metadata_from_wheel_url(\n+        negative_offset_error=negative_offset_error, expected_requests=expected_requests\n+    )\n \n     # second wheel -> one less request if negative offsets are not supported\n-    latest_requests.clear()\n-    metadata_from_wheel_url(\"poetry-core\", url, requests.Session())\n     expected_requests = min(expected_requests, 4)\n-    latest_requests = httpretty.latest_requests()\n-    assert len(latest_requests) == expected_requests\n+    assert_metadata_from_wheel_url(\n+        negative_offset_error=negative_offset_error, expected_requests=expected_requests\n+    )\n+\n+\n+def test_metadata_from_wheel_url_416_missing_content_range(\n+    assert_metadata_from_wheel_url: AssertMetadataFromWheelUrl,\n+) -> None:\n+    def request_callback_wrapper(\n+        request_callback: HTTPrettyRequestCallback,\n+    ) -> HTTPrettyRequestCallback:\n+        def _wrapped(\n+            request: HTTPrettyRequest, uri: str, response_headers: dict[str, Any]\n+        ) -> HTTPrettyResponse:\n+            status_code, response_headers, body = request_callback(\n+                request, uri, response_headers\n+            )\n+            return (\n+                status_code,\n+                {\n+                    header: response_headers[header]\n+                    for header in response_headers\n+                    if header.lower() != \"content-range\"\n+                },\n+                body,\n+            )\n+\n+        return _wrapped\n+\n+    assert_metadata_from_wheel_url(\n+        negative_offset_error=(\n+            codes.requested_range_not_satisfiable,\n+            b\"Requested range not satisfiable\",\n+        ),\n+        expected_requests=5,\n+        request_callback_wrapper=request_callback_wrapper,\n+    )\n+\n+\n+def test_metadata_from_wheel_url_with_redirect(\n+    assert_metadata_from_wheel_url: AssertMetadataFromWheelUrl,\n+) -> None:\n+    assert_metadata_from_wheel_url(\n+        negative_offset_error=None,\n+        expected_requests=6,\n+        redirect=True,\n+    )\n+\n+\n+def test_metadata_from_wheel_url_with_redirect_after_500(\n+    assert_metadata_from_wheel_url: AssertMetadataFromWheelUrl,\n+) -> None:\n+    assert_metadata_from_wheel_url(\n+        negative_offset_error=(codes.internal_server_error, b\"Internal server error\"),\n+        expected_requests=10,\n+        redirect=True,\n+    )\n \n \n-@pytest.mark.parametrize(\"negative_offset_as_positive\", [False, True])\n+@pytest.mark.parametrize(\n+    (\"negative_offset_failure\", \"expected_requests\"),\n+    [\n+        (None, 1),\n+        (NegativeOffsetFailure.as_positive, 1),\n+        (NegativeOffsetFailure.one_more, 2),\n+    ],\n+)\n def test_metadata_from_wheel_url_smaller_than_initial_chunk_size(\n     http: type[httpretty.httpretty],\n     handle_request_factory: RequestCallbackFactory,\n-    negative_offset_as_positive: bool,\n+    negative_offset_failure: NegativeOffsetFailure | None,\n+    expected_requests: int,\n ) -> None:\n-    domain = f\"tiny-wheel-{str(negative_offset_as_positive).casefold()}.com\"\n+    domain = f\"tiny-wheel-{str(negative_offset_failure).casefold()}.com\"\n     uri_regex = re.compile(f\"^https://{domain}/.*$\")\n     request_callback = handle_request_factory(\n         negative_offset_error=(\n-            (NEGATIVE_OFFSET_AS_POSITIVE, b\"\") if negative_offset_as_positive else None\n+            (negative_offset_failure, b\"\") if negative_offset_failure else None\n         )\n     )\n     http.register_uri(http.GET, uri_regex, body=request_callback)\n@@ -243,10 +360,8 @@ def test_metadata_from_wheel_url_smaller_than_initial_chunk_size(\n     assert metadata[\"author\"] == \"Jason R. Coombs\"\n     assert len(metadata[\"requires_dist\"]) == 12\n \n-    # only one request because server gives a normal response with the entire wheel\n-    # except for when server interprets negative offset as positive\n     latest_requests = http.latest_requests()\n-    assert len(latest_requests) == 1\n+    assert len(latest_requests) == expected_requests\n \n \n @pytest.mark.parametrize(\"accept_ranges\", [None, \"none\"])\n@@ -302,6 +417,31 @@ def test_metadata_from_wheel_url_range_requests_not_supported_two_requests(\n     assert latest_requests[1].method == \"HEAD\"\n \n \n+def test_metadata_from_wheel_url_range_requests_supported_but_not_respected(\n+    http: type[httpretty.httpretty],\n+    handle_request_factory: RequestCallbackFactory,\n+) -> None:\n+    domain = \"range-requests-not-respected.com\"\n+    uri_regex = re.compile(f\"^https://{domain}/.*$\")\n+    request_callback = handle_request_factory(\n+        negative_offset_error=(codes.method_not_allowed, b\"Method not allowed\"),\n+        ignore_accept_ranges=True,\n+    )\n+    http.register_uri(http.GET, uri_regex, body=request_callback)\n+    http.register_uri(http.HEAD, uri_regex, body=request_callback)\n+\n+    url = f\"https://{domain}/poetry_core-1.5.0-py3-none-any.whl\"\n+\n+    with pytest.raises(HTTPRangeRequestNotRespected):\n+        metadata_from_wheel_url(\"poetry-core\", url, requests.Session())\n+\n+    latest_requests = http.latest_requests()\n+    assert len(latest_requests) == 3\n+    assert latest_requests[0].method == \"GET\"\n+    assert latest_requests[1].method == \"HEAD\"\n+    assert latest_requests[2].method == \"GET\"\n+\n+\n def test_metadata_from_wheel_url_invalid_wheel(\n     http: type[httpretty.httpretty],\n     handle_request_factory: RequestCallbackFactory,\n@@ -320,3 +460,19 @@ def test_metadata_from_wheel_url_invalid_wheel(\n     latest_requests = http.latest_requests()\n     assert len(latest_requests) == 1\n     assert latest_requests[0].method == \"GET\"\n+\n+\n+def test_metadata_from_wheel_url_handles_unexpected_errors(\n+    mocker: MockerFixture,\n+) -> None:\n+    mocker.patch(\n+        \"poetry.inspection.lazy_wheel.LazyWheelOverHTTP.read_metadata\",\n+        side_effect=RuntimeError(),\n+    )\n+\n+    with pytest.raises(LazyWheelUnsupportedError):\n+        metadata_from_wheel_url(\n+            \"demo-missing-dist-info\",\n+            \"https://runtime-error.com/demo_missing_dist_info-0.1.0-py2.py3-none-any.whl\",\n+            requests.Session(),\n+        )\n\ndiff --git a/tests/types.py b/tests/types.py\nindex 0d9605c..4fc279a 100644\n--- a/tests/types.py\n+++ b/tests/types.py\n@@ -6,12 +6,16 @@ from typing import Protocol\n \n \n if TYPE_CHECKING:\n+    from collections.abc import Callable\n     from pathlib import Path\n+    from typing import Dict\n+    from typing import Tuple\n \n     import requests\n \n     from cleo.io.io import IO\n     from cleo.testers.command_tester import CommandTester\n+    from httpretty.core import HTTPrettyRequest\n \n     from poetry.config.config import Config\n     from poetry.config.source import Source\n@@ -20,6 +24,14 @@ if TYPE_CHECKING:\n     from poetry.poetry import Poetry\n     from poetry.utils.env import Env\n \n+    HTTPrettyResponse = Tuple[int, Dict[str, Any], bytes]  # status code, headers, body\n+    HTTPrettyRequestCallback = Callable[\n+        [HTTPrettyRequest, str, Dict[str, Any]], HTTPrettyResponse\n+    ]\n+    HTTPPrettyRequestCallbackWrapper = Callable[\n+        [HTTPrettyRequestCallback], HTTPrettyRequestCallback\n+    ]\n+\n \n class CommandTesterFactory(Protocol):\n     def __call__(\n",
+  "structured_diff": {
+    "tests/conftest.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -37,6 +37,7 @@",
+          "snippet": " from tests.helpers import MOCK_DEFAULT_GIT_REVISION\n from tests.helpers import TestLocker\n from tests.helpers import TestRepository\n from tests.helpers import get_package\n+from tests.helpers import http_setup_redirect\n from tests.helpers import isolated_environment\n from tests.helpers import mock_clone\n from tests.helpers import mock_download",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "tests/conftest.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -321,6 +322,11 @@",
+          "snippet": " def http() -> Iterator[type[httpretty.httpretty]]:\n         yield httpretty\n \n \n+@pytest.fixture\n+def http_redirector(http: type[httpretty.httpretty]) -> None:\n+    http_setup_redirect(http, http.HEAD, http.GET, http.PUT, http.POST)\n+\n+\n @pytest.fixture\n def project_root() -> Path:\n     return Path(__file__).parent.parent",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/conftest.py::http_redirector"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -513,3 +519,9 @@",
+          "snippet": " def venv_flags_default() -> dict[str, bool]:\n         \"no-pip\": False,\n         \"no-setuptools\": False,\n     }\n+\n+\n+@pytest.fixture(autouse=(os.name == \"nt\"))\n+def httpretty_windows_mock_urllib3_wait_for_socket(mocker: MockerFixture) -> None:\n+    # this is a workaround for https://github.com/gabrielfalcao/HTTPretty/issues/442\n+    mocker.patch(\"urllib3.util.wait.select_wait_for_socket\", returns=True)\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/conftest.py::httpretty_windows_mock_urllib3_wait_for_socket"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/console/commands/test_add.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -101,6 +101,29 @@",
+          "snippet": " Writing lock file\n     assert content[\"dependencies\"][\"cachy\"] == \"^0.2.0\"\n \n \n+def test_add_non_package_mode_no_name(\n+    repo: TestRepository,\n+    project_factory: ProjectFactory,\n+    command_tester_factory: CommandTesterFactory,\n+) -> None:\n+    repo.add_package(get_package(\"cachy\", \"0.2.0\"))\n+\n+    poetry = project_factory(\n+        name=\"foobar\", pyproject_content=\"[tool.poetry]\\npackage-mode = false\\n\"\n+    )\n+    tester = command_tester_factory(\"add\", poetry=poetry)\n+    tester.execute(\"cachy\")\n+\n+    assert isinstance(tester.command, InstallerCommand)\n+    assert tester.command.installer.executor.installations_count == 1\n+\n+    pyproject: dict[str, Any] = poetry.file.read()\n+    content = pyproject[\"tool\"][\"poetry\"]\n+\n+    assert \"cachy\" in content[\"dependencies\"]\n+    assert content[\"dependencies\"][\"cachy\"] == \"^0.2.0\"\n+\n+\n def test_add_replace_by_constraint(\n     app: PoetryTestApplication, repo: TestRepository, tester: CommandTester\n ) -> None:\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/console/commands/test_add.py::test_add_non_package_mode_no_name"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/helpers.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -29,6 +29,9 @@",
+          "snippet": " if TYPE_CHECKING:\n     from typing import Any\n     from typing import Mapping\n \n+    import httpretty\n+\n+    from httpretty.core import HTTPrettyRequest\n     from poetry.core.constraints.version import Version\n     from poetry.core.packages.dependency import Dependency\n     from pytest_mock import MockerFixture",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "tests/helpers.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -38,6 +41,7 @@",
+          "snippet": " if TYPE_CHECKING:\n     from poetry.installation.operations.operation import Operation\n     from poetry.poetry import Poetry\n     from poetry.utils.authenticator import Authenticator\n+    from tests.types import HTTPrettyResponse\n \n FIXTURE_PATH = Path(__file__).parent / \"fixtures\"\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "tests/helpers.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -321,3 +325,25 @@",
+          "snippet": " def flatten_dict(obj: Mapping[str, Any], delimiter: str = \".\") -> Mapping[str, A\n             yield ([], obj)\n \n     return {delimiter.join(path): value for path, value in recurse_keys(obj)}\n+\n+\n+def http_setup_redirect(\n+    http: type[httpretty.httpretty], *methods: str, status_code: int = 301\n+) -> None:\n+    redirect_uri_regex = re.compile(\"^(?P<protocol>https?)://redirect.(?P<uri>.*)$\")\n+\n+    def redirect_request_callback(\n+        request: HTTPrettyRequest, uri: str, headers: dict[str, Any]\n+    ) -> HTTPrettyResponse:\n+        redirect_uri_match = redirect_uri_regex.match(uri)\n+        assert redirect_uri_match is not None\n+        redirect_uri = f\"{redirect_uri_match.group('protocol')}://{redirect_uri_match.group('uri')}\"\n+        return status_code, {\"Location\": redirect_uri}, b\"\"\n+\n+    for method in methods:\n+        http.register_uri(\n+            method,\n+            redirect_uri_regex,\n+            status=status_code,\n+            body=redirect_request_callback,\n+        )\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/helpers.py::http_setup_redirect"
+            },
+            {
+              "kind": "function",
+              "node": "tests/helpers.py::redirect_request_callback"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/inspection/test_lazy_wheel.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -2,36 +2,36 @@",
+          "snippet": " from __future__ import annotations\n \n import re\n \n+from enum import IntEnum\n from pathlib import Path\n from typing import TYPE_CHECKING\n from typing import Any\n-from typing import Dict\n from typing import Protocol\n-from typing import Tuple\n from urllib.parse import urlparse\n \n-import httpretty\n import pytest\n import requests\n \n from requests import codes\n \n+from poetry.inspection.lazy_wheel import HTTPRangeRequestNotRespected\n from poetry.inspection.lazy_wheel import HTTPRangeRequestUnsupported\n from poetry.inspection.lazy_wheel import InvalidWheel\n+from poetry.inspection.lazy_wheel import LazyWheelUnsupportedError\n from poetry.inspection.lazy_wheel import metadata_from_wheel_url\n+from tests.helpers import http_setup_redirect\n \n \n if TYPE_CHECKING:\n-    from collections.abc import Callable\n+    import httpretty\n \n     from httpretty.core import HTTPrettyRequest\n+    from pytest_mock import MockerFixture\n \n     from tests.types import FixtureDirGetter\n-\n-    HTTPrettyResponse = Tuple[int, Dict[str, Any], bytes]  # status code, headers, body\n-    HTTPrettyRequestCallback = Callable[\n-        [HTTPrettyRequest, str, Dict[str, Any]], HTTPrettyResponse\n-    ]\n+    from tests.types import HTTPPrettyRequestCallbackWrapper\n+    from tests.types import HTTPrettyRequestCallback\n+    from tests.types import HTTPrettyResponse\n \n     class RequestCallbackFactory(Protocol):\n         def __call__(",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "tests/inspection/test_lazy_wheel.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -39,10 +39,25 @@",
+          "snippet": " if TYPE_CHECKING:\n             *,\n             accept_ranges: str | None = \"bytes\",\n             negative_offset_error: tuple[int, bytes] | None = None,\n+            ignore_accept_ranges: bool = False,\n         ) -> HTTPrettyRequestCallback: ...\n \n+    class AssertMetadataFromWheelUrl(Protocol):\n+        def __call__(\n+            self,\n+            *,\n+            accept_ranges: str | None = \"bytes\",\n+            negative_offset_error: tuple[int, bytes] | None = None,\n+            expected_requests: int = 3,\n+            request_callback_wrapper: HTTPPrettyRequestCallbackWrapper | None = None,\n+            redirect: bool = True,\n+        ) -> None: ...\n+\n \n-NEGATIVE_OFFSET_AS_POSITIVE = -1\n+class NegativeOffsetFailure(IntEnum):\n+    # numbers must be negative to avoid conflicts with HTTP status codes\n+    as_positive = -1  # JFrog Artifactory bug (RTDEV-38572)\n+    one_more = -2  # JFrog Artifactory bug (one more byte than requested)\n \n \n def build_head_response(",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "tests/inspection/test_lazy_wheel.py::RequestCallbackFactory::__call__"
+            },
+            {
+              "kind": "class",
+              "node": "tests/inspection/test_lazy_wheel.py::AssertMetadataFromWheelUrl"
+            },
+            {
+              "kind": "method",
+              "node": "tests/inspection/test_lazy_wheel.py::AssertMetadataFromWheelUrl::__call__"
+            },
+            {
+              "kind": "class",
+              "node": "tests/inspection/test_lazy_wheel.py::NegativeOffsetFailure"
+            },
+            {
+              "kind": "attribute",
+              "node": "tests/inspection/test_lazy_wheel.py::NegativeOffsetFailure::as_positive"
+            },
+            {
+              "kind": "attribute",
+              "node": "tests/inspection/test_lazy_wheel.py::NegativeOffsetFailure::one_more"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -59,7 +74,7 @@",
+          "snippet": " def build_partial_response(\n     wheel_bytes: bytes,\n     response_headers: dict[str, Any],\n     *,\n-    negative_offset_as_positive: bool = False,\n+    negative_offset_failure: NegativeOffsetFailure | None = None,\n ) -> HTTPrettyResponse:\n     status_code = 206\n     response_headers[\"Accept-Ranges\"] = \"bytes\"",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/inspection/test_lazy_wheel.py::build_partial_response"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -67,11 +82,18 @@",
+          "snippet": " def build_partial_response(\n     if rng.startswith(\"-\"):\n         # negative offset\n         offset = int(rng)\n-        if negative_offset_as_positive:\n+        if negative_offset_failure == NegativeOffsetFailure.as_positive:\n             # some servers interpret a negative offset like \"-10\" as \"0-10\"\n             start = 0\n             end = min(-offset, total_length - 1)\n             body = wheel_bytes[start : end + 1]\n+        elif negative_offset_failure == NegativeOffsetFailure.one_more:\n+            # https://github.com/python-poetry/poetry/issues/9056#issuecomment-1973273721\n+            offset -= 1  # one more byte\n+            start = total_length + offset  # negative start of content range possible!\n+            end = total_length - 1\n+            body = wheel_bytes[offset:]\n+            response_headers[\"Content-Length\"] = -offset  # just wrong...\n         else:\n             start = total_length + offset\n             if start < 0:",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/inspection/test_lazy_wheel.py::build_partial_response"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -93,6 +115,7 @@",
+          "snippet": " def handle_request_factory(fixture_dir: FixtureDirGetter) -> RequestCallbackFact\n         *,\n         accept_ranges: str | None = \"bytes\",\n         negative_offset_error: tuple[int, bytes] | None = None,\n+        ignore_accept_ranges: bool = False,\n     ) -> HTTPrettyRequestCallback:\n         def handle_request(\n             request: HTTPrettyRequest, uri: str, response_headers: dict[str, Any]",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/inspection/test_lazy_wheel.py::_factory"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -122,24 +145,26 @@",
+          "snippet": " def handle_request_factory(fixture_dir: FixtureDirGetter) -> RequestCallbackFact\n \n             rng = request.headers.get(\"Range\", \"=\").split(\"=\")[1]\n \n-            negative_offset_as_positive = False\n+            negative_offset_failure = None\n             if negative_offset_error and rng.startswith(\"-\"):\n                 if negative_offset_error[0] == codes.requested_range_not_satisfiable:\n                     response_headers[\"Content-Range\"] = f\"bytes */{len(wheel_bytes)}\"\n-                if negative_offset_error[0] == NEGATIVE_OFFSET_AS_POSITIVE:\n-                    negative_offset_as_positive = True\n+                if negative_offset_error[0] == NegativeOffsetFailure.as_positive:\n+                    negative_offset_failure = NegativeOffsetFailure.as_positive\n+                elif negative_offset_error[0] == NegativeOffsetFailure.one_more:\n+                    negative_offset_failure = NegativeOffsetFailure.one_more\n                 else:\n                     return (\n                         negative_offset_error[0],\n                         response_headers,\n                         negative_offset_error[1],\n                     )\n-            if accept_ranges == \"bytes\" and rng:\n+            if accept_ranges == \"bytes\" and rng and not ignore_accept_ranges:\n                 return build_partial_response(\n                     rng,\n                     wheel_bytes,\n                     response_headers,\n-                    negative_offset_as_positive=negative_offset_as_positive,\n+                    negative_offset_failure=negative_offset_failure,\n                 )\n \n             status_code = 200",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/inspection/test_lazy_wheel.py::handle_request"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -152,6 +177,55 @@",
+          "snippet": " def handle_request_factory(fixture_dir: FixtureDirGetter) -> RequestCallbackFact\n     return _factory\n \n \n+@pytest.fixture\n+def assert_metadata_from_wheel_url(\n+    http: type[httpretty.httpretty],\n+    handle_request_factory: RequestCallbackFactory,\n+) -> AssertMetadataFromWheelUrl:\n+    def _assertion(\n+        *,\n+        accept_ranges: str | None = \"bytes\",\n+        negative_offset_error: tuple[int, bytes] | None = None,\n+        expected_requests: int = 3,\n+        request_callback_wrapper: HTTPPrettyRequestCallbackWrapper | None = None,\n+        redirect: bool = False,\n+    ) -> None:\n+        latest_requests = http.latest_requests()\n+        latest_requests.clear()\n+\n+        domain = (\n+            f\"lazy-wheel-{negative_offset_error[0] if negative_offset_error else 0}.com\"\n+        )\n+        uri_regex = re.compile(f\"^https://{domain}/.*$\")\n+        request_callback = handle_request_factory(\n+            accept_ranges=accept_ranges, negative_offset_error=negative_offset_error\n+        )\n+        if request_callback_wrapper is not None:\n+            request_callback = request_callback_wrapper(request_callback)\n+\n+        http.register_uri(http.GET, uri_regex, body=request_callback)\n+        http.register_uri(http.HEAD, uri_regex, body=request_callback)\n+\n+        if redirect:\n+            http_setup_redirect(http, http.GET, http.HEAD)\n+\n+        url_prefix = \"redirect.\" if redirect else \"\"\n+        url = f\"https://{url_prefix}{domain}/poetry_core-1.5.0-py3-none-any.whl\"\n+\n+        metadata = metadata_from_wheel_url(\"poetry-core\", url, requests.Session())\n+\n+        assert metadata[\"name\"] == \"poetry-core\"\n+        assert metadata[\"version\"] == \"1.5.0\"\n+        assert metadata[\"author\"] == \"Sébastien Eustace\"\n+        assert metadata[\"requires_dist\"] == [\n+            'importlib-metadata (>=1.7.0) ; python_version < \"3.8\"'\n+        ]\n+\n+        assert len(latest_requests) == expected_requests\n+\n+    return _assertion\n+\n+\n @pytest.mark.parametrize(\n     \"negative_offset_error\",\n     [",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/inspection/test_lazy_wheel.py::assert_metadata_from_wheel_url"
+            },
+            {
+              "kind": "function",
+              "node": "tests/inspection/test_lazy_wheel.py::_assertion"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -161,35 +235,14 @@",
+          "snippet": " def handle_request_factory(fixture_dir: FixtureDirGetter) -> RequestCallbackFact\n         (codes.requested_range_not_satisfiable, b\"Requested range not satisfiable\"),\n         (codes.internal_server_error, b\"Internal server error\"),  # GAR\n         (codes.not_implemented, b\"Unsupported client range\"),  # PyPI\n-        (NEGATIVE_OFFSET_AS_POSITIVE, b\"handle negative offset as positive\"),\n+        (NegativeOffsetFailure.as_positive, b\"handle negative offset as positive\"),\n+        (NegativeOffsetFailure.one_more, b\"one more byte than requested\"),\n     ],\n )\n def test_metadata_from_wheel_url(\n-    http: type[httpretty.httpretty],\n-    handle_request_factory: RequestCallbackFactory,\n+    assert_metadata_from_wheel_url: AssertMetadataFromWheelUrl,\n     negative_offset_error: tuple[int, bytes] | None,\n ) -> None:\n-    domain = (\n-        f\"lazy-wheel-{negative_offset_error[0] if negative_offset_error else 0}.com\"\n-    )\n-    uri_regex = re.compile(f\"^https://{domain}/.*$\")\n-    request_callback = handle_request_factory(\n-        negative_offset_error=negative_offset_error\n-    )\n-    http.register_uri(http.GET, uri_regex, body=request_callback)\n-    http.register_uri(http.HEAD, uri_regex, body=request_callback)\n-\n-    url = f\"https://{domain}/poetry_core-1.5.0-py3-none-any.whl\"\n-\n-    metadata = metadata_from_wheel_url(\"poetry-core\", url, requests.Session())\n-\n-    assert metadata[\"name\"] == \"poetry-core\"\n-    assert metadata[\"version\"] == \"1.5.0\"\n-    assert metadata[\"author\"] == \"Sébastien Eustace\"\n-    assert metadata[\"requires_dist\"] == [\n-        'importlib-metadata (>=1.7.0) ; python_version < \"3.8\"'\n-    ]\n-\n     # negative offsets supported:\n     # 1. end of central directory\n     # 2. whole central directory",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/inspection/test_lazy_wheel.py::test_metadata_from_wheel_url"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -200,35 +253,99 @@",
+          "snippet": " def test_metadata_from_wheel_url(\n     # 3.-5. see negative offsets 1.-3.\n     expected_requests = 3\n     if negative_offset_error:\n-        if negative_offset_error[0] in (\n+        if negative_offset_error[0] in {\n             codes.requested_range_not_satisfiable,\n-            NEGATIVE_OFFSET_AS_POSITIVE,\n-        ):\n+            NegativeOffsetFailure.as_positive,\n+            NegativeOffsetFailure.one_more,\n+        }:\n             expected_requests += 1\n         else:\n             expected_requests += 2\n-    latest_requests = http.latest_requests()\n-    assert len(latest_requests) == expected_requests\n+\n+    assert_metadata_from_wheel_url(\n+        negative_offset_error=negative_offset_error, expected_requests=expected_requests\n+    )\n \n     # second wheel -> one less request if negative offsets are not supported\n-    latest_requests.clear()\n-    metadata_from_wheel_url(\"poetry-core\", url, requests.Session())\n     expected_requests = min(expected_requests, 4)\n-    latest_requests = httpretty.latest_requests()\n-    assert len(latest_requests) == expected_requests\n+    assert_metadata_from_wheel_url(\n+        negative_offset_error=negative_offset_error, expected_requests=expected_requests\n+    )\n+\n+\n+def test_metadata_from_wheel_url_416_missing_content_range(\n+    assert_metadata_from_wheel_url: AssertMetadataFromWheelUrl,\n+) -> None:\n+    def request_callback_wrapper(\n+        request_callback: HTTPrettyRequestCallback,\n+    ) -> HTTPrettyRequestCallback:\n+        def _wrapped(\n+            request: HTTPrettyRequest, uri: str, response_headers: dict[str, Any]\n+        ) -> HTTPrettyResponse:\n+            status_code, response_headers, body = request_callback(\n+                request, uri, response_headers\n+            )\n+            return (\n+                status_code,\n+                {\n+                    header: response_headers[header]\n+                    for header in response_headers\n+                    if header.lower() != \"content-range\"\n+                },\n+                body,\n+            )\n+\n+        return _wrapped\n+\n+    assert_metadata_from_wheel_url(\n+        negative_offset_error=(\n+            codes.requested_range_not_satisfiable,\n+            b\"Requested range not satisfiable\",\n+        ),\n+        expected_requests=5,\n+        request_callback_wrapper=request_callback_wrapper,\n+    )\n+\n+\n+def test_metadata_from_wheel_url_with_redirect(\n+    assert_metadata_from_wheel_url: AssertMetadataFromWheelUrl,\n+) -> None:\n+    assert_metadata_from_wheel_url(\n+        negative_offset_error=None,\n+        expected_requests=6,\n+        redirect=True,\n+    )\n+\n+\n+def test_metadata_from_wheel_url_with_redirect_after_500(\n+    assert_metadata_from_wheel_url: AssertMetadataFromWheelUrl,\n+) -> None:\n+    assert_metadata_from_wheel_url(\n+        negative_offset_error=(codes.internal_server_error, b\"Internal server error\"),\n+        expected_requests=10,\n+        redirect=True,\n+    )\n \n \n-@pytest.mark.parametrize(\"negative_offset_as_positive\", [False, True])\n+@pytest.mark.parametrize(\n+    (\"negative_offset_failure\", \"expected_requests\"),\n+    [\n+        (None, 1),\n+        (NegativeOffsetFailure.as_positive, 1),\n+        (NegativeOffsetFailure.one_more, 2),\n+    ],\n+)\n def test_metadata_from_wheel_url_smaller_than_initial_chunk_size(\n     http: type[httpretty.httpretty],\n     handle_request_factory: RequestCallbackFactory,\n-    negative_offset_as_positive: bool,\n+    negative_offset_failure: NegativeOffsetFailure | None,\n+    expected_requests: int,\n ) -> None:\n-    domain = f\"tiny-wheel-{str(negative_offset_as_positive).casefold()}.com\"\n+    domain = f\"tiny-wheel-{str(negative_offset_failure).casefold()}.com\"\n     uri_regex = re.compile(f\"^https://{domain}/.*$\")\n     request_callback = handle_request_factory(\n         negative_offset_error=(\n-            (NEGATIVE_OFFSET_AS_POSITIVE, b\"\") if negative_offset_as_positive else None\n+            (negative_offset_failure, b\"\") if negative_offset_failure else None\n         )\n     )\n     http.register_uri(http.GET, uri_regex, body=request_callback)",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/inspection/test_lazy_wheel.py::test_metadata_from_wheel_url"
+            },
+            {
+              "kind": "function",
+              "node": "tests/inspection/test_lazy_wheel.py::test_metadata_from_wheel_url_416_missing_content_range"
+            },
+            {
+              "kind": "function",
+              "node": "tests/inspection/test_lazy_wheel.py::request_callback_wrapper"
+            },
+            {
+              "kind": "function",
+              "node": "tests/inspection/test_lazy_wheel.py::_wrapped"
+            },
+            {
+              "kind": "function",
+              "node": "tests/inspection/test_lazy_wheel.py::test_metadata_from_wheel_url_with_redirect"
+            },
+            {
+              "kind": "function",
+              "node": "tests/inspection/test_lazy_wheel.py::test_metadata_from_wheel_url_with_redirect_after_500"
+            },
+            {
+              "kind": "function",
+              "node": "tests/inspection/test_lazy_wheel.py::test_metadata_from_wheel_url_smaller_than_initial_chunk_size"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -243,10 +360,8 @@",
+          "snippet": " def test_metadata_from_wheel_url_smaller_than_initial_chunk_size(\n     assert metadata[\"author\"] == \"Jason R. Coombs\"\n     assert len(metadata[\"requires_dist\"]) == 12\n \n-    # only one request because server gives a normal response with the entire wheel\n-    # except for when server interprets negative offset as positive\n     latest_requests = http.latest_requests()\n-    assert len(latest_requests) == 1\n+    assert len(latest_requests) == expected_requests\n \n \n @pytest.mark.parametrize(\"accept_ranges\", [None, \"none\"])",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/inspection/test_lazy_wheel.py::test_metadata_from_wheel_url_smaller_than_initial_chunk_size"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -302,6 +417,31 @@",
+          "snippet": " def test_metadata_from_wheel_url_range_requests_not_supported_two_requests(\n     assert latest_requests[1].method == \"HEAD\"\n \n \n+def test_metadata_from_wheel_url_range_requests_supported_but_not_respected(\n+    http: type[httpretty.httpretty],\n+    handle_request_factory: RequestCallbackFactory,\n+) -> None:\n+    domain = \"range-requests-not-respected.com\"\n+    uri_regex = re.compile(f\"^https://{domain}/.*$\")\n+    request_callback = handle_request_factory(\n+        negative_offset_error=(codes.method_not_allowed, b\"Method not allowed\"),\n+        ignore_accept_ranges=True,\n+    )\n+    http.register_uri(http.GET, uri_regex, body=request_callback)\n+    http.register_uri(http.HEAD, uri_regex, body=request_callback)\n+\n+    url = f\"https://{domain}/poetry_core-1.5.0-py3-none-any.whl\"\n+\n+    with pytest.raises(HTTPRangeRequestNotRespected):\n+        metadata_from_wheel_url(\"poetry-core\", url, requests.Session())\n+\n+    latest_requests = http.latest_requests()\n+    assert len(latest_requests) == 3\n+    assert latest_requests[0].method == \"GET\"\n+    assert latest_requests[1].method == \"HEAD\"\n+    assert latest_requests[2].method == \"GET\"\n+\n+\n def test_metadata_from_wheel_url_invalid_wheel(\n     http: type[httpretty.httpretty],\n     handle_request_factory: RequestCallbackFactory,",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/inspection/test_lazy_wheel.py::test_metadata_from_wheel_url_range_requests_supported_but_not_respected"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -320,3 +460,19 @@",
+          "snippet": " def test_metadata_from_wheel_url_invalid_wheel(\n     latest_requests = http.latest_requests()\n     assert len(latest_requests) == 1\n     assert latest_requests[0].method == \"GET\"\n+\n+\n+def test_metadata_from_wheel_url_handles_unexpected_errors(\n+    mocker: MockerFixture,\n+) -> None:\n+    mocker.patch(\n+        \"poetry.inspection.lazy_wheel.LazyWheelOverHTTP.read_metadata\",\n+        side_effect=RuntimeError(),\n+    )\n+\n+    with pytest.raises(LazyWheelUnsupportedError):\n+        metadata_from_wheel_url(\n+            \"demo-missing-dist-info\",\n+            \"https://runtime-error.com/demo_missing_dist_info-0.1.0-py2.py3-none-any.whl\",\n+            requests.Session(),\n+        )\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "tests/inspection/test_lazy_wheel.py::test_metadata_from_wheel_url_handles_unexpected_errors"
+            }
+          ]
+        }
+      ]
+    },
+    "tests/types.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -6,12 +6,16 @@",
+          "snippet": " from typing import Protocol\n \n \n if TYPE_CHECKING:\n+    from collections.abc import Callable\n     from pathlib import Path\n+    from typing import Dict\n+    from typing import Tuple\n \n     import requests\n \n     from cleo.io.io import IO\n     from cleo.testers.command_tester import CommandTester\n+    from httpretty.core import HTTPrettyRequest\n \n     from poetry.config.config import Config\n     from poetry.config.source import Source",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "tests/types.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -20,6 +24,14 @@",
+          "snippet": " if TYPE_CHECKING:\n     from poetry.poetry import Poetry\n     from poetry.utils.env import Env\n \n+    HTTPrettyResponse = Tuple[int, Dict[str, Any], bytes]  # status code, headers, body\n+    HTTPrettyRequestCallback = Callable[\n+        [HTTPrettyRequest, str, Dict[str, Any]], HTTPrettyResponse\n+    ]\n+    HTTPPrettyRequestCallbackWrapper = Callable[\n+        [HTTPrettyRequestCallback], HTTPrettyRequestCallback\n+    ]\n+\n \n class CommandTesterFactory(Protocol):\n     def __call__(",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "tests/types.py::<module>"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

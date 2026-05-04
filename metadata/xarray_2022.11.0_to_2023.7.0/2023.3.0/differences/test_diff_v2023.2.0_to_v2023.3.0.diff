@@ -1,0 +1,1211 @@
+diff --git a/xarray/tests/__init__.py b/xarray/tests/__init__.py
+index ea55684..be81bd1 100644
+--- a/xarray/tests/__init__.py
++++ b/xarray/tests/__init__.py
+@@ -37,6 +37,8 @@ except ImportError:
+ 
+ # https://github.com/pydata/xarray/issues/7322
+ warnings.filterwarnings("ignore", "'urllib3.contrib.pyopenssl' module is deprecated")
++warnings.filterwarnings("ignore", "Deprecated call to `pkg_resources.declare_namespace")
++warnings.filterwarnings("ignore", "pkg_resources is deprecated as an API")
+ 
+ arm_xfail = pytest.mark.xfail(
+     platform.machine() == "aarch64" or "arm" in platform.machine(),
+@@ -142,7 +144,18 @@ class InaccessibleArray(utils.NDArrayMixin, ExplicitlyIndexed):
+         self.array = array
+ 
+     def __getitem__(self, key):
+-        raise UnexpectedDataAccess("Tried accessing data")
++        raise UnexpectedDataAccess("Tried accessing data.")
++
++    def __array__(self):
++        raise UnexpectedDataAccess("Tried accessing data.")
++
++
++class FirstElementAccessibleArray(InaccessibleArray):
++    def __getitem__(self, key):
++        tuple_idxr = key.tuple
++        if len(tuple_idxr) > 1:
++            raise UnexpectedDataAccess("Tried accessing more than one element.")
++        return self.array[tuple_idxr]
+ 
+ 
+ class ReturnItem:
+
+diff --git a/xarray/tests/test_accessor_dt.py b/xarray/tests/test_accessor_dt.py
+index aabdf6a..ef91257 100644
+--- a/xarray/tests/test_accessor_dt.py
++++ b/xarray/tests/test_accessor_dt.py
+@@ -418,7 +418,6 @@ def test_calendar_cftime(data) -> None:
+     assert data.time.dt.calendar == expected
+ 
+ 
+-@requires_cftime
+ def test_calendar_datetime64_2d() -> None:
+     data = xr.DataArray(np.zeros((4, 5), dtype="datetime64[ns]"), dims=("x", "y"))
+     assert data.dt.calendar == "proleptic_gregorian"
+
+diff --git a/xarray/tests/test_backends.py b/xarray/tests/test_backends.py
+index a156b86..bc6b095 100644
+--- a/xarray/tests/test_backends.py
++++ b/xarray/tests/test_backends.py
+@@ -2560,7 +2560,7 @@ class ZarrBase(CFEncodedBase):
+             ds_a = xr.open_zarr(store_target, **self.version_kwargs)
+             assert_identical(ds, ds_a)
+             ds_b = xr.open_zarr(store_target, use_cftime=True, **self.version_kwargs)
+-            assert xr.coding.times.contains_cftime_datetimes(ds_b.time)
++            assert xr.coding.times.contains_cftime_datetimes(ds_b.time.variable)
+ 
+     def test_write_read_select_write(self) -> None:
+         # Test for https://github.com/pydata/xarray/issues/4084
+@@ -5663,12 +5663,14 @@ def test_write_file_from_np_str(str_type, tmpdir) -> None:
+ @requires_zarr
+ @requires_netCDF4
+ class TestNCZarr:
+-    @staticmethod
+-    def _create_nczarr(filename):
+-        netcdfc_version = Version(nc4.getlibversion().split()[0])
+-        if netcdfc_version < Version("4.8.1"):
++    @property
++    def netcdfc_version(self):
++        return Version(nc4.getlibversion().split()[0])
++
++    def _create_nczarr(self, filename):
++        if self.netcdfc_version < Version("4.8.1"):
+             pytest.skip("requires netcdf-c>=4.8.1")
+-        if (platform.system() == "Windows") and (netcdfc_version == Version("4.8.1")):
++        if platform.system() == "Windows" and self.netcdfc_version == Version("4.8.1"):
+             # Bug in netcdf-c==4.8.1 (typo: Nan instead of NaN)
+             # https://github.com/Unidata/netcdf-c/issues/2265
+             pytest.skip("netcdf-c==4.8.1 has issues on Windows")
+@@ -5678,9 +5680,7 @@ class TestNCZarr:
+         # https://github.com/Unidata/netcdf-c/issues/2259
+         ds = ds.drop_vars("dim3")
+ 
+-        # netcdf-c>4.8.1 will add _ARRAY_DIMENSIONS by default
+-        mode = "nczarr" if netcdfc_version == Version("4.8.1") else "nczarr,noxarray"
+-        ds.to_netcdf(f"file://{filename}#mode={mode}")
++        ds.to_netcdf(f"file://{filename}#mode=nczarr")
+         return ds
+ 
+     def test_open_nczarr(self) -> None:
+@@ -5700,6 +5700,9 @@ class TestNCZarr:
+     @pytest.mark.parametrize("mode", ["a", "r+"])
+     @pytest.mark.filterwarnings("ignore:.*non-consolidated metadata.*")
+     def test_raise_writing_to_nczarr(self, mode) -> None:
++        if self.netcdfc_version > Version("4.8.1"):
++            pytest.skip("netcdf-c>4.8.1 adds the _ARRAY_DIMENSIONS attribute")
++
+         with create_tmp_file(suffix=".zarr") as tmp:
+             ds = self._create_nczarr(tmp)
+             with pytest.raises(
+
+diff --git a/xarray/tests/test_cftimeindex_resample.py b/xarray/tests/test_cftimeindex_resample.py
+index 5f818b7..07bc14f 100644
+--- a/xarray/tests/test_cftimeindex_resample.py
++++ b/xarray/tests/test_cftimeindex_resample.py
+@@ -8,6 +8,7 @@ import pandas as pd
+ import pytest
+ 
+ import xarray as xr
++from xarray.core.pdcompat import _convert_base_to_offset
+ from xarray.core.resample_cftime import CFTimeGrouper
+ 
+ cftime = pytest.importorskip("cftime")
+@@ -130,17 +131,18 @@ def test_resample(freqs, closed, label, base, offset) -> None:
+     da_datetimeindex = da(datetime_index)
+     da_cftimeindex = da(cftime_index)
+ 
+-    compare_against_pandas(
+-        da_datetimeindex,
+-        da_cftimeindex,
+-        resample_freq,
+-        closed=closed,
+-        label=label,
+-        base=base,
+-        offset=offset,
+-        origin=origin,
+-        loffset=loffset,
+-    )
++    with pytest.warns(FutureWarning, match="`loffset` parameter"):
++        compare_against_pandas(
++            da_datetimeindex,
++            da_cftimeindex,
++            resample_freq,
++            closed=closed,
++            label=label,
++            base=base,
++            offset=offset,
++            origin=origin,
++            loffset=loffset,
++        )
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -245,3 +247,43 @@ def test_timedelta_offset() -> None:
+     timedelta_result = da_cftime.resample(time="2D", offset=timedelta).mean()
+     string_result = da_cftime.resample(time="2D", offset=string).mean()
+     xr.testing.assert_identical(timedelta_result, string_result)
++
++
++@pytest.mark.parametrize("loffset", ["12H", datetime.timedelta(hours=-12)])
++def test_resample_loffset_cftimeindex(loffset) -> None:
++    datetimeindex = pd.date_range("2000-01-01", freq="6H", periods=10)
++    da_datetimeindex = xr.DataArray(np.arange(10), [("time", datetimeindex)])
++
++    cftimeindex = xr.cftime_range("2000-01-01", freq="6H", periods=10)
++    da_cftimeindex = xr.DataArray(np.arange(10), [("time", cftimeindex)])
++
++    with pytest.warns(FutureWarning, match="`loffset` parameter"):
++        result = da_cftimeindex.resample(time="24H", loffset=loffset).mean()
++        expected = da_datetimeindex.resample(time="24H", loffset=loffset).mean()
++
++    result["time"] = result.xindexes["time"].to_pandas_index().to_datetimeindex()
++    xr.testing.assert_identical(result, expected)
++
++
++def test_resample_invalid_loffset_cftimeindex() -> None:
++    times = xr.cftime_range("2000-01-01", freq="6H", periods=10)
++    da = xr.DataArray(np.arange(10), [("time", times)])
++
++    with pytest.raises(ValueError):
++        da.resample(time="24H", loffset=1)  # type: ignore
++
++
++@pytest.mark.parametrize(("base", "freq"), [(1, "10S"), (17, "3H"), (15, "5U")])
++def test__convert_base_to_offset(base, freq):
++    # Verify that the cftime_offset adapted version of _convert_base_to_offset
++    # produces the same result as the pandas version.
++    datetimeindex = pd.date_range("2000", periods=2)
++    cftimeindex = xr.cftime_range("2000", periods=2)
++    pandas_result = _convert_base_to_offset(base, freq, datetimeindex)
++    cftime_result = _convert_base_to_offset(base, freq, cftimeindex)
++    assert pandas_result.to_pytimedelta() == cftime_result
++
++
++def test__convert_base_to_offset_invalid_index():
++    with pytest.raises(ValueError, match="Can only resample"):
++        _convert_base_to_offset(1, "12H", pd.Index([0]))
+
+diff --git a/xarray/tests/test_coding.py b/xarray/tests/test_coding.py
+index 5bf2381..f7579c4 100644
+--- a/xarray/tests/test_coding.py
++++ b/xarray/tests/test_coding.py
+@@ -65,13 +65,13 @@ def test_CFMaskCoder_missing_value() -> None:
+     expected.attrs["missing_value"] = -9999
+ 
+     decoded = xr.decode_cf(expected.to_dataset())
+-    encoded, _ = xr.conventions.cf_encoder(decoded, decoded.attrs)
++    encoded, _ = xr.conventions.cf_encoder(decoded.variables, decoded.attrs)
+ 
+     assert_equal(encoded["tmpk"], expected.variable)
+ 
+     decoded.tmpk.encoding["_FillValue"] = -9940
+     with pytest.raises(ValueError):
+-        encoded, _ = xr.conventions.cf_encoder(decoded, decoded.attrs)
++        encoded, _ = xr.conventions.cf_encoder(decoded.variables, decoded.attrs)
+ 
+ 
+ @requires_dask
+
+diff --git a/xarray/tests/test_coding_times.py b/xarray/tests/test_coding_times.py
+index 0746a94..580de87 100644
+--- a/xarray/tests/test_coding_times.py
++++ b/xarray/tests/test_coding_times.py
+@@ -31,6 +31,7 @@ from xarray.conventions import _update_bounds_attributes, cf_encoder
+ from xarray.core.common import contains_cftime_datetimes
+ from xarray.testing import assert_equal, assert_identical
+ from xarray.tests import (
++    FirstElementAccessibleArray,
+     arm_xfail,
+     assert_array_equal,
+     assert_no_warnings,
+@@ -787,35 +788,35 @@ def times_3d(times):
+ 
+ @requires_cftime
+ def test_contains_cftime_datetimes_1d(data) -> None:
+-    assert contains_cftime_datetimes(data.time)
++    assert contains_cftime_datetimes(data.time.variable)
+ 
+ 
+ @requires_cftime
+ @requires_dask
+ def test_contains_cftime_datetimes_dask_1d(data) -> None:
+-    assert contains_cftime_datetimes(data.time.chunk())
++    assert contains_cftime_datetimes(data.time.variable.chunk())
+ 
+ 
+ @requires_cftime
+ def test_contains_cftime_datetimes_3d(times_3d) -> None:
+-    assert contains_cftime_datetimes(times_3d)
++    assert contains_cftime_datetimes(times_3d.variable)
+ 
+ 
+ @requires_cftime
+ @requires_dask
+ def test_contains_cftime_datetimes_dask_3d(times_3d) -> None:
+-    assert contains_cftime_datetimes(times_3d.chunk())
++    assert contains_cftime_datetimes(times_3d.variable.chunk())
+ 
+ 
+ @pytest.mark.parametrize("non_cftime_data", [DataArray([]), DataArray([1, 2])])
+ def test_contains_cftime_datetimes_non_cftimes(non_cftime_data) -> None:
+-    assert not contains_cftime_datetimes(non_cftime_data)
++    assert not contains_cftime_datetimes(non_cftime_data.variable)
+ 
+ 
+ @requires_dask
+ @pytest.mark.parametrize("non_cftime_data", [DataArray([]), DataArray([1, 2])])
+ def test_contains_cftime_datetimes_non_cftimes_dask(non_cftime_data) -> None:
+-    assert not contains_cftime_datetimes(non_cftime_data.chunk())
++    assert not contains_cftime_datetimes(non_cftime_data.variable.chunk())
+ 
+ 
+ @requires_cftime
+@@ -1176,3 +1177,17 @@ def test_scalar_unit() -> None:
+     variable = Variable(("x", "y"), np.array([[0, 1], [2, 3]]), {"units": np.nan})
+     result = coding.times.CFDatetimeCoder().decode(variable)
+     assert np.isnan(result.attrs["units"])
++
++
++@requires_cftime
++def test_contains_cftime_lazy() -> None:
++    import cftime
++
++    from xarray.core.common import _contains_cftime_datetimes
++
++    times = np.array(
++        [cftime.DatetimeGregorian(1, 1, 2, 0), cftime.DatetimeGregorian(1, 1, 2, 0)],
++        dtype=object,
++    )
++    array = FirstElementAccessibleArray(times)
++    assert _contains_cftime_datetimes(array)
+
+diff --git a/xarray/tests/test_computation.py b/xarray/tests/test_computation.py
+index c1be986..8e45a07 100644
+--- a/xarray/tests/test_computation.py
++++ b/xarray/tests/test_computation.py
+@@ -1387,17 +1387,18 @@ def test_vectorize_exclude_dims_dask() -> None:
+ 
+ def test_corr_only_dataarray() -> None:
+     with pytest.raises(TypeError, match="Only xr.DataArray is supported"):
+-        xr.corr(xr.Dataset(), xr.Dataset())
++        xr.corr(xr.Dataset(), xr.Dataset())  # type: ignore[type-var]
+ 
+ 
+-def arrays_w_tuples():
++@pytest.fixture(scope="module")
++def arrays():
+     da = xr.DataArray(
+         np.random.random((3, 21, 4)),
+         coords={"time": pd.date_range("2000-01-01", freq="1D", periods=21)},
+         dims=("a", "time", "x"),
+     )
+ 
+-    arrays = [
++    return [
+         da.isel(time=range(0, 18)),
+         da.isel(time=range(2, 20)).rolling(time=3, center=True).mean(),
+         xr.DataArray([[1, 2], [1, np.nan]], dims=["x", "time"]),
+@@ -1405,7 +1406,10 @@ def arrays_w_tuples():
+         xr.DataArray([[1, 2], [2, 1]], dims=["x", "time"]),
+     ]
+ 
+-    array_tuples = [
++
++@pytest.fixture(scope="module")
++def array_tuples(arrays):
++    return [
+         (arrays[0], arrays[0]),
+         (arrays[0], arrays[1]),
+         (arrays[1], arrays[1]),
+@@ -1417,27 +1421,19 @@ def arrays_w_tuples():
+         (arrays[4], arrays[4]),
+     ]
+ 
+-    return arrays, array_tuples
+-
+ 
+ @pytest.mark.parametrize("ddof", [0, 1])
+-@pytest.mark.parametrize(
+-    "da_a, da_b",
+-    [
+-        arrays_w_tuples()[1][3],
+-        arrays_w_tuples()[1][4],
+-        arrays_w_tuples()[1][5],
+-        arrays_w_tuples()[1][6],
+-        arrays_w_tuples()[1][7],
+-        arrays_w_tuples()[1][8],
+-    ],
+-)
++@pytest.mark.parametrize("n", [3, 4, 5, 6, 7, 8])
+ @pytest.mark.parametrize("dim", [None, "x", "time"])
+ @requires_dask
+-def test_lazy_corrcov(da_a, da_b, dim, ddof) -> None:
++def test_lazy_corrcov(
++    n: int, dim: str | None, ddof: int, array_tuples: tuple[xr.DataArray, xr.DataArray]
++) -> None:
+     # GH 5284
+     from dask import is_dask_collection
+ 
++    da_a, da_b = array_tuples[n]
++
+     with raise_if_dask_computes():
+         cov = xr.cov(da_a.chunk(), da_b.chunk(), dim=dim, ddof=ddof)
+         assert is_dask_collection(cov)
+@@ -1447,12 +1443,13 @@ def test_lazy_corrcov(da_a, da_b, dim, ddof) -> None:
+ 
+ 
+ @pytest.mark.parametrize("ddof", [0, 1])
+-@pytest.mark.parametrize(
+-    "da_a, da_b",
+-    [arrays_w_tuples()[1][0], arrays_w_tuples()[1][1], arrays_w_tuples()[1][2]],
+-)
++@pytest.mark.parametrize("n", [0, 1, 2])
+ @pytest.mark.parametrize("dim", [None, "time"])
+-def test_cov(da_a, da_b, dim, ddof) -> None:
++def test_cov(
++    n: int, dim: str | None, ddof: int, array_tuples: tuple[xr.DataArray, xr.DataArray]
++) -> None:
++    da_a, da_b = array_tuples[n]
++
+     if dim is not None:
+ 
+         def np_cov_ind(ts1, ts2, a, x):
+@@ -1499,12 +1496,13 @@ def test_cov(da_a, da_b, dim, ddof) -> None:
+         assert_allclose(actual, expected)
+ 
+ 
+-@pytest.mark.parametrize(
+-    "da_a, da_b",
+-    [arrays_w_tuples()[1][0], arrays_w_tuples()[1][1], arrays_w_tuples()[1][2]],
+-)
++@pytest.mark.parametrize("n", [0, 1, 2])
+ @pytest.mark.parametrize("dim", [None, "time"])
+-def test_corr(da_a, da_b, dim) -> None:
++def test_corr(
++    n: int, dim: str | None, array_tuples: tuple[xr.DataArray, xr.DataArray]
++) -> None:
++    da_a, da_b = array_tuples[n]
++
+     if dim is not None:
+ 
+         def np_corr_ind(ts1, ts2, a, x):
+@@ -1547,12 +1545,12 @@ def test_corr(da_a, da_b, dim) -> None:
+         assert_allclose(actual, expected)
+ 
+ 
+-@pytest.mark.parametrize(
+-    "da_a, da_b",
+-    arrays_w_tuples()[1],
+-)
++@pytest.mark.parametrize("n", range(9))
+ @pytest.mark.parametrize("dim", [None, "time", "x"])
+-def test_covcorr_consistency(da_a, da_b, dim) -> None:
++def test_covcorr_consistency(
++    n: int, dim: str | None, array_tuples: tuple[xr.DataArray, xr.DataArray]
++) -> None:
++    da_a, da_b = array_tuples[n]
+     # Testing that xr.corr and xr.cov are consistent with each other
+     # 1. Broadcast the two arrays
+     da_a, da_b = broadcast(da_a, da_b)
+@@ -1569,10 +1567,13 @@ def test_covcorr_consistency(da_a, da_b, dim) -> None:
+ 
+ 
+ @requires_dask
+-@pytest.mark.parametrize("da_a, da_b", arrays_w_tuples()[1])
++@pytest.mark.parametrize("n", range(9))
+ @pytest.mark.parametrize("dim", [None, "time", "x"])
+ @pytest.mark.filterwarnings("ignore:invalid value encountered in .*divide")
+-def test_corr_lazycorr_consistency(da_a, da_b, dim) -> None:
++def test_corr_lazycorr_consistency(
++    n: int, dim: str | None, array_tuples: tuple[xr.DataArray, xr.DataArray]
++) -> None:
++    da_a, da_b = array_tuples[n]
+     da_al = da_a.chunk()
+     da_bl = da_b.chunk()
+     c_abl = xr.corr(da_al, da_bl, dim=dim)
+@@ -1591,22 +1592,27 @@ def test_corr_dtype_error():
+     xr.testing.assert_equal(xr.corr(da_a, da_b), xr.corr(da_a, da_b.chunk()))
+ 
+ 
+-@pytest.mark.parametrize(
+-    "da_a",
+-    arrays_w_tuples()[0],
+-)
++@pytest.mark.parametrize("n", range(5))
+ @pytest.mark.parametrize("dim", [None, "time", "x", ["time", "x"]])
+-def test_autocov(da_a, dim) -> None:
++def test_autocov(n: int, dim: str | None, arrays) -> None:
++    da = arrays[n]
++
+     # Testing that the autocovariance*(N-1) is ~=~ to the variance matrix
+     # 1. Ignore the nans
+-    valid_values = da_a.notnull()
++    valid_values = da.notnull()
+     # Because we're using ddof=1, this requires > 1 value in each sample
+-    da_a = da_a.where(valid_values.sum(dim=dim) > 1)
+-    expected = ((da_a - da_a.mean(dim=dim)) ** 2).sum(dim=dim, skipna=True, min_count=1)
+-    actual = xr.cov(da_a, da_a, dim=dim) * (valid_values.sum(dim) - 1)
++    da = da.where(valid_values.sum(dim=dim) > 1)
++    expected = ((da - da.mean(dim=dim)) ** 2).sum(dim=dim, skipna=True, min_count=1)
++    actual = xr.cov(da, da, dim=dim) * (valid_values.sum(dim) - 1)
+     assert_allclose(actual, expected)
+ 
+ 
++def test_complex_cov() -> None:
++    da = xr.DataArray([1j, -1j])
++    actual = xr.cov(da, da)
++    assert abs(actual.item()) == 2
++
++
+ @requires_dask
+ def test_vectorize_dask_new_output_dims() -> None:
+     # regression test for GH3574
+
+diff --git a/xarray/tests/test_dask.py b/xarray/tests/test_dask.py
+index 577debb..21f0ab9 100644
+--- a/xarray/tests/test_dask.py
++++ b/xarray/tests/test_dask.py
+@@ -123,14 +123,15 @@ class TestVariable(DaskTestCase):
+             (da.array([99, 99, 3, 99]), [0, -1, 1]),
+             (da.array([99, 99, 99, 4]), np.arange(3)),
+             (da.array([1, 99, 99, 99]), [False, True, True, True]),
+-            (da.array([1, 99, 99, 99]), np.arange(4) > 0),
+-            (da.array([99, 99, 99, 99]), Variable(("x"), da.array([1, 2, 3, 4])) > 0),
++            (da.array([1, 99, 99, 99]), np.array([False, True, True, True])),
++            (da.array([99, 99, 99, 99]), Variable(("x"), np.array([True] * 4))),
+         ],
+     )
+     def test_setitem_dask_array(self, expected_data, index):
+         arr = Variable(("x"), da.array([1, 2, 3, 4]))
+         expected = Variable(("x"), expected_data)
+-        arr[index] = 99
++        with raise_if_dask_computes():
++            arr[index] = 99
+         assert_identical(arr, expected)
+ 
+     def test_squeeze(self):
+@@ -549,17 +550,22 @@ class TestDataArrayAndDataset(DaskTestCase):
+             actual = v.rolling(x=2).mean()
+         self.assertLazyAndAllClose(expected, actual)
+ 
+-    def test_groupby_first(self):
++    @pytest.mark.parametrize("func", ["first", "last"])
++    def test_groupby_first_last(self, func):
++        method = operator.methodcaller(func)
+         u = self.eager_array
+         v = self.lazy_array
+ 
+         for coords in [u.coords, v.coords]:
+             coords["ab"] = ("x", ["a", "a", "b", "b"])
+-        with pytest.raises(NotImplementedError, match=r"dask"):
+-            v.groupby("ab").first()
+-        expected = u.groupby("ab").first()
++        expected = method(u.groupby("ab"))
++
++        with raise_if_dask_computes():
++            actual = method(v.groupby("ab"))
++        self.assertLazyAndAllClose(expected, actual)
++
+         with raise_if_dask_computes():
+-            actual = v.groupby("ab").first(skipna=False)
++            actual = method(v.groupby("ab"))
+         self.assertLazyAndAllClose(expected, actual)
+ 
+     def test_reindex(self):
+
+diff --git a/xarray/tests/test_dataarray.py b/xarray/tests/test_dataarray.py
+index 836d30b..378d471 100644
+--- a/xarray/tests/test_dataarray.py
++++ b/xarray/tests/test_dataarray.py
+@@ -4216,37 +4216,40 @@ class TestDataArray:
+         d = np.random.choice(["foo", "bar", "baz"], size=30, replace=True).astype(
+             object
+         )
+-        if backend == "numpy":
+-            aa = DataArray(data=a, dims=["x"], name="a")
+-            bb = DataArray(data=b, dims=["x"], name="b")
+-            cc = DataArray(data=c, dims=["y"], name="c")
+-            dd = DataArray(data=d, dims=["z"], name="d")
++        aa = DataArray(data=a, dims=["x"], name="a", coords={"a2": ("x", a)})
++        bb = DataArray(data=b, dims=["x"], name="b", coords={"b2": ("x", b)})
++        cc = DataArray(data=c, dims=["y"], name="c", coords={"c2": ("y", c)})
++        dd = DataArray(data=d, dims=["z"], name="d", coords={"d2": ("z", d)})
+ 
+-        elif backend == "dask":
++        if backend == "dask":
+             import dask.array as da
+ 
+-            aa = DataArray(data=da.from_array(a, chunks=3), dims=["x"], name="a")
+-            bb = DataArray(data=da.from_array(b, chunks=3), dims=["x"], name="b")
+-            cc = DataArray(data=da.from_array(c, chunks=7), dims=["y"], name="c")
+-            dd = DataArray(data=da.from_array(d, chunks=12), dims=["z"], name="d")
++            aa = aa.copy(data=da.from_array(a, chunks=3))
++            bb = bb.copy(data=da.from_array(b, chunks=3))
++            cc = cc.copy(data=da.from_array(c, chunks=7))
++            dd = dd.copy(data=da.from_array(d, chunks=12))
+ 
+         # query single dim, single variable
+-        actual = aa.query(x="a > 5", engine=engine, parser=parser)
++        with raise_if_dask_computes():
++            actual = aa.query(x="a2 > 5", engine=engine, parser=parser)
+         expect = aa.isel(x=(a > 5))
+         assert_identical(expect, actual)
+ 
+         # query single dim, single variable, via dict
+-        actual = aa.query(dict(x="a > 5"), engine=engine, parser=parser)
++        with raise_if_dask_computes():
++            actual = aa.query(dict(x="a2 > 5"), engine=engine, parser=parser)
+         expect = aa.isel(dict(x=(a > 5)))
+         assert_identical(expect, actual)
+ 
+         # query single dim, single variable
+-        actual = bb.query(x="b > 50", engine=engine, parser=parser)
++        with raise_if_dask_computes():
++            actual = bb.query(x="b2 > 50", engine=engine, parser=parser)
+         expect = bb.isel(x=(b > 50))
+         assert_identical(expect, actual)
+ 
+         # query single dim, single variable
+-        actual = cc.query(y="c < .5", engine=engine, parser=parser)
++        with raise_if_dask_computes():
++            actual = cc.query(y="c2 < .5", engine=engine, parser=parser)
+         expect = cc.isel(y=(c < 0.5))
+         assert_identical(expect, actual)
+ 
+@@ -4254,7 +4257,8 @@ class TestDataArray:
+         if parser == "pandas":
+             # N.B., this query currently only works with the pandas parser
+             # xref https://github.com/pandas-dev/pandas/issues/40436
+-            actual = dd.query(z='d == "bar"', engine=engine, parser=parser)
++            with raise_if_dask_computes():
++                actual = dd.query(z='d2 == "bar"', engine=engine, parser=parser)
+             expect = dd.isel(z=(d == "bar"))
+             assert_identical(expect, actual)
+ 
+@@ -6219,7 +6223,7 @@ class TestIrisConversion:
+             original_coord = original.coords[orginal_key]
+             assert coord.var_name == original_coord.name
+             assert_array_equal(
+-                coord.points, CFDatetimeCoder().encode(original_coord).values
++                coord.points, CFDatetimeCoder().encode(original_coord.variable).values
+             )
+             assert actual.coord_dims(coord) == original.get_axis_num(
+                 original.coords[coord.var_name].dims
+@@ -6295,7 +6299,7 @@ class TestIrisConversion:
+             original_coord = original.coords[orginal_key]
+             assert coord.var_name == original_coord.name
+             assert_array_equal(
+-                coord.points, CFDatetimeCoder().encode(original_coord).values
++                coord.points, CFDatetimeCoder().encode(original_coord.variable).values
+             )
+             assert actual.coord_dims(coord) == original.get_axis_num(
+                 original.coords[coord.var_name].dims
+
+diff --git a/xarray/tests/test_dataset.py b/xarray/tests/test_dataset.py
+index ecadc76..2e23d02 100644
+--- a/xarray/tests/test_dataset.py
++++ b/xarray/tests/test_dataset.py
+@@ -46,6 +46,7 @@ from xarray.tests import (
+     create_test_data,
+     has_cftime,
+     has_dask,
++    raise_if_dask_computes,
+     requires_bottleneck,
+     requires_cftime,
+     requires_cupy,
+@@ -2503,7 +2504,12 @@ class TestDataset:
+         actual = data.drop_vars(["time"])
+         assert_identical(expected, actual)
+ 
+-        with pytest.raises(ValueError, match=r"cannot be found"):
++        with pytest.raises(
++            ValueError,
++            match=re.escape(
++                "These variables cannot be found in this dataset: ['not_found_here']"
++            ),
++        ):
+             data.drop_vars("not_found_here")
+ 
+         actual = data.drop_vars("not_found_here", errors="ignore")
+@@ -6192,7 +6198,15 @@ class TestDataset:
+                     "d": ("z", d),
+                     "e": (("x", "y"), e),
+                     "f": (("x", "y", "z"), f),
+-                }
++                },
++                coords={
++                    "a2": ("x", a),
++                    "b2": ("x", b),
++                    "c2": ("y", c),
++                    "d2": ("z", d),
++                    "e2": (("x", "y"), e),
++                    "f2": (("x", "y", "z"), f),
++                },
+             )
+         elif backend == "dask":
+             ds = Dataset(
+@@ -6203,26 +6217,38 @@ class TestDataset:
+                     "d": ("z", da.from_array(d, chunks=12)),
+                     "e": (("x", "y"), da.from_array(e, chunks=(3, 7))),
+                     "f": (("x", "y", "z"), da.from_array(f, chunks=(3, 7, 12))),
+-                }
++                },
++                coords={
++                    "a2": ("x", a),
++                    "b2": ("x", b),
++                    "c2": ("y", c),
++                    "d2": ("z", d),
++                    "e2": (("x", "y"), e),
++                    "f2": (("x", "y", "z"), f),
++                },
+             )
+ 
+         # query single dim, single variable
+-        actual = ds.query(x="a > 5", engine=engine, parser=parser)
++        with raise_if_dask_computes():
++            actual = ds.query(x="a2 > 5", engine=engine, parser=parser)
+         expect = ds.isel(x=(a > 5))
+         assert_identical(expect, actual)
+ 
+         # query single dim, single variable, via dict
+-        actual = ds.query(dict(x="a > 5"), engine=engine, parser=parser)
++        with raise_if_dask_computes():
++            actual = ds.query(dict(x="a2 > 5"), engine=engine, parser=parser)
+         expect = ds.isel(dict(x=(a > 5)))
+         assert_identical(expect, actual)
+ 
+         # query single dim, single variable
+-        actual = ds.query(x="b > 50", engine=engine, parser=parser)
++        with raise_if_dask_computes():
++            actual = ds.query(x="b2 > 50", engine=engine, parser=parser)
+         expect = ds.isel(x=(b > 50))
+         assert_identical(expect, actual)
+ 
+         # query single dim, single variable
+-        actual = ds.query(y="c < .5", engine=engine, parser=parser)
++        with raise_if_dask_computes():
++            actual = ds.query(y="c2 < .5", engine=engine, parser=parser)
+         expect = ds.isel(y=(c < 0.5))
+         assert_identical(expect, actual)
+ 
+@@ -6230,51 +6256,67 @@ class TestDataset:
+         if parser == "pandas":
+             # N.B., this query currently only works with the pandas parser
+             # xref https://github.com/pandas-dev/pandas/issues/40436
+-            actual = ds.query(z='d == "bar"', engine=engine, parser=parser)
++            with raise_if_dask_computes():
++                actual = ds.query(z='d2 == "bar"', engine=engine, parser=parser)
+             expect = ds.isel(z=(d == "bar"))
+             assert_identical(expect, actual)
+ 
+         # query single dim, multiple variables
+-        actual = ds.query(x="(a > 5) & (b > 50)", engine=engine, parser=parser)
++        with raise_if_dask_computes():
++            actual = ds.query(x="(a2 > 5) & (b2 > 50)", engine=engine, parser=parser)
+         expect = ds.isel(x=((a > 5) & (b > 50)))
+         assert_identical(expect, actual)
+ 
+         # query single dim, multiple variables with computation
+-        actual = ds.query(x="(a * b) > 250", engine=engine, parser=parser)
++        with raise_if_dask_computes():
++            actual = ds.query(x="(a2 * b2) > 250", engine=engine, parser=parser)
+         expect = ds.isel(x=(a * b) > 250)
+         assert_identical(expect, actual)
+ 
+         # check pandas query syntax is supported
+         if parser == "pandas":
+-            actual = ds.query(x="(a > 5) and (b > 50)", engine=engine, parser=parser)
++            with raise_if_dask_computes():
++                actual = ds.query(
++                    x="(a2 > 5) and (b2 > 50)", engine=engine, parser=parser
++                )
+             expect = ds.isel(x=((a > 5) & (b > 50)))
+             assert_identical(expect, actual)
+ 
+         # query multiple dims via kwargs
+-        actual = ds.query(x="a > 5", y="c < .5", engine=engine, parser=parser)
++        with raise_if_dask_computes():
++            actual = ds.query(x="a2 > 5", y="c2 < .5", engine=engine, parser=parser)
+         expect = ds.isel(x=(a > 5), y=(c < 0.5))
+         assert_identical(expect, actual)
+ 
+         # query multiple dims via kwargs
+         if parser == "pandas":
+-            actual = ds.query(
+-                x="a > 5", y="c < .5", z="d == 'bar'", engine=engine, parser=parser
+-            )
++            with raise_if_dask_computes():
++                actual = ds.query(
++                    x="a2 > 5",
++                    y="c2 < .5",
++                    z="d2 == 'bar'",
++                    engine=engine,
++                    parser=parser,
++                )
+             expect = ds.isel(x=(a > 5), y=(c < 0.5), z=(d == "bar"))
+             assert_identical(expect, actual)
+ 
+         # query multiple dims via dict
+-        actual = ds.query(dict(x="a > 5", y="c < .5"), engine=engine, parser=parser)
++        with raise_if_dask_computes():
++            actual = ds.query(
++                dict(x="a2 > 5", y="c2 < .5"), engine=engine, parser=parser
++            )
+         expect = ds.isel(dict(x=(a > 5), y=(c < 0.5)))
+         assert_identical(expect, actual)
+ 
+         # query multiple dims via dict
+         if parser == "pandas":
+-            actual = ds.query(
+-                dict(x="a > 5", y="c < .5", z="d == 'bar'"),
+-                engine=engine,
+-                parser=parser,
+-            )
++            with raise_if_dask_computes():
++                actual = ds.query(
++                    dict(x="a2 > 5", y="c2 < .5", z="d2 == 'bar'"),
++                    engine=engine,
++                    parser=parser,
++                )
+             expect = ds.isel(dict(x=(a > 5), y=(c < 0.5), z=(d == "bar")))
+             assert_identical(expect, actual)
+ 
+
+diff --git a/xarray/tests/test_duck_array_ops.py b/xarray/tests/test_duck_array_ops.py
+index c873c7b..0d6efa2 100644
+--- a/xarray/tests/test_duck_array_ops.py
++++ b/xarray/tests/test_duck_array_ops.py
+@@ -48,7 +48,11 @@ class TestOps:
+     def setUp(self):
+         self.x = array(
+             [
+-                [[nan, nan, 2.0, nan], [nan, 5.0, 6.0, nan], [8.0, 9.0, 10.0, nan]],
++                [
++                    [nan, nan, 2.0, nan],
++                    [nan, 5.0, 6.0, nan],
++                    [8.0, 9.0, 10.0, nan],
++                ],
+                 [
+                     [nan, 13.0, 14.0, 15.0],
+                     [nan, 17.0, 18.0, nan],
+@@ -128,6 +132,29 @@ class TestOps:
+         assert np.isnan(mean([np.nan, np.nan]))
+ 
+ 
++@requires_dask
++class TestDaskOps(TestOps):
++    @pytest.fixture(autouse=True)
++    def setUp(self):
++        import dask.array
++
++        self.x = dask.array.from_array(
++            [
++                [
++                    [nan, nan, 2.0, nan],
++                    [nan, 5.0, 6.0, nan],
++                    [8.0, 9.0, 10.0, nan],
++                ],
++                [
++                    [nan, 13.0, 14.0, 15.0],
++                    [nan, 17.0, 18.0, nan],
++                    [nan, 21.0, nan, nan],
++                ],
++            ],
++            chunks=(2, 1, 2),
++        )
++
++
+ def test_cumsum_1d():
+     inputs = np.array([0, 1, 2, 3])
+     expected = np.array([0, 1, 3, 6])
+
+diff --git a/xarray/tests/test_groupby.py b/xarray/tests/test_groupby.py
+index cec3756..a7d9840 100644
+--- a/xarray/tests/test_groupby.py
++++ b/xarray/tests/test_groupby.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import datetime
+ import warnings
+ 
+ import numpy as np
+@@ -16,6 +17,7 @@ from xarray.tests import (
+     assert_equal,
+     assert_identical,
+     create_test_data,
++    has_pandas_version_two,
+     requires_dask,
+     requires_flox,
+     requires_scipy,
+@@ -1475,14 +1477,6 @@ class TestDataArrayResample:
+         actual = array.resample(time="24H").reduce(np.mean)
+         assert_identical(expected, actual)
+ 
+-        # Our use of `loffset` may change if we align our API with pandas' changes.
+-        # ref https://github.com/pydata/xarray/pull/4537
+-        actual = array.resample(time="24H", loffset="-12H").mean()
+-        expected_ = array.to_series().resample("24H").mean()
+-        expected_.index += to_offset("-12H")
+-        expected = DataArray.from_series(expected_)
+-        assert_identical(actual, expected)
+-
+         with pytest.raises(ValueError, match=r"index must be monotonic"):
+             array[[2, 0, 1]].resample(time="1D")
+ 
+@@ -1802,12 +1796,15 @@ class TestDataArrayResample:
+             # done here due to floating point arithmetic
+             assert_allclose(expected, actual, rtol=1e-16)
+ 
++    @pytest.mark.skipif(has_pandas_version_two, reason="requires pandas < 2.0.0")
+     def test_resample_base(self) -> None:
+         times = pd.date_range("2000-01-01T02:03:01", freq="6H", periods=10)
+         array = DataArray(np.arange(10), [("time", times)])
+ 
+         base = 11
+-        actual = array.resample(time="24H", base=base).mean()
++
++        with pytest.warns(FutureWarning, match="the `base` parameter to resample"):
++            actual = array.resample(time="24H", base=base).mean()
+         expected = DataArray(array.to_series().resample("24H", base=base).mean())
+         assert_identical(expected, actual)
+ 
+@@ -1829,6 +1826,32 @@ class TestDataArrayResample:
+         expected = DataArray(array.to_series().resample("24H", origin=origin).mean())
+         assert_identical(expected, actual)
+ 
++    @pytest.mark.skipif(has_pandas_version_two, reason="requires pandas < 2.0.0")
++    @pytest.mark.parametrize(
++        "loffset",
++        [
++            "-12H",
++            datetime.timedelta(hours=-12),
++            pd.Timedelta(hours=-12),
++            pd.DateOffset(hours=-12),
++        ],
++    )
++    def test_resample_loffset(self, loffset) -> None:
++        times = pd.date_range("2000-01-01", freq="6H", periods=10)
++        array = DataArray(np.arange(10), [("time", times)])
++
++        with pytest.warns(FutureWarning, match="`loffset` parameter"):
++            actual = array.resample(time="24H", loffset=loffset).mean()
++        expected = DataArray(array.to_series().resample("24H", loffset=loffset).mean())
++        assert_identical(actual, expected)
++
++    def test_resample_invalid_loffset(self) -> None:
++        times = pd.date_range("2000-01-01", freq="6H", periods=10)
++        array = DataArray(np.arange(10), [("time", times)])
++
++        with pytest.raises(ValueError, match="`loffset` must be"):
++            array.resample(time="24H", loffset=1).mean()  # type: ignore
++
+ 
+ class TestDatasetResample:
+     def test_resample_and_first(self):
+
+diff --git a/xarray/tests/test_indexing.py b/xarray/tests/test_indexing.py
+index 8229db0..9f57b3b 100644
+--- a/xarray/tests/test_indexing.py
++++ b/xarray/tests/test_indexing.py
+@@ -11,7 +11,14 @@ from xarray import DataArray, Dataset, Variable
+ from xarray.core import indexing, nputils
+ from xarray.core.indexes import PandasIndex, PandasMultiIndex
+ from xarray.core.types import T_Xarray
+-from xarray.tests import IndexerMaker, ReturnItem, assert_array_equal
++from xarray.tests import (
++    IndexerMaker,
++    ReturnItem,
++    assert_array_equal,
++    assert_identical,
++    raise_if_dask_computes,
++    requires_dask,
++)
+ 
+ B = IndexerMaker(indexing.BasicIndexer)
+ 
+@@ -820,3 +827,65 @@ def test_indexing_1d_object_array() -> None:
+     expected = DataArray(expected_data)
+ 
+     assert [actual.data.item()] == [expected.data.item()]
++
++
++@requires_dask
++def test_indexing_dask_array():
++    import dask.array
++
++    da = DataArray(
++        np.ones(10 * 3 * 3).reshape((10, 3, 3)),
++        dims=("time", "x", "y"),
++    ).chunk(dict(time=-1, x=1, y=1))
++    with raise_if_dask_computes():
++        actual = da.isel(time=dask.array.from_array([9], chunks=(1,)))
++    expected = da.isel(time=[9])
++    assert_identical(actual, expected)
++
++
++@requires_dask
++def test_indexing_dask_array_scalar():
++    # GH4276
++    import dask.array
++
++    a = dask.array.from_array(np.linspace(0.0, 1.0))
++    da = DataArray(a, dims="x")
++    x_selector = da.argmax(dim=...)
++    with raise_if_dask_computes():
++        actual = da.isel(x_selector)
++    expected = da.isel(x=-1)
++    assert_identical(actual, expected)
++
++
++@requires_dask
++def test_vectorized_indexing_dask_array():
++    # https://github.com/pydata/xarray/issues/2511#issuecomment-563330352
++    darr = DataArray(data=[0.2, 0.4, 0.6], coords={"z": range(3)}, dims=("z",))
++    indexer = DataArray(
++        data=np.random.randint(0, 3, 8).reshape(4, 2).astype(int),
++        coords={"y": range(4), "x": range(2)},
++        dims=("y", "x"),
++    )
++    with pytest.raises(ValueError, match="Vectorized indexing with Dask arrays"):
++        darr[indexer.chunk({"y": 2})]
++
++
++@requires_dask
++def test_advanced_indexing_dask_array():
++    # GH4663
++    import dask.array as da
++
++    ds = Dataset(
++        dict(
++            a=("x", da.from_array(np.random.randint(0, 100, 100))),
++            b=(("x", "y"), da.random.random((100, 10))),
++        )
++    )
++    expected = ds.b.sel(x=ds.a.compute())
++    with raise_if_dask_computes():
++        actual = ds.b.sel(x=ds.a)
++    assert_identical(expected, actual)
++
++    with raise_if_dask_computes():
++        actual = ds.b.sel(x=ds.a.data)
++    assert_identical(expected, actual)
+
+diff --git a/xarray/tests/test_missing.py b/xarray/tests/test_missing.py
+index 83ed1aa..a6b6b1f 100644
+--- a/xarray/tests/test_missing.py
++++ b/xarray/tests/test_missing.py
+@@ -542,19 +542,28 @@ def test_bfill_dataset(ds):
+ 
+ @requires_bottleneck
+ @pytest.mark.parametrize(
+-    "y, lengths",
++    "y, lengths_expected",
+     [
+-        [np.arange(9), [[3, 3, 3, 0, 3, 3, 0, 2, 2]]],
+-        [np.arange(9) * 3, [[9, 9, 9, 0, 9, 9, 0, 6, 6]]],
+-        [[0, 2, 5, 6, 7, 8, 10, 12, 14], [[6, 6, 6, 0, 4, 4, 0, 4, 4]]],
++        [np.arange(9), [[1, 0, 7, 7, 7, 7, 7, 7, 0], [3, 3, 3, 0, 3, 3, 0, 2, 2]]],
++        [
++            np.arange(9) * 3,
++            [[3, 0, 21, 21, 21, 21, 21, 21, 0], [9, 9, 9, 0, 9, 9, 0, 6, 6]],
++        ],
++        [
++            [0, 2, 5, 6, 7, 8, 10, 12, 14],
++            [[2, 0, 12, 12, 12, 12, 12, 12, 0], [6, 6, 6, 0, 4, 4, 0, 4, 4]],
++        ],
+     ],
+ )
+-def test_interpolate_na_nan_block_lengths(y, lengths):
+-    arr = [[np.nan, np.nan, np.nan, 1, np.nan, np.nan, 4, np.nan, np.nan]]
+-    da = xr.DataArray(arr * 2, dims=["x", "y"], coords={"x": [0, 1], "y": y})
++def test_interpolate_na_nan_block_lengths(y, lengths_expected):
++    arr = [
++        [np.nan, 1, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 4],
++        [np.nan, np.nan, np.nan, 1, np.nan, np.nan, 4, np.nan, np.nan],
++    ]
++    da = xr.DataArray(arr, dims=["x", "y"], coords={"x": [0, 1], "y": y})
+     index = get_clean_interp_index(da, dim="y", use_coordinate=True)
+     actual = _get_nan_block_lengths(da, dim="y", index=index)
+-    expected = da.copy(data=lengths * 2)
++    expected = da.copy(data=lengths_expected)
+     assert_equal(actual, expected)
+ 
+ 
+@@ -660,16 +669,17 @@ def test_interpolate_na_max_gap_time_specifier(
+     "coords",
+     [
+         pytest.param(None, marks=pytest.mark.xfail()),
+-        {"x": np.arange(4), "y": np.arange(11)},
++        {"x": np.arange(4), "y": np.arange(12)},
+     ],
+ )
+ def test_interpolate_na_2d(coords):
++    n = np.nan
+     da = xr.DataArray(
+         [
+-            [1, 2, 3, 4, np.nan, 6, 7, np.nan, np.nan, np.nan, 11],
+-            [1, 2, 3, np.nan, np.nan, 6, 7, np.nan, np.nan, np.nan, 11],
+-            [1, 2, 3, np.nan, np.nan, 6, 7, np.nan, np.nan, np.nan, 11],
+-            [1, 2, 3, 4, np.nan, 6, 7, np.nan, np.nan, np.nan, 11],
++            [1, 2, 3, 4, n, 6, n, n, n, 10, 11, n],
++            [n, n, 3, n, n, 6, n, n, n, 10, n, n],
++            [n, n, 3, n, n, 6, n, n, n, 10, n, n],
++            [n, 2, 3, 4, n, 6, n, n, n, 10, 11, n],
+         ],
+         dims=["x", "y"],
+         coords=coords,
+@@ -678,21 +688,32 @@ def test_interpolate_na_2d(coords):
+     actual = da.interpolate_na("y", max_gap=2)
+     expected_y = da.copy(
+         data=[
+-            [1, 2, 3, 4, 5, 6, 7, np.nan, np.nan, np.nan, 11],
+-            [1, 2, 3, np.nan, np.nan, 6, 7, np.nan, np.nan, np.nan, 11],
+-            [1, 2, 3, np.nan, np.nan, 6, 7, np.nan, np.nan, np.nan, 11],
+-            [1, 2, 3, 4, 5, 6, 7, np.nan, np.nan, np.nan, 11],
++            [1, 2, 3, 4, 5, 6, n, n, n, 10, 11, n],
++            [n, n, 3, n, n, 6, n, n, n, 10, n, n],
++            [n, n, 3, n, n, 6, n, n, n, 10, n, n],
++            [n, 2, 3, 4, 5, 6, n, n, n, 10, 11, n],
+         ]
+     )
+     assert_equal(actual, expected_y)
+ 
++    actual = da.interpolate_na("y", max_gap=1, fill_value="extrapolate")
++    expected_y_extra = da.copy(
++        data=[
++            [1, 2, 3, 4, n, 6, n, n, n, 10, 11, 12],
++            [n, n, 3, n, n, 6, n, n, n, 10, n, n],
++            [n, n, 3, n, n, 6, n, n, n, 10, n, n],
++            [1, 2, 3, 4, n, 6, n, n, n, 10, 11, 12],
++        ]
++    )
++    assert_equal(actual, expected_y_extra)
++
+     actual = da.interpolate_na("x", max_gap=3)
+     expected_x = xr.DataArray(
+         [
+-            [1, 2, 3, 4, np.nan, 6, 7, np.nan, np.nan, np.nan, 11],
+-            [1, 2, 3, 4, np.nan, 6, 7, np.nan, np.nan, np.nan, 11],
+-            [1, 2, 3, 4, np.nan, 6, 7, np.nan, np.nan, np.nan, 11],
+-            [1, 2, 3, 4, np.nan, 6, 7, np.nan, np.nan, np.nan, 11],
++            [1, 2, 3, 4, n, 6, n, n, n, 10, 11, n],
++            [n, 2, 3, 4, n, 6, n, n, n, 10, 11, n],
++            [n, 2, 3, 4, n, 6, n, n, n, 10, 11, n],
++            [n, 2, 3, 4, n, 6, n, n, n, 10, 11, n],
+         ],
+         dims=["x", "y"],
+         coords=coords,
+
+diff --git a/xarray/tests/test_plot.py b/xarray/tests/test_plot.py
+index b4043af..b7b5f00 100644
+--- a/xarray/tests/test_plot.py
++++ b/xarray/tests/test_plot.py
+@@ -30,6 +30,7 @@ from xarray.plot.utils import (
+ from xarray.tests import (
+     assert_array_equal,
+     assert_equal,
++    assert_no_warnings,
+     requires_cartopy,
+     requires_cftime,
+     requires_matplotlib,
+@@ -426,6 +427,16 @@ class TestPlot(PlotTestCase):
+             _, unique_counts = np.unique(v[:-1], axis=0, return_counts=True)
+             assert np.all(unique_counts == 1)
+ 
++    def test_str_coordinates_pcolormesh(self) -> None:
++        # test for #6775
++        x = DataArray(
++            [[1, 2, 3], [4, 5, 6]],
++            dims=("a", "b"),
++            coords={"a": [1, 2], "b": ["a", "b", "c"]},
++        )
++        x.plot.pcolormesh()
++        x.T.plot.pcolormesh()
++
+     def test_contourf_cmap_set(self) -> None:
+         a = DataArray(easy_array((4, 4)), dims=["z", "time"])
+ 
+@@ -2109,6 +2120,14 @@ class TestFacetGrid(PlotTestCase):
+ 
+         assert 1 == len(find_possible_colorbars())
+ 
++    def test_colorbar_scatter(self) -> None:
++        ds = Dataset({"a": (("x", "y"), np.arange(4).reshape(2, 2))})
++        fg: xplt.FacetGrid = ds.plot.scatter(x="a", y="a", row="x", hue="a")
++        cbar = fg.cbar
++        assert cbar is not None
++        assert cbar.vmin == 0
++        assert cbar.vmax == 3
++
+     @pytest.mark.slow
+     def test_empty_cell(self) -> None:
+         g = xplt.FacetGrid(self.darray, col="z", col_wrap=2)
+@@ -2716,7 +2735,7 @@ class TestDatasetScatterPlots(PlotTestCase):
+     def test_non_numeric_legend(self) -> None:
+         ds2 = self.ds.copy()
+         ds2["hue"] = ["a", "b", "c", "d"]
+-        pc = ds2.plot.scatter(x="A", y="B", hue="hue")
++        pc = ds2.plot.scatter(x="A", y="B", markersize="hue")
+         # should make a discrete legend
+         assert pc.axes.legend_ is not None
+ 
+@@ -2724,15 +2743,9 @@ class TestDatasetScatterPlots(PlotTestCase):
+         # regression test for #4126: incorrect legend labels
+         ds2 = self.ds.copy()
+         ds2["hue"] = ["a", "a", "b", "b"]
+-        pc = ds2.plot.scatter(x="A", y="B", hue="hue")
++        pc = ds2.plot.scatter(x="A", y="B", markersize="hue")
+         actual = [t.get_text() for t in pc.axes.get_legend().texts]
+-        expected = [
+-            "col [colunits]",
+-            "$\\mathdefault{0}$",
+-            "$\\mathdefault{1}$",
+-            "$\\mathdefault{2}$",
+-            "$\\mathdefault{3}$",
+-        ]
++        expected = ["hue", "a", "b"]
+         assert actual == expected
+ 
+     def test_legend_labels_facetgrid(self) -> None:
+@@ -3204,3 +3217,38 @@ def test_facetgrid_axes_raises_deprecation_warning() -> None:
+             ds = xr.tutorial.scatter_example_dataset()
+             g = ds.plot.scatter(x="A", y="B", col="x")
+             g.axes
++
++
++@requires_matplotlib
++def test_plot1d_default_rcparams() -> None:
++    import matplotlib as mpl
++
++    ds = xr.tutorial.scatter_example_dataset(seed=42)
++
++    with figure_context():
++        # scatter markers should by default have white edgecolor to better
++        # see overlapping markers:
++        fig, ax = plt.subplots(1, 1)
++        ds.plot.scatter(x="A", y="B", marker="o", ax=ax)
++        np.testing.assert_allclose(
++            ax.collections[0].get_edgecolor(), mpl.colors.to_rgba_array("w")
++        )
++
++        # Facetgrids should have the default value as well:
++        fg = ds.plot.scatter(x="A", y="B", col="x", marker="o")
++        ax = fg.axs.ravel()[0]
++        np.testing.assert_allclose(
++            ax.collections[0].get_edgecolor(), mpl.colors.to_rgba_array("w")
++        )
++
++        # scatter should not emit any warnings when using unfilled markers:
++        with assert_no_warnings():
++            fig, ax = plt.subplots(1, 1)
++            ds.plot.scatter(x="A", y="B", ax=ax, marker="x")
++
++        # Prioritize edgecolor argument over default plot1d values:
++        fig, ax = plt.subplots(1, 1)
++        ds.plot.scatter(x="A", y="B", marker="o", ax=ax, edgecolor="k")
++        np.testing.assert_allclose(
++            ax.collections[0].get_edgecolor(), mpl.colors.to_rgba_array("k")
++        )

@@ -1,0 +1,769 @@
+{
+  "old_dir": ".packages/xarray/2022.11.0",
+  "new_dir": ".packages/xarray/2022.12.0",
+  "extracted_at": "2026-03-26T21:24:07.318184",
+  "diff_file": "metadata/xarray_upgrade/v2022.11.0_v2022.12.0/test_diff_v2022.11.0_to_v2022.12.0.diff",
+  "diff_content": "diff --git a/xarray/tests/__init__.py b/xarray/tests/__init__.py\nindex 584053d..6970a34 100644\n--- a/xarray/tests/__init__.py\n+++ b/xarray/tests/__init__.py\n@@ -35,6 +35,8 @@ try:\n except ImportError:\n     pass\n \n+# https://github.com/pydata/xarray/issues/7322\n+warnings.filterwarnings(\"ignore\", \"'urllib3.contrib.pyopenssl' module is deprecated\")\n \n arm_xfail = pytest.mark.xfail(\n     platform.machine() == \"aarch64\" or \"arm\" in platform.machine(),\n@@ -68,7 +70,6 @@ has_pseudonetcdf, requires_pseudonetcdf = _importorskip(\"PseudoNetCDF\")\n has_cftime, requires_cftime = _importorskip(\"cftime\")\n has_dask, requires_dask = _importorskip(\"dask\")\n has_bottleneck, requires_bottleneck = _importorskip(\"bottleneck\")\n-has_nc_time_axis, requires_nc_time_axis = _importorskip(\"nc_time_axis\")\n has_rasterio, requires_rasterio = _importorskip(\"rasterio\")\n has_zarr, requires_zarr = _importorskip(\"zarr\")\n has_fsspec, requires_fsspec = _importorskip(\"fsspec\")\n\ndiff --git a/xarray/tests/test_backends.py b/xarray/tests/test_backends.py\nindex 64030b3..81417f8 100644\n--- a/xarray/tests/test_backends.py\n+++ b/xarray/tests/test_backends.py\n@@ -102,6 +102,24 @@ try:\n except ImportError:\n     pass\n \n+have_zarr_kvstore = False\n+try:\n+    from zarr.storage import KVStore\n+\n+    have_zarr_kvstore = True\n+except ImportError:\n+    KVStore = None\n+\n+have_zarr_v3 = False\n+try:\n+    # as of Zarr v2.13 these imports require environment variable\n+    # ZARR_V3_EXPERIMENTAL_API=1\n+    from zarr import DirectoryStoreV3, KVStoreV3\n+\n+    have_zarr_v3 = True\n+except ImportError:\n+    KVStoreV3 = None\n+\n ON_WINDOWS = sys.platform == \"win32\"\n default_value = object()\n dask_array_type = array_type(\"dask\")\n@@ -1735,6 +1753,8 @@ class TestNetCDF4ViaDaskData(TestNetCDF4Data):\n class ZarrBase(CFEncodedBase):\n \n     DIMENSION_KEY = \"_ARRAY_DIMENSIONS\"\n+    zarr_version = 2\n+    version_kwargs: dict[str, Any] = {}\n \n     def create_zarr_target(self):\n         raise NotImplementedError\n@@ -1742,14 +1762,18 @@ class ZarrBase(CFEncodedBase):\n     @contextlib.contextmanager\n     def create_store(self):\n         with self.create_zarr_target() as store_target:\n-            yield backends.ZarrStore.open_group(store_target, mode=\"w\")\n+            yield backends.ZarrStore.open_group(\n+                store_target, mode=\"w\", **self.version_kwargs\n+            )\n \n     def save(self, dataset, store_target, **kwargs):\n-        return dataset.to_zarr(store=store_target, **kwargs)\n+        return dataset.to_zarr(store=store_target, **kwargs, **self.version_kwargs)\n \n     @contextlib.contextmanager\n     def open(self, store_target, **kwargs):\n-        with xr.open_dataset(store_target, engine=\"zarr\", **kwargs) as ds:\n+        with xr.open_dataset(\n+            store_target, engine=\"zarr\", **kwargs, **self.version_kwargs\n+        ) as ds:\n             yield ds\n \n     @contextlib.contextmanager\n@@ -1767,24 +1791,30 @@ class ZarrBase(CFEncodedBase):\n \n     @pytest.mark.parametrize(\"consolidated\", [False, True, None])\n     def test_roundtrip_consolidated(self, consolidated) -> None:\n+        if consolidated and self.zarr_version > 2:\n+            pytest.xfail(\"consolidated metadata is not supported for zarr v3 yet\")\n         expected = create_test_data()\n         with self.roundtrip(\n             expected,\n-            save_kwargs={\"consolidated\": True},\n-            open_kwargs={\"backend_kwargs\": {\"consolidated\": True}},\n+            save_kwargs={\"consolidated\": consolidated},\n+            open_kwargs={\"backend_kwargs\": {\"consolidated\": consolidated}},\n         ) as actual:\n             self.check_dtypes_roundtripped(expected, actual)\n             assert_identical(expected, actual)\n \n     def test_read_non_consolidated_warning(self) -> None:\n+\n+        if self.zarr_version > 2:\n+            pytest.xfail(\"consolidated metadata is not supported for zarr v3 yet\")\n+\n         expected = create_test_data()\n         with self.create_zarr_target() as store:\n-            expected.to_zarr(store, consolidated=False)\n+            expected.to_zarr(store, consolidated=False, **self.version_kwargs)\n             with pytest.warns(\n                 RuntimeWarning,\n                 match=\"Failed to open Zarr store with consolidated\",\n             ):\n-                with xr.open_zarr(store) as ds:\n+                with xr.open_zarr(store, **self.version_kwargs) as ds:\n                     assert_identical(ds, expected)\n \n     def test_non_existent_store(self) -> None:\n@@ -2076,10 +2106,14 @@ class ZarrBase(CFEncodedBase):\n         # check append mode for append write\n         ds, ds_to_append, _ = create_append_test_data()\n         with self.create_zarr_target() as store_target:\n-            ds.to_zarr(store_target, mode=\"w\", group=group)\n-            ds_to_append.to_zarr(store_target, append_dim=\"time\", group=group)\n+            ds.to_zarr(store_target, mode=\"w\", group=group, **self.version_kwargs)\n+            ds_to_append.to_zarr(\n+                store_target, append_dim=\"time\", group=group, **self.version_kwargs\n+            )\n             original = xr.concat([ds, ds_to_append], dim=\"time\")\n-            actual = xr.open_dataset(store_target, group=group, engine=\"zarr\")\n+            actual = xr.open_dataset(\n+                store_target, group=group, engine=\"zarr\", **self.version_kwargs\n+            )\n             assert_identical(original, actual)\n \n     def test_compressor_encoding(self) -> None:\n@@ -2119,8 +2153,8 @@ class ZarrBase(CFEncodedBase):\n         original = Dataset({\"foo\": (\"x\", [1])})\n         modified = Dataset({\"foo\": (\"x\", [2])})\n         with self.create_zarr_target() as store:\n-            original.to_zarr(store)\n-            modified.to_zarr(store, mode=\"r+\")\n+            original.to_zarr(store, **self.version_kwargs)\n+            modified.to_zarr(store, mode=\"r+\", **self.version_kwargs)\n             with self.open(store) as actual:\n                 assert_identical(actual, modified)\n \n@@ -2128,61 +2162,69 @@ class ZarrBase(CFEncodedBase):\n         original = Dataset({\"foo\": (\"x\", [1])})\n         modified = Dataset({\"bar\": (\"x\", [2])})\n         with self.create_zarr_target() as store:\n-            original.to_zarr(store)\n+            original.to_zarr(store, **self.version_kwargs)\n             with pytest.raises(\n                 ValueError, match=\"dataset contains non-pre-existing variables\"\n             ):\n-                modified.to_zarr(store, mode=\"r+\")\n+                modified.to_zarr(store, mode=\"r+\", **self.version_kwargs)\n \n     def test_append_with_invalid_dim_raises(self) -> None:\n         ds, ds_to_append, _ = create_append_test_data()\n         with self.create_zarr_target() as store_target:\n-            ds.to_zarr(store_target, mode=\"w\")\n+            ds.to_zarr(store_target, mode=\"w\", **self.version_kwargs)\n             with pytest.raises(\n                 ValueError, match=\"does not match any existing dataset dimensions\"\n             ):\n-                ds_to_append.to_zarr(store_target, append_dim=\"notvalid\")\n+                ds_to_append.to_zarr(\n+                    store_target, append_dim=\"notvalid\", **self.version_kwargs\n+                )\n \n     def test_append_with_no_dims_raises(self) -> None:\n         with self.create_zarr_target() as store_target:\n-            Dataset({\"foo\": (\"x\", [1])}).to_zarr(store_target, mode=\"w\")\n+            Dataset({\"foo\": (\"x\", [1])}).to_zarr(\n+                store_target, mode=\"w\", **self.version_kwargs\n+            )\n             with pytest.raises(ValueError, match=\"different dimension names\"):\n-                Dataset({\"foo\": (\"y\", [2])}).to_zarr(store_target, mode=\"a\")\n+                Dataset({\"foo\": (\"y\", [2])}).to_zarr(\n+                    store_target, mode=\"a\", **self.version_kwargs\n+                )\n \n     def test_append_with_append_dim_not_set_raises(self) -> None:\n         ds, ds_to_append, _ = create_append_test_data()\n         with self.create_zarr_target() as store_target:\n-            ds.to_zarr(store_target, mode=\"w\")\n+            ds.to_zarr(store_target, mode=\"w\", **self.version_kwargs)\n             with pytest.raises(ValueError, match=\"different dimension sizes\"):\n-                ds_to_append.to_zarr(store_target, mode=\"a\")\n+                ds_to_append.to_zarr(store_target, mode=\"a\", **self.version_kwargs)\n \n     def test_append_with_mode_not_a_raises(self) -> None:\n         ds, ds_to_append, _ = create_append_test_data()\n         with self.create_zarr_target() as store_target:\n-            ds.to_zarr(store_target, mode=\"w\")\n+            ds.to_zarr(store_target, mode=\"w\", **self.version_kwargs)\n             with pytest.raises(ValueError, match=\"cannot set append_dim unless\"):\n-                ds_to_append.to_zarr(store_target, mode=\"w\", append_dim=\"time\")\n+                ds_to_append.to_zarr(\n+                    store_target, mode=\"w\", append_dim=\"time\", **self.version_kwargs\n+                )\n \n     def test_append_with_existing_encoding_raises(self) -> None:\n         ds, ds_to_append, _ = create_append_test_data()\n         with self.create_zarr_target() as store_target:\n-            ds.to_zarr(store_target, mode=\"w\")\n+            ds.to_zarr(store_target, mode=\"w\", **self.version_kwargs)\n             with pytest.raises(ValueError, match=\"but encoding was provided\"):\n                 ds_to_append.to_zarr(\n                     store_target,\n                     append_dim=\"time\",\n                     encoding={\"da\": {\"compressor\": None}},\n+                    **self.version_kwargs,\n                 )\n \n     @pytest.mark.parametrize(\"dtype\", [\"U\", \"S\"])\n     def test_append_string_length_mismatch_raises(self, dtype) -> None:\n         ds, ds_to_append = create_append_string_length_mismatch_test_data(dtype)\n         with self.create_zarr_target() as store_target:\n-            ds.to_zarr(store_target, mode=\"w\")\n+            ds.to_zarr(store_target, mode=\"w\", **self.version_kwargs)\n             with pytest.raises(ValueError, match=\"Mismatched dtypes for variable\"):\n                 ds_to_append.to_zarr(\n-                    store_target,\n-                    append_dim=\"time\",\n+                    store_target, append_dim=\"time\", **self.version_kwargs\n                 )\n \n     def test_check_encoding_is_consistent_after_append(self) -> None:\n@@ -2195,13 +2237,17 @@ class ZarrBase(CFEncodedBase):\n \n             compressor = zarr.Blosc()\n             encoding = {\"da\": {\"compressor\": compressor}}\n-            ds.to_zarr(store_target, mode=\"w\", encoding=encoding)\n-            ds_to_append.to_zarr(store_target, append_dim=\"time\")\n-            actual_ds = xr.open_dataset(store_target, engine=\"zarr\")\n+            ds.to_zarr(store_target, mode=\"w\", encoding=encoding, **self.version_kwargs)\n+            ds_to_append.to_zarr(store_target, append_dim=\"time\", **self.version_kwargs)\n+            actual_ds = xr.open_dataset(\n+                store_target, engine=\"zarr\", **self.version_kwargs\n+            )\n             actual_encoding = actual_ds[\"da\"].encoding[\"compressor\"]\n             assert actual_encoding.get_config() == compressor.get_config()\n             assert_identical(\n-                xr.open_dataset(store_target, engine=\"zarr\").compute(),\n+                xr.open_dataset(\n+                    store_target, engine=\"zarr\", **self.version_kwargs\n+                ).compute(),\n                 xr.concat([ds, ds_to_append], dim=\"time\"),\n             )\n \n@@ -2211,11 +2257,16 @@ class ZarrBase(CFEncodedBase):\n \n         # check append mode for new variable\n         with self.create_zarr_target() as store_target:\n-            xr.concat([ds, ds_to_append], dim=\"time\").to_zarr(store_target, mode=\"w\")\n-            ds_with_new_var.to_zarr(store_target, mode=\"a\")\n+            xr.concat([ds, ds_to_append], dim=\"time\").to_zarr(\n+                store_target, mode=\"w\", **self.version_kwargs\n+            )\n+            ds_with_new_var.to_zarr(store_target, mode=\"a\", **self.version_kwargs)\n             combined = xr.concat([ds, ds_to_append], dim=\"time\")\n             combined[\"new_var\"] = ds_with_new_var[\"new_var\"]\n-            assert_identical(combined, xr.open_dataset(store_target, engine=\"zarr\"))\n+            assert_identical(\n+                combined,\n+                xr.open_dataset(store_target, engine=\"zarr\", **self.version_kwargs),\n+            )\n \n     @requires_dask\n     def test_to_zarr_compute_false_roundtrip(self) -> None:\n@@ -2291,12 +2342,14 @@ class ZarrBase(CFEncodedBase):\n             with self.roundtrip(ds, open_kwargs=dict(chunks={\"a\": 1})) as ds_reload:\n                 assert_identical(ds, ds_reload)\n \n-    @pytest.mark.parametrize(\"consolidated\", [False, True])\n+    @pytest.mark.parametrize(\"consolidated\", [False, True, None])\n     @pytest.mark.parametrize(\"compute\", [False, True])\n     @pytest.mark.parametrize(\"use_dask\", [False, True])\n     def test_write_region(self, consolidated, compute, use_dask) -> None:\n         if (use_dask or not compute) and not has_dask:\n             pytest.skip(\"requires dask\")\n+        if consolidated and self.zarr_version > 2:\n+            pytest.xfail(\"consolidated metadata is not supported for zarr v3 yet\")\n \n         zeros = Dataset({\"u\": ((\"x\",), np.zeros(10))})\n         nonzeros = Dataset({\"u\": ((\"x\",), np.arange(1, 11))})\n@@ -2311,16 +2364,24 @@ class ZarrBase(CFEncodedBase):\n                 consolidated=consolidated,\n                 compute=compute,\n                 encoding={\"u\": dict(chunks=2)},\n+                **self.version_kwargs,\n             )\n             if compute:\n-                with xr.open_zarr(store, consolidated=consolidated) as actual:\n+                with xr.open_zarr(\n+                    store, consolidated=consolidated, **self.version_kwargs\n+                ) as actual:\n                     assert_identical(actual, zeros)\n             for i in range(0, 10, 2):\n                 region = {\"x\": slice(i, i + 2)}\n                 nonzeros.isel(region).to_zarr(\n-                    store, region=region, consolidated=consolidated\n+                    store,\n+                    region=region,\n+                    consolidated=consolidated,\n+                    **self.version_kwargs,\n                 )\n-            with xr.open_zarr(store, consolidated=consolidated) as actual:\n+            with xr.open_zarr(\n+                store, consolidated=consolidated, **self.version_kwargs\n+            ) as actual:\n                 assert_identical(actual, nonzeros)\n \n     @pytest.mark.parametrize(\"mode\", [None, \"r+\", \"a\"])\n@@ -2328,10 +2389,12 @@ class ZarrBase(CFEncodedBase):\n         zeros = Dataset({\"u\": ((\"x\",), np.zeros(10))})\n         nonzeros = Dataset({\"u\": ((\"x\",), np.arange(1, 11))})\n         with self.create_zarr_target() as store:\n-            zeros.to_zarr(store)\n+            zeros.to_zarr(store, **self.version_kwargs)\n             for region in [{\"x\": slice(5)}, {\"x\": slice(5, 10)}]:\n-                nonzeros.isel(region).to_zarr(store, region=region, mode=mode)\n-            with xr.open_zarr(store) as actual:\n+                nonzeros.isel(region).to_zarr(\n+                    store, region=region, mode=mode, **self.version_kwargs\n+                )\n+            with xr.open_zarr(store, **self.version_kwargs) as actual:\n                 assert_identical(actual, nonzeros)\n \n     @requires_dask\n@@ -2355,8 +2418,8 @@ class ZarrBase(CFEncodedBase):\n         )\n \n         with self.create_zarr_target() as store:\n-            original.to_zarr(store, compute=False)\n-            both_modified.to_zarr(store, mode=\"a\")\n+            original.to_zarr(store, compute=False, **self.version_kwargs)\n+            both_modified.to_zarr(store, mode=\"a\", **self.version_kwargs)\n             with self.open(store) as actual:\n                 # NOTE: this arguably incorrect -- we should probably be\n                 # overriding the variable metadata, too. See the TODO note in\n@@ -2364,15 +2427,17 @@ class ZarrBase(CFEncodedBase):\n                 assert_identical(actual, global_modified)\n \n         with self.create_zarr_target() as store:\n-            original.to_zarr(store, compute=False)\n-            both_modified.to_zarr(store, mode=\"r+\")\n+            original.to_zarr(store, compute=False, **self.version_kwargs)\n+            both_modified.to_zarr(store, mode=\"r+\", **self.version_kwargs)\n             with self.open(store) as actual:\n                 assert_identical(actual, only_new_data)\n \n         with self.create_zarr_target() as store:\n-            original.to_zarr(store, compute=False)\n+            original.to_zarr(store, compute=False, **self.version_kwargs)\n             # with region, the default mode becomes r+\n-            both_modified.to_zarr(store, region={\"x\": slice(None)})\n+            both_modified.to_zarr(\n+                store, region={\"x\": slice(None)}, **self.version_kwargs\n+            )\n             with self.open(store) as actual:\n                 assert_identical(actual, only_new_data)\n \n@@ -2383,7 +2448,7 @@ class ZarrBase(CFEncodedBase):\n         @contextlib.contextmanager\n         def setup_and_verify_store(expected=data):\n             with self.create_zarr_target() as store:\n-                data.to_zarr(store)\n+                data.to_zarr(store, **self.version_kwargs)\n                 yield store\n                 with self.open(store) as actual:\n                     assert_identical(actual, expected)\n@@ -2391,7 +2456,7 @@ class ZarrBase(CFEncodedBase):\n         # verify the base case works\n         expected = Dataset({\"u\": ((\"x\",), np.array([10, 11, 2, 3, 4]))})\n         with setup_and_verify_store(expected) as store:\n-            data2.to_zarr(store, region={\"x\": slice(2)})\n+            data2.to_zarr(store, region={\"x\": slice(2)}, **self.version_kwargs)\n \n         with setup_and_verify_store() as store:\n             with pytest.raises(\n@@ -2400,46 +2465,57 @@ class ZarrBase(CFEncodedBase):\n                     \"cannot set region unless mode='a', mode='r+' or mode=None\"\n                 ),\n             ):\n-                data.to_zarr(store, region={\"x\": slice(None)}, mode=\"w\")\n+                data.to_zarr(\n+                    store, region={\"x\": slice(None)}, mode=\"w\", **self.version_kwargs\n+                )\n \n         with setup_and_verify_store() as store:\n             with pytest.raises(TypeError, match=r\"must be a dict\"):\n-                data.to_zarr(store, region=slice(None))  # type: ignore[call-overload]\n+                data.to_zarr(store, region=slice(None), **self.version_kwargs)  # type: ignore[call-overload]\n \n         with setup_and_verify_store() as store:\n             with pytest.raises(TypeError, match=r\"must be slice objects\"):\n-                data2.to_zarr(store, region={\"x\": [0, 1]})  # type: ignore[dict-item]\n+                data2.to_zarr(store, region={\"x\": [0, 1]}, **self.version_kwargs)  # type: ignore[dict-item]\n \n         with setup_and_verify_store() as store:\n             with pytest.raises(ValueError, match=r\"step on all slices\"):\n-                data2.to_zarr(store, region={\"x\": slice(None, None, 2)})\n+                data2.to_zarr(\n+                    store, region={\"x\": slice(None, None, 2)}, **self.version_kwargs\n+                )\n \n         with setup_and_verify_store() as store:\n             with pytest.raises(\n                 ValueError,\n                 match=r\"all keys in ``region`` are not in Dataset dimensions\",\n             ):\n-                data.to_zarr(store, region={\"y\": slice(None)})\n+                data.to_zarr(store, region={\"y\": slice(None)}, **self.version_kwargs)\n \n         with setup_and_verify_store() as store:\n             with pytest.raises(\n                 ValueError,\n                 match=r\"all variables in the dataset to write must have at least one dimension in common\",\n             ):\n-                data2.assign(v=2).to_zarr(store, region={\"x\": slice(2)})\n+                data2.assign(v=2).to_zarr(\n+                    store, region={\"x\": slice(2)}, **self.version_kwargs\n+                )\n \n         with setup_and_verify_store() as store:\n             with pytest.raises(\n                 ValueError, match=r\"cannot list the same dimension in both\"\n             ):\n-                data.to_zarr(store, region={\"x\": slice(None)}, append_dim=\"x\")\n+                data.to_zarr(\n+                    store,\n+                    region={\"x\": slice(None)},\n+                    append_dim=\"x\",\n+                    **self.version_kwargs,\n+                )\n \n         with setup_and_verify_store() as store:\n             with pytest.raises(\n                 ValueError,\n                 match=r\"variable 'u' already exists with different dimension sizes\",\n             ):\n-                data2.to_zarr(store, region={\"x\": slice(3)})\n+                data2.to_zarr(store, region={\"x\": slice(3)}, **self.version_kwargs)\n \n     @requires_dask\n     def test_encoding_chunksizes(self) -> None:\n@@ -2481,10 +2557,10 @@ class ZarrBase(CFEncodedBase):\n     def test_open_zarr_use_cftime(self) -> None:\n         ds = create_test_data()\n         with self.create_zarr_target() as store_target:\n-            ds.to_zarr(store_target)\n-            ds_a = xr.open_zarr(store_target)\n+            ds.to_zarr(store_target, **self.version_kwargs)\n+            ds_a = xr.open_zarr(store_target, **self.version_kwargs)\n             assert_identical(ds, ds_a)\n-            ds_b = xr.open_zarr(store_target, use_cftime=True)\n+            ds_b = xr.open_zarr(store_target, use_cftime=True, **self.version_kwargs)\n             assert xr.coding.times.contains_cftime_datetimes(ds_b.time)\n \n     def test_write_read_select_write(self) -> None:\n@@ -2493,13 +2569,13 @@ class ZarrBase(CFEncodedBase):\n \n         # NOTE: using self.roundtrip, which uses open_dataset, will not trigger the bug.\n         with self.create_zarr_target() as initial_store:\n-            ds.to_zarr(initial_store, mode=\"w\")\n-            ds1 = xr.open_zarr(initial_store)\n+            ds.to_zarr(initial_store, mode=\"w\", **self.version_kwargs)\n+            ds1 = xr.open_zarr(initial_store, **self.version_kwargs)\n \n         # Combination of where+squeeze triggers error on write.\n         ds_sel = ds1.where(ds1.coords[\"dim3\"] == \"a\", drop=True).squeeze(\"dim3\")\n         with self.create_zarr_target() as final_store:\n-            ds_sel.to_zarr(final_store, mode=\"w\")\n+            ds_sel.to_zarr(final_store, mode=\"w\", **self.version_kwargs)\n \n     @pytest.mark.parametrize(\"obj\", [Dataset(), DataArray(name=\"foo\")])\n     def test_attributes(self, obj) -> None:\n@@ -2508,21 +2584,24 @@ class ZarrBase(CFEncodedBase):\n         obj.attrs[\"good\"] = {\"key\": \"value\"}\n         ds = obj if isinstance(obj, Dataset) else obj.to_dataset()\n         with self.create_zarr_target() as store_target:\n-            ds.to_zarr(store_target)\n-            assert_identical(ds, xr.open_zarr(store_target))\n+            ds.to_zarr(store_target, **self.version_kwargs)\n+            assert_identical(ds, xr.open_zarr(store_target, **self.version_kwargs))\n \n         obj.attrs[\"bad\"] = DataArray()\n         ds = obj if isinstance(obj, Dataset) else obj.to_dataset()\n         with self.create_zarr_target() as store_target:\n             with pytest.raises(TypeError, match=r\"Invalid attribute in Dataset.attrs.\"):\n-                ds.to_zarr(store_target)\n+                ds.to_zarr(store_target, **self.version_kwargs)\n \n \n @requires_zarr\n class TestZarrDictStore(ZarrBase):\n     @contextlib.contextmanager\n     def create_zarr_target(self):\n-        yield {}\n+        if have_zarr_kvstore:\n+            yield KVStore({})\n+        else:\n+            yield {}\n \n \n @requires_zarr\n@@ -2532,6 +2611,55 @@ class TestZarrDirectoryStore(ZarrBase):\n         with create_tmp_file(suffix=\".zarr\") as tmp:\n             yield tmp\n \n+    @contextlib.contextmanager\n+    def create_store(self):\n+        with self.create_zarr_target() as store_target:\n+            group = backends.ZarrStore.open_group(store_target, mode=\"w\")\n+            # older Zarr versions do not have the _store_version attribute\n+            if have_zarr_v3:\n+                # verify that a v2 store was created\n+                assert group.zarr_group.store._store_version == 2\n+            yield group\n+\n+\n+class ZarrBaseV3(ZarrBase):\n+    zarr_version = 3\n+\n+    def test_roundtrip_coordinates_with_space(self):\n+        original = Dataset(coords={\"x\": 0, \"y z\": 1})\n+        with pytest.warns(SerializationWarning):\n+            # v3 stores do not allow spaces in the key name\n+            with pytest.raises(ValueError):\n+                with self.roundtrip(original):\n+                    pass\n+\n+\n+@pytest.mark.skipif(not have_zarr_v3, reason=\"requires zarr version 3\")\n+class TestZarrKVStoreV3(ZarrBaseV3):\n+    @contextlib.contextmanager\n+    def create_zarr_target(self):\n+        yield KVStoreV3({})\n+\n+\n+@pytest.mark.skipif(not have_zarr_v3, reason=\"requires zarr version 3\")\n+class TestZarrDirectoryStoreV3(ZarrBaseV3):\n+    @contextlib.contextmanager\n+    def create_zarr_target(self):\n+        with create_tmp_file(suffix=\".zr3\") as tmp:\n+            yield DirectoryStoreV3(tmp)\n+\n+\n+@pytest.mark.skipif(not have_zarr_v3, reason=\"requires zarr version 3\")\n+class TestZarrDirectoryStoreV3FromPath(TestZarrDirectoryStoreV3):\n+    # Must specify zarr_version=3 to get a v3 store because create_zarr_target\n+    # is a string path.\n+    version_kwargs = {\"zarr_version\": 3}\n+\n+    @contextlib.contextmanager\n+    def create_zarr_target(self):\n+        with create_tmp_file(suffix=\".zr3\") as tmp:\n+            yield tmp\n+\n \n @requires_zarr\n @requires_fsspec\n@@ -3025,19 +3153,18 @@ class TestH5NetCDFFileObject(TestH5NetCDFData):\n         with pytest.raises(\n             ValueError, match=r\"not the signature of a valid netCDF4 file\"\n         ):\n-            with open_dataset(BytesIO(b\"garbage\"), engine=\"h5netcdf\"):  # type: ignore[arg-type]\n+            with open_dataset(BytesIO(b\"garbage\"), engine=\"h5netcdf\"):\n                 pass\n \n     def test_open_twice(self) -> None:\n         expected = create_test_data()\n         expected.attrs[\"foo\"] = \"bar\"\n-        with pytest.raises(ValueError, match=r\"read/write pointer not at the start\"):\n-            with create_tmp_file() as tmp_file:\n-                expected.to_netcdf(tmp_file, engine=\"h5netcdf\")\n-                with open(tmp_file, \"rb\") as f:\n+        with create_tmp_file() as tmp_file:\n+            expected.to_netcdf(tmp_file, engine=\"h5netcdf\")\n+            with open(tmp_file, \"rb\") as f:\n+                with open_dataset(f, engine=\"h5netcdf\"):\n                     with open_dataset(f, engine=\"h5netcdf\"):\n-                        with open_dataset(f, engine=\"h5netcdf\"):\n-                            pass\n+                        pass\n \n     @requires_scipy\n     def test_open_fileobj(self) -> None:\n@@ -3069,15 +3196,7 @@ class TestH5NetCDFFileObject(TestH5NetCDFData):\n             # `raises_regex`?). Ref https://github.com/pydata/xarray/pull/5191\n             with open(tmp_file, \"rb\") as f:\n                 f.seek(8)\n-                with pytest.raises(\n-                    ValueError,\n-                    match=\"match in any of xarray's currently installed IO\",\n-                ):\n-                    with pytest.warns(\n-                        RuntimeWarning,\n-                        match=re.escape(\"'h5netcdf' fails while guessing\"),\n-                    ):\n-                        open_dataset(f)\n+                open_dataset(f)\n \n \n @requires_h5netcdf\n@@ -4949,6 +5068,12 @@ class TestEncodingInvalid:\n         encoding = _extract_nc4_variable_encoding(var, unlimited_dims=(\"x\",))\n         assert {} == encoding\n \n+    @requires_netCDF4\n+    def test_extract_nc4_variable_encoding_netcdf4(self, monkeypatch):\n+        # New netCDF4 1.6.0 compression argument.\n+        var = xr.Variable((\"x\",), [1, 2, 3], {}, {\"compression\": \"szlib\"})\n+        _extract_nc4_variable_encoding(var, backend=\"netCDF4\", raise_on_invalid=True)\n+\n     def test_extract_h5nc_encoding(self) -> None:\n         # not supported with h5netcdf (yet)\n         var = xr.Variable((\"x\",), [1, 2, 3], {}, {\"least_sigificant_digit\": 2})\n\ndiff --git a/xarray/tests/test_cftime_offsets.py b/xarray/tests/test_cftime_offsets.py\nindex 075393e..d28f459 100644\n--- a/xarray/tests/test_cftime_offsets.py\n+++ b/xarray/tests/test_cftime_offsets.py\n@@ -1385,3 +1385,9 @@ def test_date_range_like_errors():\n         match=\"'source' must be a 1D array of datetime objects for inferring its range.\",\n     ):\n         date_range_like(da, \"noleap\")\n+\n+\n+def as_timedelta_not_implemented_error():\n+    tick = Tick()\n+    with pytest.raises(NotImplementedError):\n+        tick.as_timedelta()\n\ndiff --git a/xarray/tests/test_cftimeindex_resample.py b/xarray/tests/test_cftimeindex_resample.py\nindex 35447a3..e780421 100644\n--- a/xarray/tests/test_cftimeindex_resample.py\n+++ b/xarray/tests/test_cftimeindex_resample.py\n@@ -9,7 +9,7 @@ import pytest\n import xarray as xr\n from xarray.core.resample_cftime import CFTimeGrouper\n \n-pytest.importorskip(\"cftime\")\n+cftime = pytest.importorskip(\"cftime\")\n \n \n # Create a list of pairs of similar-length initial and resample frequencies\n@@ -50,7 +50,63 @@ FREQS = [\n ]\n \n \n-def da(index):\n+def compare_against_pandas(\n+    da_datetimeindex,\n+    da_cftimeindex,\n+    freq,\n+    closed=None,\n+    label=None,\n+    base=None,\n+    offset=None,\n+    origin=None,\n+    loffset=None,\n+) -> None:\n+    if isinstance(origin, tuple):\n+        origin_pandas = pd.Timestamp(datetime.datetime(*origin))\n+        origin_cftime = cftime.DatetimeGregorian(*origin)\n+    else:\n+        origin_pandas = origin\n+        origin_cftime = origin\n+\n+    try:\n+        result_datetimeindex = da_datetimeindex.resample(\n+            time=freq,\n+            closed=closed,\n+            label=label,\n+            base=base,\n+            loffset=loffset,\n+            offset=offset,\n+            origin=origin_pandas,\n+        ).mean()\n+    except ValueError:\n+        with pytest.raises(ValueError):\n+            da_cftimeindex.resample(\n+                time=freq,\n+                closed=closed,\n+                label=label,\n+                base=base,\n+                loffset=loffset,\n+                origin=origin_cftime,\n+                offset=offset,\n+            ).mean()\n+    else:\n+        result_cftimeindex = da_cftimeindex.resample(\n+            time=freq,\n+            closed=closed,\n+            label=label,\n+            base=base,\n+            loffset=loffset,\n+            origin=origin_cftime,\n+            offset=offset,\n+        ).mean()\n+    # TODO (benbovy - flexible indexes): update when CFTimeIndex is a xarray Index subclass\n+    result_cftimeindex[\"time\"] = (\n+        result_cftimeindex.xindexes[\"time\"].to_pandas_index().to_datetimeindex()\n+    )\n+    xr.testing.assert_identical(result_cftimeindex, result_datetimeindex)\n+\n+\n+def da(index) -> xr.DataArray:\n     return xr.DataArray(\n         np.arange(100.0, 100.0 + index.size), coords=[index], dims=[\"time\"]\n     )\n@@ -59,53 +115,31 @@ def da(index):\n @pytest.mark.parametrize(\"freqs\", FREQS, ids=lambda x: \"{}->{}\".format(*x))\n @pytest.mark.parametrize(\"closed\", [None, \"left\", \"right\"])\n @pytest.mark.parametrize(\"label\", [None, \"left\", \"right\"])\n-@pytest.mark.parametrize(\"base\", [24, 31])\n-def test_resample(freqs, closed, label, base) -> None:\n+@pytest.mark.parametrize(\n+    (\"base\", \"offset\"), [(24, None), (31, None), (None, \"5S\")], ids=lambda x: f\"{x}\"\n+)\n+def test_resample(freqs, closed, label, base, offset) -> None:\n     initial_freq, resample_freq = freqs\n     start = \"2000-01-01T12:07:01\"\n+    loffset = \"12H\"\n+    origin = \"start\"\n     index_kwargs = dict(start=start, periods=5, freq=initial_freq)\n     datetime_index = pd.date_range(**index_kwargs)\n     cftime_index = xr.cftime_range(**index_kwargs)\n+    da_datetimeindex = da(datetime_index)\n+    da_cftimeindex = da(cftime_index)\n \n-    loffset = \"12H\"\n-    try:\n-        da_datetime = (\n-            da(datetime_index)\n-            .resample(\n-                time=resample_freq,\n-                closed=closed,\n-                label=label,\n-                base=base,\n-                loffset=loffset,\n-            )\n-            .mean()\n-        )\n-    except ValueError:\n-        with pytest.raises(ValueError):\n-            da(cftime_index).resample(\n-                time=resample_freq,\n-                closed=closed,\n-                label=label,\n-                base=base,\n-                loffset=loffset,\n-            ).mean()\n-    else:\n-        da_cftime = (\n-            da(cftime_index)\n-            .resample(\n-                time=resample_freq,\n-                closed=closed,\n-                label=label,\n-                base=base,\n-                loffset=loffset,\n-            )\n-            .mean()\n-        )\n-        # TODO (benbovy - flexible indexes): update when CFTimeIndex is a xarray Index subclass\n-        da_cftime[\"time\"] = (\n-            da_cftime.xindexes[\"time\"].to_pandas_index().to_datetimeindex()\n-        )\n-        xr.testing.assert_identical(da_cftime, da_datetime)\n+    compare_against_pandas(\n+        da_datetimeindex,\n+        da_cftimeindex,\n+        resample_freq,\n+        closed=closed,\n+        label=label,\n+        base=base,\n+        offset=offset,\n+        origin=origin,\n+        loffset=loffset,\n+    )\n \n \n @pytest.mark.parametrize(\n@@ -153,3 +187,54 @@ def test_calendars(calendar) -> None:\n     # TODO (benbovy - flexible indexes): update when CFTimeIndex is a xarray Index subclass\n     da_cftime[\"time\"] = da_cftime.xindexes[\"time\"].to_pandas_index().to_datetimeindex()\n     xr.testing.assert_identical(da_cftime, da_datetime)\n+\n+\n+@pytest.mark.parametrize(\"closed\", [\"left\", \"right\"])\n+@pytest.mark.parametrize(\n+    \"origin\",\n+    [\"start_day\", \"start\", \"end\", \"end_day\", \"epoch\", (1970, 1, 1, 3, 2)],\n+    ids=lambda x: f\"{x}\",\n+)\n+def test_origin(closed, origin) -> None:\n+    initial_freq, resample_freq = (\"3H\", \"9H\")\n+    start = \"1969-12-31T12:07:01\"\n+    index_kwargs = dict(start=start, periods=12, freq=initial_freq)\n+    datetime_index = pd.date_range(**index_kwargs)\n+    cftime_index = xr.cftime_range(**index_kwargs)\n+    da_datetimeindex = da(datetime_index)\n+    da_cftimeindex = da(cftime_index)\n+\n+    compare_against_pandas(\n+        da_datetimeindex,\n+        da_cftimeindex,\n+        resample_freq,\n+        closed=closed,\n+        origin=origin,\n+    )\n+\n+\n+def test_base_and_offset_error():\n+    cftime_index = xr.cftime_range(\"2000\", periods=5)\n+    da_cftime = da(cftime_index)\n+    with pytest.raises(ValueError, match=\"base and offset cannot\"):\n+        da_cftime.resample(time=\"2D\", base=3, offset=\"5S\")\n+\n+\n+@pytest.mark.parametrize(\"offset\", [\"foo\", \"5MS\", 10])\n+def test_invalid_offset_error(offset) -> None:\n+    cftime_index = xr.cftime_range(\"2000\", periods=5)\n+    da_cftime = da(cftime_index)\n+    with pytest.raises(ValueError, match=\"offset must be\"):\n+        da_cftime.resample(time=\"2D\", offset=offset)\n+\n+\n+def test_timedelta_offset() -> None:\n+    timedelta = datetime.timedelta(seconds=5)\n+    string = \"5S\"\n+\n+    cftime_index = xr.cftime_range(\"2000\", periods=5)\n+    da_cftime = da(cftime_index)\n+\n+    timedelta_result = da_cftime.resample(time=\"2D\", offset=timedelta).mean()\n+    string_result = da_cftime.resample(time=\"2D\", offset=string).mean()\n+    xr.testing.assert_identical(timedelta_result, string_result)\n\ndiff --git a/xarray/tests/test_coding_times.py b/xarray/tests/test_coding_times.py\nindex a73e547..ca3b937 100644\n--- a/xarray/tests/test_coding_times.py\n+++ b/xarray/tests/test_coding_times.py\n@@ -614,7 +614,7 @@ def test_cf_timedelta_2d() -> None:\n \n     actual = coding.times.decode_cf_timedelta(numbers, units)\n     assert_array_equal(expected, actual)\n-    assert expected.dtype == actual.dtype  # type: ignore\n+    assert expected.dtype == actual.dtype\n \n \n @pytest.mark.parametrize(\n@@ -651,7 +651,7 @@ def test_format_cftime_datetime(date_args, expected) -> None:\n def test_decode_cf(calendar) -> None:\n     days = [1.0, 2.0, 3.0]\n     # TODO: GH5690 — do we want to allow this type for `coords`?\n-    da = DataArray(days, coords=[days], dims=[\"time\"], name=\"test\")  # type: ignore\n+    da = DataArray(days, coords=[days], dims=[\"time\"], name=\"test\")\n     ds = da.to_dataset()\n \n     for v in [\"test\", \"time\"]:\n\ndiff --git a/xarray/tests/test_computation.py b/xarray/tests/test_computation.py\nindex da1bd01..73889c3 100644\n--- a/xarray/tests/test_computation.py\n+++ b/xarray/tests/test_computation.py\n@@ -1925,16 +1925,63 @@ def test_where() -> None:\n \n \n def test_where_attrs() -> None:\n-    cond = xr.DataArray([True, False], dims=\"x\", attrs={\"attr\": \"cond\"})\n-    x = xr.DataArray([1, 1], dims=\"x\", attrs={\"attr\": \"x\"})\n-    y = xr.DataArray([0, 0], dims=\"x\", attrs={\"attr\": \"y\"})\n+    cond = xr.DataArray([True, False], coords={\"a\": [0, 1]}, attrs={\"attr\": \"cond_da\"})\n+    cond[\"a\"].attrs = {\"attr\": \"cond_coord\"}\n+    x = xr.DataArray([1, 1], coords={\"a\": [0, 1]}, attrs={\"attr\": \"x_da\"})\n+    x[\"a\"].attrs = {\"attr\": \"x_coord\"}\n+    y = xr.DataArray([0, 0], coords={\"a\": [0, 1]}, attrs={\"attr\": \"y_da\"})\n+    y[\"a\"].attrs = {\"attr\": \"y_coord\"}\n+\n+    # 3 DataArrays, takes attrs from x\n     actual = xr.where(cond, x, y, keep_attrs=True)\n-    expected = xr.DataArray([1, 0], dims=\"x\", attrs={\"attr\": \"x\"})\n+    expected = xr.DataArray([1, 0], coords={\"a\": [0, 1]}, attrs={\"attr\": \"x_da\"})\n+    expected[\"a\"].attrs = {\"attr\": \"x_coord\"}\n     assert_identical(expected, actual)\n \n-    # ensure keep_attrs can handle scalar values\n+    # x as a scalar, takes no attrs\n+    actual = xr.where(cond, 0, y, keep_attrs=True)\n+    expected = xr.DataArray([0, 0], coords={\"a\": [0, 1]})\n+    assert_identical(expected, actual)\n+\n+    # y as a scalar, takes attrs from x\n+    actual = xr.where(cond, x, 0, keep_attrs=True)\n+    expected = xr.DataArray([1, 0], coords={\"a\": [0, 1]}, attrs={\"attr\": \"x_da\"})\n+    expected[\"a\"].attrs = {\"attr\": \"x_coord\"}\n+    assert_identical(expected, actual)\n+\n+    # x and y as a scalar, takes no attrs\n     actual = xr.where(cond, 1, 0, keep_attrs=True)\n-    assert actual.attrs == {}\n+    expected = xr.DataArray([1, 0], coords={\"a\": [0, 1]})\n+    assert_identical(expected, actual)\n+\n+    # cond and y as a scalar, takes attrs from x\n+    actual = xr.where(True, x, y, keep_attrs=True)\n+    expected = xr.DataArray([1, 1], coords={\"a\": [0, 1]}, attrs={\"attr\": \"x_da\"})\n+    expected[\"a\"].attrs = {\"attr\": \"x_coord\"}\n+    assert_identical(expected, actual)\n+\n+    # DataArray and 2 Datasets, takes attrs from x\n+    ds_x = xr.Dataset(data_vars={\"x\": x}, attrs={\"attr\": \"x_ds\"})\n+    ds_y = xr.Dataset(data_vars={\"x\": y}, attrs={\"attr\": \"y_ds\"})\n+    ds_actual = xr.where(cond, ds_x, ds_y, keep_attrs=True)\n+    ds_expected = xr.Dataset(\n+        data_vars={\n+            \"x\": xr.DataArray([1, 0], coords={\"a\": [0, 1]}, attrs={\"attr\": \"x_da\"})\n+        },\n+        attrs={\"attr\": \"x_ds\"},\n+    )\n+    ds_expected[\"a\"].attrs = {\"attr\": \"x_coord\"}\n+    assert_identical(ds_expected, ds_actual)\n+\n+    # 2 DataArrays and 1 Dataset, takes attrs from x\n+    ds_actual = xr.where(cond, x.rename(\"x\"), ds_y, keep_attrs=True)\n+    ds_expected = xr.Dataset(\n+        data_vars={\n+            \"x\": xr.DataArray([1, 0], coords={\"a\": [0, 1]}, attrs={\"attr\": \"x_da\"})\n+        },\n+    )\n+    ds_expected[\"a\"].attrs = {\"attr\": \"x_coord\"}\n+    assert_identical(ds_expected, ds_actual)\n \n \n @pytest.mark.parametrize(\n\ndiff --git a/xarray/tests/test_dataarray.py b/xarray/tests/test_dataarray.py\nindex ac60498..8184fe1 100644\n--- a/xarray/tests/test_dataarray.py\n+++ b/xarray/tests/test_dataarray.py\n@@ -512,7 +512,7 @@ class TestDataArray:\n \n     def test_equals_failures(self) -> None:\n         orig = DataArray(np.arange(5.0), {\"a\": 42}, dims=\"x\")\n-        assert not orig.equals(np.arange(5))  # type: ignore\n+        assert not orig.equals(np.arange(5))  # type: ignore[arg-type]\n         assert not orig.identical(123)  # type: ignore\n         assert not orig.broadcast_equals({1: 2})  # type: ignore\n \n@@ -2754,9 +2754,9 @@ class TestDataArray:\n         actual = DataArray(self.va).quantile(q, method=method)\n \n         if Version(np.__version__) >= Version(\"1.22.0\"):\n-            expected = np.nanquantile(self.dv.values, np.array(q), method=method)  # type: ignore[call-arg]\n+            expected = np.nanquantile(self.dv.values, np.array(q), method=method)\n         else:\n-            expected = np.nanquantile(self.dv.values, np.array(q), interpolation=method)  # type: ignore[call-arg]\n+            expected = np.nanquantile(self.dv.values, np.array(q), interpolation=method)\n \n         np.testing.assert_allclose(actual.values, expected)\n \n\ndiff --git a/xarray/tests/test_dataset.py b/xarray/tests/test_dataset.py\nindex 23ea705..6bf3a2e 100644\n--- a/xarray/tests/test_dataset.py\n+++ b/xarray/tests/test_dataset.py\n@@ -4170,6 +4170,20 @@ class TestDataset:\n             is not actual.xindexes[\"level_2\"]\n         )\n \n+    def test_assign_coords_custom_index_side_effect(self) -> None:\n+        # test that assigning new coordinates do not reset other dimension coord indexes\n+        # to default (pandas) index (https://github.com/pydata/xarray/issues/7346)\n+        class CustomIndex(PandasIndex):\n+            pass\n+\n+        ds = (\n+            Dataset(coords={\"x\": [1, 2, 3]})\n+            .drop_indexes(\"x\")\n+            .set_xindex(\"x\", CustomIndex)\n+        )\n+        actual = ds.assign_coords(y=[4, 5, 6])\n+        assert isinstance(actual.xindexes[\"x\"], CustomIndex)\n+\n     def test_merge_multiindex_level(self) -> None:\n         data = create_test_multiindex()\n \n@@ -6230,7 +6244,7 @@ class TestDataset:\n         with pytest.raises(ValueError):\n             ds.query(\"a > 5\")  # type: ignore # must be dict or kwargs\n         with pytest.raises(ValueError):\n-            ds.query(x=(a > 5))  # type: ignore # must be query string\n+            ds.query(x=(a > 5))\n         with pytest.raises(IndexError):\n             ds.query(y=\"a > 5\")  # wrong length dimension\n         with pytest.raises(IndexError):\n\ndiff --git a/xarray/tests/test_distributed.py b/xarray/tests/test_distributed.py\nindex 780417c..2dd589f 100644\n--- a/xarray/tests/test_distributed.py\n+++ b/xarray/tests/test_distributed.py\n@@ -189,7 +189,7 @@ def test_dask_distributed_zarr_integration_test(\n         write_kwargs: dict[str, Any] = {\"consolidated\": True}\n         read_kwargs: dict[str, Any] = {\"backend_kwargs\": {\"consolidated\": True}}\n     else:\n-        write_kwargs = read_kwargs = {}  # type: ignore\n+        write_kwargs = read_kwargs = {}\n     chunks = {\"dim1\": 4, \"dim2\": 3, \"dim3\": 5}\n     with cluster() as (s, [a, b]):\n         with Client(s[\"address\"], loop=loop):\n\ndiff --git a/xarray/tests/test_extensions.py b/xarray/tests/test_extensions.py\nindex 6f91cdf..d4414b1 100644\n--- a/xarray/tests/test_extensions.py\n+++ b/xarray/tests/test_extensions.py\n@@ -37,7 +37,6 @@ class TestAccessor:\n \n         da = xr.DataArray(0)\n         assert da.demo.foo == \"bar\"\n-\n         # accessor is cached\n         assert ds.demo is ds.demo\n \n@@ -45,7 +44,7 @@ class TestAccessor:\n         assert ds.demo.__doc__ == \"Demo accessor.\"\n         # TODO: typing doesn't seem to work with accessors\n         assert xr.Dataset.demo.__doc__ == \"Demo accessor.\"  # type: ignore\n-        assert isinstance(ds.demo, DemoAccessor)  # type: ignore\n+        assert isinstance(ds.demo, DemoAccessor)\n         assert xr.Dataset.demo is DemoAccessor  # type: ignore\n \n         # ensure we can remove it\n\ndiff --git a/xarray/tests/test_groupby.py b/xarray/tests/test_groupby.py\nindex d647c82..335f31d 100644\n--- a/xarray/tests/test_groupby.py\n+++ b/xarray/tests/test_groupby.py\n@@ -235,13 +235,13 @@ def test_da_groupby_quantile() -> None:\n         dims=(\"x\", \"y\"),\n     )\n \n-    actual_x = array.groupby(\"x\").quantile(0, dim=...)  # type: ignore[arg-type]  # https://github.com/python/mypy/issues/7818\n+    actual_x = array.groupby(\"x\").quantile(0, dim=...)\n     expected_x = xr.DataArray(\n         data=[1, 4], coords={\"x\": [1, 2], \"quantile\": 0}, dims=\"x\"\n     )\n     assert_identical(expected_x, actual_x)\n \n-    actual_y = array.groupby(\"y\").quantile(0, dim=...)  # type: ignore[arg-type]  # https://github.com/python/mypy/issues/7818\n+    actual_y = array.groupby(\"y\").quantile(0, dim=...)\n     expected_y = xr.DataArray(\n         data=[1, 22], coords={\"y\": [0, 1], \"quantile\": 0}, dims=\"y\"\n     )\n@@ -272,7 +272,7 @@ def test_da_groupby_quantile() -> None:\n     )\n     g = foo.groupby(foo.time.dt.month)\n \n-    actual = g.quantile(0, dim=...)  # type: ignore[arg-type]  # https://github.com/python/mypy/issues/7818\n+    actual = g.quantile(0, dim=...)\n     expected = xr.DataArray(\n         data=[\n             0.0,\n@@ -356,11 +356,11 @@ def test_ds_groupby_quantile() -> None:\n         coords={\"x\": [1, 1, 1, 2, 2], \"y\": [0, 0, 1]},\n     )\n \n-    actual_x = ds.groupby(\"x\").quantile(0, dim=...)  # type: ignore[arg-type]  # https://github.com/python/mypy/issues/7818\n+    actual_x = ds.groupby(\"x\").quantile(0, dim=...)\n     expected_x = xr.Dataset({\"a\": (\"x\", [1, 4])}, coords={\"x\": [1, 2], \"quantile\": 0})\n     assert_identical(expected_x, actual_x)\n \n-    actual_y = ds.groupby(\"y\").quantile(0, dim=...)  # type: ignore[arg-type]  # https://github.com/python/mypy/issues/7818\n+    actual_y = ds.groupby(\"y\").quantile(0, dim=...)\n     expected_y = xr.Dataset({\"a\": (\"y\", [1, 22])}, coords={\"y\": [0, 1], \"quantile\": 0})\n     assert_identical(expected_y, actual_y)\n \n@@ -386,7 +386,7 @@ def test_ds_groupby_quantile() -> None:\n     )\n     g = foo.groupby(foo.time.dt.month)\n \n-    actual = g.quantile(0, dim=...)  # type: ignore[arg-type]  # https://github.com/python/mypy/issues/7818\n+    actual = g.quantile(0, dim=...)\n     expected = xr.Dataset(\n         {\n             \"a\": (\n@@ -1810,6 +1810,33 @@ class TestDataArrayResample:\n             # done here due to floating point arithmetic\n             assert_allclose(expected, actual, rtol=1e-16)\n \n+    def test_resample_base(self) -> None:\n+        times = pd.date_range(\"2000-01-01T02:03:01\", freq=\"6H\", periods=10)\n+        array = DataArray(np.arange(10), [(\"time\", times)])\n+\n+        base = 11\n+        actual = array.resample(time=\"24H\", base=base).mean()\n+        expected = DataArray(array.to_series().resample(\"24H\", base=base).mean())\n+        assert_identical(expected, actual)\n+\n+    def test_resample_offset(self) -> None:\n+        times = pd.date_range(\"2000-01-01T02:03:01\", freq=\"6H\", periods=10)\n+        array = DataArray(np.arange(10), [(\"time\", times)])\n+\n+        offset = pd.Timedelta(\"11H\")\n+        actual = array.resample(time=\"24H\", offset=offset).mean()\n+        expected = DataArray(array.to_series().resample(\"24H\", offset=offset).mean())\n+        assert_identical(expected, actual)\n+\n+    def test_resample_origin(self) -> None:\n+        times = pd.date_range(\"2000-01-01T02:03:01\", freq=\"6H\", periods=10)\n+        array = DataArray(np.arange(10), [(\"time\", times)])\n+\n+        origin = \"start\"\n+        actual = array.resample(time=\"24H\", origin=origin).mean()\n+        expected = DataArray(array.to_series().resample(\"24H\", origin=origin).mean())\n+        assert_identical(expected, actual)\n+\n \n class TestDatasetResample:\n     def test_resample_and_first(self):\n\ndiff --git a/xarray/tests/test_plot.py b/xarray/tests/test_plot.py\nindex 01f616f..d4a707b 100644\n--- a/xarray/tests/test_plot.py\n+++ b/xarray/tests/test_plot.py\n@@ -14,6 +14,7 @@ import pytest\n import xarray as xr\n import xarray.plot as xplt\n from xarray import DataArray, Dataset\n+from xarray.core.utils import module_available\n from xarray.plot.dataarray_plot import _infer_interval_breaks\n from xarray.plot.dataset_plot import _infer_meta_data\n from xarray.plot.utils import (\n@@ -29,19 +30,20 @@ from xarray.plot.utils import (\n from . import (\n     assert_array_equal,\n     assert_equal,\n-    has_nc_time_axis,\n     requires_cartopy,\n     requires_cftime,\n     requires_matplotlib,\n-    requires_nc_time_axis,\n     requires_seaborn,\n )\n \n+# this should not be imported to test if the automatic lazy import works\n+has_nc_time_axis = module_available(\"nc_time_axis\")\n+\n # import mpl and change the backend before other mpl imports\n try:\n     import matplotlib as mpl\n     import matplotlib.pyplot as plt\n-    import mpl_toolkits  # type: ignore\n+    import mpl_toolkits\n except ImportError:\n     pass\n \n@@ -2823,8 +2825,8 @@ class TestDatetimePlot(PlotTestCase):\n \n \n @pytest.mark.filterwarnings(\"ignore:setting an array element with a sequence\")\n-@requires_nc_time_axis\n @requires_cftime\n+@pytest.mark.skipif(not has_nc_time_axis, reason=\"nc_time_axis is not installed\")\n class TestCFDatetimePlot(PlotTestCase):\n     @pytest.fixture(autouse=True)\n     def setUp(self) -> None:\n@@ -3206,7 +3208,7 @@ def test_plot_empty_raises(val: list | float, method: str) -> None:\n \n \n @requires_matplotlib\n-def test_facetgrid_axes_raises_deprecation_warning():\n+def test_facetgrid_axes_raises_deprecation_warning() -> None:\n     with pytest.warns(\n         DeprecationWarning,\n         match=(\n\ndiff --git a/xarray/tests/test_plugins.py b/xarray/tests/test_plugins.py\nindex d44973e..8029eb3 100644\n--- a/xarray/tests/test_plugins.py\n+++ b/xarray/tests/test_plugins.py\n@@ -203,6 +203,7 @@ def test_lazy_import() -> None:\n         \"scipy\",\n         \"zarr\",\n         \"matplotlib\",\n+        \"nc_time_axis\",\n         \"flox\",\n         # \"dask\",  # TODO: backends.locks is not lazy yet :(\n         \"dask.array\",\n\ndiff --git a/xarray/tests/test_utils.py b/xarray/tests/test_utils.py\nindex ae0c083..a1a9a41 100644\n--- a/xarray/tests/test_utils.py\n+++ b/xarray/tests/test_utils.py\n@@ -1,6 +1,6 @@\n from __future__ import annotations\n \n-from typing import Hashable\n+from typing import Hashable, Iterable, Sequence\n \n import numpy as np\n import pandas as pd\n@@ -253,6 +253,90 @@ def test_infix_dims_errors(supplied, all_):\n         list(utils.infix_dims(supplied, all_))\n \n \n+@pytest.mark.parametrize(\n+    [\"dim\", \"expected\"],\n+    [\n+        pytest.param(\"a\", (\"a\",), id=\"str\"),\n+        pytest.param([\"a\", \"b\"], (\"a\", \"b\"), id=\"list_of_str\"),\n+        pytest.param([\"a\", 1], (\"a\", 1), id=\"list_mixed\"),\n+        pytest.param((\"a\", \"b\"), (\"a\", \"b\"), id=\"tuple_of_str\"),\n+        pytest.param([\"a\", (\"b\", \"c\")], (\"a\", (\"b\", \"c\")), id=\"list_with_tuple\"),\n+        pytest.param(((\"b\", \"c\"),), ((\"b\", \"c\"),), id=\"tuple_of_tuple\"),\n+        pytest.param(None, None, id=\"None\"),\n+        pytest.param(..., ..., id=\"ellipsis\"),\n+    ],\n+)\n+def test_parse_dims(\n+    dim: str | Iterable[Hashable] | None,\n+    expected: tuple[Hashable, ...],\n+) -> None:\n+    all_dims = (\"a\", \"b\", 1, (\"b\", \"c\"))  # selection of different Hashables\n+    actual = utils.parse_dims(dim, all_dims, replace_none=False)\n+    assert actual == expected\n+\n+\n+def test_parse_dims_set() -> None:\n+    all_dims = (\"a\", \"b\", 1, (\"b\", \"c\"))  # selection of different Hashables\n+    dim = {\"a\", 1}\n+    actual = utils.parse_dims(dim, all_dims)\n+    assert set(actual) == dim\n+\n+\n+@pytest.mark.parametrize(\n+    \"dim\", [pytest.param(None, id=\"None\"), pytest.param(..., id=\"ellipsis\")]\n+)\n+def test_parse_dims_replace_none(dim: None | ellipsis) -> None:\n+    all_dims = (\"a\", \"b\", 1, (\"b\", \"c\"))  # selection of different Hashables\n+    actual = utils.parse_dims(dim, all_dims, replace_none=True)\n+    assert actual == all_dims\n+\n+\n+@pytest.mark.parametrize(\n+    \"dim\",\n+    [\n+        pytest.param(\"x\", id=\"str_missing\"),\n+        pytest.param([\"a\", \"x\"], id=\"list_missing_one\"),\n+        pytest.param([\"x\", 2], id=\"list_missing_all\"),\n+    ],\n+)\n+def test_parse_dims_raises(dim: str | Iterable[Hashable]) -> None:\n+    all_dims = (\"a\", \"b\", 1, (\"b\", \"c\"))  # selection of different Hashables\n+    with pytest.raises(ValueError, match=\"'x'\"):\n+        utils.parse_dims(dim, all_dims, check_exists=True)\n+\n+\n+@pytest.mark.parametrize(\n+    [\"dim\", \"expected\"],\n+    [\n+        pytest.param(\"a\", (\"a\",), id=\"str\"),\n+        pytest.param([\"a\", \"b\"], (\"a\", \"b\"), id=\"list\"),\n+        pytest.param([...], (\"a\", \"b\", \"c\"), id=\"list_only_ellipsis\"),\n+        pytest.param([\"a\", ...], (\"a\", \"b\", \"c\"), id=\"list_with_ellipsis\"),\n+        pytest.param([\"a\", ..., \"b\"], (\"a\", \"c\", \"b\"), id=\"list_with_middle_ellipsis\"),\n+    ],\n+)\n+def test_parse_ordered_dims(\n+    dim: str | Sequence[Hashable | ellipsis],\n+    expected: tuple[Hashable, ...],\n+) -> None:\n+    all_dims = (\"a\", \"b\", \"c\")\n+    actual = utils.parse_ordered_dims(dim, all_dims)\n+    assert actual == expected\n+\n+\n+def test_parse_ordered_dims_raises() -> None:\n+    all_dims = (\"a\", \"b\", \"c\")\n+\n+    with pytest.raises(ValueError, match=\"'x' do not exist\"):\n+        utils.parse_ordered_dims(\"x\", all_dims, check_exists=True)\n+\n+    with pytest.raises(ValueError, match=\"repeated dims\"):\n+        utils.parse_ordered_dims([\"a\", ...], all_dims + (\"a\",))\n+\n+    with pytest.raises(ValueError, match=\"More than one ellipsis\"):\n+        utils.parse_ordered_dims([\"a\", ..., \"b\", ...], all_dims)\n+\n+\n @pytest.mark.parametrize(\n     \"nested_list, expected\",\n     [\n\ndiff --git a/xarray/tests/test_variable.py b/xarray/tests/test_variable.py\nindex 983c584..3a6c8f1 100644\n--- a/xarray/tests/test_variable.py\n+++ b/xarray/tests/test_variable.py\n@@ -1769,9 +1769,9 @@ class TestVariable(VariableSubclassobjects):\n         actual = v.quantile(q, dim=\"y\", method=method)\n \n         if Version(np.__version__) >= Version(\"1.22\"):\n-            expected = np.nanquantile(self.d, q, axis=1, method=method)  # type: ignore[call-arg]\n+            expected = np.nanquantile(self.d, q, axis=1, method=method)\n         else:\n-            expected = np.nanquantile(self.d, q, axis=1, interpolation=method)  # type: ignore[call-arg]\n+            expected = np.nanquantile(self.d, q, axis=1, interpolation=method)\n \n         if use_dask:\n             assert isinstance(actual.data, dask_array_type)\n",
+  "structured_diff": {
+    "xarray/tests/__init__.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -35,6 +35,8 @@",
+          "snippet": " try:\n except ImportError:\n     pass\n \n+# https://github.com/pydata/xarray/issues/7322\n+warnings.filterwarnings(\"ignore\", \"'urllib3.contrib.pyopenssl' module is deprecated\")\n \n arm_xfail = pytest.mark.xfail(\n     platform.machine() == \"aarch64\" or \"arm\" in platform.machine(),",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/tests/__init__.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -68,7 +70,6 @@",
+          "snippet": " has_pseudonetcdf, requires_pseudonetcdf = _importorskip(\"PseudoNetCDF\")\n has_cftime, requires_cftime = _importorskip(\"cftime\")\n has_dask, requires_dask = _importorskip(\"dask\")\n has_bottleneck, requires_bottleneck = _importorskip(\"bottleneck\")\n-has_nc_time_axis, requires_nc_time_axis = _importorskip(\"nc_time_axis\")\n has_rasterio, requires_rasterio = _importorskip(\"rasterio\")\n has_zarr, requires_zarr = _importorskip(\"zarr\")\n has_fsspec, requires_fsspec = _importorskip(\"fsspec\")\n",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/tests/__init__.py::<module>"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/tests/test_backends.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -102,6 +102,24 @@",
+          "snippet": " try:\n except ImportError:\n     pass\n \n+have_zarr_kvstore = False\n+try:\n+    from zarr.storage import KVStore\n+\n+    have_zarr_kvstore = True\n+except ImportError:\n+    KVStore = None\n+\n+have_zarr_v3 = False\n+try:\n+    # as of Zarr v2.13 these imports require environment variable\n+    # ZARR_V3_EXPERIMENTAL_API=1\n+    from zarr import DirectoryStoreV3, KVStoreV3\n+\n+    have_zarr_v3 = True\n+except ImportError:\n+    KVStoreV3 = None\n+\n ON_WINDOWS = sys.platform == \"win32\"\n default_value = object()\n dask_array_type = array_type(\"dask\")",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "xarray/tests/test_backends.py::have_zarr_kvstore"
+            },
+            {
+              "kind": "variable",
+              "node": "xarray/tests/test_backends.py::have_zarr_v3"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1735,6 +1753,8 @@",
+          "snippet": " class TestNetCDF4ViaDaskData(TestNetCDF4Data):\n class ZarrBase(CFEncodedBase):\n \n     DIMENSION_KEY = \"_ARRAY_DIMENSIONS\"\n+    zarr_version = 2\n+    version_kwargs: dict[str, Any] = {}\n \n     def create_zarr_target(self):\n         raise NotImplementedError",
+          "affect": [
+            {
+              "kind": "attribute",
+              "node": "xarray/tests/test_backends.py::ZarrBase::zarr_version"
+            },
+            {
+              "kind": "attribute",
+              "node": "xarray/tests/test_backends.py::ZarrBase::version_kwargs"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1742,14 +1762,18 @@",
+          "snippet": " class ZarrBase(CFEncodedBase):\n     @contextlib.contextmanager\n     def create_store(self):\n         with self.create_zarr_target() as store_target:\n-            yield backends.ZarrStore.open_group(store_target, mode=\"w\")\n+            yield backends.ZarrStore.open_group(\n+                store_target, mode=\"w\", **self.version_kwargs\n+            )\n \n     def save(self, dataset, store_target, **kwargs):\n-        return dataset.to_zarr(store=store_target, **kwargs)\n+        return dataset.to_zarr(store=store_target, **kwargs, **self.version_kwargs)\n \n     @contextlib.contextmanager\n     def open(self, store_target, **kwargs):\n-        with xr.open_dataset(store_target, engine=\"zarr\", **kwargs) as ds:\n+        with xr.open_dataset(\n+            store_target, engine=\"zarr\", **kwargs, **self.version_kwargs\n+        ) as ds:\n             yield ds\n \n     @contextlib.contextmanager",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::create_store"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::save"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::open"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1767,24 +1791,30 @@",
+          "snippet": " class ZarrBase(CFEncodedBase):\n \n     @pytest.mark.parametrize(\"consolidated\", [False, True, None])\n     def test_roundtrip_consolidated(self, consolidated) -> None:\n+        if consolidated and self.zarr_version > 2:\n+            pytest.xfail(\"consolidated metadata is not supported for zarr v3 yet\")\n         expected = create_test_data()\n         with self.roundtrip(\n             expected,\n-            save_kwargs={\"consolidated\": True},\n-            open_kwargs={\"backend_kwargs\": {\"consolidated\": True}},\n+            save_kwargs={\"consolidated\": consolidated},\n+            open_kwargs={\"backend_kwargs\": {\"consolidated\": consolidated}},\n         ) as actual:\n             self.check_dtypes_roundtripped(expected, actual)\n             assert_identical(expected, actual)\n \n     def test_read_non_consolidated_warning(self) -> None:\n+\n+        if self.zarr_version > 2:\n+            pytest.xfail(\"consolidated metadata is not supported for zarr v3 yet\")\n+\n         expected = create_test_data()\n         with self.create_zarr_target() as store:\n-            expected.to_zarr(store, consolidated=False)\n+            expected.to_zarr(store, consolidated=False, **self.version_kwargs)\n             with pytest.warns(\n                 RuntimeWarning,\n                 match=\"Failed to open Zarr store with consolidated\",\n             ):\n-                with xr.open_zarr(store) as ds:\n+                with xr.open_zarr(store, **self.version_kwargs) as ds:\n                     assert_identical(ds, expected)\n \n     def test_non_existent_store(self) -> None:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_roundtrip_consolidated"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_read_non_consolidated_warning"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2076,10 +2106,14 @@",
+          "snippet": " class ZarrBase(CFEncodedBase):\n         # check append mode for append write\n         ds, ds_to_append, _ = create_append_test_data()\n         with self.create_zarr_target() as store_target:\n-            ds.to_zarr(store_target, mode=\"w\", group=group)\n-            ds_to_append.to_zarr(store_target, append_dim=\"time\", group=group)\n+            ds.to_zarr(store_target, mode=\"w\", group=group, **self.version_kwargs)\n+            ds_to_append.to_zarr(\n+                store_target, append_dim=\"time\", group=group, **self.version_kwargs\n+            )\n             original = xr.concat([ds, ds_to_append], dim=\"time\")\n-            actual = xr.open_dataset(store_target, group=group, engine=\"zarr\")\n+            actual = xr.open_dataset(\n+                store_target, group=group, engine=\"zarr\", **self.version_kwargs\n+            )\n             assert_identical(original, actual)\n \n     def test_compressor_encoding(self) -> None:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_write_persistence_modes"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2119,8 +2153,8 @@",
+          "snippet": " class ZarrBase(CFEncodedBase):\n         original = Dataset({\"foo\": (\"x\", [1])})\n         modified = Dataset({\"foo\": (\"x\", [2])})\n         with self.create_zarr_target() as store:\n-            original.to_zarr(store)\n-            modified.to_zarr(store, mode=\"r+\")\n+            original.to_zarr(store, **self.version_kwargs)\n+            modified.to_zarr(store, mode=\"r+\", **self.version_kwargs)\n             with self.open(store) as actual:\n                 assert_identical(actual, modified)\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_append_with_mode_rplus_success"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2128,61 +2162,69 @@",
+          "snippet": " class ZarrBase(CFEncodedBase):\n         original = Dataset({\"foo\": (\"x\", [1])})\n         modified = Dataset({\"bar\": (\"x\", [2])})\n         with self.create_zarr_target() as store:\n-            original.to_zarr(store)\n+            original.to_zarr(store, **self.version_kwargs)\n             with pytest.raises(\n                 ValueError, match=\"dataset contains non-pre-existing variables\"\n             ):\n-                modified.to_zarr(store, mode=\"r+\")\n+                modified.to_zarr(store, mode=\"r+\", **self.version_kwargs)\n \n     def test_append_with_invalid_dim_raises(self) -> None:\n         ds, ds_to_append, _ = create_append_test_data()\n         with self.create_zarr_target() as store_target:\n-            ds.to_zarr(store_target, mode=\"w\")\n+            ds.to_zarr(store_target, mode=\"w\", **self.version_kwargs)\n             with pytest.raises(\n                 ValueError, match=\"does not match any existing dataset dimensions\"\n             ):\n-                ds_to_append.to_zarr(store_target, append_dim=\"notvalid\")\n+                ds_to_append.to_zarr(\n+                    store_target, append_dim=\"notvalid\", **self.version_kwargs\n+                )\n \n     def test_append_with_no_dims_raises(self) -> None:\n         with self.create_zarr_target() as store_target:\n-            Dataset({\"foo\": (\"x\", [1])}).to_zarr(store_target, mode=\"w\")\n+            Dataset({\"foo\": (\"x\", [1])}).to_zarr(\n+                store_target, mode=\"w\", **self.version_kwargs\n+            )\n             with pytest.raises(ValueError, match=\"different dimension names\"):\n-                Dataset({\"foo\": (\"y\", [2])}).to_zarr(store_target, mode=\"a\")\n+                Dataset({\"foo\": (\"y\", [2])}).to_zarr(\n+                    store_target, mode=\"a\", **self.version_kwargs\n+                )\n \n     def test_append_with_append_dim_not_set_raises(self) -> None:\n         ds, ds_to_append, _ = create_append_test_data()\n         with self.create_zarr_target() as store_target:\n-            ds.to_zarr(store_target, mode=\"w\")\n+            ds.to_zarr(store_target, mode=\"w\", **self.version_kwargs)\n             with pytest.raises(ValueError, match=\"different dimension sizes\"):\n-                ds_to_append.to_zarr(store_target, mode=\"a\")\n+                ds_to_append.to_zarr(store_target, mode=\"a\", **self.version_kwargs)\n \n     def test_append_with_mode_not_a_raises(self) -> None:\n         ds, ds_to_append, _ = create_append_test_data()\n         with self.create_zarr_target() as store_target:\n-            ds.to_zarr(store_target, mode=\"w\")\n+            ds.to_zarr(store_target, mode=\"w\", **self.version_kwargs)\n             with pytest.raises(ValueError, match=\"cannot set append_dim unless\"):\n-                ds_to_append.to_zarr(store_target, mode=\"w\", append_dim=\"time\")\n+                ds_to_append.to_zarr(\n+                    store_target, mode=\"w\", append_dim=\"time\", **self.version_kwargs\n+                )\n \n     def test_append_with_existing_encoding_raises(self) -> None:\n         ds, ds_to_append, _ = create_append_test_data()\n         with self.create_zarr_target() as store_target:\n-            ds.to_zarr(store_target, mode=\"w\")\n+            ds.to_zarr(store_target, mode=\"w\", **self.version_kwargs)\n             with pytest.raises(ValueError, match=\"but encoding was provided\"):\n                 ds_to_append.to_zarr(\n                     store_target,\n                     append_dim=\"time\",\n                     encoding={\"da\": {\"compressor\": None}},\n+                    **self.version_kwargs,\n                 )\n \n     @pytest.mark.parametrize(\"dtype\", [\"U\", \"S\"])\n     def test_append_string_length_mismatch_raises(self, dtype) -> None:\n         ds, ds_to_append = create_append_string_length_mismatch_test_data(dtype)\n         with self.create_zarr_target() as store_target:\n-            ds.to_zarr(store_target, mode=\"w\")\n+            ds.to_zarr(store_target, mode=\"w\", **self.version_kwargs)\n             with pytest.raises(ValueError, match=\"Mismatched dtypes for variable\"):\n                 ds_to_append.to_zarr(\n-                    store_target,\n-                    append_dim=\"time\",\n+                    store_target, append_dim=\"time\", **self.version_kwargs\n                 )\n \n     def test_check_encoding_is_consistent_after_append(self) -> None:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_append_with_mode_rplus_fails"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_append_with_invalid_dim_raises"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_append_with_no_dims_raises"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_append_with_append_dim_not_set_raises"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_append_with_mode_not_a_raises"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_append_with_existing_encoding_raises"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_append_string_length_mismatch_raises"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2195,13 +2237,17 @@",
+          "snippet": " class ZarrBase(CFEncodedBase):\n \n             compressor = zarr.Blosc()\n             encoding = {\"da\": {\"compressor\": compressor}}\n-            ds.to_zarr(store_target, mode=\"w\", encoding=encoding)\n-            ds_to_append.to_zarr(store_target, append_dim=\"time\")\n-            actual_ds = xr.open_dataset(store_target, engine=\"zarr\")\n+            ds.to_zarr(store_target, mode=\"w\", encoding=encoding, **self.version_kwargs)\n+            ds_to_append.to_zarr(store_target, append_dim=\"time\", **self.version_kwargs)\n+            actual_ds = xr.open_dataset(\n+                store_target, engine=\"zarr\", **self.version_kwargs\n+            )\n             actual_encoding = actual_ds[\"da\"].encoding[\"compressor\"]\n             assert actual_encoding.get_config() == compressor.get_config()\n             assert_identical(\n-                xr.open_dataset(store_target, engine=\"zarr\").compute(),\n+                xr.open_dataset(\n+                    store_target, engine=\"zarr\", **self.version_kwargs\n+                ).compute(),\n                 xr.concat([ds, ds_to_append], dim=\"time\"),\n             )\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_check_encoding_is_consistent_after_append"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2211,11 +2257,16 @@",
+          "snippet": " class ZarrBase(CFEncodedBase):\n \n         # check append mode for new variable\n         with self.create_zarr_target() as store_target:\n-            xr.concat([ds, ds_to_append], dim=\"time\").to_zarr(store_target, mode=\"w\")\n-            ds_with_new_var.to_zarr(store_target, mode=\"a\")\n+            xr.concat([ds, ds_to_append], dim=\"time\").to_zarr(\n+                store_target, mode=\"w\", **self.version_kwargs\n+            )\n+            ds_with_new_var.to_zarr(store_target, mode=\"a\", **self.version_kwargs)\n             combined = xr.concat([ds, ds_to_append], dim=\"time\")\n             combined[\"new_var\"] = ds_with_new_var[\"new_var\"]\n-            assert_identical(combined, xr.open_dataset(store_target, engine=\"zarr\"))\n+            assert_identical(\n+                combined,\n+                xr.open_dataset(store_target, engine=\"zarr\", **self.version_kwargs),\n+            )\n \n     @requires_dask\n     def test_to_zarr_compute_false_roundtrip(self) -> None:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_append_with_new_variable"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2291,12 +2342,14 @@",
+          "snippet": " class ZarrBase(CFEncodedBase):\n             with self.roundtrip(ds, open_kwargs=dict(chunks={\"a\": 1})) as ds_reload:\n                 assert_identical(ds, ds_reload)\n \n-    @pytest.mark.parametrize(\"consolidated\", [False, True])\n+    @pytest.mark.parametrize(\"consolidated\", [False, True, None])\n     @pytest.mark.parametrize(\"compute\", [False, True])\n     @pytest.mark.parametrize(\"use_dask\", [False, True])\n     def test_write_region(self, consolidated, compute, use_dask) -> None:\n         if (use_dask or not compute) and not has_dask:\n             pytest.skip(\"requires dask\")\n+        if consolidated and self.zarr_version > 2:\n+            pytest.xfail(\"consolidated metadata is not supported for zarr v3 yet\")\n \n         zeros = Dataset({\"u\": ((\"x\",), np.zeros(10))})\n         nonzeros = Dataset({\"u\": ((\"x\",), np.arange(1, 11))})",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "xarray/tests/test_backends.py::ZarrBase"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_write_region"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2311,16 +2364,24 @@",
+          "snippet": " class ZarrBase(CFEncodedBase):\n                 consolidated=consolidated,\n                 compute=compute,\n                 encoding={\"u\": dict(chunks=2)},\n+                **self.version_kwargs,\n             )\n             if compute:\n-                with xr.open_zarr(store, consolidated=consolidated) as actual:\n+                with xr.open_zarr(\n+                    store, consolidated=consolidated, **self.version_kwargs\n+                ) as actual:\n                     assert_identical(actual, zeros)\n             for i in range(0, 10, 2):\n                 region = {\"x\": slice(i, i + 2)}\n                 nonzeros.isel(region).to_zarr(\n-                    store, region=region, consolidated=consolidated\n+                    store,\n+                    region=region,\n+                    consolidated=consolidated,\n+                    **self.version_kwargs,\n                 )\n-            with xr.open_zarr(store, consolidated=consolidated) as actual:\n+            with xr.open_zarr(\n+                store, consolidated=consolidated, **self.version_kwargs\n+            ) as actual:\n                 assert_identical(actual, nonzeros)\n \n     @pytest.mark.parametrize(\"mode\", [None, \"r+\", \"a\"])",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_write_region"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2328,10 +2389,12 @@",
+          "snippet": " class ZarrBase(CFEncodedBase):\n         zeros = Dataset({\"u\": ((\"x\",), np.zeros(10))})\n         nonzeros = Dataset({\"u\": ((\"x\",), np.arange(1, 11))})\n         with self.create_zarr_target() as store:\n-            zeros.to_zarr(store)\n+            zeros.to_zarr(store, **self.version_kwargs)\n             for region in [{\"x\": slice(5)}, {\"x\": slice(5, 10)}]:\n-                nonzeros.isel(region).to_zarr(store, region=region, mode=mode)\n-            with xr.open_zarr(store) as actual:\n+                nonzeros.isel(region).to_zarr(\n+                    store, region=region, mode=mode, **self.version_kwargs\n+                )\n+            with xr.open_zarr(store, **self.version_kwargs) as actual:\n                 assert_identical(actual, nonzeros)\n \n     @requires_dask",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_write_region_mode"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2355,8 +2418,8 @@",
+          "snippet": " class ZarrBase(CFEncodedBase):\n         )\n \n         with self.create_zarr_target() as store:\n-            original.to_zarr(store, compute=False)\n-            both_modified.to_zarr(store, mode=\"a\")\n+            original.to_zarr(store, compute=False, **self.version_kwargs)\n+            both_modified.to_zarr(store, mode=\"a\", **self.version_kwargs)\n             with self.open(store) as actual:\n                 # NOTE: this arguably incorrect -- we should probably be\n                 # overriding the variable metadata, too. See the TODO note in",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_write_preexisting_override_metadata"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2364,15 +2427,17 @@",
+          "snippet": " class ZarrBase(CFEncodedBase):\n                 assert_identical(actual, global_modified)\n \n         with self.create_zarr_target() as store:\n-            original.to_zarr(store, compute=False)\n-            both_modified.to_zarr(store, mode=\"r+\")\n+            original.to_zarr(store, compute=False, **self.version_kwargs)\n+            both_modified.to_zarr(store, mode=\"r+\", **self.version_kwargs)\n             with self.open(store) as actual:\n                 assert_identical(actual, only_new_data)\n \n         with self.create_zarr_target() as store:\n-            original.to_zarr(store, compute=False)\n+            original.to_zarr(store, compute=False, **self.version_kwargs)\n             # with region, the default mode becomes r+\n-            both_modified.to_zarr(store, region={\"x\": slice(None)})\n+            both_modified.to_zarr(\n+                store, region={\"x\": slice(None)}, **self.version_kwargs\n+            )\n             with self.open(store) as actual:\n                 assert_identical(actual, only_new_data)\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_write_preexisting_override_metadata"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2383,7 +2448,7 @@",
+          "snippet": " class ZarrBase(CFEncodedBase):\n         @contextlib.contextmanager\n         def setup_and_verify_store(expected=data):\n             with self.create_zarr_target() as store:\n-                data.to_zarr(store)\n+                data.to_zarr(store, **self.version_kwargs)\n                 yield store\n                 with self.open(store) as actual:\n                     assert_identical(actual, expected)",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::setup_and_verify_store"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2391,7 +2456,7 @@",
+          "snippet": " class ZarrBase(CFEncodedBase):\n         # verify the base case works\n         expected = Dataset({\"u\": ((\"x\",), np.array([10, 11, 2, 3, 4]))})\n         with setup_and_verify_store(expected) as store:\n-            data2.to_zarr(store, region={\"x\": slice(2)})\n+            data2.to_zarr(store, region={\"x\": slice(2)}, **self.version_kwargs)\n \n         with setup_and_verify_store() as store:\n             with pytest.raises(",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_write_region_errors"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2400,46 +2465,57 @@",
+          "snippet": " class ZarrBase(CFEncodedBase):\n                     \"cannot set region unless mode='a', mode='r+' or mode=None\"\n                 ),\n             ):\n-                data.to_zarr(store, region={\"x\": slice(None)}, mode=\"w\")\n+                data.to_zarr(\n+                    store, region={\"x\": slice(None)}, mode=\"w\", **self.version_kwargs\n+                )\n \n         with setup_and_verify_store() as store:\n             with pytest.raises(TypeError, match=r\"must be a dict\"):\n-                data.to_zarr(store, region=slice(None))  # type: ignore[call-overload]\n+                data.to_zarr(store, region=slice(None), **self.version_kwargs)  # type: ignore[call-overload]\n \n         with setup_and_verify_store() as store:\n             with pytest.raises(TypeError, match=r\"must be slice objects\"):\n-                data2.to_zarr(store, region={\"x\": [0, 1]})  # type: ignore[dict-item]\n+                data2.to_zarr(store, region={\"x\": [0, 1]}, **self.version_kwargs)  # type: ignore[dict-item]\n \n         with setup_and_verify_store() as store:\n             with pytest.raises(ValueError, match=r\"step on all slices\"):\n-                data2.to_zarr(store, region={\"x\": slice(None, None, 2)})\n+                data2.to_zarr(\n+                    store, region={\"x\": slice(None, None, 2)}, **self.version_kwargs\n+                )\n \n         with setup_and_verify_store() as store:\n             with pytest.raises(\n                 ValueError,\n                 match=r\"all keys in ``region`` are not in Dataset dimensions\",\n             ):\n-                data.to_zarr(store, region={\"y\": slice(None)})\n+                data.to_zarr(store, region={\"y\": slice(None)}, **self.version_kwargs)\n \n         with setup_and_verify_store() as store:\n             with pytest.raises(\n                 ValueError,\n                 match=r\"all variables in the dataset to write must have at least one dimension in common\",\n             ):\n-                data2.assign(v=2).to_zarr(store, region={\"x\": slice(2)})\n+                data2.assign(v=2).to_zarr(\n+                    store, region={\"x\": slice(2)}, **self.version_kwargs\n+                )\n \n         with setup_and_verify_store() as store:\n             with pytest.raises(\n                 ValueError, match=r\"cannot list the same dimension in both\"\n             ):\n-                data.to_zarr(store, region={\"x\": slice(None)}, append_dim=\"x\")\n+                data.to_zarr(\n+                    store,\n+                    region={\"x\": slice(None)},\n+                    append_dim=\"x\",\n+                    **self.version_kwargs,\n+                )\n \n         with setup_and_verify_store() as store:\n             with pytest.raises(\n                 ValueError,\n                 match=r\"variable 'u' already exists with different dimension sizes\",\n             ):\n-                data2.to_zarr(store, region={\"x\": slice(3)})\n+                data2.to_zarr(store, region={\"x\": slice(3)}, **self.version_kwargs)\n \n     @requires_dask\n     def test_encoding_chunksizes(self) -> None:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_write_region_errors"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2481,10 +2557,10 @@",
+          "snippet": " class ZarrBase(CFEncodedBase):\n     def test_open_zarr_use_cftime(self) -> None:\n         ds = create_test_data()\n         with self.create_zarr_target() as store_target:\n-            ds.to_zarr(store_target)\n-            ds_a = xr.open_zarr(store_target)\n+            ds.to_zarr(store_target, **self.version_kwargs)\n+            ds_a = xr.open_zarr(store_target, **self.version_kwargs)\n             assert_identical(ds, ds_a)\n-            ds_b = xr.open_zarr(store_target, use_cftime=True)\n+            ds_b = xr.open_zarr(store_target, use_cftime=True, **self.version_kwargs)\n             assert xr.coding.times.contains_cftime_datetimes(ds_b.time)\n \n     def test_write_read_select_write(self) -> None:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_open_zarr_use_cftime"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2493,13 +2569,13 @@",
+          "snippet": " class ZarrBase(CFEncodedBase):\n \n         # NOTE: using self.roundtrip, which uses open_dataset, will not trigger the bug.\n         with self.create_zarr_target() as initial_store:\n-            ds.to_zarr(initial_store, mode=\"w\")\n-            ds1 = xr.open_zarr(initial_store)\n+            ds.to_zarr(initial_store, mode=\"w\", **self.version_kwargs)\n+            ds1 = xr.open_zarr(initial_store, **self.version_kwargs)\n \n         # Combination of where+squeeze triggers error on write.\n         ds_sel = ds1.where(ds1.coords[\"dim3\"] == \"a\", drop=True).squeeze(\"dim3\")\n         with self.create_zarr_target() as final_store:\n-            ds_sel.to_zarr(final_store, mode=\"w\")\n+            ds_sel.to_zarr(final_store, mode=\"w\", **self.version_kwargs)\n \n     @pytest.mark.parametrize(\"obj\", [Dataset(), DataArray(name=\"foo\")])\n     def test_attributes(self, obj) -> None:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_write_read_select_write"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2508,21 +2584,24 @@",
+          "snippet": " class ZarrBase(CFEncodedBase):\n         obj.attrs[\"good\"] = {\"key\": \"value\"}\n         ds = obj if isinstance(obj, Dataset) else obj.to_dataset()\n         with self.create_zarr_target() as store_target:\n-            ds.to_zarr(store_target)\n-            assert_identical(ds, xr.open_zarr(store_target))\n+            ds.to_zarr(store_target, **self.version_kwargs)\n+            assert_identical(ds, xr.open_zarr(store_target, **self.version_kwargs))\n \n         obj.attrs[\"bad\"] = DataArray()\n         ds = obj if isinstance(obj, Dataset) else obj.to_dataset()\n         with self.create_zarr_target() as store_target:\n             with pytest.raises(TypeError, match=r\"Invalid attribute in Dataset.attrs.\"):\n-                ds.to_zarr(store_target)\n+                ds.to_zarr(store_target, **self.version_kwargs)\n \n \n @requires_zarr\n class TestZarrDictStore(ZarrBase):\n     @contextlib.contextmanager\n     def create_zarr_target(self):\n-        yield {}\n+        if have_zarr_kvstore:\n+            yield KVStore({})\n+        else:\n+            yield {}\n \n \n @requires_zarr",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBase::test_attributes"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::TestZarrDictStore::create_zarr_target"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2532,6 +2611,55 @@",
+          "snippet": " class TestZarrDirectoryStore(ZarrBase):\n         with create_tmp_file(suffix=\".zarr\") as tmp:\n             yield tmp\n \n+    @contextlib.contextmanager\n+    def create_store(self):\n+        with self.create_zarr_target() as store_target:\n+            group = backends.ZarrStore.open_group(store_target, mode=\"w\")\n+            # older Zarr versions do not have the _store_version attribute\n+            if have_zarr_v3:\n+                # verify that a v2 store was created\n+                assert group.zarr_group.store._store_version == 2\n+            yield group\n+\n+\n+class ZarrBaseV3(ZarrBase):\n+    zarr_version = 3\n+\n+    def test_roundtrip_coordinates_with_space(self):\n+        original = Dataset(coords={\"x\": 0, \"y z\": 1})\n+        with pytest.warns(SerializationWarning):\n+            # v3 stores do not allow spaces in the key name\n+            with pytest.raises(ValueError):\n+                with self.roundtrip(original):\n+                    pass\n+\n+\n+@pytest.mark.skipif(not have_zarr_v3, reason=\"requires zarr version 3\")\n+class TestZarrKVStoreV3(ZarrBaseV3):\n+    @contextlib.contextmanager\n+    def create_zarr_target(self):\n+        yield KVStoreV3({})\n+\n+\n+@pytest.mark.skipif(not have_zarr_v3, reason=\"requires zarr version 3\")\n+class TestZarrDirectoryStoreV3(ZarrBaseV3):\n+    @contextlib.contextmanager\n+    def create_zarr_target(self):\n+        with create_tmp_file(suffix=\".zr3\") as tmp:\n+            yield DirectoryStoreV3(tmp)\n+\n+\n+@pytest.mark.skipif(not have_zarr_v3, reason=\"requires zarr version 3\")\n+class TestZarrDirectoryStoreV3FromPath(TestZarrDirectoryStoreV3):\n+    # Must specify zarr_version=3 to get a v3 store because create_zarr_target\n+    # is a string path.\n+    version_kwargs = {\"zarr_version\": 3}\n+\n+    @contextlib.contextmanager\n+    def create_zarr_target(self):\n+        with create_tmp_file(suffix=\".zr3\") as tmp:\n+            yield tmp\n+\n \n @requires_zarr\n @requires_fsspec",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "xarray/tests/test_backends.py::TestZarrDirectoryStore"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::TestZarrDirectoryStore::create_store"
+            },
+            {
+              "kind": "class",
+              "node": "xarray/tests/test_backends.py::ZarrBaseV3"
+            },
+            {
+              "kind": "attribute",
+              "node": "xarray/tests/test_backends.py::ZarrBaseV3::zarr_version"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::ZarrBaseV3::test_roundtrip_coordinates_with_space"
+            },
+            {
+              "kind": "class",
+              "node": "xarray/tests/test_backends.py::TestZarrKVStoreV3"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::TestZarrKVStoreV3::create_zarr_target"
+            },
+            {
+              "kind": "class",
+              "node": "xarray/tests/test_backends.py::TestZarrDirectoryStoreV3"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::TestZarrDirectoryStoreV3::create_zarr_target"
+            },
+            {
+              "kind": "class",
+              "node": "xarray/tests/test_backends.py::TestZarrDirectoryStoreV3FromPath"
+            },
+            {
+              "kind": "attribute",
+              "node": "xarray/tests/test_backends.py::TestZarrDirectoryStoreV3FromPath::version_kwargs"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::TestZarrDirectoryStoreV3FromPath::create_zarr_target"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -3025,19 +3153,18 @@",
+          "snippet": " class TestH5NetCDFFileObject(TestH5NetCDFData):\n         with pytest.raises(\n             ValueError, match=r\"not the signature of a valid netCDF4 file\"\n         ):\n-            with open_dataset(BytesIO(b\"garbage\"), engine=\"h5netcdf\"):  # type: ignore[arg-type]\n+            with open_dataset(BytesIO(b\"garbage\"), engine=\"h5netcdf\"):\n                 pass\n \n     def test_open_twice(self) -> None:\n         expected = create_test_data()\n         expected.attrs[\"foo\"] = \"bar\"\n-        with pytest.raises(ValueError, match=r\"read/write pointer not at the start\"):\n-            with create_tmp_file() as tmp_file:\n-                expected.to_netcdf(tmp_file, engine=\"h5netcdf\")\n-                with open(tmp_file, \"rb\") as f:\n+        with create_tmp_file() as tmp_file:\n+            expected.to_netcdf(tmp_file, engine=\"h5netcdf\")\n+            with open(tmp_file, \"rb\") as f:\n+                with open_dataset(f, engine=\"h5netcdf\"):\n                     with open_dataset(f, engine=\"h5netcdf\"):\n-                        with open_dataset(f, engine=\"h5netcdf\"):\n-                            pass\n+                        pass\n \n     @requires_scipy\n     def test_open_fileobj(self) -> None:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::TestH5NetCDFFileObject::test_open_badbytes"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::TestH5NetCDFFileObject::test_open_twice"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -3069,15 +3196,7 @@",
+          "snippet": " class TestH5NetCDFFileObject(TestH5NetCDFData):\n             # `raises_regex`?). Ref https://github.com/pydata/xarray/pull/5191\n             with open(tmp_file, \"rb\") as f:\n                 f.seek(8)\n-                with pytest.raises(\n-                    ValueError,\n-                    match=\"match in any of xarray's currently installed IO\",\n-                ):\n-                    with pytest.warns(\n-                        RuntimeWarning,\n-                        match=re.escape(\"'h5netcdf' fails while guessing\"),\n-                    ):\n-                        open_dataset(f)\n+                open_dataset(f)\n \n \n @requires_h5netcdf",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::TestH5NetCDFFileObject::test_open_fileobj"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -4949,6 +5068,12 @@",
+          "snippet": " class TestEncodingInvalid:\n         encoding = _extract_nc4_variable_encoding(var, unlimited_dims=(\"x\",))\n         assert {} == encoding\n \n+    @requires_netCDF4\n+    def test_extract_nc4_variable_encoding_netcdf4(self, monkeypatch):\n+        # New netCDF4 1.6.0 compression argument.\n+        var = xr.Variable((\"x\",), [1, 2, 3], {}, {\"compression\": \"szlib\"})\n+        _extract_nc4_variable_encoding(var, backend=\"netCDF4\", raise_on_invalid=True)\n+\n     def test_extract_h5nc_encoding(self) -> None:\n         # not supported with h5netcdf (yet)\n         var = xr.Variable((\"x\",), [1, 2, 3], {}, {\"least_sigificant_digit\": 2})\n",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "xarray/tests/test_backends.py::TestEncodingInvalid"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_backends.py::TestEncodingInvalid::test_extract_nc4_variable_encoding_netcdf4"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/tests/test_cftime_offsets.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1385,3 +1385,9 @@",
+          "snippet": " def test_date_range_like_errors():\n         match=\"'source' must be a 1D array of datetime objects for inferring its range.\",\n     ):\n         date_range_like(da, \"noleap\")\n+\n+\n+def as_timedelta_not_implemented_error():\n+    tick = Tick()\n+    with pytest.raises(NotImplementedError):\n+        tick.as_timedelta()\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_cftime_offsets.py::as_timedelta_not_implemented_error"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/tests/test_cftimeindex_resample.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -9,7 +9,7 @@",
+          "snippet": " import pytest\n import xarray as xr\n from xarray.core.resample_cftime import CFTimeGrouper\n \n-pytest.importorskip(\"cftime\")\n+cftime = pytest.importorskip(\"cftime\")\n \n \n # Create a list of pairs of similar-length initial and resample frequencies",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "xarray/tests/test_cftimeindex_resample.py::cftime"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -50,7 +50,63 @@",
+          "snippet": " FREQS = [\n ]\n \n \n-def da(index):\n+def compare_against_pandas(\n+    da_datetimeindex,\n+    da_cftimeindex,\n+    freq,\n+    closed=None,\n+    label=None,\n+    base=None,\n+    offset=None,\n+    origin=None,\n+    loffset=None,\n+) -> None:\n+    if isinstance(origin, tuple):\n+        origin_pandas = pd.Timestamp(datetime.datetime(*origin))\n+        origin_cftime = cftime.DatetimeGregorian(*origin)\n+    else:\n+        origin_pandas = origin\n+        origin_cftime = origin\n+\n+    try:\n+        result_datetimeindex = da_datetimeindex.resample(\n+            time=freq,\n+            closed=closed,\n+            label=label,\n+            base=base,\n+            loffset=loffset,\n+            offset=offset,\n+            origin=origin_pandas,\n+        ).mean()\n+    except ValueError:\n+        with pytest.raises(ValueError):\n+            da_cftimeindex.resample(\n+                time=freq,\n+                closed=closed,\n+                label=label,\n+                base=base,\n+                loffset=loffset,\n+                origin=origin_cftime,\n+                offset=offset,\n+            ).mean()\n+    else:\n+        result_cftimeindex = da_cftimeindex.resample(\n+            time=freq,\n+            closed=closed,\n+            label=label,\n+            base=base,\n+            loffset=loffset,\n+            origin=origin_cftime,\n+            offset=offset,\n+        ).mean()\n+    # TODO (benbovy - flexible indexes): update when CFTimeIndex is a xarray Index subclass\n+    result_cftimeindex[\"time\"] = (\n+        result_cftimeindex.xindexes[\"time\"].to_pandas_index().to_datetimeindex()\n+    )\n+    xr.testing.assert_identical(result_cftimeindex, result_datetimeindex)\n+\n+\n+def da(index) -> xr.DataArray:\n     return xr.DataArray(\n         np.arange(100.0, 100.0 + index.size), coords=[index], dims=[\"time\"]\n     )",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_cftimeindex_resample.py::compare_against_pandas"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_cftimeindex_resample.py::da"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -59,53 +115,31 @@",
+          "snippet": " def da(index):\n @pytest.mark.parametrize(\"freqs\", FREQS, ids=lambda x: \"{}->{}\".format(*x))\n @pytest.mark.parametrize(\"closed\", [None, \"left\", \"right\"])\n @pytest.mark.parametrize(\"label\", [None, \"left\", \"right\"])\n-@pytest.mark.parametrize(\"base\", [24, 31])\n-def test_resample(freqs, closed, label, base) -> None:\n+@pytest.mark.parametrize(\n+    (\"base\", \"offset\"), [(24, None), (31, None), (None, \"5S\")], ids=lambda x: f\"{x}\"\n+)\n+def test_resample(freqs, closed, label, base, offset) -> None:\n     initial_freq, resample_freq = freqs\n     start = \"2000-01-01T12:07:01\"\n+    loffset = \"12H\"\n+    origin = \"start\"\n     index_kwargs = dict(start=start, periods=5, freq=initial_freq)\n     datetime_index = pd.date_range(**index_kwargs)\n     cftime_index = xr.cftime_range(**index_kwargs)\n+    da_datetimeindex = da(datetime_index)\n+    da_cftimeindex = da(cftime_index)\n \n-    loffset = \"12H\"\n-    try:\n-        da_datetime = (\n-            da(datetime_index)\n-            .resample(\n-                time=resample_freq,\n-                closed=closed,\n-                label=label,\n-                base=base,\n-                loffset=loffset,\n-            )\n-            .mean()\n-        )\n-    except ValueError:\n-        with pytest.raises(ValueError):\n-            da(cftime_index).resample(\n-                time=resample_freq,\n-                closed=closed,\n-                label=label,\n-                base=base,\n-                loffset=loffset,\n-            ).mean()\n-    else:\n-        da_cftime = (\n-            da(cftime_index)\n-            .resample(\n-                time=resample_freq,\n-                closed=closed,\n-                label=label,\n-                base=base,\n-                loffset=loffset,\n-            )\n-            .mean()\n-        )\n-        # TODO (benbovy - flexible indexes): update when CFTimeIndex is a xarray Index subclass\n-        da_cftime[\"time\"] = (\n-            da_cftime.xindexes[\"time\"].to_pandas_index().to_datetimeindex()\n-        )\n-        xr.testing.assert_identical(da_cftime, da_datetime)\n+    compare_against_pandas(\n+        da_datetimeindex,\n+        da_cftimeindex,\n+        resample_freq,\n+        closed=closed,\n+        label=label,\n+        base=base,\n+        offset=offset,\n+        origin=origin,\n+        loffset=loffset,\n+    )\n \n \n @pytest.mark.parametrize(",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_cftimeindex_resample.py::test_resample"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -153,3 +187,54 @@",
+          "snippet": " def test_calendars(calendar) -> None:\n     # TODO (benbovy - flexible indexes): update when CFTimeIndex is a xarray Index subclass\n     da_cftime[\"time\"] = da_cftime.xindexes[\"time\"].to_pandas_index().to_datetimeindex()\n     xr.testing.assert_identical(da_cftime, da_datetime)\n+\n+\n+@pytest.mark.parametrize(\"closed\", [\"left\", \"right\"])\n+@pytest.mark.parametrize(\n+    \"origin\",\n+    [\"start_day\", \"start\", \"end\", \"end_day\", \"epoch\", (1970, 1, 1, 3, 2)],\n+    ids=lambda x: f\"{x}\",\n+)\n+def test_origin(closed, origin) -> None:\n+    initial_freq, resample_freq = (\"3H\", \"9H\")\n+    start = \"1969-12-31T12:07:01\"\n+    index_kwargs = dict(start=start, periods=12, freq=initial_freq)\n+    datetime_index = pd.date_range(**index_kwargs)\n+    cftime_index = xr.cftime_range(**index_kwargs)\n+    da_datetimeindex = da(datetime_index)\n+    da_cftimeindex = da(cftime_index)\n+\n+    compare_against_pandas(\n+        da_datetimeindex,\n+        da_cftimeindex,\n+        resample_freq,\n+        closed=closed,\n+        origin=origin,\n+    )\n+\n+\n+def test_base_and_offset_error():\n+    cftime_index = xr.cftime_range(\"2000\", periods=5)\n+    da_cftime = da(cftime_index)\n+    with pytest.raises(ValueError, match=\"base and offset cannot\"):\n+        da_cftime.resample(time=\"2D\", base=3, offset=\"5S\")\n+\n+\n+@pytest.mark.parametrize(\"offset\", [\"foo\", \"5MS\", 10])\n+def test_invalid_offset_error(offset) -> None:\n+    cftime_index = xr.cftime_range(\"2000\", periods=5)\n+    da_cftime = da(cftime_index)\n+    with pytest.raises(ValueError, match=\"offset must be\"):\n+        da_cftime.resample(time=\"2D\", offset=offset)\n+\n+\n+def test_timedelta_offset() -> None:\n+    timedelta = datetime.timedelta(seconds=5)\n+    string = \"5S\"\n+\n+    cftime_index = xr.cftime_range(\"2000\", periods=5)\n+    da_cftime = da(cftime_index)\n+\n+    timedelta_result = da_cftime.resample(time=\"2D\", offset=timedelta).mean()\n+    string_result = da_cftime.resample(time=\"2D\", offset=string).mean()\n+    xr.testing.assert_identical(timedelta_result, string_result)\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_cftimeindex_resample.py::test_origin"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_cftimeindex_resample.py::test_base_and_offset_error"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_cftimeindex_resample.py::test_invalid_offset_error"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_cftimeindex_resample.py::test_timedelta_offset"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/tests/test_coding_times.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -614,7 +614,7 @@",
+          "snippet": " def test_cf_timedelta_2d() -> None:\n \n     actual = coding.times.decode_cf_timedelta(numbers, units)\n     assert_array_equal(expected, actual)\n-    assert expected.dtype == actual.dtype  # type: ignore\n+    assert expected.dtype == actual.dtype\n \n \n @pytest.mark.parametrize(",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_coding_times.py::test_cf_timedelta_2d"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -651,7 +651,7 @@",
+          "snippet": " def test_format_cftime_datetime(date_args, expected) -> None:\n def test_decode_cf(calendar) -> None:\n     days = [1.0, 2.0, 3.0]\n     # TODO: GH5690 — do we want to allow this type for `coords`?\n-    da = DataArray(days, coords=[days], dims=[\"time\"], name=\"test\")  # type: ignore\n+    da = DataArray(days, coords=[days], dims=[\"time\"], name=\"test\")\n     ds = da.to_dataset()\n \n     for v in [\"test\", \"time\"]:\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_coding_times.py::test_decode_cf"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/tests/test_computation.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1925,16 +1925,63 @@",
+          "snippet": " def test_where() -> None:\n \n \n def test_where_attrs() -> None:\n-    cond = xr.DataArray([True, False], dims=\"x\", attrs={\"attr\": \"cond\"})\n-    x = xr.DataArray([1, 1], dims=\"x\", attrs={\"attr\": \"x\"})\n-    y = xr.DataArray([0, 0], dims=\"x\", attrs={\"attr\": \"y\"})\n+    cond = xr.DataArray([True, False], coords={\"a\": [0, 1]}, attrs={\"attr\": \"cond_da\"})\n+    cond[\"a\"].attrs = {\"attr\": \"cond_coord\"}\n+    x = xr.DataArray([1, 1], coords={\"a\": [0, 1]}, attrs={\"attr\": \"x_da\"})\n+    x[\"a\"].attrs = {\"attr\": \"x_coord\"}\n+    y = xr.DataArray([0, 0], coords={\"a\": [0, 1]}, attrs={\"attr\": \"y_da\"})\n+    y[\"a\"].attrs = {\"attr\": \"y_coord\"}\n+\n+    # 3 DataArrays, takes attrs from x\n     actual = xr.where(cond, x, y, keep_attrs=True)\n-    expected = xr.DataArray([1, 0], dims=\"x\", attrs={\"attr\": \"x\"})\n+    expected = xr.DataArray([1, 0], coords={\"a\": [0, 1]}, attrs={\"attr\": \"x_da\"})\n+    expected[\"a\"].attrs = {\"attr\": \"x_coord\"}\n     assert_identical(expected, actual)\n \n-    # ensure keep_attrs can handle scalar values\n+    # x as a scalar, takes no attrs\n+    actual = xr.where(cond, 0, y, keep_attrs=True)\n+    expected = xr.DataArray([0, 0], coords={\"a\": [0, 1]})\n+    assert_identical(expected, actual)\n+\n+    # y as a scalar, takes attrs from x\n+    actual = xr.where(cond, x, 0, keep_attrs=True)\n+    expected = xr.DataArray([1, 0], coords={\"a\": [0, 1]}, attrs={\"attr\": \"x_da\"})\n+    expected[\"a\"].attrs = {\"attr\": \"x_coord\"}\n+    assert_identical(expected, actual)\n+\n+    # x and y as a scalar, takes no attrs\n     actual = xr.where(cond, 1, 0, keep_attrs=True)\n-    assert actual.attrs == {}\n+    expected = xr.DataArray([1, 0], coords={\"a\": [0, 1]})\n+    assert_identical(expected, actual)\n+\n+    # cond and y as a scalar, takes attrs from x\n+    actual = xr.where(True, x, y, keep_attrs=True)\n+    expected = xr.DataArray([1, 1], coords={\"a\": [0, 1]}, attrs={\"attr\": \"x_da\"})\n+    expected[\"a\"].attrs = {\"attr\": \"x_coord\"}\n+    assert_identical(expected, actual)\n+\n+    # DataArray and 2 Datasets, takes attrs from x\n+    ds_x = xr.Dataset(data_vars={\"x\": x}, attrs={\"attr\": \"x_ds\"})\n+    ds_y = xr.Dataset(data_vars={\"x\": y}, attrs={\"attr\": \"y_ds\"})\n+    ds_actual = xr.where(cond, ds_x, ds_y, keep_attrs=True)\n+    ds_expected = xr.Dataset(\n+        data_vars={\n+            \"x\": xr.DataArray([1, 0], coords={\"a\": [0, 1]}, attrs={\"attr\": \"x_da\"})\n+        },\n+        attrs={\"attr\": \"x_ds\"},\n+    )\n+    ds_expected[\"a\"].attrs = {\"attr\": \"x_coord\"}\n+    assert_identical(ds_expected, ds_actual)\n+\n+    # 2 DataArrays and 1 Dataset, takes attrs from x\n+    ds_actual = xr.where(cond, x.rename(\"x\"), ds_y, keep_attrs=True)\n+    ds_expected = xr.Dataset(\n+        data_vars={\n+            \"x\": xr.DataArray([1, 0], coords={\"a\": [0, 1]}, attrs={\"attr\": \"x_da\"})\n+        },\n+    )\n+    ds_expected[\"a\"].attrs = {\"attr\": \"x_coord\"}\n+    assert_identical(ds_expected, ds_actual)\n \n \n @pytest.mark.parametrize(\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_computation.py::test_where_attrs"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/tests/test_dataarray.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -512,7 +512,7 @@",
+          "snippet": " class TestDataArray:\n \n     def test_equals_failures(self) -> None:\n         orig = DataArray(np.arange(5.0), {\"a\": 42}, dims=\"x\")\n-        assert not orig.equals(np.arange(5))  # type: ignore\n+        assert not orig.equals(np.arange(5))  # type: ignore[arg-type]\n         assert not orig.identical(123)  # type: ignore\n         assert not orig.broadcast_equals({1: 2})  # type: ignore\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_dataarray.py::TestDataArray::test_equals_failures"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2754,9 +2754,9 @@",
+          "snippet": " class TestDataArray:\n         actual = DataArray(self.va).quantile(q, method=method)\n \n         if Version(np.__version__) >= Version(\"1.22.0\"):\n-            expected = np.nanquantile(self.dv.values, np.array(q), method=method)  # type: ignore[call-arg]\n+            expected = np.nanquantile(self.dv.values, np.array(q), method=method)\n         else:\n-            expected = np.nanquantile(self.dv.values, np.array(q), interpolation=method)  # type: ignore[call-arg]\n+            expected = np.nanquantile(self.dv.values, np.array(q), interpolation=method)\n \n         np.testing.assert_allclose(actual.values, expected)\n \n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_dataarray.py::TestDataArray::test_quantile_method"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/tests/test_dataset.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -4170,6 +4170,20 @@",
+          "snippet": " class TestDataset:\n             is not actual.xindexes[\"level_2\"]\n         )\n \n+    def test_assign_coords_custom_index_side_effect(self) -> None:\n+        # test that assigning new coordinates do not reset other dimension coord indexes\n+        # to default (pandas) index (https://github.com/pydata/xarray/issues/7346)\n+        class CustomIndex(PandasIndex):\n+            pass\n+\n+        ds = (\n+            Dataset(coords={\"x\": [1, 2, 3]})\n+            .drop_indexes(\"x\")\n+            .set_xindex(\"x\", CustomIndex)\n+        )\n+        actual = ds.assign_coords(y=[4, 5, 6])\n+        assert isinstance(actual.xindexes[\"x\"], CustomIndex)\n+\n     def test_merge_multiindex_level(self) -> None:\n         data = create_test_multiindex()\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_dataset.py::TestDataset::test_assign_coords_custom_index_side_effect"
+            },
+            {
+              "kind": "class",
+              "node": "xarray/tests/test_dataset.py::TestDataset::CustomIndex"
+            },
+            {
+              "kind": "class",
+              "node": "xarray/tests/test_dataset.py::TestDataset"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -6230,7 +6244,7 @@",
+          "snippet": " class TestDataset:\n         with pytest.raises(ValueError):\n             ds.query(\"a > 5\")  # type: ignore # must be dict or kwargs\n         with pytest.raises(ValueError):\n-            ds.query(x=(a > 5))  # type: ignore # must be query string\n+            ds.query(x=(a > 5))\n         with pytest.raises(IndexError):\n             ds.query(y=\"a > 5\")  # wrong length dimension\n         with pytest.raises(IndexError):\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_dataset.py::TestDataset::test_query"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/tests/test_distributed.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -189,7 +189,7 @@",
+          "snippet": " def test_dask_distributed_zarr_integration_test(\n         write_kwargs: dict[str, Any] = {\"consolidated\": True}\n         read_kwargs: dict[str, Any] = {\"backend_kwargs\": {\"consolidated\": True}}\n     else:\n-        write_kwargs = read_kwargs = {}  # type: ignore\n+        write_kwargs = read_kwargs = {}\n     chunks = {\"dim1\": 4, \"dim2\": 3, \"dim3\": 5}\n     with cluster() as (s, [a, b]):\n         with Client(s[\"address\"], loop=loop):\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_distributed.py::test_dask_distributed_zarr_integration_test"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/tests/test_extensions.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -37,7 +37,6 @@",
+          "snippet": " class TestAccessor:\n \n         da = xr.DataArray(0)\n         assert da.demo.foo == \"bar\"\n-\n         # accessor is cached\n         assert ds.demo is ds.demo\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_extensions.py::TestAccessor::test_register"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -45,7 +44,7 @@",
+          "snippet": " class TestAccessor:\n         assert ds.demo.__doc__ == \"Demo accessor.\"\n         # TODO: typing doesn't seem to work with accessors\n         assert xr.Dataset.demo.__doc__ == \"Demo accessor.\"  # type: ignore\n-        assert isinstance(ds.demo, DemoAccessor)  # type: ignore\n+        assert isinstance(ds.demo, DemoAccessor)\n         assert xr.Dataset.demo is DemoAccessor  # type: ignore\n \n         # ensure we can remove it\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_extensions.py::TestAccessor::test_register"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/tests/test_groupby.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -235,13 +235,13 @@",
+          "snippet": " def test_da_groupby_quantile() -> None:\n         dims=(\"x\", \"y\"),\n     )\n \n-    actual_x = array.groupby(\"x\").quantile(0, dim=...)  # type: ignore[arg-type]  # https://github.com/python/mypy/issues/7818\n+    actual_x = array.groupby(\"x\").quantile(0, dim=...)\n     expected_x = xr.DataArray(\n         data=[1, 4], coords={\"x\": [1, 2], \"quantile\": 0}, dims=\"x\"\n     )\n     assert_identical(expected_x, actual_x)\n \n-    actual_y = array.groupby(\"y\").quantile(0, dim=...)  # type: ignore[arg-type]  # https://github.com/python/mypy/issues/7818\n+    actual_y = array.groupby(\"y\").quantile(0, dim=...)\n     expected_y = xr.DataArray(\n         data=[1, 22], coords={\"y\": [0, 1], \"quantile\": 0}, dims=\"y\"\n     )",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_groupby.py::test_da_groupby_quantile"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -272,7 +272,7 @@",
+          "snippet": " def test_da_groupby_quantile() -> None:\n     )\n     g = foo.groupby(foo.time.dt.month)\n \n-    actual = g.quantile(0, dim=...)  # type: ignore[arg-type]  # https://github.com/python/mypy/issues/7818\n+    actual = g.quantile(0, dim=...)\n     expected = xr.DataArray(\n         data=[\n             0.0,",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_groupby.py::test_da_groupby_quantile"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -356,11 +356,11 @@",
+          "snippet": " def test_ds_groupby_quantile() -> None:\n         coords={\"x\": [1, 1, 1, 2, 2], \"y\": [0, 0, 1]},\n     )\n \n-    actual_x = ds.groupby(\"x\").quantile(0, dim=...)  # type: ignore[arg-type]  # https://github.com/python/mypy/issues/7818\n+    actual_x = ds.groupby(\"x\").quantile(0, dim=...)\n     expected_x = xr.Dataset({\"a\": (\"x\", [1, 4])}, coords={\"x\": [1, 2], \"quantile\": 0})\n     assert_identical(expected_x, actual_x)\n \n-    actual_y = ds.groupby(\"y\").quantile(0, dim=...)  # type: ignore[arg-type]  # https://github.com/python/mypy/issues/7818\n+    actual_y = ds.groupby(\"y\").quantile(0, dim=...)\n     expected_y = xr.Dataset({\"a\": (\"y\", [1, 22])}, coords={\"y\": [0, 1], \"quantile\": 0})\n     assert_identical(expected_y, actual_y)\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_groupby.py::test_ds_groupby_quantile"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -386,7 +386,7 @@",
+          "snippet": " def test_ds_groupby_quantile() -> None:\n     )\n     g = foo.groupby(foo.time.dt.month)\n \n-    actual = g.quantile(0, dim=...)  # type: ignore[arg-type]  # https://github.com/python/mypy/issues/7818\n+    actual = g.quantile(0, dim=...)\n     expected = xr.Dataset(\n         {\n             \"a\": (",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_groupby.py::test_ds_groupby_quantile"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1810,6 +1810,33 @@",
+          "snippet": " class TestDataArrayResample:\n             # done here due to floating point arithmetic\n             assert_allclose(expected, actual, rtol=1e-16)\n \n+    def test_resample_base(self) -> None:\n+        times = pd.date_range(\"2000-01-01T02:03:01\", freq=\"6H\", periods=10)\n+        array = DataArray(np.arange(10), [(\"time\", times)])\n+\n+        base = 11\n+        actual = array.resample(time=\"24H\", base=base).mean()\n+        expected = DataArray(array.to_series().resample(\"24H\", base=base).mean())\n+        assert_identical(expected, actual)\n+\n+    def test_resample_offset(self) -> None:\n+        times = pd.date_range(\"2000-01-01T02:03:01\", freq=\"6H\", periods=10)\n+        array = DataArray(np.arange(10), [(\"time\", times)])\n+\n+        offset = pd.Timedelta(\"11H\")\n+        actual = array.resample(time=\"24H\", offset=offset).mean()\n+        expected = DataArray(array.to_series().resample(\"24H\", offset=offset).mean())\n+        assert_identical(expected, actual)\n+\n+    def test_resample_origin(self) -> None:\n+        times = pd.date_range(\"2000-01-01T02:03:01\", freq=\"6H\", periods=10)\n+        array = DataArray(np.arange(10), [(\"time\", times)])\n+\n+        origin = \"start\"\n+        actual = array.resample(time=\"24H\", origin=origin).mean()\n+        expected = DataArray(array.to_series().resample(\"24H\", origin=origin).mean())\n+        assert_identical(expected, actual)\n+\n \n class TestDatasetResample:\n     def test_resample_and_first(self):\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_groupby.py::TestDataArrayResample::test_resample_base"
+            },
+            {
+              "kind": "class",
+              "node": "xarray/tests/test_groupby.py::TestDataArrayResample"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_groupby.py::TestDataArrayResample::test_resample_offset"
+            },
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_groupby.py::TestDataArrayResample::test_resample_origin"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/tests/test_plot.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -14,6 +14,7 @@",
+          "snippet": " import pytest\n import xarray as xr\n import xarray.plot as xplt\n from xarray import DataArray, Dataset\n+from xarray.core.utils import module_available\n from xarray.plot.dataarray_plot import _infer_interval_breaks\n from xarray.plot.dataset_plot import _infer_meta_data\n from xarray.plot.utils import (",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/tests/test_plot.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -29,19 +30,20 @@",
+          "snippet": " from xarray.plot.utils import (\n from . import (\n     assert_array_equal,\n     assert_equal,\n-    has_nc_time_axis,\n     requires_cartopy,\n     requires_cftime,\n     requires_matplotlib,\n-    requires_nc_time_axis,\n     requires_seaborn,\n )\n \n+# this should not be imported to test if the automatic lazy import works\n+has_nc_time_axis = module_available(\"nc_time_axis\")\n+\n # import mpl and change the backend before other mpl imports\n try:\n     import matplotlib as mpl\n     import matplotlib.pyplot as plt\n-    import mpl_toolkits  # type: ignore\n+    import mpl_toolkits\n except ImportError:\n     pass\n ",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "xarray/tests/test_plot.py::has_nc_time_axis"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2823,8 +2825,8 @@",
+          "snippet": " class TestDatetimePlot(PlotTestCase):\n \n \n @pytest.mark.filterwarnings(\"ignore:setting an array element with a sequence\")\n-@requires_nc_time_axis\n @requires_cftime\n+@pytest.mark.skipif(not has_nc_time_axis, reason=\"nc_time_axis is not installed\")\n class TestCFDatetimePlot(PlotTestCase):\n     @pytest.fixture(autouse=True)\n     def setUp(self) -> None:",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/tests/test_plot.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -3206,7 +3208,7 @@",
+          "snippet": " def test_plot_empty_raises(val: list | float, method: str) -> None:\n \n \n @requires_matplotlib\n-def test_facetgrid_axes_raises_deprecation_warning():\n+def test_facetgrid_axes_raises_deprecation_warning() -> None:\n     with pytest.warns(\n         DeprecationWarning,\n         match=(\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_plot.py::test_facetgrid_axes_raises_deprecation_warning"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/tests/test_plugins.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -203,6 +203,7 @@",
+          "snippet": " def test_lazy_import() -> None:\n         \"scipy\",\n         \"zarr\",\n         \"matplotlib\",\n+        \"nc_time_axis\",\n         \"flox\",\n         # \"dask\",  # TODO: backends.locks is not lazy yet :(\n         \"dask.array\",\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_plugins.py::test_lazy_import"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/tests/test_utils.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,6 +1,6 @@",
+          "snippet": " from __future__ import annotations\n \n-from typing import Hashable\n+from typing import Hashable, Iterable, Sequence\n \n import numpy as np\n import pandas as pd",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "xarray/tests/test_utils.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -253,6 +253,90 @@",
+          "snippet": " def test_infix_dims_errors(supplied, all_):\n         list(utils.infix_dims(supplied, all_))\n \n \n+@pytest.mark.parametrize(\n+    [\"dim\", \"expected\"],\n+    [\n+        pytest.param(\"a\", (\"a\",), id=\"str\"),\n+        pytest.param([\"a\", \"b\"], (\"a\", \"b\"), id=\"list_of_str\"),\n+        pytest.param([\"a\", 1], (\"a\", 1), id=\"list_mixed\"),\n+        pytest.param((\"a\", \"b\"), (\"a\", \"b\"), id=\"tuple_of_str\"),\n+        pytest.param([\"a\", (\"b\", \"c\")], (\"a\", (\"b\", \"c\")), id=\"list_with_tuple\"),\n+        pytest.param(((\"b\", \"c\"),), ((\"b\", \"c\"),), id=\"tuple_of_tuple\"),\n+        pytest.param(None, None, id=\"None\"),\n+        pytest.param(..., ..., id=\"ellipsis\"),\n+    ],\n+)\n+def test_parse_dims(\n+    dim: str | Iterable[Hashable] | None,\n+    expected: tuple[Hashable, ...],\n+) -> None:\n+    all_dims = (\"a\", \"b\", 1, (\"b\", \"c\"))  # selection of different Hashables\n+    actual = utils.parse_dims(dim, all_dims, replace_none=False)\n+    assert actual == expected\n+\n+\n+def test_parse_dims_set() -> None:\n+    all_dims = (\"a\", \"b\", 1, (\"b\", \"c\"))  # selection of different Hashables\n+    dim = {\"a\", 1}\n+    actual = utils.parse_dims(dim, all_dims)\n+    assert set(actual) == dim\n+\n+\n+@pytest.mark.parametrize(\n+    \"dim\", [pytest.param(None, id=\"None\"), pytest.param(..., id=\"ellipsis\")]\n+)\n+def test_parse_dims_replace_none(dim: None | ellipsis) -> None:\n+    all_dims = (\"a\", \"b\", 1, (\"b\", \"c\"))  # selection of different Hashables\n+    actual = utils.parse_dims(dim, all_dims, replace_none=True)\n+    assert actual == all_dims\n+\n+\n+@pytest.mark.parametrize(\n+    \"dim\",\n+    [\n+        pytest.param(\"x\", id=\"str_missing\"),\n+        pytest.param([\"a\", \"x\"], id=\"list_missing_one\"),\n+        pytest.param([\"x\", 2], id=\"list_missing_all\"),\n+    ],\n+)\n+def test_parse_dims_raises(dim: str | Iterable[Hashable]) -> None:\n+    all_dims = (\"a\", \"b\", 1, (\"b\", \"c\"))  # selection of different Hashables\n+    with pytest.raises(ValueError, match=\"'x'\"):\n+        utils.parse_dims(dim, all_dims, check_exists=True)\n+\n+\n+@pytest.mark.parametrize(\n+    [\"dim\", \"expected\"],\n+    [\n+        pytest.param(\"a\", (\"a\",), id=\"str\"),\n+        pytest.param([\"a\", \"b\"], (\"a\", \"b\"), id=\"list\"),\n+        pytest.param([...], (\"a\", \"b\", \"c\"), id=\"list_only_ellipsis\"),\n+        pytest.param([\"a\", ...], (\"a\", \"b\", \"c\"), id=\"list_with_ellipsis\"),\n+        pytest.param([\"a\", ..., \"b\"], (\"a\", \"c\", \"b\"), id=\"list_with_middle_ellipsis\"),\n+    ],\n+)\n+def test_parse_ordered_dims(\n+    dim: str | Sequence[Hashable | ellipsis],\n+    expected: tuple[Hashable, ...],\n+) -> None:\n+    all_dims = (\"a\", \"b\", \"c\")\n+    actual = utils.parse_ordered_dims(dim, all_dims)\n+    assert actual == expected\n+\n+\n+def test_parse_ordered_dims_raises() -> None:\n+    all_dims = (\"a\", \"b\", \"c\")\n+\n+    with pytest.raises(ValueError, match=\"'x' do not exist\"):\n+        utils.parse_ordered_dims(\"x\", all_dims, check_exists=True)\n+\n+    with pytest.raises(ValueError, match=\"repeated dims\"):\n+        utils.parse_ordered_dims([\"a\", ...], all_dims + (\"a\",))\n+\n+    with pytest.raises(ValueError, match=\"More than one ellipsis\"):\n+        utils.parse_ordered_dims([\"a\", ..., \"b\", ...], all_dims)\n+\n+\n @pytest.mark.parametrize(\n     \"nested_list, expected\",\n     [\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_utils.py::test_parse_dims"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_utils.py::test_parse_dims_set"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_utils.py::test_parse_dims_replace_none"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_utils.py::test_parse_dims_raises"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_utils.py::test_parse_ordered_dims"
+            },
+            {
+              "kind": "function",
+              "node": "xarray/tests/test_utils.py::test_parse_ordered_dims_raises"
+            }
+          ]
+        }
+      ]
+    },
+    "xarray/tests/test_variable.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1769,9 +1769,9 @@",
+          "snippet": " class TestVariable(VariableSubclassobjects):\n         actual = v.quantile(q, dim=\"y\", method=method)\n \n         if Version(np.__version__) >= Version(\"1.22\"):\n-            expected = np.nanquantile(self.d, q, axis=1, method=method)  # type: ignore[call-arg]\n+            expected = np.nanquantile(self.d, q, axis=1, method=method)\n         else:\n-            expected = np.nanquantile(self.d, q, axis=1, interpolation=method)  # type: ignore[call-arg]\n+            expected = np.nanquantile(self.d, q, axis=1, interpolation=method)\n \n         if use_dask:\n             assert isinstance(actual.data, dask_array_type)",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "xarray/tests/test_variable.py::TestVariable::test_quantile_method"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

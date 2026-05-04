@@ -1,0 +1,1431 @@
+diff --git a/test/__init__.py b/test/__init__.py
+index 62c2633..b5eedc7 100644
+--- a/test/__init__.py
++++ b/test/__init__.py
+@@ -32,19 +32,14 @@ except ImportError:
+ else:
+     HAS_ZSTD = True
+ 
+-from urllib3 import util
+ from urllib3.connectionpool import ConnectionPool
+ from urllib3.exceptions import HTTPWarning
+-from urllib3.util import ssl_
+ 
+ try:
+     import urllib3.contrib.pyopenssl as pyopenssl
+ except ImportError:
+     pyopenssl = None  # type: ignore[assignment]
+ 
+-if typing.TYPE_CHECKING:
+-    import ssl
+-
+ 
+ _RT = typing.TypeVar("_RT")  # return type
+ _TestFuncT = typing.TypeVar("_TestFuncT", bound=typing.Callable[..., typing.Any])
+@@ -90,19 +85,6 @@ def _can_resolve(host: str) -> bool:
+         return False
+ 
+ 
+-def has_alpn(ctx_cls: type[ssl.SSLContext] | None = None) -> bool:
+-    """Detect if ALPN support is enabled."""
+-    ctx_cls = ctx_cls or util.SSLContext
+-    ctx = ctx_cls(protocol=ssl_.PROTOCOL_TLS)  # type: ignore[misc, attr-defined]
+-    try:
+-        if hasattr(ctx, "set_alpn_protocols"):
+-            ctx.set_alpn_protocols(ssl_.ALPN_PROTOCOLS)
+-            return True
+-    except NotImplementedError:
+-        pass
+-    return False
+-
+-
+ # Some systems might not resolve "localhost." correctly.
+ # See https://github.com/urllib3/urllib3/issues/1809 and
+ # https://github.com/urllib3/urllib3/pull/1475#issuecomment-440788064.
+
+diff --git a/test/conftest.py b/test/conftest.py
+index b71c7d9..8e6d1a6 100644
+--- a/test/conftest.py
++++ b/test/conftest.py
+@@ -6,18 +6,17 @@ import ssl
+ import typing
+ from pathlib import Path
+ 
+-import hypercorn
+ import pytest
+ import trustme
+ 
+ import urllib3.http2
++import urllib3.http2.probe as http2_probe
+ from dummyserver.app import hypercorn_app
+ from dummyserver.asgi_proxy import ProxyApp
+ from dummyserver.hypercornserver import run_hypercorn_in_thread
+ from dummyserver.socketserver import HAS_IPV6
+ from dummyserver.testcase import HTTPSHypercornDummyServerTestCase
+ from urllib3.util import ssl_
+-from urllib3.util.url import parse_url
+ 
+ from .tz_stub import stub_timezone_ctx
+ 
+@@ -81,12 +80,7 @@ def run_server_in_thread(
+     ca.cert_pem.write_to_path(ca_cert_path)
+     server_certs = _write_cert_to_dir(server_cert, tmpdir)
+ 
+-    config = hypercorn.Config()
+-    config.certfile = server_certs["certfile"]
+-    config.keyfile = server_certs["keyfile"]
+-    config.bind = [f"{host}:0"]
+-    with run_hypercorn_in_thread(config, hypercorn_app):
+-        port = typing.cast(int, parse_url(config.bind[0]).port)
++    with run_hypercorn_in_thread(host, server_certs, hypercorn_app) as port:
+         yield ServerConfig(scheme, host, port, ca_cert_path)
+ 
+ 
+@@ -106,19 +100,12 @@ def run_server_and_proxy_in_thread(
+     proxy_certs = _write_cert_to_dir(proxy_cert, tmpdir, "proxy")
+ 
+     with contextlib.ExitStack() as stack:
+-        server_config = hypercorn.Config()
+-        server_config.certfile = server_certs["certfile"]
+-        server_config.keyfile = server_certs["keyfile"]
+-        server_config.bind = ["localhost:0"]
+-        stack.enter_context(run_hypercorn_in_thread(server_config, hypercorn_app))
+-        port = typing.cast(int, parse_url(server_config.bind[0]).port)
+-
+-        proxy_config = hypercorn.Config()
+-        proxy_config.certfile = proxy_certs["certfile"]
+-        proxy_config.keyfile = proxy_certs["keyfile"]
+-        proxy_config.bind = [f"{proxy_host}:0"]
+-        stack.enter_context(run_hypercorn_in_thread(proxy_config, ProxyApp()))
+-        proxy_port = typing.cast(int, parse_url(proxy_config.bind[0]).port)
++        port = stack.enter_context(
++            run_hypercorn_in_thread("localhost", server_certs, hypercorn_app)
++        )
++        proxy_port = stack.enter_context(
++            run_hypercorn_in_thread(proxy_host, proxy_certs, ProxyApp())
++        )
+ 
+         yield (
+             ServerConfig(proxy_scheme, proxy_host, proxy_port, ca_cert_path),
+@@ -372,12 +359,40 @@ def requires_tlsv1_3(supported_tls_versions: typing.AbstractSet[str]) -> None:
+         pytest.skip("Test requires TLSv1.3")
+ 
+ 
++class ErroringHTTPConnection:
++    def __init__(self, *args: typing.Any, **kwargs: typing.Any):
++        raise ValueError(
++            "HTTP/2 support currently only applies to HTTPS, don't use http_version for HTTP tests"
++        )
++
++
+ @pytest.fixture(params=["h11", "h2"])
+ def http_version(request: pytest.FixtureRequest) -> typing.Generator[str, None, None]:
++    orig_HTTPConnection: typing.Any = None
++
+     if request.param == "h2":
+         urllib3.http2.inject_into_urllib3()
+ 
+-    yield request.param
++        from urllib3 import connection as urllib3_connection
++        from urllib3.connectionpool import HTTPConnectionPool
+ 
+-    if request.param == "h2":
+-        urllib3.http2.extract_from_urllib3()
++        orig_HTTPConnection = urllib3_connection.HTTPConnection
++        urllib3_connection.HTTPConnection = ErroringHTTPConnection  # type: ignore[misc,assignment]
++        HTTPConnectionPool.ConnectionCls = ErroringHTTPConnection  # type: ignore[assignment]
++    try:
++        yield request.param
++    finally:
++        if request.param == "h2":
++            urllib3_connection.HTTPConnection = orig_HTTPConnection  # type: ignore[misc]
++            HTTPConnectionPool.ConnectionCls = orig_HTTPConnection
++
++            urllib3.http2.extract_from_urllib3()
++
++
++@pytest.fixture(autouse=True, scope="function")
++def reset_http2_probe_cache() -> typing.Generator[None, None, None]:
++    # Always reset the HTTP/2 probe cache per test case.
++    try:
++        yield
++    finally:
++        http2_probe._reset()
+
+diff --git a/test/contrib/emscripten/conftest.py b/test/contrib/emscripten/conftest.py
+index ebe9092..96c0e97 100644
+--- a/test/contrib/emscripten/conftest.py
++++ b/test/contrib/emscripten/conftest.py
+@@ -4,18 +4,15 @@ import contextlib
+ import os
+ import random
+ import textwrap
+-import typing
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Generator
+ 
+-import hypercorn
+ import pytest
+ 
+ from dummyserver.app import pyodide_testing_app
+ from dummyserver.hypercornserver import run_hypercorn_in_thread
+ from dummyserver.socketserver import DEFAULT_CERTS
+-from urllib3.util.url import parse_url
+ 
+ _coverage_count = 0
+ 
+@@ -35,24 +32,12 @@ def testserver_http(
+     pyodide_testing_app.config["pyodide_dist_dir"] = str(pyodide_dist_dir)
+     http_host = "localhost"
+     with contextlib.ExitStack() as stack:
+-        http_server_config = hypercorn.Config()
+-        http_server_config.bind = [f"{http_host}:0"]
+-        stack.enter_context(
+-            run_hypercorn_in_thread(http_server_config, pyodide_testing_app)
++        http_port = stack.enter_context(
++            run_hypercorn_in_thread(http_host, None, pyodide_testing_app)
+         )
+-        http_port = typing.cast(int, parse_url(http_server_config.bind[0]).port)
+-
+-        https_server_config = hypercorn.Config()
+-        https_server_config.certfile = DEFAULT_CERTS["certfile"]
+-        https_server_config.keyfile = DEFAULT_CERTS["keyfile"]
+-        https_server_config.verify_mode = DEFAULT_CERTS["cert_reqs"]
+-        https_server_config.ca_certs = DEFAULT_CERTS["ca_certs"]
+-        https_server_config.alpn_protocols = DEFAULT_CERTS["alpn_protocols"]
+-        https_server_config.bind = [f"{http_host}:0"]
+-        stack.enter_context(
+-            run_hypercorn_in_thread(https_server_config, pyodide_testing_app)
++        https_port = stack.enter_context(
++            run_hypercorn_in_thread(http_host, DEFAULT_CERTS, pyodide_testing_app)
+         )
+-        https_port = typing.cast(int, parse_url(https_server_config.bind[0]).port)
+ 
+         yield PyodideServerInfo(
+             http_host=http_host,
+
+diff --git a/test/test_compatibility.py b/test/test_compatibility.py
+index f18b003..95dea64 100644
+--- a/test/test_compatibility.py
++++ b/test/test_compatibility.py
+@@ -2,7 +2,11 @@ from __future__ import annotations
+ 
+ import http.cookiejar
+ import urllib
++from unittest import mock
+ 
++import pytest
++
++import urllib3.http2
+ from urllib3.response import HTTPResponse
+ 
+ 
+@@ -20,3 +24,25 @@ class TestCookiejar:
+             response.headers.add("set-cookie", c)
+         cookiejar.extract_cookies(response, request)  # type: ignore[arg-type]
+         assert len(cookiejar) == len(cookies)
++
++
++class TestInitialization:
++    @mock.patch("urllib3.http2.version")
++    def test_h2_version_check(self, mock_version: mock.MagicMock) -> None:
++        try:
++            mock_version.return_value = "4.1.0"
++            urllib3.http2.inject_into_urllib3()
++
++            mock_version.return_value = "3.9.9"
++            with pytest.raises(
++                ImportError, match="urllib3 v2 supports h2 version 4.x.x.*"
++            ):
++                urllib3.http2.inject_into_urllib3()
++
++            mock_version.return_value = "5.0.0"
++            with pytest.raises(
++                ImportError, match="urllib3 v2 supports h2 version 4.x.x.*"
++            ):
++                urllib3.http2.inject_into_urllib3()
++        finally:
++            urllib3.http2.extract_from_urllib3()
+
+diff --git a/test/test_http2_connection.py b/test/test_http2_connection.py
+new file mode 100644
+index 0000000..52c754e
+--- /dev/null
++++ b/test/test_http2_connection.py
+@@ -0,0 +1,360 @@
++from __future__ import annotations
++
++import socket
++from unittest import mock
++
++import pytest
++
++from urllib3.connection import _get_default_user_agent
++from urllib3.exceptions import ConnectionError
++from urllib3.http2.connection import (
++    HTTP2Connection,
++    _is_illegal_header_value,
++    _is_legal_header_name,
++)
++
++# [1] https://httpwg.org/specs/rfc9113.html#n-field-validity
++
++
++class TestHTTP2Connection:
++    def test__is_legal_header_name(self) -> None:
++        assert _is_legal_header_name(b"foo"), "foo"
++        assert _is_legal_header_name(b"foo-bar"), "foo-bar"
++        assert _is_legal_header_name(b"foo-bar-baz"), "foo-bar-baz"
++
++        # A field name MUST NOT contain characters in the ranges 0x00-0x20,
++        # 0x41-0x5a, or 0x7f-0xff (all ranges inclusive). [1]
++        for i in range(0x00, 0x20):
++            assert not _is_legal_header_name(
++                f"foo{chr(i)}bar".encode()
++            ), f"foo\\x{i}bar"
++        for i in range(0x41, 0x5A):
++            assert not _is_legal_header_name(
++                f"foo{chr(i)}bar".encode()
++            ), f"foo\\x{i}bar"
++        for i in range(0x7F, 0xFF):
++            assert not _is_legal_header_name(
++                f"foo{chr(i)}bar".encode()
++            ), f"foo\\x{i}bar"
++
++        # This specifically excludes all non-visible ASCII characters, ASCII SP
++        # (0x20), and uppercase characters ('A' to 'Z', ASCII 0x41 to 0x5a). [1]
++        assert not _is_legal_header_name(b"foo bar"), "foo bar"
++        assert not _is_legal_header_name(b"foo\x20bar"), "foo\\x20bar"
++        assert not _is_legal_header_name(b"Foo-Bar"), "Foo-Bar"
++
++        # With the exception of pseudo-header fields (Section 8.3), which have a
++        # name that starts with a single colon, field names MUST NOT include a
++        # colon (ASCII COLON, 0x3a). [1]
++        assert not _is_legal_header_name(b":foo"), ":foo"
++        assert not _is_legal_header_name(b"foo:bar"), "foo:bar"
++        assert not _is_legal_header_name(b"foo:"), "foo:"
++
++    def test__is_illegal_header_value(self) -> None:
++        assert not _is_illegal_header_value(b"foo"), "foo"
++        assert not _is_illegal_header_value(b"foo bar"), "foo bar"
++        assert not _is_illegal_header_value(b"foo\tbar"), "foo\\tbar"
++
++        # A field value MUST NOT contain the zero value (ASCII NUL, 0x00), line
++        # feed (ASCII LF, 0x0a), or carriage return (ASCII CR, 0x0d) at any
++        # position. [1]
++        assert _is_illegal_header_value(b"foo\0bar"), "foo\\0bar"
++        assert _is_illegal_header_value(b"foo\x00bar"), "foo\\x00bar"
++        assert _is_illegal_header_value(b"foo\x0abar"), "foo\\x0abar"
++        assert _is_illegal_header_value(b"foo\x0dbar"), "foo\\x0dbar"
++        assert _is_illegal_header_value(b"foo\rbar"), "foo\\rbar"
++        assert _is_illegal_header_value(b"foo\nbar"), "foo\\nbar"
++        assert _is_illegal_header_value(b"foo\r\nbar"), "foo\\r\\nbar"
++
++        # A field value MUST NOT start or end with an ASCII whitespace character
++        # (ASCII SP or HTAB, 0x20 or 0x09). [1]
++        assert _is_illegal_header_value(b" foo"), " foo"
++        assert _is_illegal_header_value(b"foo "), "foo "
++        assert _is_illegal_header_value(b"foo\x20"), "foo\\x20"
++        assert _is_illegal_header_value(b"\tfoo"), "\\tfoo"
++        assert _is_illegal_header_value(b"foo\t"), "foo\\t"
++        assert _is_illegal_header_value(b"foo\x09"), "foo\\x09"
++
++    def test_default_socket_options(self) -> None:
++        conn = HTTP2Connection("example.com")
++        assert conn.socket_options == [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
++        assert conn.port == 443
++
++    def test_putheader(self) -> None:
++        conn = HTTP2Connection("example.com")
++        conn.putheader("foo", "bar")
++        assert conn._headers == [(b"foo", b"bar")]
++
++    def test_request_putheader(self) -> None:
++        conn = HTTP2Connection("example.com")
++        conn.sock = mock.MagicMock(
++            sendall=mock.Mock(return_value=None),
++        )
++        conn.putheader = mock.MagicMock(return_value=None)  # type: ignore[method-assign]
++        conn.request("GET", "/", headers={"foo": "bar"})
++        conn.putheader.assert_has_calls(
++            [
++                mock.call("foo", "bar"),
++                mock.call(b"user-agent", _get_default_user_agent()),
++            ]
++        )
++
++    def test_putheader_ValueError(self) -> None:
++        conn = HTTP2Connection("example.com")
++        with pytest.raises(ValueError):
++            conn.putheader("foo\0bar", "baz")
++        with pytest.raises(ValueError):
++            conn.putheader("foo", "foo\r\nbar")
++
++    def test_endheaders_ConnectionError(self) -> None:
++        conn = HTTP2Connection("example.com")
++        with pytest.raises(ConnectionError):
++            conn.endheaders()
++
++    def test_send_ConnectionError(self) -> None:
++        conn = HTTP2Connection("example.com")
++        with pytest.raises(ConnectionError):
++            conn.send(b"foo")
++
++    def test_send_bytes(self) -> None:
++        conn = HTTP2Connection("example.com")
++        conn.sock = mock.MagicMock(
++            sendall=mock.Mock(return_value=None),
++        )
++        conn._h2_conn._obj.data_to_send = mock.Mock(return_value=b"bar")
++        conn._h2_conn._obj.send_data = mock.Mock(return_value=None)
++        conn._h2_conn._obj.get_next_available_stream_id = mock.Mock(return_value=1)
++
++        conn.putrequest("GET", "/")
++        conn.endheaders()
++        conn.send(b"foo")
++
++        conn._h2_conn._obj.data_to_send.assert_called_with()
++        conn.sock.sendall.assert_called_with(b"bar")
++        conn._h2_conn._obj.send_data.assert_called_with(1, b"foo", end_stream=True)
++
++    def test_send_str(self) -> None:
++        conn = HTTP2Connection("example.com")
++        conn.sock = mock.MagicMock(
++            sendall=mock.Mock(return_value=None),
++        )
++        conn._h2_conn._obj.data_to_send = mock.Mock(return_value=b"bar")
++        conn._h2_conn._obj.send_data = mock.Mock(return_value=None)
++        conn._h2_conn._obj.get_next_available_stream_id = mock.Mock(return_value=1)
++
++        conn.putrequest("GET", "/")
++        conn.endheaders(message_body=b"foo")
++        conn.send("foo")
++
++        conn._h2_conn._obj.data_to_send.assert_called_with()
++        conn.sock.sendall.assert_called_with(b"bar")
++        conn._h2_conn._obj.send_data.assert_called_with(1, b"foo", end_stream=True)
++
++    def test_send_iter(self) -> None:
++        conn = HTTP2Connection("example.com")
++        conn.sock = mock.MagicMock(
++            sendall=mock.Mock(return_value=None),
++        )
++        conn._h2_conn._obj.data_to_send = mock.Mock(return_value=b"baz")
++        conn._h2_conn._obj.send_data = mock.Mock(return_value=None)
++        conn._h2_conn._obj.get_next_available_stream_id = mock.Mock(return_value=1)
++        conn._h2_conn._obj.end_stream = mock.Mock(return_value=None)
++
++        conn.putrequest("GET", "/")
++        conn.endheaders(message_body=[b"foo", b"bar"])
++        conn.send([b"foo", b"bar"])
++
++        conn._h2_conn._obj.data_to_send.assert_has_calls(
++            [
++                mock.call(),
++                mock.call(),
++            ]
++        )
++        conn.sock.sendall.assert_has_calls(
++            [
++                mock.call(b"baz"),
++                mock.call(b"baz"),
++            ]
++        )
++        conn._h2_conn._obj.send_data.assert_has_calls(
++            [
++                mock.call(1, b"foo", end_stream=False),
++                mock.call(1, b"bar", end_stream=False),
++            ]
++        )
++        conn._h2_conn._obj.end_stream.assert_called_with(1)
++
++    def test_send_file_str(self) -> None:
++        conn = HTTP2Connection("example.com")
++        mock_open = mock.mock_open(read_data="foo\r\nbar\r\n")
++        with mock.patch("builtins.open", mock_open):
++            conn.sock = mock.MagicMock(
++                sendall=mock.Mock(return_value=None),
++            )
++            conn._h2_conn._obj.data_to_send = mock.Mock(return_value=b"foo")
++            conn._h2_conn._obj.send_data = mock.Mock(return_value=None)
++            conn._h2_conn._obj.get_next_available_stream_id = mock.Mock(return_value=1)
++            conn._h2_conn._obj.end_stream = mock.Mock(return_value=None)
++
++            with open("foo") as body:
++                conn.putrequest("GET", "/")
++                conn.endheaders(message_body=body)
++                conn.send(body)
++
++                conn._h2_conn._obj.data_to_send.assert_called_with()
++                conn.sock.sendall.assert_called_with(b"foo")
++                conn._h2_conn._obj.send_data.assert_called_with(
++                    1, b"foo\r\nbar\r\n", end_stream=False
++                )
++                conn._h2_conn._obj.end_stream.assert_called_with(1)
++
++    def test_send_file_bytes(self) -> None:
++        conn = HTTP2Connection("example.com")
++        mock_open = mock.mock_open(read_data=b"foo\r\nbar\r\n")
++        with mock.patch("builtins.open", mock_open):
++            conn.sock = mock.MagicMock(
++                sendall=mock.Mock(return_value=None),
++            )
++            conn._h2_conn._obj.data_to_send = mock.Mock(return_value=b"foo")
++            conn._h2_conn._obj.send_data = mock.Mock(return_value=None)
++            conn._h2_conn._obj.get_next_available_stream_id = mock.Mock(return_value=1)
++            conn._h2_conn._obj.end_stream = mock.Mock(return_value=None)
++
++            body = open("foo", "rb")
++            conn.putrequest("GET", "/")
++            conn.endheaders(message_body=body)
++            conn.send(body)
++
++            conn._h2_conn._obj.data_to_send.assert_called_with()
++            conn.sock.sendall.assert_called_with(b"foo")
++            conn._h2_conn._obj.send_data.assert_called_with(
++                1, b"foo\r\nbar\r\n", end_stream=False
++            )
++            conn._h2_conn._obj.end_stream.assert_called_with(1)
++
++    def test_send_invalid_type(self) -> None:
++        conn = HTTP2Connection("example.com")
++        conn.putrequest("GET", "/")
++        with pytest.raises(TypeError):
++            conn.send(1)
++
++    def test_request_GET(self) -> None:
++        conn = HTTP2Connection("example.com")
++        conn.sock = mock.MagicMock(
++            sendall=mock.Mock(return_value=None),
++        )
++        sendall = conn.sock.sendall
++        data_to_send = conn._h2_conn._obj.data_to_send = mock.Mock(return_value=b"foo")
++        send_headers = conn._h2_conn._obj.send_headers = mock.Mock(return_value=None)
++        conn._h2_conn._obj.send_data = mock.Mock(return_value=None)
++        conn._h2_conn._obj.get_next_available_stream_id = mock.Mock(return_value=1)
++        close_connection = conn._h2_conn._obj.close_connection = mock.Mock(
++            return_value=None
++        )
++
++        conn.request("GET", "/")
++        conn.close()
++
++        data_to_send.assert_called_with()
++        sendall.assert_called_with(b"foo")
++        send_headers.assert_called_with(
++            stream_id=1,
++            headers=[
++                (b":scheme", b"https"),
++                (b":method", b"GET"),
++                (b":authority", b"example.com:443"),
++                (b":path", b"/"),
++                (b"user-agent", _get_default_user_agent().encode()),
++            ],
++            end_stream=True,
++        )
++
++        close_connection.assert_called_with()
++
++    def test_request_POST(self) -> None:
++        conn = HTTP2Connection("example.com")
++        conn.sock = mock.MagicMock(
++            sendall=mock.Mock(return_value=None),
++        )
++        sendall = conn.sock.sendall
++        data_to_send = conn._h2_conn._obj.data_to_send = mock.Mock(return_value=b"foo")
++        send_headers = conn._h2_conn._obj.send_headers = mock.Mock(return_value=None)
++        send_data = conn._h2_conn._obj.send_data = mock.Mock(return_value=None)
++        conn._h2_conn._obj.get_next_available_stream_id = mock.Mock(return_value=1)
++        close_connection = conn._h2_conn._obj.close_connection = mock.Mock(
++            return_value=None
++        )
++
++        conn.request("POST", "/", body=b"foo")
++        conn.close()
++
++        data_to_send.assert_called_with()
++        sendall.assert_called_with(b"foo")
++        send_headers.assert_called_with(
++            stream_id=1,
++            headers=[
++                (b":scheme", b"https"),
++                (b":method", b"POST"),
++                (b":authority", b"example.com:443"),
++                (b":path", b"/"),
++                (b"user-agent", _get_default_user_agent().encode()),
++            ],
++            end_stream=False,
++        )
++        send_data.assert_called_with(1, b"foo", end_stream=True)
++        close_connection.assert_called_with()
++
++    def test_close(self) -> None:
++        conn = HTTP2Connection("example.com")
++        conn.sock = mock.MagicMock(
++            sendall=mock.Mock(side_effect=Exception("foo")),
++        )
++        sendall = conn.sock.sendall
++        data_to_send = conn._h2_conn._obj.data_to_send = mock.Mock(return_value=b"foo")
++        close_connection = conn._h2_conn._obj.close_connection = mock.Mock(
++            return_value=None
++        )
++
++        try:
++            conn.close()
++        except Exception:
++            assert False, "Exception was raised"
++
++        close_connection.assert_called_with()
++        data_to_send.assert_called_with()
++        sendall.assert_called_with(b"foo")
++        assert conn._h2_stream is None
++        assert conn._headers == []
++
++    def test_request_ignore_chunked(self) -> None:
++        conn = HTTP2Connection("example.com")
++        conn.sock = mock.MagicMock(
++            sendall=mock.Mock(return_value=None),
++        )
++        sendall = conn.sock.sendall
++        data_to_send = conn._h2_conn._obj.data_to_send = mock.Mock(return_value=b"foo")
++        send_headers = conn._h2_conn._obj.send_headers = mock.Mock(return_value=None)
++        conn._h2_conn._obj.send_data = mock.Mock(return_value=None)
++        conn._h2_conn._obj.get_next_available_stream_id = mock.Mock(return_value=1)
++        close_connection = conn._h2_conn._obj.close_connection = mock.Mock(
++            return_value=None
++        )
++
++        conn.request("GET", "/", headers={"Transfer-Encoding": "chunked"}, chunked=True)
++        conn.close()
++
++        data_to_send.assert_called_with()
++        sendall.assert_called_with(b"foo")
++        send_headers.assert_called_with(
++            stream_id=1,
++            headers=[
++                (b":scheme", b"https"),
++                (b":method", b"GET"),
++                (b":authority", b"example.com:443"),
++                (b":path", b"/"),
++                (b"user-agent", _get_default_user_agent().encode()),
++            ],
++            end_stream=True,
++        )
++
++        close_connection.assert_called_with()
+
+diff --git a/test/test_response.py b/test/test_response.py
+index c006277..5d676fc 100644
+--- a/test/test_response.py
++++ b/test/test_response.py
+@@ -96,7 +96,9 @@ class TestBytesQueueBuffer:
+         (lambda b: b.get(len(b)), lambda b: b.get_all()),
+         ids=("get", "get_all"),
+     )
+-    @pytest.mark.limit_memory("12.5 MB")  # assert that we're not doubling memory usage
++    @pytest.mark.limit_memory(
++        "12.5 MB", current_thread_only=True
++    )  # assert that we're not doubling memory usagelimit_mem
+     def test_memory_usage(
+         self, get_func: typing.Callable[[BytesQueueBuffer], str]
+     ) -> None:
+@@ -108,7 +110,7 @@ class TestBytesQueueBuffer:
+ 
+         assert len(get_func(buffer)) == 10 * 2**20
+ 
+-    @pytest.mark.limit_memory("10.01 MB")
++    @pytest.mark.limit_memory("10.01 MB", current_thread_only=True)
+     def test_get_all_memory_usage_single_chunk(self) -> None:
+         buffer = BytesQueueBuffer()
+         chunk = bytes(10 * 2**20)  # 10 MiB
+@@ -1095,7 +1097,7 @@ class TestResponse:
+             (False, 10 * 2**20, "read1"),
+         ],
+     )
+-    @pytest.mark.limit_memory("25 MB")
++    @pytest.mark.limit_memory("25 MB", current_thread_only=True)
+     def test_buffer_memory_usage_decode_one_chunk(
+         self, preload_content: bool, amt: int, read_meth: str
+     ) -> None:
+@@ -1119,7 +1121,7 @@ class TestResponse:
+             (False, 10 * 2**20, "read1"),
+         ],
+     )
+-    @pytest.mark.limit_memory("10.5 MB")
++    @pytest.mark.limit_memory("10.5 MB", current_thread_only=True)
+     def test_buffer_memory_usage_no_decoding(
+         self, preload_content: bool, amt: int, read_meth: str
+     ) -> None:
+
+diff --git a/test/test_ssltransport.py b/test/test_ssltransport.py
+index b6d1f86..880f399 100644
+--- a/test/test_ssltransport.py
++++ b/test/test_ssltransport.py
+@@ -230,9 +230,8 @@ class SingleTLSLayerTestCase(SocketDummyServerTestCase):
+             cipher = ssock.cipher()
+             assert type(cipher) is tuple
+ 
+-            # No chosen protocol through ALPN or NPN.
++            # No chosen protocol.
+             assert ssock.selected_alpn_protocol() is None
+-            assert ssock.selected_npn_protocol() is None
+ 
+             shared_ciphers = ssock.shared_ciphers()
+             # SSLContext.shared_ciphers() changed behavior completely in a patch version.
+
+diff --git a/test/with_dummyserver/test_chunked_transfer.py b/test/with_dummyserver/test_chunked_transfer.py
+index c2dc12e..96f28e0 100644
+--- a/test/with_dummyserver/test_chunked_transfer.py
++++ b/test/with_dummyserver/test_chunked_transfer.py
+@@ -1,6 +1,8 @@
+ from __future__ import annotations
+ 
++import io
+ import socket
++import typing
+ 
+ import pytest
+ 
+@@ -57,15 +59,29 @@ class TestChunkedTransfer(SocketDummyServerTestCase):
+                 assert lines[i * 2] == hex(len(chunk))[2:].encode("utf-8")
+                 assert lines[i * 2 + 1] == chunk.encode("utf-8")
+ 
+-    def _test_body(self, data: bytes | str | None) -> None:
++    def _test_body(
++        self,
++        data: bytes
++        | str
++        | io.BytesIO
++        | io.StringIO
++        | typing.Iterable[bytes]
++        | typing.Iterable[str]
++        | None,
++        expected_data: bytes | None = None,
++    ) -> None:
+         self.start_chunked_handler()
+         with HTTPConnectionPool(self.host, self.port, retries=False) as pool:
+-            pool.urlopen("GET", "/", data, chunked=True)
++            pool.urlopen("GET", "/", body=data, chunked=True)  # type: ignore[arg-type]
+             header, body = self.buffer.split(b"\r\n\r\n", 1)
+ 
+             assert b"Transfer-Encoding: chunked" in header.split(b"\r\n")
+             if data:
+-                bdata = data if isinstance(data, bytes) else data.encode("utf-8")
++                if expected_data is not None:
++                    bdata = expected_data
++                else:
++                    assert isinstance(data, (bytes, str))
++                    bdata = data if isinstance(data, bytes) else data.encode("utf-8")
+                 assert b"\r\n" + bdata + b"\r\n" in body
+                 assert body.endswith(b"\r\n0\r\n\r\n")
+ 
+@@ -79,7 +95,48 @@ class TestChunkedTransfer(SocketDummyServerTestCase):
+         self._test_body(b"thisshouldbeonechunk\r\nasdf")
+ 
+     def test_unicode_body(self) -> None:
+-        self._test_body("thisshouldbeonechunk\r\näöüß")
++        self._test_body(
++            "thisshouldbeonechunk\r\näöüß\xFF",
++            expected_data=b"thisshouldbeonechunk\r\n\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f\xc3\xbf",
++        )
++
++    @pytest.mark.parametrize(
++        "bytes_data",
++        [
++            b"thisshouldbeonechunk\r\n\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f\xc3\xbf",  # utf-8
++            b"thisshouldbeonechunk\r\n\xe4\xf6\xfc\xdf\xff",  # latin-1
++        ],
++    )
++    def test_bytes_body_fileio(self, bytes_data: bytes) -> None:
++        self._test_body(io.BytesIO(bytes_data), expected_data=bytes_data)
++
++    def test_unicode_body_fileio(self) -> None:
++        self._test_body(
++            io.StringIO("thisshouldbeonechunk\r\näöüß\xFF"),
++            expected_data=b"thisshouldbeonechunk\r\n\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f\xc3\xbf",
++        )
++
++    @pytest.mark.parametrize(
++        "bytes_data",
++        [
++            b"thisshouldbeonechunk\r\n\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f\xc3\xbf",  # utf-8
++            b"thisshouldbeonechunk\r\n\xe4\xf6\xfc\xdf\xff",  # latin-1
++        ],
++    )
++    def test_bytes_body_iterable(self, bytes_data: bytes) -> None:
++        def send_body() -> typing.Iterable[bytes]:
++            yield bytes_data
++
++        self._test_body(send_body(), expected_data=bytes_data)
++
++    def test_unicode_body_iterable(self) -> None:
++        def send_body() -> typing.Iterable[str]:
++            yield "thisshouldbeonechunk\r\näöüß\xFF"
++
++        self._test_body(
++            send_body(),
++            expected_data=b"thisshouldbeonechunk\r\n\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f\xc3\xbf",
++        )
+ 
+     def test_empty_body(self) -> None:
+         self._test_body(None)
+
+diff --git a/test/with_dummyserver/test_connectionpool.py b/test/with_dummyserver/test_connectionpool.py
+index 4fbe6a4..1b8c682 100644
+--- a/test/with_dummyserver/test_connectionpool.py
++++ b/test/with_dummyserver/test_connectionpool.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import io
++import platform
+ import socket
+ import time
+ import typing
+@@ -98,13 +99,18 @@ class TestConnectionPoolTimeouts(SocketDummyServerTestCase):
+             self.host, self.port, timeout=short_timeout, retries=False
+         ) as pool:
+             wait_for_socket(ready_event)
+-            now = time.time()
++            now = time.perf_counter()
+             with pytest.raises(ReadTimeoutError):
+                 pool.request("GET", "/", timeout=LONG_TIMEOUT)
+-            delta = time.time() - now
++            delta = time.perf_counter() - now
+ 
+             message = "timeout was pool-level SHORT_TIMEOUT rather than request-level LONG_TIMEOUT"
+-            assert delta >= (LONG_TIMEOUT - 1e-5), message
++            if platform.system() == "Windows":
++                # Adjust tolerance for floating-point comparison on Windows to
++                # avoid flakiness in CI #3413
++                assert delta >= (LONG_TIMEOUT - 1e-3), message
++            else:
++                assert delta >= (LONG_TIMEOUT - 1e-5), message
+             block_event.set()  # Release request
+ 
+             # Timeout passed directly to request should raise a request timeout
+@@ -199,6 +205,17 @@ class TestConnectionPoolTimeouts(SocketDummyServerTestCase):
+ 
+ 
+ class TestConnectionPool(HypercornDummyServerTestCase):
++    def test_http2_test_error(self, http_version: str) -> None:
++        with HTTPConnectionPool(self.host, self.port) as pool:
++            if http_version == "h2":
++                with pytest.raises(
++                    ValueError, match="HTTP/2 support currently only applies to HTTPS.*"
++                ):
++                    r = pool.request("GET", "/")
++            else:
++                r = pool.request("GET", "/")
++                assert r.status == 200
++
+     def test_get(self) -> None:
+         with HTTPConnectionPool(self.host, self.port) as pool:
+             r = pool.request("GET", "/specific_method", fields={"method": "GET"})
+@@ -343,7 +360,7 @@ class TestConnectionPool(HypercornDummyServerTestCase):
+             try:
+                 # Update the default socket options
+                 assert conn.socket_options is not None
+-                conn.socket_options += [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]  # type: ignore[operator]
++                conn.socket_options += [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+                 s = conn._new_conn()  # type: ignore[attr-defined]
+                 nagle_disabled = (
+                     s.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) > 0
+@@ -438,7 +455,6 @@ class TestConnectionPool(HypercornDummyServerTestCase):
+             )
+ 
+     def test_tunnel(self) -> None:
+-        # note the actual httplib.py has no tests for this functionality
+         timeout = Timeout(total=None)
+         with HTTPConnectionPool(self.host, self.port, timeout=timeout) as pool:
+             conn = pool._get_conn()
+@@ -801,7 +817,8 @@ class TestConnectionPool(HypercornDummyServerTestCase):
+             self.host, self.port, source_address=invalid_source_address, retries=False
+         ) as pool:
+             if is_ipv6:
+-                with pytest.raises(NameResolutionError):
++                # with pytest.raises(NameResolutionError):
++                with pytest.raises(NewConnectionError):
+                     pool.request("GET", f"/source_address?{invalid_source_address}")
+             else:
+                 with pytest.raises(NewConnectionError):
+@@ -1155,7 +1172,9 @@ class TestRetry(HypercornDummyServerTestCase):
+             )
+             assert resp.status == 418
+ 
+-    def test_read_retries_unsuccessful(self) -> None:
++    def test_read_retries_unsuccessful(
++        self,
++    ) -> None:
+         with HTTPConnectionPool(self.host, self.port) as pool:
+             headers = {"test-name": "test_read_retries_unsuccessful"}
+             resp = pool.request("GET", "/successful_retry", headers=headers, retries=1)
+@@ -1301,6 +1320,7 @@ class TestRetryAfter(HypercornDummyServerTestCase):
+             r = pool.request("GET", "/redirect_after", retries=False)
+             assert r.status == 303
+ 
++            # Real timestamps are needed for this test
+             t = time.time()
+             r = pool.request("GET", "/redirect_after")
+             assert r.status == 200
+
+diff --git a/test/with_dummyserver/test_https.py b/test/with_dummyserver/test_https.py
+index b8353d7..fe6a037 100644
+--- a/test/with_dummyserver/test_https.py
++++ b/test/with_dummyserver/test_https.py
+@@ -1,11 +1,14 @@
+ from __future__ import annotations
+ 
++import concurrent.futures
+ import contextlib
+ import datetime
+ import os.path
+ import shutil
+ import ssl
+ import tempfile
++import time
++import typing
+ import warnings
+ from pathlib import Path
+ from test import (
+@@ -21,6 +24,8 @@ from unittest import mock
+ import pytest
+ import trustme
+ 
++import urllib3.http2
++import urllib3.http2.probe as http2_probe
+ import urllib3.util as util
+ import urllib3.util.ssl_
+ from dummyserver.socketserver import (
+@@ -43,8 +48,6 @@ from urllib3.exceptions import (
+ from urllib3.util.ssl_match_hostname import CertificateError
+ from urllib3.util.timeout import Timeout
+ 
+-from .. import has_alpn
+-
+ TLSv1_CERTS = DEFAULT_CERTS.copy()
+ TLSv1_CERTS["ssl_version"] = getattr(ssl, "PROTOCOL_TLSv1", None)
+ 
+@@ -147,6 +150,10 @@ class BaseTestHTTPS(HTTPSHypercornDummyServerTestCase):
+             assert r.headers["server"] == f"hypercorn-{http_version}"
+             assert r.data == b"Dummy server!"
+ 
++    def test_default_port(self) -> None:
++        conn = HTTPSConnection(self.host, port=None)
++        assert conn.port == 443
++
+     @resolvesLocalhostFQDN()
+     def test_dotted_fqdn(self) -> None:
+         with HTTPSConnectionPool(
+@@ -609,7 +616,7 @@ class BaseTestHTTPS(HTTPSHypercornDummyServerTestCase):
+             with pytest.warns(InsecureRequestWarning):
+                 https_pool.request("GET", "/")
+ 
+-    def test_tunnel(self) -> None:
++    def test_tunnel(self, http_version: str) -> None:
+         """test the _tunnel behavior"""
+         timeout = Timeout(total=None)
+         with HTTPSConnectionPool(
+@@ -620,13 +627,21 @@ class BaseTestHTTPS(HTTPSHypercornDummyServerTestCase):
+             ssl_minimum_version=self.tls_version(),
+         ) as https_pool:
+             with contextlib.closing(https_pool._new_conn()) as conn:
+-                conn.set_tunnel(self.host, self.port)
+-                with mock.patch.object(
+-                    conn, "_tunnel", create=True, return_value=None
+-                ) as conn_tunnel:
+-                    with pytest.warns(InsecureRequestWarning):
+-                        https_pool._make_request(conn, "GET", "/")
+-                conn_tunnel.assert_called_once_with()
++                if http_version == "h2":
++                    with pytest.raises(NotImplementedError) as e:
++                        conn.set_tunnel(self.host, self.port)
++                    assert (
++                        str(e.value)
++                        == "HTTP/2 does not support setting up a tunnel through a proxy"
++                    )
++                else:
++                    conn.set_tunnel(self.host, self.port)
++                    with mock.patch.object(
++                        conn, "_tunnel", create=True, return_value=None
++                    ) as conn_tunnel:
++                        with pytest.warns(InsecureRequestWarning):
++                            https_pool._make_request(conn, "GET", "/")
++                    conn_tunnel.assert_called_once_with()
+ 
+     @requires_network()
+     def test_enhanced_timeout(self) -> None:
+@@ -942,10 +957,8 @@ class BaseTestHTTPS(HTTPSHypercornDummyServerTestCase):
+             r = pool.request("GET", "/")
+             assert r.status == 200, r.data
+ 
+-    def test_alpn_default(self) -> None:
++    def test_alpn_default(self, http_version: str) -> None:
+         """Default ALPN protocols are sent by default."""
+-        if not has_alpn() or not has_alpn(ssl.SSLContext):
+-            pytest.skip("ALPN-support not available")
+         with HTTPSConnectionPool(
+             self.host,
+             self.port,
+@@ -955,6 +968,143 @@ class BaseTestHTTPS(HTTPSHypercornDummyServerTestCase):
+             r = pool.request("GET", "/alpn_protocol", retries=0)
+             assert r.status == 200
+             assert r.data.decode("utf-8") == util.ALPN_PROTOCOLS[0]
++            assert (
++                r.data.decode("utf-8") == {"h11": "http/1.1", "h2": "h2"}[http_version]
++            )
++
++    def test_http2_probe_result_is_cached(self, http_version: str) -> None:
++        assert http2_probe._values() == {}
++
++        for i in range(2):  # Do this twice to exercise the cache path
++            with HTTPSConnectionPool(
++                self.host,
++                self.port,
++                ca_certs=DEFAULT_CA,
++            ) as pool:
++                r = pool.request("GET", "/alpn_protocol", retries=0)
++                assert r.status == 200
++
++            if http_version == "h2":
++                # This means the probe was successful.
++                assert http2_probe._values() == {(self.host, self.port): True}
++            else:
++                # This means the probe wasn't attempted, otherwise would have a value.
++                assert http_version == "h11"
++                assert http2_probe._values() == {}
++
++    @pytest.mark.xfail(reason="Hypercorn always supports both HTTP/2 and HTTP/1.1")
++    def test_http2_probe_result_failed(self, http_version: str) -> None:
++        if http_version == "h2":
++            pytest.skip("Test must have server in HTTP/1.1 mode")
++        assert http2_probe._values() == {}
++
++        urllib3.http2.inject_into_urllib3()
++        try:
++            with HTTPSConnectionPool(
++                self.host,
++                self.port,
++                ca_certs=DEFAULT_CA,
++            ) as pool:
++                r = pool.request("GET", "/", retries=0)
++                assert r.status == 200
++
++            # The probe was a failure because Hypercorn didn't support HTTP/2.
++            assert http2_probe._values() == {(self.host, self.port): False}
++        finally:
++            urllib3.http2.extract_from_urllib3()
++
++    def test_http2_probe_no_result_in_connect_error(self) -> None:
++        assert http2_probe._values() == {}
++
++        urllib3.http2.inject_into_urllib3()
++        try:
++            with HTTPSConnectionPool(
++                TARPIT_HOST,
++                self.port,
++                ca_certs=DEFAULT_CA,
++                timeout=SHORT_TIMEOUT,
++            ) as pool:
++                with pytest.raises(ConnectTimeoutError):
++                    pool.request("GET", "/", retries=False)
++
++            # The probe was inconclusive since an error occurred during connection.
++            assert http2_probe._values() == {(TARPIT_HOST, self.port): None}
++        finally:
++            urllib3.http2.extract_from_urllib3()
++
++    def test_http2_probe_no_result_in_ssl_error(self) -> None:
++        urllib3.http2.inject_into_urllib3()
++        try:
++            with HTTPSConnectionPool(
++                self.host,
++                self.port,
++                ca_certs=None,
++                timeout=LONG_TIMEOUT,
++            ) as pool:
++                with pytest.raises(SSLError):
++                    pool.request("GET", "/", retries=False)
++
++            # The probe was inconclusive since an error occurred during connection.
++            assert http2_probe._values() == {(self.host, self.port): None}
++        finally:
++            urllib3.http2.extract_from_urllib3()
++
++    def test_http2_probe_blocked_per_thread(self) -> None:
++        state, current_thread, last_action = None, None, time.perf_counter()
++
++        def connect_callback(label: str, thread_id: int, **kwargs: typing.Any) -> None:
++            nonlocal state, current_thread, last_action
++
++            if label in ("before connect", "after connect failure"):
++                # We don't know if the target supports HTTP/2 as connections fail
++                assert kwargs["target_supports_http2"] is None
++
++            # Since we're trying to connect to TARPIT_HOST, all connections will
++            # fail, but they should be tried one after the other
++            now = time.perf_counter()
++            assert now >= last_action
++            last_action = now
++
++            if label == "before connect":
++                assert state is None
++                state = "connect"
++                assert current_thread != thread_id
++                current_thread = thread_id
++            elif label == "after connect failure":
++                assert state == "connect"
++                assert current_thread == thread_id
++                state = None
++
++        assert http2_probe._values() == {}
++
++        connect_timeout = LONG_TIMEOUT
++        total_threads = 3
++        urllib3.http2.inject_into_urllib3()
++        try:
++
++            def try_connect(_: typing.Any) -> tuple[float, float]:
++                with HTTPSConnectionPool(
++                    TARPIT_HOST,
++                    self.port,
++                    ca_certs=DEFAULT_CA,
++                    timeout=connect_timeout,
++                ) as pool:
++                    start_time = time.time()
++                    conn = pool._get_conn()
++                    assert isinstance(conn, HTTPSConnection)
++                    conn._connect_callback = connect_callback
++                    with pytest.raises(ConnectTimeoutError):
++                        conn.connect()
++                    end_time = time.time()
++                    return start_time, end_time
++
++            threadpool = concurrent.futures.ThreadPoolExecutor(total_threads)
++            list(threadpool.map(try_connect, range(total_threads)))
++
++            # The probe was inconclusive since an error occurred during connection.
++            assert http2_probe._values() == {(TARPIT_HOST, self.port): None}
++        finally:
++            urllib3.http2.extract_from_urllib3()
+ 
+     def test_default_ssl_context_ssl_min_max_versions(self) -> None:
+         ctx = urllib3.util.ssl_.create_urllib3_context()
+@@ -990,6 +1140,26 @@ class BaseTestHTTPS(HTTPSHypercornDummyServerTestCase):
+         assert ctx.minimum_version == self.tls_version()
+         assert ctx.maximum_version == self.tls_version()
+ 
++    def test_assert_missing_hashfunc(self, monkeypatch: pytest.MonkeyPatch) -> None:
++        fingerprint = "55:39:BF:70:05:12:43:FA:1F:D1:BF:4E:E8:1B:07:1D"
++        with HTTPSConnectionPool(
++            "localhost",
++            self.port,
++            cert_reqs="CERT_REQUIRED",
++            ca_certs=DEFAULT_CA,
++            assert_fingerprint=(fingerprint),
++            ssl_minimum_version=self.tls_version(),
++        ) as https_pool:
++            digest_length = len(fingerprint.replace(":", "").lower())
++            monkeypatch.setitem(urllib3.util.ssl_.HASHFUNC_MAP, digest_length, None)
++            with pytest.raises(MaxRetryError) as cm:
++                https_pool.request("GET", "/", retries=0)
++            assert type(cm.value.reason) is SSLError
++            assert (
++                f"Hash function implementation unavailable for fingerprint length: {digest_length}"
++                == str(cm.value.reason)
++            )
++
+ 
+ @pytest.mark.usefixtures("requires_tlsv1")
+ class TestHTTPS_TLSv1(BaseTestHTTPS):
+
+diff --git a/test/with_dummyserver/test_proxy_poolmanager.py b/test/with_dummyserver/test_proxy_poolmanager.py
+index 397181a..355cd22 100644
+--- a/test/with_dummyserver/test_proxy_poolmanager.py
++++ b/test/with_dummyserver/test_proxy_poolmanager.py
+@@ -529,9 +529,6 @@ class TestHTTPProxyManager(HypercornDummyProxyTestCase):
+             # target so we put the blame on the target.
+             assert isinstance(e.value.reason, ReadTimeoutError)
+ 
+-    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
+-    # see https://github.com/python/cpython/issues/103472
+-    @pytest.mark.filterwarnings("default::ResourceWarning")
+     @requires_network()
+     @pytest.mark.parametrize(
+         ["proxy_scheme", "target_scheme"], [("http", "https"), ("https", "https")]
+@@ -552,9 +549,6 @@ class TestHTTPProxyManager(HypercornDummyProxyTestCase):
+ 
+             assert isinstance(e.value.reason, ReadTimeoutError)
+ 
+-    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
+-    # see https://github.com/python/cpython/issues/103472
+-    @pytest.mark.filterwarnings("default::ResourceWarning")
+     @requires_network()
+     @pytest.mark.parametrize(
+         ["proxy_scheme", "target_scheme", "use_forwarding_for_https"],
+@@ -583,9 +577,6 @@ class TestHTTPProxyManager(HypercornDummyProxyTestCase):
+             assert isinstance(e.value.reason, ProxyError)
+             assert isinstance(e.value.reason.original_error, ConnectTimeoutError)
+ 
+-    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
+-    # see https://github.com/python/cpython/issues/103472
+-    @pytest.mark.filterwarnings("default::ResourceWarning")
+     @requires_network()
+     @pytest.mark.parametrize(
+         ["proxy_scheme", "target_scheme"], [("http", "https"), ("https", "https")]
+@@ -605,9 +596,6 @@ class TestHTTPProxyManager(HypercornDummyProxyTestCase):
+             assert isinstance(e.value.reason, ProxyError)
+             assert isinstance(e.value.reason.original_error, ConnectTimeoutError)
+ 
+-    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
+-    # see https://github.com/python/cpython/issues/103472
+-    @pytest.mark.filterwarnings("default::ResourceWarning")
+     @requires_network()
+     @pytest.mark.parametrize(
+         ["target_scheme", "use_forwarding_for_https"],
+@@ -632,9 +620,6 @@ class TestHTTPProxyManager(HypercornDummyProxyTestCase):
+             assert isinstance(e.value.reason, ProxyError)
+             assert isinstance(e.value.reason.original_error, SSLError)
+ 
+-    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
+-    # see https://github.com/python/cpython/issues/103472
+-    @pytest.mark.filterwarnings("default::ResourceWarning")
+     @requires_network()
+     @pytest.mark.parametrize(
+         ["proxy_scheme", "use_forwarding_for_https"],
+@@ -665,9 +650,6 @@ class TestHTTPProxyManager(HypercornDummyProxyTestCase):
+                 proxy.request("GET", self.https_url)
+             assert isinstance(e.value.reason, SSLError)
+ 
+-    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
+-    # see https://github.com/python/cpython/issues/103472
+-    @pytest.mark.filterwarnings("default::ResourceWarning")
+     def test_scheme_host_case_insensitive(self) -> None:
+         """Assert that upper-case schemes and hosts are normalized."""
+         with proxy_from_url(self.proxy_url.upper(), ca_certs=DEFAULT_CA) as http:
+@@ -694,9 +676,6 @@ class TestHTTPProxyManager(HypercornDummyProxyTestCase):
+             ),
+         ],
+     )
+-    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
+-    # see https://github.com/python/cpython/issues/103472
+-    @pytest.mark.filterwarnings("default::ResourceWarning")
+     def test_invalid_schema(self, url: str, error_msg: str) -> None:
+         with pytest.raises(ProxySchemeUnknown, match=error_msg):
+             proxy_from_url(url)
+@@ -713,9 +692,6 @@ class TestIPv6HTTPProxyManager(IPv6HypercornDummyProxyTestCase):
+         cls.https_url_alt = f"https://{cls.https_host_alt}:{int(cls.https_port)}"
+         cls.proxy_url = f"http://[{cls.proxy_host}]:{int(cls.proxy_port)}"
+ 
+-    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
+-    # see https://github.com/python/cpython/issues/103472
+-    @pytest.mark.filterwarnings("default::ResourceWarning")
+     def test_basic_ipv6_proxy(self) -> None:
+         with proxy_from_url(self.proxy_url, ca_certs=DEFAULT_CA) as http:
+             r = http.request("GET", f"{self.http_url}/")
+@@ -747,9 +723,6 @@ class TestHTTPSProxyVerification:
+         # Transform ipv6 like '::1' to 0:0:0:0:0:0:0:1 via '0000:0000:0000:0000:0000:0000:0000:0001'
+         return addr.exploded.replace("0000", "0").replace("000", "")
+ 
+-    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
+-    # see https://github.com/python/cpython/issues/103472
+-    @pytest.mark.filterwarnings("default::ResourceWarning")
+     def test_https_proxy_assert_fingerprint_md5(
+         self, no_san_proxy_with_server: tuple[ServerConfig, ServerConfig]
+     ) -> None:
+@@ -765,9 +738,6 @@ class TestHTTPSProxyVerification:
+         ) as https:
+             https.request("GET", destination_url)
+ 
+-    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
+-    # see https://github.com/python/cpython/issues/103472
+-    @pytest.mark.filterwarnings("default::ResourceWarning")
+     def test_https_proxy_assert_fingerprint_md5_non_matching(
+         self, no_san_proxy_with_server: tuple[ServerConfig, ServerConfig]
+     ) -> None:
+@@ -789,9 +759,6 @@ class TestHTTPSProxyVerification:
+ 
+             assert "Fingerprints did not match" in str(e)
+ 
+-    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
+-    # see https://github.com/python/cpython/issues/103472
+-    @pytest.mark.filterwarnings("default::ResourceWarning")
+     def test_https_proxy_assert_hostname(
+         self, san_proxy_with_server: tuple[ServerConfig, ServerConfig]
+     ) -> None:
+@@ -803,9 +770,6 @@ class TestHTTPSProxyVerification:
+         ) as https:
+             https.request("GET", destination_url)
+ 
+-    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
+-    # see https://github.com/python/cpython/issues/103472
+-    @pytest.mark.filterwarnings("default::ResourceWarning")
+     def test_https_proxy_assert_hostname_non_matching(
+         self, san_proxy_with_server: tuple[ServerConfig, ServerConfig]
+     ) -> None:
+@@ -825,9 +789,6 @@ class TestHTTPSProxyVerification:
+             msg = f"hostname \\'{proxy_hostname}\\' doesn\\'t match \\'{proxy_host}\\'"
+             assert msg in str(e)
+ 
+-    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
+-    # see https://github.com/python/cpython/issues/103472
+-    @pytest.mark.filterwarnings("default::ResourceWarning")
+     def test_https_proxy_hostname_verification(
+         self, no_localhost_san_server: ServerConfig
+     ) -> None:
+@@ -857,9 +818,6 @@ class TestHTTPSProxyVerification:
+                 ssl_error
+             ) or "Hostname mismatch" in str(ssl_error)
+ 
+-    # stdlib http.client.HTTPConnection._tunnel() causes a ResourceWarning
+-    # see https://github.com/python/cpython/issues/103472
+-    @pytest.mark.filterwarnings("default::ResourceWarning")
+     def test_https_proxy_ipv4_san(
+         self, ipv4_san_proxy_with_server: tuple[ServerConfig, ServerConfig]
+     ) -> None:
+
+diff --git a/test/with_dummyserver/test_socketlevel.py b/test/with_dummyserver/test_socketlevel.py
+index dceb5ee..c17732e 100644
+--- a/test/with_dummyserver/test_socketlevel.py
++++ b/test/with_dummyserver/test_socketlevel.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import contextlib
+ import errno
++import http.client
+ import io
+ import os
+ import os.path
+@@ -48,7 +49,7 @@ from urllib3.util import ssl_, ssl_wrap_socket
+ from urllib3.util.retry import Retry
+ from urllib3.util.timeout import Timeout
+ 
+-from .. import LogRecorder, has_alpn
++from .. import LogRecorder
+ 
+ if typing.TYPE_CHECKING:
+     from _typeshed import StrOrBytesPath
+@@ -107,9 +108,6 @@ class TestSNI(SocketDummyServerTestCase):
+ 
+ class TestALPN(SocketDummyServerTestCase):
+     def test_alpn_protocol_in_first_request_packet(self) -> None:
+-        if not has_alpn():
+-            pytest.skip("ALPN-support not available")
+-
+         done_receiving = Event()
+         self.buf = b""
+ 
+@@ -1140,6 +1138,27 @@ class TestProxyManager(SocketDummyServerTestCase):
+                     retries=False,
+                 )
+ 
++    def test_tunnel_sets_http_11_alpn(self) -> None:
++        done_receiving = Event()
++        self.buf = b""
++
++        def socket_handler(listener: socket.socket) -> None:
++            sock = listener.accept()[0]
++
++            self.buf = sock.recv(65536)  # We only accept one packet
++            done_receiving.set()  # let the test know it can proceed
++            sock.close()
++
++        self._start_server(socket_handler)
++        base_url = f"https://{self.host}:{self.port}"
++        with proxy_from_url(base_url) as proxy:
++            with pytest.raises(MaxRetryError):
++                proxy.request("GET", "https://localhost/")
++
++        done_receiving.wait()
++        assert b"http/1.1" in self.buf
++        assert b"h2" not in self.buf
++
+     def test_connect_reconn(self) -> None:
+         def proxy_ssl_one(listener: socket.socket) -> None:
+             sock = listener.accept()[0]
+@@ -1270,6 +1289,84 @@ class TestProxyManager(SocketDummyServerTestCase):
+                 e.value.reason
+             )
+ 
++    def test_proxy_status_not_ok(self) -> None:
++        def http_socket_handler(listener: socket.socket) -> None:
++            sock = listener.accept()[0]
++            consume_socket(sock)
++            sock.send(b"HTTP/1.0 501 Not Implemented\r\nConnection: close\r\n\r\n")
++            sock.close()
++
++        self._start_server(http_socket_handler)
++        base_url = f"http://{self.host}:{self.port}"
++
++        with ProxyManager(base_url) as proxy:
++            with pytest.raises(MaxRetryError) as e:
++                proxy.request("GET", "https://example.com", retries=0)
++
++            assert type(e.value.reason) is ProxyError
++            assert e.value.reason.args[0] == "Unable to connect to proxy"
++            assert type(e.value.reason.args[1]) is OSError
++            assert (
++                str(e.value.reason.args[1])
++                == "Tunnel connection failed: 501 Not Implemented"
++            )
++
++    def test_early_eof_doesnt_cause_infinite_loop(self) -> None:
++        def http_socket_handler(listener: socket.socket) -> None:
++            sock = listener.accept()[0]
++            consume_socket(sock)
++            sock.send(b"HTTP/1.0 200 OK\r\n")
++            sock.close()
++
++        self._start_server(http_socket_handler)
++        base_url = f"http://{self.host}:{self.port}"
++
++        with ProxyManager(base_url) as proxy:
++            with pytest.raises(MaxRetryError):
++                proxy.request("GET", "https://example.com", retries=0)
++
++    def test_header_longer_than_maxline(self) -> None:
++        def http_socket_handler(listener: socket.socket) -> None:
++            sock = listener.accept()[0]
++            consume_socket(sock)
++            sock.send(
++                b"HTTP/1.0 200 OK\r\nThis-Header-Is-Too-Long: Way-Too-Long\r\n\r\n"
++            )
++            sock.close()
++
++        self._start_server(http_socket_handler)
++        base_url = f"http://{self.host}:{self.port}"
++
++        with mock.patch("http.client._MAXLINE", 17):
++            with ProxyManager(base_url) as proxy:
++                with pytest.raises(MaxRetryError) as e:
++                    proxy.request("GET", "https://example.com", retries=0)
++
++            assert type(e.value.reason) is ProtocolError
++            assert e.value.reason.args[0] == "Connection aborted."
++            assert type(e.value.reason.args[1]) is http.client.LineTooLong
++            assert (
++                str(e.value.reason.args[1])
++                == "got more than 17 bytes when reading header line"
++            )
++
++    def test_debuglevel(self, capsys: pytest.CaptureFixture[str]) -> None:
++        def http_socket_handler(listener: socket.socket) -> None:
++            sock = listener.accept()[0]
++            consume_socket(sock)
++            sock.send(b"HTTP/1.0 200 OK\r\nExample-Header: Example-Value\r\n\r\n")
++            sock.close()
++
++        self._start_server(http_socket_handler)
++        base_url = f"http://{self.host}:{self.port}"
++
++        with mock.patch("http.client.HTTPConnection.debuglevel", 1):
++            with ProxyManager(base_url) as proxy:
++                with pytest.raises(MaxRetryError):
++                    proxy.request("GET", "https://example.com", retries=0)
++
++        assert "header: Example-Header: Example-Value\r\n\n" in capsys.readouterr().out
++
+ 
+ class TestSSL(SocketDummyServerTestCase):
+     def test_ssl_failure_midway_through_conn(self) -> None:

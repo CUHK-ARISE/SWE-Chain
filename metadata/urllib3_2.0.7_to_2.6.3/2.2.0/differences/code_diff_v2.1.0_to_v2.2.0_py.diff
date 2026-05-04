@@ -1,0 +1,3474 @@
+diff --git a/dummyserver/app.py b/dummyserver/app.py
+new file mode 100644
+index 0000000..692c314
+--- /dev/null
++++ b/dummyserver/app.py
+@@ -0,0 +1,383 @@
++from __future__ import annotations
++
++import collections
++import contextlib
++import datetime
++import email.utils
++import gzip
++import mimetypes
++import zlib
++from io import BytesIO
++from pathlib import Path
++from typing import Iterator
++
++import trio
++from quart import make_response, request
++
++# TODO switch to Response if https://github.com/pallets/quart/issues/288 is fixed
++from quart.typing import ResponseTypes
++from quart_trio import QuartTrio
++
++hypercorn_app = QuartTrio(__name__)
++
++# Globals are not safe in Flask/Quart but work for our Hypercorn use case
++RETRY_TEST_NAMES: collections.Counter[str] = collections.Counter()
++LAST_RETRY_AFTER_REQ: datetime.datetime = datetime.datetime.min
++
++
++pyodide_testing_app = QuartTrio(__name__)
++DEFAULT_HEADERS = [
++    # Allow cross-origin requests for emscripten
++    ("Access-Control-Allow-Origin", "*"),
++    ("Cross-Origin-Opener-Policy", "same-origin"),
++    ("Cross-Origin-Embedder-Policy", "require-corp"),
++    ("Feature-Policy", "sync-xhr *;"),
++    ("Access-Control-Allow-Headers", "*"),
++]
++
++
++@hypercorn_app.route("/")
++@pyodide_testing_app.route("/")
++@pyodide_testing_app.route("/index")
++async def index() -> ResponseTypes:
++    return await make_response("Dummy server!")
++
++
++@hypercorn_app.route("/alpn_protocol")
++async def alpn_protocol() -> ResponseTypes:
++    """Return the requester's certificate."""
++    alpn_protocol = request.scope["extensions"]["tls"]["alpn_protocol"]
++    return await make_response(alpn_protocol)
++
++
++@hypercorn_app.route("/certificate")
++async def certificate() -> ResponseTypes:
++    """Return the requester's certificate."""
++    print("scope", request.scope)
++    subject = request.scope["extensions"]["tls"]["client_cert_name"]
++    subject_as_dict = dict(part.split("=") for part in subject.split(", "))
++    return await make_response(subject_as_dict)
++
++
++@hypercorn_app.route("/specific_method", methods=["GET", "POST", "PUT"])
++@pyodide_testing_app.route("/specific_method", methods=["GET", "POST", "PUT"])
++async def specific_method() -> ResponseTypes:
++    "Confirm that the request matches the desired method type"
++    method_param = (await request.values).get("method", "")
++
++    if request.method.upper() == method_param.upper():
++        return await make_response("", 200)
++    else:
++        return await make_response(
++            f"Wrong method: {method_param} != {request.method}", 400
++        )
++
++
++@hypercorn_app.route("/upload", methods=["POST"])
++async def upload() -> ResponseTypes:
++    "Confirm that the uploaded file conforms to specification"
++    params = await request.form
++    param = params.get("upload_param")
++    filename_param = params.get("upload_filename")
++    size = int(params.get("upload_size", "0"))
++    files_ = (await request.files).getlist(param)
++    assert files_ is not None
++
++    if len(files_) != 1:
++        return await make_response(
++            f"Expected 1 file for '{param}', not {len(files_)}", 400
++        )
++
++    file_ = files_[0]
++    # data is short enough to read synchronously without blocking the event loop
++    with contextlib.closing(file_.stream) as stream:
++        data = stream.read()
++
++    if int(size) != len(data):
++        return await make_response(f"Wrong size: {int(size)} != {len(data)}", 400)
++
++    if filename_param != file_.filename:
++        return await make_response(
++            f"Wrong filename: {filename_param} != {file_.filename}", 400
++        )
++
++    return await make_response()
++
++
++@hypercorn_app.route("/chunked")
++async def chunked() -> ResponseTypes:
++    def generate() -> Iterator[str]:
++        for _ in range(4):
++            yield "123"
++
++    return await make_response(generate())
++
++
++@hypercorn_app.route("/chunked_gzip")
++async def chunked_gzip() -> ResponseTypes:
++    def generate() -> Iterator[bytes]:
++        compressor = zlib.compressobj(6, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
++
++        for uncompressed in [b"123"] * 4:
++            yield compressor.compress(uncompressed)
++        yield compressor.flush()
++
++    return await make_response(generate(), 200, [("Content-Encoding", "gzip")])
++
++
++@hypercorn_app.route("/keepalive")
++async def keepalive() -> ResponseTypes:
++    if request.args.get("close", b"0") == b"1":
++        headers = [("Connection", "close")]
++        return await make_response("Closing", 200, headers)
++
++    headers = [("Connection", "keep-alive")]
++    return await make_response("Keeping alive", 200, headers)
++
++
++@hypercorn_app.route("/echo", methods=["GET", "POST", "PUT"])
++async def echo() -> ResponseTypes:
++    "Echo back the params"
++    if request.method == "GET":
++        return await make_response(request.query_string)
++
++    return await make_response(await request.get_data())
++
++
++@hypercorn_app.route("/echo_json", methods=["POST"])
++@pyodide_testing_app.route("/echo_json", methods=["POST", "OPTIONS"])
++async def echo_json() -> ResponseTypes:
++    "Echo back the JSON"
++    if request.method == "OPTIONS":
++        return await make_response("", 200)
++    data = await request.get_data()
++    return await make_response(data, 200, request.headers)
++
++
++@hypercorn_app.route("/echo_uri/<path:rest>")
++@hypercorn_app.route("/echo_uri", defaults={"rest": ""})
++async def echo_uri(rest: str) -> ResponseTypes:
++    "Echo back the requested URI"
++    assert request.full_path is not None
++    return await make_response(request.full_path)
++
++
++@hypercorn_app.route("/echo_params")
++async def echo_params() -> ResponseTypes:
++    "Echo back the query parameters"
++    await request.get_data()
++    echod = sorted((k, v) for k, v in request.args.items())
++    return await make_response(repr(echod))
++
++
++@hypercorn_app.route("/headers", methods=["GET", "POST"])
++async def headers() -> ResponseTypes:
++    return await make_response(dict(request.headers.items()))
++
++
++@hypercorn_app.route("/headers_and_params")
++async def headers_and_params() -> ResponseTypes:
++    return await make_response(
++        {
++            "headers": dict(request.headers),
++            "params": request.args,
++        }
++    )
++
++
++@hypercorn_app.route("/multi_headers", methods=["GET", "POST"])
++async def multi_headers() -> ResponseTypes:
++    return await make_response({"headers": list(request.headers)})
++
++
++@hypercorn_app.route("/multi_redirect")
++async def multi_redirect() -> ResponseTypes:
++    "Performs a redirect chain based on ``redirect_codes``"
++    params = request.args
++    codes = params.get("redirect_codes", "200")
++    head, tail = codes.split(",", 1) if "," in codes else (codes, None)
++    assert head is not None
++    status = head
++    if not tail:
++        return await make_response("Done redirecting", status)
++
++    headers = [("Location", f"/multi_redirect?redirect_codes={tail}")]
++    return await make_response("", status, headers)
++
++
++@hypercorn_app.route("/encodingrequest")
++async def encodingrequest() -> ResponseTypes:
++    "Check for UA accepting gzip/deflate encoding"
++    data = b"hello, world!"
++    encoding = request.headers.get("Accept-Encoding", "")
++    headers = []
++    if encoding == "gzip":
++        headers = [("Content-Encoding", "gzip")]
++        file_ = BytesIO()
++        with contextlib.closing(gzip.GzipFile("", mode="w", fileobj=file_)) as zipfile:
++            zipfile.write(data)
++        data = file_.getvalue()
++    elif encoding == "deflate":
++        headers = [("Content-Encoding", "deflate")]
++        data = zlib.compress(data)
++    elif encoding == "garbage-gzip":
++        headers = [("Content-Encoding", "gzip")]
++        data = b"garbage"
++    elif encoding == "garbage-deflate":
++        headers = [("Content-Encoding", "deflate")]
++        data = b"garbage"
++    return await make_response(data, 200, headers)
++
++
++@hypercorn_app.route("/redirect", methods=["GET", "POST", "PUT"])
++async def redirect() -> ResponseTypes:
++    "Perform a redirect to ``target``"
++    values = await request.values
++    target = values.get("target", "/")
++    status = values.get("status", "303 See Other")
++    status_code = status.split(" ")[0]
++
++    headers = [("Location", target)]
++    return await make_response("", status_code, headers)
++
++
++@hypercorn_app.route("/redirect_after")
++async def redirect_after() -> ResponseTypes:
++    "Perform a redirect to ``target``"
++    params = request.args
++    date = params.get("date")
++    if date:
++        dt = datetime.datetime.fromtimestamp(float(date), tz=datetime.timezone.utc)
++        http_dt = email.utils.format_datetime(dt, usegmt=True)
++        retry_after = str(http_dt)
++    else:
++        retry_after = "1"
++    target = params.get("target", "/")
++    headers = [("Location", target), ("Retry-After", retry_after)]
++    return await make_response("", 303, headers)
++
++
++@hypercorn_app.route("/retry_after")
++async def retry_after() -> ResponseTypes:
++    global LAST_RETRY_AFTER_REQ
++    params = request.args
++    if datetime.datetime.now() - LAST_RETRY_AFTER_REQ < datetime.timedelta(seconds=1):
++        status = params.get("status", "429 Too Many Requests")
++        status_code = status.split(" ")[0]
++
++        return await make_response("", status_code, [("Retry-After", "1")])
++
++    LAST_RETRY_AFTER_REQ = datetime.datetime.now()
++    return await make_response("", 200)
++
++
++@hypercorn_app.route("/status")
++@pyodide_testing_app.route("/status")
++async def status() -> ResponseTypes:
++    values = await request.values
++    status = values.get("status", "200 OK")
++    status_code = status.split(" ")[0]
++    return await make_response("", status_code)
++
++
++@hypercorn_app.route("/source_address")
++async def source_address() -> ResponseTypes:
++    """Return the requester's IP address."""
++    return await make_response(request.remote_addr)
++
++
++@hypercorn_app.route("/successful_retry", methods=["GET", "PUT"])
++async def successful_retry() -> ResponseTypes:
++    """First return an error and then success
++
++    It's not currently very flexible as the number of retries is hard-coded.
++    """
++    test_name = request.headers.get("test-name", None)
++    if not test_name:
++        return await make_response("test-name header not set", 400)
++
++    RETRY_TEST_NAMES[test_name] += 1
++
++    if RETRY_TEST_NAMES[test_name] >= 2:
++        return await make_response("Retry successful!", 200)
++    else:
++        return await make_response("need to keep retrying!", 418)
++
++
++@pyodide_testing_app.after_request
++def apply_caching(response: ResponseTypes) -> ResponseTypes:
++    for header, value in DEFAULT_HEADERS:
++        response.headers[header] = value
++    return response
++
++
++@pyodide_testing_app.route("/slow")
++async def slow() -> ResponseTypes:
++    await trio.sleep(10)
++    return await make_response("TEN SECONDS LATER", 200)
++
++
++@pyodide_testing_app.route("/bigfile")
++async def bigfile() -> ResponseTypes:
++    # great big text file, should force streaming
++    # if supported
++    bigdata = 1048576 * b"WOOO YAY BOOYAKAH"
++    return await make_response(bigdata, 200)
++
++
++@pyodide_testing_app.route("/mediumfile")
++async def mediumfile() -> ResponseTypes:
++    # quite big file
++    bigdata = 1024 * b"WOOO YAY BOOYAKAH"
++    return await make_response(bigdata, 200)
++
++
++@pyodide_testing_app.route("/upload", methods=["POST", "OPTIONS"])
++async def pyodide_upload() -> ResponseTypes:
++    if request.method == "OPTIONS":
++        return await make_response("", 200)
++    spare_data = await request.get_data(parse_form_data=True)
++    if len(spare_data) != 0:
++        return await make_response("Bad upload data", 404)
++    files = await request.files
++    form = await request.form
++    if form["upload_param"] != "filefield" or form["upload_filename"] != "lolcat.txt":
++        return await make_response("Bad upload form values", 404)
++    if len(files) != 1 or files.get("filefield") is None:
++        return await make_response("Missing file in form", 404)
++    file = files["filefield"]
++    if file.filename != "lolcat.txt":
++        return await make_response(f"File name incorrect {file.name}", 404)
++    with contextlib.closing(file):
++        data = file.read().decode("utf-8")
++    if data != "I'm in ur multipart form-data, hazing a cheezburgr":
++        return await make_response(f"File data incorrect {data}", 200)
++    return await make_response("Uploaded file correct", 200)
++
++
++@pyodide_testing_app.route("/pyodide/<py_file>")
++async def pyodide(py_file: str) -> ResponseTypes:
++    file_path = Path(pyodide_testing_app.config["pyodide_dist_dir"], py_file)
++    if file_path.exists():
++        mime_type, encoding = mimetypes.guess_type(file_path)
++        if not mime_type:
++            mime_type = "text/plain"
++        return await make_response(
++            file_path.read_bytes(), 200, [("Content-Type", mime_type)]
++        )
++    else:
++        return await make_response("", 404)
++
++
++@pyodide_testing_app.route("/wheel/dist.whl")
++async def wheel() -> ResponseTypes:
++    # serve our wheel
++    wheel_folder = Path(__file__).parent.parent / "dist"
++    wheels = list(wheel_folder.glob("*.whl"))
++    if len(wheels) > 0:
++        wheel = wheels[0]
++        headers = [("Content-Disposition", f"inline; filename='{wheel.name}'")]
++        resp = await make_response(wheel.read_bytes(), 200, headers)
++        return resp
++    else:
++        return await make_response(f"NO WHEEL IN {wheel_folder}", 404)
+
+diff --git a/dummyserver/asgi_proxy.py b/dummyserver/asgi_proxy.py
+new file mode 100755
+index 0000000..107c5e0
+--- /dev/null
++++ b/dummyserver/asgi_proxy.py
+@@ -0,0 +1,110 @@
++from __future__ import annotations
++
++import typing
++
++import httpx
++import trio
++from hypercorn.typing import (
++    ASGIReceiveCallable,
++    ASGISendCallable,
++    HTTPResponseBodyEvent,
++    HTTPResponseStartEvent,
++    HTTPScope,
++    Scope,
++)
++
++
++async def _read_body(receive: ASGIReceiveCallable) -> bytes:
++    body = bytearray()
++    body_consumed = False
++    while not body_consumed:
++        event = await receive()
++        if event["type"] == "http.request":
++            body.extend(event["body"])
++            body_consumed = not event["more_body"]
++        else:
++            raise ValueError(event["type"])
++    return bytes(body)
++
++
++class ProxyApp:
++    def __init__(self, upstream_ca_certs: str | None = None):
++        self.upstream_ca_certs = upstream_ca_certs
++
++    async def __call__(
++        self, scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable
++    ) -> None:
++        assert scope["type"] == "http"
++        if scope["method"] in ["GET", "POST"]:
++            await self.absolute_uri(scope, receive, send)
++        elif scope["method"] == "CONNECT":
++            await self.connect(scope, send)
++        else:
++            raise ValueError(scope["method"])
++
++    async def absolute_uri(
++        self,
++        scope: HTTPScope,
++        receive: ASGIReceiveCallable,
++        send: ASGISendCallable,
++    ) -> None:
++        async with httpx.AsyncClient(verify=self.upstream_ca_certs or True) as client:
++            client_response = await client.request(
++                method=scope["method"],
++                url=scope["path"],
++                headers=list(scope["headers"]),
++                content=await _read_body(receive),
++            )
++
++        headers = []
++        for header in (
++            "Date",
++            "Cache-Control",
++            "Server",
++            "Content-Type",
++            "Location",
++        ):
++            v = client_response.headers.get(header)
++            if v:
++                headers.append((header.encode(), v.encode()))
++        headers.append((b"Content-Length", str(len(client_response.content)).encode()))
++
++        await send(
++            HTTPResponseStartEvent(
++                type="http.response.start",
++                status=client_response.status_code,
++                headers=headers,
++            )
++        )
++        await send(
++            HTTPResponseBodyEvent(
++                type="http.response.body",
++                body=client_response.content,
++                more_body=False,
++            )
++        )
++
++    async def connect(self, scope: HTTPScope, send: ASGISendCallable) -> None:
++        async def start_forward(
++            reader: trio.SocketStream, writer: trio.SocketStream
++        ) -> None:
++            while True:
++                try:
++                    data = await reader.receive_some(4096)
++                except trio.ClosedResourceError:
++                    break
++                if not data:
++                    break
++                await writer.send_all(data)
++            await writer.aclose()
++
++        host, port = scope["path"].split(":")
++        async with await trio.open_tcp_stream(host, int(port)) as upstream:
++            await send({"type": "http.response.start", "status": 200, "headers": []})
++            await send({"type": "http.response.body", "body": b"", "more_body": True})
++
++            client = typing.cast(trio.SocketStream, scope["extensions"]["_transport"])
++
++            async with trio.open_nursery(strict_exception_groups=True) as nursery:
++                nursery.start_soon(start_forward, client, upstream)
++                nursery.start_soon(start_forward, upstream, client)
+
+diff --git a/dummyserver/handlers.py b/dummyserver/handlers.py
+deleted file mode 100644
+index 86201a1..0000000
+--- a/dummyserver/handlers.py
++++ /dev/null
+@@ -1,364 +0,0 @@
+-from __future__ import annotations
+-
+-import collections
+-import contextlib
+-import gzip
+-import json
+-import logging
+-import sys
+-import typing
+-import zlib
+-from datetime import datetime, timedelta, timezone
+-from http.client import responses
+-from io import BytesIO
+-from urllib.parse import urlsplit
+-
+-from tornado import httputil
+-from tornado.web import RequestHandler
+-
+-from urllib3.util.util import to_str
+-
+-log = logging.getLogger(__name__)
+-
+-
+-class Response:
+-    def __init__(
+-        self,
+-        body: str | bytes | typing.Sequence[str | bytes] = "",
+-        status: str = "200 OK",
+-        headers: typing.Sequence[tuple[str, str | bytes]] | None = None,
+-        json: typing.Any | None = None,
+-    ) -> None:
+-        self.body = body
+-        self.status = status
+-        if json is not None:
+-            self.headers = headers or [("Content-type", "application/json")]
+-            self.body = json
+-        else:
+-            self.headers = headers or [("Content-type", "text/plain")]
+-
+-    def __call__(self, request_handler: RequestHandler) -> None:
+-        status, reason = self.status.split(" ", 1)
+-        request_handler.set_status(int(status), reason)
+-        for header, value in self.headers:
+-            request_handler.add_header(header, value)
+-
+-        if isinstance(self.body, str):
+-            request_handler.write(self.body.encode())
+-        elif isinstance(self.body, bytes):
+-            request_handler.write(self.body)
+-        # chunked
+-        else:
+-            for item in self.body:
+-                if not isinstance(item, bytes):
+-                    item = item.encode("utf8")
+-                request_handler.write(item)
+-                request_handler.flush()
+-
+-
+-RETRY_TEST_NAMES: dict[str, int] = collections.defaultdict(int)
+-
+-
+-def request_params(request: httputil.HTTPServerRequest) -> dict[str, bytes]:
+-    params = {}
+-    for k, v in request.arguments.items():
+-        params[k] = next(iter(v))
+-    return params
+-
+-
+-class TestingApp(RequestHandler):
+-    """
+-    Simple app that performs various operations, useful for testing an HTTP
+-    library.
+-
+-    Given any path, it will attempt to load a corresponding local method if
+-    it exists. Status code 200 indicates success, 400 indicates failure. Each
+-    method has its own conditions for success/failure.
+-    """
+-
+-    def get(self) -> None:
+-        """Handle GET requests"""
+-        self._call_method()
+-
+-    def post(self) -> None:
+-        """Handle POST requests"""
+-        self._call_method()
+-
+-    def put(self) -> None:
+-        """Handle PUT requests"""
+-        self._call_method()
+-
+-    def options(self) -> None:
+-        """Handle OPTIONS requests"""
+-        self._call_method()
+-
+-    def head(self) -> None:
+-        """Handle HEAD requests"""
+-        self._call_method()
+-
+-    def _call_method(self) -> None:
+-        """Call the correct method in this class based on the incoming URI"""
+-        req = self.request
+-
+-        path = req.path[:]
+-        if not path.startswith("/"):
+-            path = urlsplit(path).path
+-
+-        target = path[1:].split("/", 1)[0]
+-        method = getattr(self, target, self.index)
+-
+-        resp = method(req)
+-
+-        if dict(resp.headers).get("Connection") == "close":
+-            # FIXME: Can we kill the connection somehow?
+-            pass
+-
+-        resp(self)
+-
+-    def index(self, _request: httputil.HTTPServerRequest) -> Response:
+-        "Render simple message"
+-        return Response("Dummy server!")
+-
+-    def certificate(self, request: httputil.HTTPServerRequest) -> Response:
+-        """Return the requester's certificate."""
+-        cert = request.get_ssl_certificate()
+-        assert isinstance(cert, dict)
+-        subject = {}
+-        if cert is not None:
+-            subject = {k: v for (k, v) in [y for z in cert["subject"] for y in z]}
+-        return Response(json.dumps(subject))
+-
+-    def alpn_protocol(self, request: httputil.HTTPServerRequest) -> Response:
+-        """Return the selected ALPN protocol."""
+-        assert request.connection is not None
+-        proto = request.connection.stream.socket.selected_alpn_protocol()  # type: ignore[attr-defined]
+-        return Response(proto.encode("utf8") if proto is not None else "")
+-
+-    def source_address(self, request: httputil.HTTPServerRequest) -> Response:
+-        """Return the requester's IP address."""
+-        return Response(request.remote_ip)  # type: ignore[arg-type]
+-
+-    def set_up(self, request: httputil.HTTPServerRequest) -> Response:
+-        params = request_params(request)
+-        test_type = params.get("test_type")
+-        test_id = params.get("test_id")
+-        if test_id:
+-            print(f"\nNew test {test_type!r}: {test_id!r}")
+-        else:
+-            print(f"\nNew test {test_type!r}")
+-        return Response("Dummy server is ready!")
+-
+-    def specific_method(self, request: httputil.HTTPServerRequest) -> Response:
+-        "Confirm that the request matches the desired method type"
+-        params = request_params(request)
+-        method = params.get("method")
+-        method_str = method.decode() if method else None
+-
+-        if request.method != method_str:
+-            return Response(
+-                f"Wrong method: {method_str} != {request.method}",
+-                status="400 Bad Request",
+-            )
+-        return Response()
+-
+-    def upload(self, request: httputil.HTTPServerRequest) -> Response:
+-        "Confirm that the uploaded file conforms to specification"
+-        params = request_params(request)
+-        # FIXME: This is a huge broken mess
+-        param = params.get("upload_param", b"myfile").decode("ascii")
+-        filename = params.get("upload_filename", b"").decode("utf-8")
+-        size = int(params.get("upload_size", "0"))
+-        files_ = request.files.get(param)
+-        assert files_ is not None
+-
+-        if len(files_) != 1:
+-            return Response(
+-                f"Expected 1 file for '{param}', not {len(files_)}",
+-                status="400 Bad Request",
+-            )
+-        file_ = files_[0]
+-
+-        data = file_["body"]
+-        if int(size) != len(data):
+-            return Response(
+-                f"Wrong size: {int(size)} != {len(data)}", status="400 Bad Request"
+-            )
+-
+-        got_filename = file_["filename"]
+-        if isinstance(got_filename, bytes):
+-            got_filename = got_filename.decode("utf-8")
+-
+-        # Tornado can leave the trailing \n in place on the filename.
+-        if filename != got_filename:
+-            return Response(
+-                f"Wrong filename: {filename} != {file_.filename}",
+-                status="400 Bad Request",
+-            )
+-
+-        return Response()
+-
+-    def redirect(self, request: httputil.HTTPServerRequest) -> Response:  # type: ignore[override]
+-        "Perform a redirect to ``target``"
+-        params = request_params(request)
+-        target = params.get("target", "/")
+-        status = params.get("status", b"303 See Other").decode("latin-1")
+-        if len(status) == 3:
+-            status = f"{status} Redirect"
+-
+-        headers = [("Location", target)]
+-        return Response(status=status, headers=headers)
+-
+-    def not_found(self, request: httputil.HTTPServerRequest) -> Response:
+-        return Response("Not found", status="404 Not Found")
+-
+-    def multi_redirect(self, request: httputil.HTTPServerRequest) -> Response:
+-        "Performs a redirect chain based on ``redirect_codes``"
+-        params = request_params(request)
+-        codes = params.get("redirect_codes", b"200").decode("utf-8")
+-        head, tail = codes.split(",", 1) if "," in codes else (codes, None)
+-        assert head is not None
+-        status = f"{head} {responses[int(head)]}"
+-        if not tail:
+-            return Response("Done redirecting", status=status)
+-
+-        headers = [("Location", f"/multi_redirect?redirect_codes={tail}")]
+-        return Response(status=status, headers=headers)
+-
+-    def keepalive(self, request: httputil.HTTPServerRequest) -> Response:
+-        params = request_params(request)
+-        if params.get("close", b"0") == b"1":
+-            headers = [("Connection", "close")]
+-            return Response("Closing", headers=headers)
+-
+-        headers = [("Connection", "keep-alive")]
+-        return Response("Keeping alive", headers=headers)
+-
+-    def echo_params(self, request: httputil.HTTPServerRequest) -> Response:
+-        params = request_params(request)
+-        echod = sorted((to_str(k), to_str(v)) for k, v in params.items())
+-        return Response(repr(echod))
+-
+-    def echo(self, request: httputil.HTTPServerRequest) -> Response:
+-        "Echo back the params"
+-        if request.method == "GET":
+-            return Response(request.query)
+-
+-        return Response(request.body)
+-
+-    def echo_json(self, request: httputil.HTTPServerRequest) -> Response:
+-        "Echo back the JSON"
+-        return Response(json=request.body, headers=list(request.headers.items()))
+-
+-    def echo_uri(self, request: httputil.HTTPServerRequest) -> Response:
+-        "Echo back the requested URI"
+-        assert request.uri is not None
+-        return Response(request.uri)
+-
+-    def encodingrequest(self, request: httputil.HTTPServerRequest) -> Response:
+-        "Check for UA accepting gzip/deflate encoding"
+-        data = b"hello, world!"
+-        encoding = request.headers.get("Accept-Encoding", "")
+-        headers = None
+-        if encoding == "gzip":
+-            headers = [("Content-Encoding", "gzip")]
+-            file_ = BytesIO()
+-            with contextlib.closing(
+-                gzip.GzipFile("", mode="w", fileobj=file_)
+-            ) as zipfile:
+-                zipfile.write(data)
+-            data = file_.getvalue()
+-        elif encoding == "deflate":
+-            headers = [("Content-Encoding", "deflate")]
+-            data = zlib.compress(data)
+-        elif encoding == "garbage-gzip":
+-            headers = [("Content-Encoding", "gzip")]
+-            data = b"garbage"
+-        elif encoding == "garbage-deflate":
+-            headers = [("Content-Encoding", "deflate")]
+-            data = b"garbage"
+-        return Response(data, headers=headers)
+-
+-    def headers(self, request: httputil.HTTPServerRequest) -> Response:
+-        return Response(json.dumps(dict(request.headers)))
+-
+-    def headers_and_params(self, request: httputil.HTTPServerRequest) -> Response:
+-        params = request_params(request)
+-        return Response(
+-            json.dumps({"headers": dict(request.headers), "params": params})
+-        )
+-
+-    def multi_headers(self, request: httputil.HTTPServerRequest) -> Response:
+-        return Response(json.dumps({"headers": list(request.headers.get_all())}))
+-
+-    def successful_retry(self, request: httputil.HTTPServerRequest) -> Response:
+-        """Handler which will return an error and then success
+-
+-        It's not currently very flexible as the number of retries is hard-coded.
+-        """
+-        test_name = request.headers.get("test-name", None)
+-        if not test_name:
+-            return Response("test-name header not set", status="400 Bad Request")
+-
+-        RETRY_TEST_NAMES[test_name] += 1
+-
+-        if RETRY_TEST_NAMES[test_name] >= 2:
+-            return Response("Retry successful!")
+-        else:
+-            return Response("need to keep retrying!", status="418 I'm A Teapot")
+-
+-    def chunked(self, request: httputil.HTTPServerRequest) -> Response:
+-        return Response(["123"] * 4)
+-
+-    def chunked_gzip(self, request: httputil.HTTPServerRequest) -> Response:
+-        chunks = []
+-        compressor = zlib.compressobj(6, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+-
+-        for uncompressed in [b"123"] * 4:
+-            chunks.append(compressor.compress(uncompressed))
+-
+-        chunks.append(compressor.flush())
+-
+-        return Response(chunks, headers=[("Content-Encoding", "gzip")])
+-
+-    def nbytes(self, request: httputil.HTTPServerRequest) -> Response:
+-        params = request_params(request)
+-        length = int(params["length"])
+-        data = b"1" * length
+-        return Response(data, headers=[("Content-Type", "application/octet-stream")])
+-
+-    def status(self, request: httputil.HTTPServerRequest) -> Response:
+-        params = request_params(request)
+-        status = params.get("status", b"200 OK").decode("latin-1")
+-
+-        return Response(status=status)
+-
+-    def retry_after(self, request: httputil.HTTPServerRequest) -> Response:
+-        params = request_params(request)
+-        if datetime.now() - self.application.last_req < timedelta(seconds=1):  # type: ignore[attr-defined]
+-            status = params.get("status", b"429 Too Many Requests")
+-            return Response(
+-                status=status.decode("utf-8"), headers=[("Retry-After", "1")]
+-            )
+-
+-        self.application.last_req = datetime.now()  # type: ignore[attr-defined]
+-
+-        return Response(status="200 OK")
+-
+-    def redirect_after(self, request: httputil.HTTPServerRequest) -> Response:
+-        "Perform a redirect to ``target``"
+-        params = request_params(request)
+-        date = params.get("date")
+-        if date:
+-            retry_after = str(
+-                httputil.format_timestamp(
+-                    datetime.fromtimestamp(float(date), tz=timezone.utc)
+-                )
+-            )
+-        else:
+-            retry_after = "1"
+-        target = params.get("target", "/")
+-        headers = [("Location", target), ("Retry-After", retry_after)]
+-        return Response(status="303 See Other", headers=headers)
+-
+-    def shutdown(self, request: httputil.HTTPServerRequest) -> typing.NoReturn:
+-        sys.exit()
+
+diff --git a/dummyserver/https_proxy.py b/dummyserver/https_proxy.py
+deleted file mode 100755
+index 79dae1c..0000000
+--- a/dummyserver/https_proxy.py
++++ /dev/null
+@@ -1,48 +0,0 @@
+-#!/usr/bin/env python
+-
+-from __future__ import annotations
+-
+-import sys
+-import typing
+-
+-import tornado.httpserver
+-import tornado.ioloop
+-import tornado.web
+-
+-from dummyserver.proxy import ProxyHandler
+-from dummyserver.server import DEFAULT_CERTS, ssl_options_to_context
+-
+-
+-def run_proxy(port: int, certs: dict[str, typing.Any] = DEFAULT_CERTS) -> None:
+-    """
+-    Run proxy on the specified port using the provided certs.
+-
+-    Example usage:
+-
+-    python -m dummyserver.https_proxy
+-
+-    You'll need to ensure you have access to certain packages such as trustme,
+-    tornado, urllib3.
+-    """
+-    upstream_ca_certs = certs.get("ca_certs")
+-    app = tornado.web.Application(
+-        [(r".*", ProxyHandler)], upstream_ca_certs=upstream_ca_certs
+-    )
+-    ssl_opts = ssl_options_to_context(**certs)
+-    http_server = tornado.httpserver.HTTPServer(app, ssl_options=ssl_opts)
+-    http_server.listen(port)
+-
+-    ioloop = tornado.ioloop.IOLoop.instance()
+-    try:
+-        ioloop.start()
+-    except KeyboardInterrupt:
+-        ioloop.stop()
+-
+-
+-if __name__ == "__main__":
+-    port = 8443
+-    if len(sys.argv) > 1:
+-        port = int(sys.argv[1])
+-
+-    print(f"Starting HTTPS proxy on port {port}")
+-    run_proxy(port)
+
+diff --git a/dummyserver/hypercornserver.py b/dummyserver/hypercornserver.py
+new file mode 100644
+index 0000000..c8b75ee
+--- /dev/null
++++ b/dummyserver/hypercornserver.py
+@@ -0,0 +1,85 @@
++from __future__ import annotations
++
++import concurrent.futures
++import contextlib
++import functools
++import sys
++import threading
++from typing import Generator
++
++import hypercorn
++import hypercorn.trio
++import hypercorn.typing
++import trio
++from quart_trio import QuartTrio
++
++
++# https://github.com/pgjones/hypercorn/blob/19dfb96411575a6a647cdea63fa581b48ebb9180/src/hypercorn/utils.py#L172-L178
++async def graceful_shutdown(shutdown_event: threading.Event) -> None:
++    while True:
++        if shutdown_event.is_set():
++            return
++        await trio.sleep(0.1)
++
++
++async def _start_server(
++    config: hypercorn.Config,
++    app: QuartTrio,
++    ready_event: threading.Event,
++    shutdown_event: threading.Event,
++) -> None:
++    async with trio.open_nursery() as nursery:
++        config.bind = await nursery.start(
++            functools.partial(
++                hypercorn.trio.serve,
++                app,
++                config,
++                shutdown_trigger=functools.partial(graceful_shutdown, shutdown_event),
++            )
++        )
++        ready_event.set()
++
++
++@contextlib.contextmanager
++def run_hypercorn_in_thread(
++    config: hypercorn.Config, app: hypercorn.typing.ASGIFramework
++) -> Generator[None, None, None]:
++    ready_event = threading.Event()
++    shutdown_event = threading.Event()
++
++    with concurrent.futures.ThreadPoolExecutor(
++        1, thread_name_prefix="hypercorn dummyserver"
++    ) as executor:
++        future = executor.submit(
++            trio.run,
++            _start_server,  # type: ignore[arg-type]
++            config,
++            app,
++            ready_event,
++            shutdown_event,
++        )
++        ready_event.wait(5)
++        if not ready_event.is_set():
++            raise Exception("most likely failed to start server")
++
++        try:
++            yield
++        finally:
++            shutdown_event.set()
++            future.result()
++
++
++def main() -> int:
++    # For debugging dummyserver itself - PYTHONPATH=src python -m dummyserver.hypercornserver
++    from .app import hypercorn_app
++
++    config = hypercorn.Config()
++    config.bind = ["localhost:0"]
++    ready_event = threading.Event()
++    shutdown_event = threading.Event()
++    trio.run(_start_server, config, hypercorn_app, ready_event, shutdown_event)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+
+diff --git a/dummyserver/proxy.py b/dummyserver/proxy.py
+deleted file mode 100755
+index 45fb44e..0000000
+--- a/dummyserver/proxy.py
++++ /dev/null
+@@ -1,133 +0,0 @@
+-#!/usr/bin/env python
+-#
+-# Simple asynchronous HTTP proxy with tunnelling (CONNECT).
+-#
+-# GET/POST proxying based on
+-# http://groups.google.com/group/python-tornado/msg/7bea08e7a049cf26
+-#
+-# Copyright (C) 2012 Senko Rasic <senko.rasic@dobarkod.hr>
+-#
+-# Permission is hereby granted, free of charge, to any person obtaining a copy
+-# of this software and associated documentation files (the "Software"), to deal
+-# in the Software without restriction, including without limitation the rights
+-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+-# copies of the Software, and to permit persons to whom the Software is
+-# furnished to do so, subject to the following conditions:
+-#
+-# The above copyright notice and this permission notice shall be included in
+-# all copies or substantial portions of the Software.
+-#
+-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+-# THE SOFTWARE.
+-
+-from __future__ import annotations
+-
+-import socket
+-import ssl
+-import sys
+-
+-import tornado.gen
+-import tornado.httpclient
+-import tornado.httpserver
+-import tornado.ioloop
+-import tornado.iostream
+-import tornado.web
+-
+-__all__ = ["ProxyHandler", "run_proxy"]
+-
+-
+-class ProxyHandler(tornado.web.RequestHandler):
+-    SUPPORTED_METHODS = ["GET", "POST", "CONNECT"]  # type: ignore[assignment]
+-
+-    async def get(self) -> None:
+-        upstream_ca_certs = self.application.settings.get("upstream_ca_certs", None)
+-        ssl_options = None
+-
+-        if upstream_ca_certs:
+-            ssl_options = ssl.create_default_context(cafile=upstream_ca_certs)
+-
+-        assert self.request.uri is not None
+-        assert self.request.method is not None
+-        req = tornado.httpclient.HTTPRequest(
+-            url=self.request.uri,
+-            method=self.request.method,
+-            body=self.request.body,
+-            headers=self.request.headers,
+-            follow_redirects=False,
+-            allow_nonstandard_methods=True,
+-            ssl_options=ssl_options,
+-        )
+-
+-        client = tornado.httpclient.AsyncHTTPClient()
+-        response = await client.fetch(req, raise_error=False)
+-        self.set_status(response.code)
+-        for header in (
+-            "Date",
+-            "Cache-Control",
+-            "Server",
+-            "Content-Type",
+-            "Location",
+-        ):
+-            v = response.headers.get(header)
+-            if v:
+-                self.set_header(header, v)
+-        if response.body:
+-            self.write(response.body)
+-        await self.finish()
+-
+-    async def post(self) -> None:
+-        await self.get()
+-
+-    async def connect(self) -> None:
+-        assert self.request.uri is not None
+-        host, port = self.request.uri.split(":")
+-        assert self.request.connection is not None
+-        client: tornado.iostream.IOStream = self.request.connection.stream  # type: ignore[attr-defined]
+-
+-        async def start_forward(
+-            reader: tornado.iostream.IOStream, writer: tornado.iostream.IOStream
+-        ) -> None:
+-            while True:
+-                try:
+-                    data = await reader.read_bytes(4096, partial=True)
+-                except tornado.iostream.StreamClosedError:
+-                    break
+-                if not data:
+-                    break
+-                writer.write(data)
+-            writer.close()
+-
+-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+-        upstream = tornado.iostream.IOStream(s)
+-        await upstream.connect((host, int(port)))
+-
+-        client.write(b"HTTP/1.0 200 Connection established\r\n\r\n")
+-        fu1 = start_forward(client, upstream)
+-        fu2 = start_forward(upstream, client)
+-        await tornado.gen.multi([fu1, fu2])
+-
+-
+-def run_proxy(port: int, start_ioloop: bool = True) -> None:
+-    """
+-    Run proxy on the specified port. If start_ioloop is True (default),
+-    the tornado IOLoop will be started immediately.
+-    """
+-    app = tornado.web.Application([(r".*", ProxyHandler)])
+-    app.listen(port)
+-    ioloop = tornado.ioloop.IOLoop.instance()
+-    if start_ioloop:
+-        ioloop.start()
+-
+-
+-if __name__ == "__main__":
+-    port = 8888
+-    if len(sys.argv) > 1:
+-        port = int(sys.argv[1])
+-
+-    print(f"Starting HTTP proxy on port {port}")
+-    run_proxy(port)
+
+diff --git a/dummyserver/server.py b/dummyserver/socketserver.py
+similarity index 52%
+rename from dummyserver/server.py
+rename to dummyserver/socketserver.py
+index 2683c9e..202915c 100755
+--- a/dummyserver/server.py
++++ b/dummyserver/socketserver.py
+@@ -6,10 +6,6 @@ Dummy server used for unit testing.
+ 
+ from __future__ import annotations
+ 
+-import asyncio
+-import concurrent.futures
+-import contextlib
+-import errno
+ import logging
+ import os
+ import socket
+@@ -18,19 +14,13 @@ import sys
+ import threading
+ import typing
+ import warnings
+-from collections.abc import Coroutine, Generator
+-from datetime import datetime
+ 
+-import tornado.httpserver
+-import tornado.ioloop
+-import tornado.netutil
+-import tornado.web
+ import trustme
+ from cryptography.hazmat.backends import default_backend
+ from cryptography.hazmat.primitives import serialization
+ 
+ from urllib3.exceptions import HTTPWarning
+-from urllib3.util import ALPN_PROTOCOLS, resolve_cert_reqs, resolve_ssl_version
++from urllib3.util import resolve_cert_reqs, resolve_ssl_version
+ 
+ if typing.TYPE_CHECKING:
+     from typing_extensions import ParamSpec
+@@ -45,7 +35,7 @@ DEFAULT_CERTS: dict[str, typing.Any] = {
+     "keyfile": os.path.join(CERTS_PATH, "server.key"),
+     "cert_reqs": ssl.CERT_OPTIONAL,
+     "ca_certs": os.path.join(CERTS_PATH, "cacert.pem"),
+-    "alpn_protocols": ALPN_PROTOCOLS,
++    "alpn_protocols": ["h2", "http/1.1"],
+ }
+ DEFAULT_CA = os.path.join(CERTS_PATH, "cacert.pem")
+ DEFAULT_CA_KEY = os.path.join(CERTS_PATH, "cacert.key")
+@@ -134,17 +124,18 @@ class SocketServerThread(threading.Thread):
+             sock = socket.socket(socket.AF_INET)
+         if sys.platform != "win32":
+             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+-        sock.bind((self.host, 0))
+-        self.port = sock.getsockname()[1]
+ 
+-        # Once listen() returns, the server socket is ready
+-        sock.listen(1)
++        with sock:
++            sock.bind((self.host, 0))
++            self.port = sock.getsockname()[1]
+ 
+-        if self.ready_event:
+-            self.ready_event.set()
++            # Once listen() returns, the server socket is ready
++            sock.listen(1)
+ 
+-        self.socket_handler(sock)
+-        sock.close()
++            if self.ready_event:
++                self.ready_event.set()
++
++            self.socket_handler(sock)
+ 
+     def run(self) -> None:
+         self._start_server()
+@@ -183,46 +174,6 @@ def ssl_options_to_context(  # type: ignore[no-untyped-def]
+     return ctx
+ 
+ 
+-def run_tornado_app(
+-    app: tornado.web.Application,
+-    certs: dict[str, typing.Any] | None,
+-    scheme: str,
+-    host: str,
+-) -> tuple[tornado.httpserver.HTTPServer, int]:
+-    # We can't use fromtimestamp(0) because of CPython issue 29097, so we'll
+-    # just construct the datetime object directly.
+-    app.last_req = datetime(1970, 1, 1)  # type: ignore[attr-defined]
+-
+-    if scheme == "https":
+-        assert certs is not None
+-        ssl_opts = ssl_options_to_context(**certs)
+-        http_server = tornado.httpserver.HTTPServer(app, ssl_options=ssl_opts)
+-    else:
+-        http_server = tornado.httpserver.HTTPServer(app)
+-
+-    # When we request a socket with host localhost and port zero (None in Python), then
+-    # Tornado gets a free IPv4 port and requests that same port in IPv6. But that port
+-    # could easily be taken with IPv6, especially in crowded CI environments. For this
+-    # reason we put bind_sockets in a retry loop. Full details:
+-    #  * https://github.com/urllib3/urllib3/issues/2171
+-    #  * https://github.com/tornadoweb/tornado/issues/1860
+-    for i in range(10):
+-        try:
+-            sockets = tornado.netutil.bind_sockets(None, address=host)  # type: ignore[arg-type]
+-        except OSError as e:
+-            if e.errno == errno.EADDRINUSE:
+-                # TODO this should be a warning if there's a way for pytest to print it
+-                print(
+-                    f"Retrying bind_sockets({host}) after EADDRINUSE", file=sys.stderr
+-                )
+-                continue
+-        break
+-
+-    port = sockets[0].getsockname()[1]
+-    http_server.add_sockets(sockets)
+-    return http_server, port
+-
+-
+ def get_unreachable_address() -> tuple[str, int]:
+     # reserved as per rfc2606
+     return ("something.invalid", 54321)
+@@ -238,79 +189,3 @@ def encrypt_key_pem(private_key_pem: trustme.Blob, password: bytes) -> trustme.B
+         serialization.BestAvailableEncryption(password),
+     )
+     return trustme.Blob(encrypted_key)
+-
+-
+-R = typing.TypeVar("R")
+-
+-
+-def _run_and_close_tornado(
+-    async_fn: typing.Callable[P, Coroutine[typing.Any, typing.Any, R]],
+-    *args: P.args,
+-    **kwargs: P.kwargs,
+-) -> R:
+-    tornado_loop = None
+-
+-    async def inner_fn() -> R:
+-        nonlocal tornado_loop
+-        tornado_loop = tornado.ioloop.IOLoop.current()
+-        return await async_fn(*args, **kwargs)
+-
+-    try:
+-        return asyncio.run(inner_fn())
+-    finally:
+-        tornado_loop.close(all_fds=True)  # type: ignore[union-attr]
+-
+-
+-@contextlib.contextmanager
+-def run_loop_in_thread() -> Generator[tornado.ioloop.IOLoop, None, None]:
+-    loop_started: concurrent.futures.Future[
+-        tuple[tornado.ioloop.IOLoop, asyncio.Event]
+-    ] = concurrent.futures.Future()
+-    with concurrent.futures.ThreadPoolExecutor(
+-        1, thread_name_prefix="test IOLoop"
+-    ) as tpe:
+-
+-        async def run() -> None:
+-            io_loop = tornado.ioloop.IOLoop.current()
+-            stop_event = asyncio.Event()
+-            loop_started.set_result((io_loop, stop_event))
+-            await stop_event.wait()
+-
+-        # run asyncio.run in a thread and collect exceptions from *either*
+-        # the loop failing to start, or failing to close
+-        ran = tpe.submit(_run_and_close_tornado, run)  # type: ignore[arg-type]
+-        for f in concurrent.futures.as_completed((loop_started, ran)):  # type: ignore[misc]
+-            if f is loop_started:
+-                io_loop, stop_event = loop_started.result()
+-                try:
+-                    yield io_loop
+-                finally:
+-                    io_loop.add_callback(stop_event.set)
+-
+-            elif f is ran:
+-                # if this is the first iteration the loop failed to start
+-                # if it's the second iteration the loop has finished or
+-                # the loop failed to close and we need to raise the exception
+-                ran.result()
+-                return
+-
+-
+-def main() -> int:
+-    # For debugging dummyserver itself - python -m dummyserver.server
+-    from .handlers import TestingApp
+-
+-    host = "127.0.0.1"
+-
+-    async def amain() -> int:
+-        app = tornado.web.Application([(r".*", TestingApp)])
+-        server, port = run_tornado_app(app, None, "http", host)
+-
+-        print(f"Listening on http://{host}:{port}")
+-        await asyncio.Event().wait()
+-        return 0
+-
+-    return asyncio.run(amain())
+-
+-
+-if __name__ == "__main__":
+-    sys.exit(main())
+
+diff --git a/dummyserver/testcase.py b/dummyserver/testcase.py
+index a681106..7eed476 100644
+--- a/dummyserver/testcase.py
++++ b/dummyserver/testcase.py
+@@ -1,26 +1,21 @@
+ from __future__ import annotations
+ 
+-import asyncio
+ import contextlib
+ import socket
+ import ssl
+ import threading
+ import typing
+ 
++import hypercorn
+ import pytest
+-from tornado import httpserver, ioloop, web
+-
+-from dummyserver.handlers import TestingApp
+-from dummyserver.proxy import ProxyHandler
+-from dummyserver.server import (
+-    DEFAULT_CERTS,
+-    HAS_IPV6,
+-    SocketServerThread,
+-    run_loop_in_thread,
+-    run_tornado_app,
+-)
++
++from dummyserver.app import hypercorn_app
++from dummyserver.asgi_proxy import ProxyApp
++from dummyserver.hypercornserver import run_hypercorn_in_thread
++from dummyserver.socketserver import DEFAULT_CERTS, HAS_IPV6, SocketServerThread
+ from urllib3.connection import HTTPConnection
+ from urllib3.util.ssltransport import SSLTransport
++from urllib3.util.url import parse_url
+ 
+ 
+ def consume_socket(
+@@ -147,56 +142,37 @@ class IPV4SocketDummyServerTestCase(SocketDummyServerTestCase):
+         cls.port = cls.server_thread.port
+ 
+ 
+-class HTTPDummyServerTestCase:
+-    """A simple HTTP server that runs when your test class runs
+-
+-    Have your test class inherit from this one, and then a simple server
+-    will start when your tests run, and automatically shut down when they
+-    complete. For examples of what test requests you can send to the server,
+-    see the TestingApp in dummyserver/handlers.py.
+-    """
+-
+-    scheme = "http"
++class HypercornDummyServerTestCase:
+     host = "localhost"
+-    host_alt = "127.0.0.1"  # Some tests need two hosts
+-    certs = DEFAULT_CERTS
++    host_alt = "127.0.0.1"
++    port: typing.ClassVar[int]
+     base_url: typing.ClassVar[str]
+     base_url_alt: typing.ClassVar[str]
++    certs: typing.ClassVar[dict[str, typing.Any]] = {}
+ 
+-    io_loop: typing.ClassVar[ioloop.IOLoop]
+-    server: typing.ClassVar[httpserver.HTTPServer]
+-    port: typing.ClassVar[int]
+-    server_thread: typing.ClassVar[threading.Thread]
+     _stack: typing.ClassVar[contextlib.ExitStack]
+ 
+     @classmethod
+-    def _start_server(cls) -> None:
++    def setup_class(cls) -> None:
+         with contextlib.ExitStack() as stack:
+-            io_loop = stack.enter_context(run_loop_in_thread())
+-
+-            async def run_app() -> None:
+-                app = web.Application([(r".*", TestingApp)])
+-                cls.server, cls.port = run_tornado_app(
+-                    app, cls.certs, cls.scheme, cls.host
+-                )
+-
+-            asyncio.run_coroutine_threadsafe(run_app(), io_loop.asyncio_loop).result()  # type: ignore[attr-defined]
++            config = hypercorn.Config()
++            if cls.certs:
++                config.certfile = cls.certs["certfile"]
++                config.keyfile = cls.certs["keyfile"]
++                config.verify_mode = cls.certs["cert_reqs"]
++                config.ca_certs = cls.certs["ca_certs"]
++                config.alpn_protocols = cls.certs["alpn_protocols"]
++            config.bind = [f"{cls.host}:0"]
++            stack.enter_context(run_hypercorn_in_thread(config, hypercorn_app))
+             cls._stack = stack.pop_all()
+-
+-    @classmethod
+-    def _stop_server(cls) -> None:
+-        cls._stack.close()
+-
+-    @classmethod
+-    def setup_class(cls) -> None:
+-        cls._start_server()
++            cls.port = typing.cast(int, parse_url(config.bind[0]).port)
+ 
+     @classmethod
+     def teardown_class(cls) -> None:
+-        cls._stop_server()
++        cls._stack.close()
+ 
+ 
+-class HTTPSDummyServerTestCase(HTTPDummyServerTestCase):
++class HTTPSHypercornDummyServerTestCase(HypercornDummyServerTestCase):
+     scheme = "https"
+     host = "localhost"
+     certs = DEFAULT_CERTS
+@@ -204,12 +180,9 @@ class HTTPSDummyServerTestCase(HTTPDummyServerTestCase):
+     bad_ca_path = ""
+ 
+ 
+-class HTTPDummyProxyTestCase:
+-    io_loop: typing.ClassVar[ioloop.IOLoop]
+-
++class HypercornDummyProxyTestCase:
+     http_host: typing.ClassVar[str] = "localhost"
+     http_host_alt: typing.ClassVar[str] = "127.0.0.1"
+-    http_server: typing.ClassVar[httpserver.HTTPServer]
+     http_port: typing.ClassVar[int]
+     http_url: typing.ClassVar[str]
+     http_url_alt: typing.ClassVar[str]
+@@ -217,17 +190,15 @@ class HTTPDummyProxyTestCase:
+     https_host: typing.ClassVar[str] = "localhost"
+     https_host_alt: typing.ClassVar[str] = "127.0.0.1"
+     https_certs: typing.ClassVar[dict[str, typing.Any]] = DEFAULT_CERTS
+-    https_server: typing.ClassVar[httpserver.HTTPServer]
+     https_port: typing.ClassVar[int]
+     https_url: typing.ClassVar[str]
+     https_url_alt: typing.ClassVar[str]
++    https_url_fqdn: typing.ClassVar[str]
+ 
+     proxy_host: typing.ClassVar[str] = "localhost"
+     proxy_host_alt: typing.ClassVar[str] = "127.0.0.1"
+-    proxy_server: typing.ClassVar[httpserver.HTTPServer]
+     proxy_port: typing.ClassVar[int]
+     proxy_url: typing.ClassVar[str]
+-    https_proxy_server: typing.ClassVar[httpserver.HTTPServer]
+     https_proxy_port: typing.ClassVar[int]
+     https_proxy_url: typing.ClassVar[str]
+ 
+@@ -240,33 +211,47 @@ class HTTPDummyProxyTestCase:
+     @classmethod
+     def setup_class(cls) -> None:
+         with contextlib.ExitStack() as stack:
+-            io_loop = stack.enter_context(run_loop_in_thread())
+-
+-            async def run_app() -> None:
+-                app = web.Application([(r".*", TestingApp)])
+-                cls.http_server, cls.http_port = run_tornado_app(
+-                    app, None, "http", cls.http_host
+-                )
+-
+-                app = web.Application([(r".*", TestingApp)])
+-                cls.https_server, cls.https_port = run_tornado_app(
+-                    app, cls.https_certs, "https", cls.http_host
+-                )
+-
+-                app = web.Application([(r".*", ProxyHandler)])
+-                cls.proxy_server, cls.proxy_port = run_tornado_app(
+-                    app, None, "http", cls.proxy_host
+-                )
+-
+-                upstream_ca_certs = cls.https_certs.get("ca_certs")
+-                app = web.Application(
+-                    [(r".*", ProxyHandler)], upstream_ca_certs=upstream_ca_certs
+-                )
+-                cls.https_proxy_server, cls.https_proxy_port = run_tornado_app(
+-                    app, cls.https_certs, "https", cls.proxy_host
+-                )
+-
+-            asyncio.run_coroutine_threadsafe(run_app(), io_loop.asyncio_loop).result()  # type: ignore[attr-defined]
++            http_server_config = hypercorn.Config()
++            http_server_config.bind = [f"{cls.http_host}:0"]
++            stack.enter_context(
++                run_hypercorn_in_thread(http_server_config, hypercorn_app)
++            )
++            cls.http_port = typing.cast(int, parse_url(http_server_config.bind[0]).port)
++
++            https_server_config = hypercorn.Config()
++            https_server_config.certfile = cls.https_certs["certfile"]
++            https_server_config.keyfile = cls.https_certs["keyfile"]
++            https_server_config.verify_mode = cls.https_certs["cert_reqs"]
++            https_server_config.ca_certs = cls.https_certs["ca_certs"]
++            https_server_config.alpn_protocols = cls.https_certs["alpn_protocols"]
++            https_server_config.bind = [f"{cls.https_host}:0"]
++            stack.enter_context(
++                run_hypercorn_in_thread(https_server_config, hypercorn_app)
++            )
++            cls.https_port = typing.cast(
++                int, parse_url(https_server_config.bind[0]).port
++            )
++
++            http_proxy_config = hypercorn.Config()
++            http_proxy_config.bind = [f"{cls.proxy_host}:0"]
++            stack.enter_context(run_hypercorn_in_thread(http_proxy_config, ProxyApp()))
++            cls.proxy_port = typing.cast(int, parse_url(http_proxy_config.bind[0]).port)
++
++            https_proxy_config = hypercorn.Config()
++            https_proxy_config.certfile = cls.https_certs["certfile"]
++            https_proxy_config.keyfile = cls.https_certs["keyfile"]
++            https_proxy_config.verify_mode = cls.https_certs["cert_reqs"]
++            https_proxy_config.ca_certs = cls.https_certs["ca_certs"]
++            https_proxy_config.alpn_protocols = cls.https_certs["alpn_protocols"]
++            https_proxy_config.bind = [f"{cls.proxy_host}:0"]
++            upstream_ca_certs = cls.https_certs.get("ca_certs")
++            stack.enter_context(
++                run_hypercorn_in_thread(https_proxy_config, ProxyApp(upstream_ca_certs))
++            )
++            cls.https_proxy_port = typing.cast(
++                int, parse_url(https_proxy_config.bind[0]).port
++            )
++
+             cls._stack = stack.pop_all()
+ 
+     @classmethod
+@@ -275,12 +260,12 @@ class HTTPDummyProxyTestCase:
+ 
+ 
+ @pytest.mark.skipif(not HAS_IPV6, reason="IPv6 not available")
+-class IPv6HTTPDummyServerTestCase(HTTPDummyServerTestCase):
++class IPv6HypercornDummyServerTestCase(HypercornDummyServerTestCase):
+     host = "::1"
+ 
+ 
+ @pytest.mark.skipif(not HAS_IPV6, reason="IPv6 not available")
+-class IPv6HTTPDummyProxyTestCase(HTTPDummyProxyTestCase):
++class IPv6HypercornDummyProxyTestCase(HypercornDummyProxyTestCase):
+     http_host = "localhost"
+     http_host_alt = "127.0.0.1"
+ 
+
+diff --git a/src/urllib3/__init__.py b/src/urllib3/__init__.py
+index 46c8976..1e0bf37 100644
+--- a/src/urllib3/__init__.py
++++ b/src/urllib3/__init__.py
+@@ -6,6 +6,7 @@ from __future__ import annotations
+ 
+ # Set default logging handler to avoid "No handler found" warnings.
+ import logging
++import sys
+ import typing
+ import warnings
+ from logging import NullHandler
+@@ -132,6 +133,61 @@ def request(
+     Therefore, its side effects could be shared across dependencies relying on it.
+     To avoid side effects create a new ``PoolManager`` instance and use it instead.
+     The method does not accept low-level ``**urlopen_kw`` keyword arguments.
++
++    :param method:
++        HTTP request method (such as GET, POST, PUT, etc.)
++
++    :param url:
++        The URL to perform the request on.
++
++    :param body:
++        Data to send in the request body, either :class:`str`, :class:`bytes`,
++        an iterable of :class:`str`/:class:`bytes`, or a file-like object.
++
++    :param fields:
++        Data to encode and send in the request body.
++
++    :param headers:
++        Dictionary of custom headers to send, such as User-Agent,
++        If-None-Match, etc.
++
++    :param bool preload_content:
++        If True, the response's body will be preloaded into memory.
++
++    :param bool decode_content:
++        If True, will attempt to decode the body based on the
++        'content-encoding' header.
++
++    :param redirect:
++        If True, automatically handle redirects (status codes 301, 302,
++        303, 307, 308). Each redirect counts as a retry. Disabling retries
++        will disable redirect, too.
++
++    :param retries:
++        Configure the number of retries to allow before raising a
++        :class:`~urllib3.exceptions.MaxRetryError` exception.
++
++        Pass ``None`` to retry until you receive a response. Pass a
++        :class:`~urllib3.util.retry.Retry` object for fine-grained control
++        over different types of retries.
++        Pass an integer number to retry connection errors that many times,
++        but no other types of errors. Pass zero to never retry.
++
++        If ``False``, then retries are disabled and any exception is raised
++        immediately. Also, instead of raising a MaxRetryError on redirects,
++        the redirect response will be returned.
++
++    :type retries: :class:`~urllib3.util.retry.Retry`, False, or an int.
++
++    :param timeout:
++        If specified, overrides the default timeout for this one
++        request. It may be a float (in seconds) or an instance of
++        :class:`urllib3.util.Timeout`.
++
++    :param json:
++        Data to encode and send as JSON with UTF-encoded in the request body.
++        The ``"Content-Type"`` header will be set to ``"application/json"``
++        unless specified otherwise.
+     """
+ 
+     return _DEFAULT_POOL.request(
+@@ -147,3 +203,9 @@ def request(
+         timeout=timeout,
+         json=json,
+     )
++
++
++if sys.platform == "emscripten":
++    from .contrib.emscripten import inject_into_urllib3  # noqa: 401
++
++    inject_into_urllib3()
+
+diff --git a/src/urllib3/_request_methods.py b/src/urllib3/_request_methods.py
+index 1d0f346..632042f 100644
+--- a/src/urllib3/_request_methods.py
++++ b/src/urllib3/_request_methods.py
+@@ -85,6 +85,30 @@ class RequestMethods:
+         option to drop down to more specific methods when necessary, such as
+         :meth:`request_encode_url`, :meth:`request_encode_body`,
+         or even the lowest level :meth:`urlopen`.
++
++        :param method:
++            HTTP request method (such as GET, POST, PUT, etc.)
++
++        :param url:
++            The URL to perform the request on.
++
++        :param body:
++            Data to send in the request body, either :class:`str`, :class:`bytes`,
++            an iterable of :class:`str`/:class:`bytes`, or a file-like object.
++
++        :param fields:
++            Data to encode and send in the request body.  Values are processed
++            by :func:`urllib.parse.urlencode`.
++
++        :param headers:
++            Dictionary of custom headers to send, such as User-Agent,
++            If-None-Match, etc. If None, pool headers are used. If provided,
++            these headers completely replace any pool-specific headers.
++
++        :param json:
++            Data to encode and send as JSON with UTF-encoded in the request body.
++            The ``"Content-Type"`` header will be set to ``"application/json"``
++            unless specified otherwise.
+         """
+         method = method.upper()
+ 
+@@ -95,9 +119,11 @@ class RequestMethods:
+ 
+         if json is not None:
+             if headers is None:
+-                headers = self.headers.copy()  # type: ignore
++                headers = self.headers
++
+             if not ("content-type" in map(str.lower, headers.keys())):
+-                headers["Content-Type"] = "application/json"  # type: ignore
++                headers = HTTPHeaderDict(headers)
++                headers["Content-Type"] = "application/json"
+ 
+             body = _json.dumps(json, separators=(",", ":"), ensure_ascii=False).encode(
+                 "utf-8"
+@@ -130,6 +156,20 @@ class RequestMethods:
+         """
+         Make a request using :meth:`urlopen` with the ``fields`` encoded in
+         the url. This is useful for request methods like GET, HEAD, DELETE, etc.
++
++        :param method:
++            HTTP request method (such as GET, POST, PUT, etc.)
++
++        :param url:
++            The URL to perform the request on.
++
++        :param fields:
++            Data to encode and send in the request body.
++
++        :param headers:
++            Dictionary of custom headers to send, such as User-Agent,
++            If-None-Match, etc. If None, pool headers are used. If provided,
++            these headers completely replace any pool-specific headers.
+         """
+         if headers is None:
+             headers = self.headers
+@@ -186,6 +226,28 @@ class RequestMethods:
+         be overwritten because it depends on the dynamic random boundary string
+         which is used to compose the body of the request. The random boundary
+         string can be explicitly set with the ``multipart_boundary`` parameter.
++
++        :param method:
++            HTTP request method (such as GET, POST, PUT, etc.)
++
++        :param url:
++            The URL to perform the request on.
++
++        :param fields:
++            Data to encode and send in the request body.
++
++        :param headers:
++            Dictionary of custom headers to send, such as User-Agent,
++            If-None-Match, etc. If None, pool headers are used. If provided,
++            these headers completely replace any pool-specific headers.
++
++        :param encode_multipart:
++            If True, encode the ``fields`` using the multipart/form-data MIME
++            format.
++
++        :param multipart_boundary:
++            If not specified, then a random boundary will be generated using
++            :func:`urllib3.filepost.choose_boundary`.
+         """
+         if headers is None:
+             headers = self.headers
+
+diff --git a/src/urllib3/_version.py b/src/urllib3/_version.py
+index 409ba3f..f697e3e 100644
+--- a/src/urllib3/_version.py
++++ b/src/urllib3/_version.py
+@@ -1,4 +1,4 @@
+ # This file is protected via CODEOWNERS
+ from __future__ import annotations
+ 
+-__version__ = "2.1.0"
++__version__ = "2.2.0"
+
+diff --git a/src/urllib3/connection.py b/src/urllib3/connection.py
+index 38a2fd6..0318601 100644
+--- a/src/urllib3/connection.py
++++ b/src/urllib3/connection.py
+@@ -73,7 +73,7 @@ port_by_scheme = {"http": 80, "https": 443}
+ 
+ # When it comes time to update this value as a part of regular maintenance
+ # (ie test_recent_date is failing) update it to ~6 months before the current date.
+-RECENT_DATE = datetime.date(2022, 1, 1)
++RECENT_DATE = datetime.date(2023, 6, 1)
+ 
+ _CONTAINS_CONTROL_CHAR_RE = re.compile(r"[^-!#$%&'*+.^_`|~0-9a-zA-Z]")
+ 
+@@ -160,11 +160,6 @@ class HTTPConnection(_HTTPConnection):
+         self._tunnel_port: int | None = None
+         self._tunnel_scheme: str | None = None
+ 
+-    # https://github.com/python/mypy/issues/4125
+-    # Mypy treats this as LSP violation, which is considered a bug.
+-    # If `host` is made a property it violates LSP, because a writeable attribute is overridden with a read-only one.
+-    # However, there is also a `host` setter so LSP is not violated.
+-    # Potentially, a `@host.deleter` might be needed depending on how this issue will be fixed.
+     @property
+     def host(self) -> str:
+         """
+@@ -253,6 +248,9 @@ class HTTPConnection(_HTTPConnection):
+         # not using tunnelling.
+         self._has_connected_to_proxy = bool(self.proxy)
+ 
++        if self._has_connected_to_proxy:
++            self.proxy_is_verified = False
++
+     @property
+     def is_closed(self) -> bool:
+         return self.sock is None
+@@ -267,6 +265,13 @@ class HTTPConnection(_HTTPConnection):
+     def has_connected_to_proxy(self) -> bool:
+         return self._has_connected_to_proxy
+ 
++    @property
++    def proxy_is_forwarding(self) -> bool:
++        """
++        Return True if a forwarding proxy is configured, else return False
++        """
++        return bool(self.proxy) and self._tunnel_host is None
++
+     def close(self) -> None:
+         try:
+             super().close()
+@@ -616,8 +621,11 @@ class HTTPSConnection(HTTPConnection):
+         if self._tunnel_host is not None:
+             # We're tunneling to an HTTPS origin so need to do TLS-in-TLS.
+             if self._tunnel_scheme == "https":
++                # _connect_tls_proxy will verify and assign proxy_is_verified
+                 self.sock = sock = self._connect_tls_proxy(self.host, sock)
+                 tls_in_tls = True
++            elif self._tunnel_scheme == "http":
++                self.proxy_is_verified = False
+ 
+             # If we're tunneling it means we're connected to our proxy.
+             self._has_connected_to_proxy = True
+@@ -639,6 +647,9 @@ class HTTPSConnection(HTTPConnection):
+                 SystemTimeWarning,
+             )
+ 
++        # Remove trailing '.' from fqdn hostnames to allow certificate validation
++        server_hostname_rm_dot = server_hostname.rstrip(".")
++
+         sock_and_verified = _ssl_wrap_socket_and_match_hostname(
+             sock=sock,
+             cert_reqs=self.cert_reqs,
+@@ -651,20 +662,33 @@ class HTTPSConnection(HTTPConnection):
+             cert_file=self.cert_file,
+             key_file=self.key_file,
+             key_password=self.key_password,
+-            server_hostname=server_hostname,
++            server_hostname=server_hostname_rm_dot,
+             ssl_context=self.ssl_context,
+             tls_in_tls=tls_in_tls,
+             assert_hostname=self.assert_hostname,
+             assert_fingerprint=self.assert_fingerprint,
+         )
+         self.sock = sock_and_verified.socket
+-        self.is_verified = sock_and_verified.is_verified
++
++        # Forwarding proxies can never have a verified target since
++        # the proxy is the one doing the verification. Should instead
++        # use a CONNECT tunnel in order to verify the target.
++        # See: https://github.com/urllib3/urllib3/issues/3267.
++        if self.proxy_is_forwarding:
++            self.is_verified = False
++        else:
++            self.is_verified = sock_and_verified.is_verified
+ 
+         # If there's a proxy to be connected to we are fully connected.
+         # This is set twice (once above and here) due to forwarding proxies
+         # not using tunnelling.
+         self._has_connected_to_proxy = bool(self.proxy)
+ 
++        # Set `self.proxy_is_verified` unless it's already set while
++        # establishing a tunnel.
++        if self._has_connected_to_proxy and self.proxy_is_verified is None:
++            self.proxy_is_verified = sock_and_verified.is_verified
++
+     def _connect_tls_proxy(self, hostname: str, sock: socket.socket) -> ssl.SSLSocket:
+         """
+         Establish a TLS connection to the proxy using the provided SSL context.
+@@ -864,6 +888,7 @@ def _wrap_proxy_error(err: Exception, proxy_scheme: str | None) -> ProxyError:
+     is_likely_http_proxy = (
+         "wrong version number" in error_normalized
+         or "unknown protocol" in error_normalized
++        or "record layer failure" in error_normalized
+     )
+     http_proxy_warning = (
+         ". Your proxy appears to only use HTTP and not HTTPS, "
+
+diff --git a/src/urllib3/connectionpool.py b/src/urllib3/connectionpool.py
+index 70048b7..c952dcb 100644
+--- a/src/urllib3/connectionpool.py
++++ b/src/urllib3/connectionpool.py
+@@ -511,9 +511,10 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
+             pass
+         except OSError as e:
+             # MacOS/Linux
+-            # EPROTOTYPE is needed on macOS
++            # EPROTOTYPE and ECONNRESET are needed on macOS
+             # https://erickt.github.io/blog/2014/11/19/adventures-in-debugging-a-potential-osx-kernel-bug/
+-            if e.errno != errno.EPROTOTYPE:
++            # Condition changed later to emit ECONNRESET instead of only EPROTOTYPE.
++            if e.errno != errno.EPROTOTYPE and e.errno != errno.ECONNRESET:
+                 raise
+ 
+         # Reset the timeout for the recv() on the socket
+@@ -543,6 +544,8 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
+         response._connection = response_conn  # type: ignore[attr-defined]
+         response._pool = self  # type: ignore[attr-defined]
+ 
++        # emscripten connection doesn't have _http_vsn_str
++        http_version = getattr(conn, "_http_vsn_str", "HTTP/?")
+         log.debug(
+             '%s://%s:%s "%s %s %s" %s %s',
+             self.scheme,
+@@ -551,9 +554,9 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
+             method,
+             url,
+             # HTTP version
+-            conn._http_vsn_str,  # type: ignore[attr-defined]
++            http_version,
+             response.status,
+-            response.length_remaining,  # type: ignore[attr-defined]
++            response.length_remaining,
+         )
+ 
+         return response
+@@ -748,8 +751,8 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
+         # have to copy the headers dict so we can safely change it without those
+         # changes being reflected in anyone else's copy.
+         if not http_tunnel_required:
+-            headers = headers.copy()  # type: ignore[attr-defined]
+-            headers.update(self.proxy_headers)  # type: ignore[union-attr]
++            headers = HTTPHeaderDict(headers)
++            headers.update(self.proxy_headers)
+ 
+         # Must keep the exception bound to a separate variable or else Python 3
+         # complains about UnboundLocalError.
+@@ -1095,7 +1098,8 @@ class HTTPSConnectionPool(HTTPConnectionPool):
+         if conn.is_closed:
+             conn.connect()
+ 
+-        if not conn.is_verified:
++        # TODO revise this, see https://github.com/urllib3/urllib3/issues/2791
++        if not conn.is_verified and not conn.proxy_is_verified:
+             warnings.warn(
+                 (
+                     f"Unverified HTTPS request is being made to host '{conn.host}'. "
+
+diff --git a/src/urllib3/contrib/emscripten/__init__.py b/src/urllib3/contrib/emscripten/__init__.py
+new file mode 100644
+index 0000000..8a3c5be
+--- /dev/null
++++ b/src/urllib3/contrib/emscripten/__init__.py
+@@ -0,0 +1,16 @@
++from __future__ import annotations
++
++import urllib3.connection
++
++from ...connectionpool import HTTPConnectionPool, HTTPSConnectionPool
++from .connection import EmscriptenHTTPConnection, EmscriptenHTTPSConnection
++
++
++def inject_into_urllib3() -> None:
++    # override connection classes to use emscripten specific classes
++    # n.b. mypy complains about the overriding of classes below
++    # if it isn't ignored
++    HTTPConnectionPool.ConnectionCls = EmscriptenHTTPConnection
++    HTTPSConnectionPool.ConnectionCls = EmscriptenHTTPSConnection
++    urllib3.connection.HTTPConnection = EmscriptenHTTPConnection  # type: ignore[misc,assignment]
++    urllib3.connection.HTTPSConnection = EmscriptenHTTPSConnection  # type: ignore[misc,assignment]
+
+diff --git a/src/urllib3/contrib/emscripten/connection.py b/src/urllib3/contrib/emscripten/connection.py
+new file mode 100644
+index 0000000..9090e51
+--- /dev/null
++++ b/src/urllib3/contrib/emscripten/connection.py
+@@ -0,0 +1,249 @@
++from __future__ import annotations
++
++import os
++import typing
++
++# use http.client.HTTPException for consistency with non-emscripten
++from http.client import HTTPException as HTTPException  # noqa: F401
++from http.client import ResponseNotReady
++
++from ..._base_connection import _TYPE_BODY
++from ...connection import HTTPConnection, ProxyConfig, port_by_scheme
++from ...exceptions import TimeoutError
++from ...response import BaseHTTPResponse
++from ...util.connection import _TYPE_SOCKET_OPTIONS
++from ...util.timeout import _DEFAULT_TIMEOUT, _TYPE_TIMEOUT
++from ...util.url import Url
++from .fetch import _RequestError, _TimeoutError, send_request, send_streaming_request
++from .request import EmscriptenRequest
++from .response import EmscriptenHttpResponseWrapper, EmscriptenResponse
++
++if typing.TYPE_CHECKING:
++    from ..._base_connection import BaseHTTPConnection, BaseHTTPSConnection
++
++
++class EmscriptenHTTPConnection:
++    default_port: typing.ClassVar[int] = port_by_scheme["http"]
++    default_socket_options: typing.ClassVar[_TYPE_SOCKET_OPTIONS]
++
++    timeout: None | (float)
++
++    host: str
++    port: int
++    blocksize: int
++    source_address: tuple[str, int] | None
++    socket_options: _TYPE_SOCKET_OPTIONS | None
++
++    proxy: Url | None
++    proxy_config: ProxyConfig | None
++
++    is_verified: bool = False
++    proxy_is_verified: bool | None = None
++
++    _response: EmscriptenResponse | None
++
++    def __init__(
++        self,
++        host: str,
++        port: int = 0,
++        *,
++        timeout: _TYPE_TIMEOUT = _DEFAULT_TIMEOUT,
++        source_address: tuple[str, int] | None = None,
++        blocksize: int = 8192,
++        socket_options: _TYPE_SOCKET_OPTIONS | None = None,
++        proxy: Url | None = None,
++        proxy_config: ProxyConfig | None = None,
++    ) -> None:
++        self.host = host
++        self.port = port
++        self.timeout = timeout if isinstance(timeout, float) else 0.0
++        self.scheme = "http"
++        self._closed = True
++        self._response = None
++        # ignore these things because we don't
++        # have control over that stuff
++        self.proxy = None
++        self.proxy_config = None
++        self.blocksize = blocksize
++        self.source_address = None
++        self.socket_options = None
++
++    def set_tunnel(
++        self,
++        host: str,
++        port: int | None = 0,
++        headers: typing.Mapping[str, str] | None = None,
++        scheme: str = "http",
++    ) -> None:
++        pass
++
++    def connect(self) -> None:
++        pass
++
++    def request(
++        self,
++        method: str,
++        url: str,
++        body: _TYPE_BODY | None = None,
++        headers: typing.Mapping[str, str] | None = None,
++        # We know *at least* botocore is depending on the order of the
++        # first 3 parameters so to be safe we only mark the later ones
++        # as keyword-only to ensure we have space to extend.
++        *,
++        chunked: bool = False,
++        preload_content: bool = True,
++        decode_content: bool = True,
++        enforce_content_length: bool = True,
++    ) -> None:
++        self._closed = False
++        if url.startswith("/"):
++            # no scheme / host / port included, make a full url
++            url = f"{self.scheme}://{self.host}:{self.port}" + url
++        request = EmscriptenRequest(
++            url=url,
++            method=method,
++            timeout=self.timeout if self.timeout else 0,
++            decode_content=decode_content,
++        )
++        request.set_body(body)
++        if headers:
++            for k, v in headers.items():
++                request.set_header(k, v)
++        self._response = None
++        try:
++            if not preload_content:
++                self._response = send_streaming_request(request)
++            if self._response is None:
++                self._response = send_request(request)
++        except _TimeoutError as e:
++            raise TimeoutError(e.message) from e
++        except _RequestError as e:
++            raise HTTPException(e.message) from e
++
++    def getresponse(self) -> BaseHTTPResponse:
++        if self._response is not None:
++            return EmscriptenHttpResponseWrapper(
++                internal_response=self._response,
++                url=self._response.request.url,
++                connection=self,
++            )
++        else:
++            raise ResponseNotReady()
++
++    def close(self) -> None:
++        self._closed = True
++        self._response = None
++
++    @property
++    def is_closed(self) -> bool:
++        """Whether the connection either is brand new or has been previously closed.
++        If this property is True then both ``is_connected`` and ``has_connected_to_proxy``
++        properties must be False.
++        """
++        return self._closed
++
++    @property
++    def is_connected(self) -> bool:
++        """Whether the connection is actively connected to any origin (proxy or target)"""
++        return True
++
++    @property
++    def has_connected_to_proxy(self) -> bool:
++        """Whether the connection has successfully connected to its proxy.
++        This returns False if no proxy is in use. Used to determine whether
++        errors are coming from the proxy layer or from tunnelling to the target origin.
++        """
++        return False
++
++
++class EmscriptenHTTPSConnection(EmscriptenHTTPConnection):
++    default_port = port_by_scheme["https"]
++    # all this is basically ignored, as browser handles https
++    cert_reqs: int | str | None = None
++    ca_certs: str | None = None
++    ca_cert_dir: str | None = None
++    ca_cert_data: None | str | bytes = None
++    cert_file: str | None
++    key_file: str | None
++    key_password: str | None
++    ssl_context: typing.Any | None
++    ssl_version: int | str | None = None
++    ssl_minimum_version: int | None = None
++    ssl_maximum_version: int | None = None
++    assert_hostname: None | str | typing.Literal[False]
++    assert_fingerprint: str | None = None
++
++    def __init__(
++        self,
++        host: str,
++        port: int = 0,
++        *,
++        timeout: _TYPE_TIMEOUT = _DEFAULT_TIMEOUT,
++        source_address: tuple[str, int] | None = None,
++        blocksize: int = 16384,
++        socket_options: None
++        | _TYPE_SOCKET_OPTIONS = HTTPConnection.default_socket_options,
++        proxy: Url | None = None,
++        proxy_config: ProxyConfig | None = None,
++        cert_reqs: int | str | None = None,
++        assert_hostname: None | str | typing.Literal[False] = None,
++        assert_fingerprint: str | None = None,
++        server_hostname: str | None = None,
++        ssl_context: typing.Any | None = None,
++        ca_certs: str | None = None,
++        ca_cert_dir: str | None = None,
++        ca_cert_data: None | str | bytes = None,
++        ssl_minimum_version: int | None = None,
++        ssl_maximum_version: int | None = None,
++        ssl_version: int | str | None = None,  # Deprecated
++        cert_file: str | None = None,
++        key_file: str | None = None,
++        key_password: str | None = None,
++    ) -> None:
++        super().__init__(
++            host,
++            port=port,
++            timeout=timeout,
++            source_address=source_address,
++            blocksize=blocksize,
++            socket_options=socket_options,
++            proxy=proxy,
++            proxy_config=proxy_config,
++        )
++        self.scheme = "https"
++
++        self.key_file = key_file
++        self.cert_file = cert_file
++        self.key_password = key_password
++        self.ssl_context = ssl_context
++        self.server_hostname = server_hostname
++        self.assert_hostname = assert_hostname
++        self.assert_fingerprint = assert_fingerprint
++        self.ssl_version = ssl_version
++        self.ssl_minimum_version = ssl_minimum_version
++        self.ssl_maximum_version = ssl_maximum_version
++        self.ca_certs = ca_certs and os.path.expanduser(ca_certs)
++        self.ca_cert_dir = ca_cert_dir and os.path.expanduser(ca_cert_dir)
++        self.ca_cert_data = ca_cert_data
++
++        self.cert_reqs = None
++
++    def set_cert(
++        self,
++        key_file: str | None = None,
++        cert_file: str | None = None,
++        cert_reqs: int | str | None = None,
++        key_password: str | None = None,
++        ca_certs: str | None = None,
++        assert_hostname: None | str | typing.Literal[False] = None,
++        assert_fingerprint: str | None = None,
++        ca_cert_dir: str | None = None,
++        ca_cert_data: None | str | bytes = None,
++    ) -> None:
++        pass
++
++
++# verify that this class implements BaseHTTP(s) connection correctly
++if typing.TYPE_CHECKING:
++    _supports_http_protocol: BaseHTTPConnection = EmscriptenHTTPConnection("", 0)
++    _supports_https_protocol: BaseHTTPSConnection = EmscriptenHTTPSConnection("", 0)
+
+diff --git a/src/urllib3/contrib/emscripten/fetch.py b/src/urllib3/contrib/emscripten/fetch.py
+new file mode 100644
+index 0000000..ecf845d
+--- /dev/null
++++ b/src/urllib3/contrib/emscripten/fetch.py
+@@ -0,0 +1,413 @@
++"""
++Support for streaming http requests in emscripten.
++
++A few caveats -
++
++Firstly, you can't do streaming http in the main UI thread, because atomics.wait isn't allowed.
++Streaming only works if you're running pyodide in a web worker.
++
++Secondly, this uses an extra web worker and SharedArrayBuffer to do the asynchronous fetch
++operation, so it requires that you have crossOriginIsolation enabled, by serving over https
++(or from localhost) with the two headers below set:
++
++    Cross-Origin-Opener-Policy: same-origin
++    Cross-Origin-Embedder-Policy: require-corp
++
++You can tell if cross origin isolation is successfully enabled by looking at the global crossOriginIsolated variable in
++javascript console. If it isn't, streaming requests will fallback to XMLHttpRequest, i.e. getting the whole
++request into a buffer and then returning it. it shows a warning in the javascript console in this case.
++
++Finally, the webworker which does the streaming fetch is created on initial import, but will only be started once
++control is returned to javascript. Call `await wait_for_streaming_ready()` to wait for streaming fetch.
++
++NB: in this code, there are a lot of javascript objects. They are named js_*
++to make it clear what type of object they are.
++"""
++from __future__ import annotations
++
++import io
++import json
++from email.parser import Parser
++from importlib.resources import files
++from typing import TYPE_CHECKING, Any
++
++import js  # type: ignore[import]
++from pyodide.ffi import JsArray, JsException, JsProxy, to_js  # type: ignore[import]
++
++if TYPE_CHECKING:
++    from typing_extensions import Buffer
++
++from .request import EmscriptenRequest
++from .response import EmscriptenResponse
++
++"""
++There are some headers that trigger unintended CORS preflight requests.
++See also https://github.com/koenvo/pyodide-http/issues/22
++"""
++HEADERS_TO_IGNORE = ("user-agent",)
++
++SUCCESS_HEADER = -1
++SUCCESS_EOF = -2
++ERROR_TIMEOUT = -3
++ERROR_EXCEPTION = -4
++
++_STREAMING_WORKER_CODE = (
++    files(__package__)
++    .joinpath("emscripten_fetch_worker.js")
++    .read_text(encoding="utf-8")
++)
++
++
++class _RequestError(Exception):
++    def __init__(
++        self,
++        message: str | None = None,
++        *,
++        request: EmscriptenRequest | None = None,
++        response: EmscriptenResponse | None = None,
++    ):
++        self.request = request
++        self.response = response
++        self.message = message
++        super().__init__(self.message)
++
++
++class _StreamingError(_RequestError):
++    pass
++
++
++class _TimeoutError(_RequestError):
++    pass
++
++
++def _obj_from_dict(dict_val: dict[str, Any]) -> JsProxy:
++    return to_js(dict_val, dict_converter=js.Object.fromEntries)
++
++
++class _ReadStream(io.RawIOBase):
++    def __init__(
++        self,
++        int_buffer: JsArray,
++        byte_buffer: JsArray,
++        timeout: float,
++        worker: JsProxy,
++        connection_id: int,
++        request: EmscriptenRequest,
++    ):
++        self.int_buffer = int_buffer
++        self.byte_buffer = byte_buffer
++        self.read_pos = 0
++        self.read_len = 0
++        self.connection_id = connection_id
++        self.worker = worker
++        self.timeout = int(1000 * timeout) if timeout > 0 else None
++        self.is_live = True
++        self._is_closed = False
++        self.request: EmscriptenRequest | None = request
++
++    def __del__(self) -> None:
++        self.close()
++
++    # this is compatible with _base_connection
++    def is_closed(self) -> bool:
++        return self._is_closed
++
++    # for compatibility with RawIOBase
++    @property
++    def closed(self) -> bool:
++        return self.is_closed()
++
++    def close(self) -> None:
++        if not self.is_closed():
++            self.read_len = 0
++            self.read_pos = 0
++            self.int_buffer = None
++            self.byte_buffer = None
++            self._is_closed = True
++            self.request = None
++            if self.is_live:
++                self.worker.postMessage(_obj_from_dict({"close": self.connection_id}))
++                self.is_live = False
++            super().close()
++
++    def readable(self) -> bool:
++        return True
++
++    def writable(self) -> bool:
++        return False
++
++    def seekable(self) -> bool:
++        return False
++
++    def readinto(self, byte_obj: Buffer) -> int:
++        if not self.int_buffer:
++            raise _StreamingError(
++                "No buffer for stream in _ReadStream.readinto",
++                request=self.request,
++                response=None,
++            )
++        if self.read_len == 0:
++            # wait for the worker to send something
++            js.Atomics.store(self.int_buffer, 0, ERROR_TIMEOUT)
++            self.worker.postMessage(_obj_from_dict({"getMore": self.connection_id}))
++            if (
++                js.Atomics.wait(self.int_buffer, 0, ERROR_TIMEOUT, self.timeout)
++                == "timed-out"
++            ):
++                raise _TimeoutError
++            data_len = self.int_buffer[0]
++            if data_len > 0:
++                self.read_len = data_len
++                self.read_pos = 0
++            elif data_len == ERROR_EXCEPTION:
++                string_len = self.int_buffer[1]
++                # decode the error string
++                js_decoder = js.TextDecoder.new()
++                json_str = js_decoder.decode(self.byte_buffer.slice(0, string_len))
++                raise _StreamingError(
++                    f"Exception thrown in fetch: {json_str}",
++                    request=self.request,
++                    response=None,
++                )
++            else:
++                # EOF, free the buffers and return zero
++                # and free the request
++                self.is_live = False
++                self.close()
++                return 0
++        # copy from int32array to python bytes
++        ret_length = min(self.read_len, len(memoryview(byte_obj)))
++        subarray = self.byte_buffer.subarray(
++            self.read_pos, self.read_pos + ret_length
++        ).to_py()
++        memoryview(byte_obj)[0:ret_length] = subarray
++        self.read_len -= ret_length
++        self.read_pos += ret_length
++        return ret_length
++
++
++class _StreamingFetcher:
++    def __init__(self) -> None:
++        # make web-worker and data buffer on startup
++        self.streaming_ready = False
++
++        js_data_blob = js.Blob.new(
++            [_STREAMING_WORKER_CODE], _obj_from_dict({"type": "application/javascript"})
++        )
++
++        def promise_resolver(js_resolve_fn: JsProxy, js_reject_fn: JsProxy) -> None:
++            def onMsg(e: JsProxy) -> None:
++                self.streaming_ready = True
++                js_resolve_fn(e)
++
++            def onErr(e: JsProxy) -> None:
++                js_reject_fn(e)  # Defensive: never happens in ci
++
++            self.js_worker.onmessage = onMsg
++            self.js_worker.onerror = onErr
++
++        js_data_url = js.URL.createObjectURL(js_data_blob)
++        self.js_worker = js.globalThis.Worker.new(js_data_url)
++        self.js_worker_ready_promise = js.globalThis.Promise.new(promise_resolver)
++
++    def send(self, request: EmscriptenRequest) -> EmscriptenResponse:
++        headers = {
++            k: v for k, v in request.headers.items() if k not in HEADERS_TO_IGNORE
++        }
++
++        body = request.body
++        fetch_data = {"headers": headers, "body": to_js(body), "method": request.method}
++        # start the request off in the worker
++        timeout = int(1000 * request.timeout) if request.timeout > 0 else None
++        js_shared_buffer = js.SharedArrayBuffer.new(1048576)
++        js_int_buffer = js.Int32Array.new(js_shared_buffer)
++        js_byte_buffer = js.Uint8Array.new(js_shared_buffer, 8)
++
++        js.Atomics.store(js_int_buffer, 0, ERROR_TIMEOUT)
++        js.Atomics.notify(js_int_buffer, 0)
++        js_absolute_url = js.URL.new(request.url, js.location).href
++        self.js_worker.postMessage(
++            _obj_from_dict(
++                {
++                    "buffer": js_shared_buffer,
++                    "url": js_absolute_url,
++                    "fetchParams": fetch_data,
++                }
++            )
++        )
++        # wait for the worker to send something
++        js.Atomics.wait(js_int_buffer, 0, ERROR_TIMEOUT, timeout)
++        if js_int_buffer[0] == ERROR_TIMEOUT:
++            raise _TimeoutError(
++                "Timeout connecting to streaming request",
++                request=request,
++                response=None,
++            )
++        elif js_int_buffer[0] == SUCCESS_HEADER:
++            # got response
++            # header length is in second int of intBuffer
++            string_len = js_int_buffer[1]
++            # decode the rest to a JSON string
++            js_decoder = js.TextDecoder.new()
++            # this does a copy (the slice) because decode can't work on shared array
++            # for some silly reason
++            json_str = js_decoder.decode(js_byte_buffer.slice(0, string_len))
++            # get it as an object
++            response_obj = json.loads(json_str)
++            return EmscriptenResponse(
++                request=request,
++                status_code=response_obj["status"],
++                headers=response_obj["headers"],
++                body=_ReadStream(
++                    js_int_buffer,
++                    js_byte_buffer,
++                    request.timeout,
++                    self.js_worker,
++                    response_obj["connectionID"],
++                    request,
++                ),
++            )
++        elif js_int_buffer[0] == ERROR_EXCEPTION:
++            string_len = js_int_buffer[1]
++            # decode the error string
++            js_decoder = js.TextDecoder.new()
++            json_str = js_decoder.decode(js_byte_buffer.slice(0, string_len))
++            raise _StreamingError(
++                f"Exception thrown in fetch: {json_str}", request=request, response=None
++            )
++        else:
++            raise _StreamingError(
++                f"Unknown status from worker in fetch: {js_int_buffer[0]}",
++                request=request,
++                response=None,
++            )
++
++
++# check if we are in a worker or not
++def is_in_browser_main_thread() -> bool:
++    return hasattr(js, "window") and hasattr(js, "self") and js.self == js.window
++
++
++def is_cross_origin_isolated() -> bool:
++    return hasattr(js, "crossOriginIsolated") and js.crossOriginIsolated
++
++
++def is_in_node() -> bool:
++    return (
++        hasattr(js, "process")
++        and hasattr(js.process, "release")
++        and hasattr(js.process.release, "name")
++        and js.process.release.name == "node"
++    )
++
++
++def is_worker_available() -> bool:
++    return hasattr(js, "Worker") and hasattr(js, "Blob")
++
++
++_fetcher: _StreamingFetcher | None = None
++
++if is_worker_available() and (
++    (is_cross_origin_isolated() and not is_in_browser_main_thread())
++    and (not is_in_node())
++):
++    _fetcher = _StreamingFetcher()
++else:
++    _fetcher = None
++
++
++def send_streaming_request(request: EmscriptenRequest) -> EmscriptenResponse | None:
++    if _fetcher and streaming_ready():
++        return _fetcher.send(request)
++    else:
++        _show_streaming_warning()
++        return None
++
++
++_SHOWN_TIMEOUT_WARNING = False
++
++
++def _show_timeout_warning() -> None:
++    global _SHOWN_TIMEOUT_WARNING
++    if not _SHOWN_TIMEOUT_WARNING:
++        _SHOWN_TIMEOUT_WARNING = True
++        message = "Warning: Timeout is not available on main browser thread"
++        js.console.warn(message)
++
++
++_SHOWN_STREAMING_WARNING = False
++
++
++def _show_streaming_warning() -> None:
++    global _SHOWN_STREAMING_WARNING
++    if not _SHOWN_STREAMING_WARNING:
++        _SHOWN_STREAMING_WARNING = True
++        message = "Can't stream HTTP requests because: \n"
++        if not is_cross_origin_isolated():
++            message += "  Page is not cross-origin isolated\n"
++        if is_in_browser_main_thread():
++            message += "  Python is running in main browser thread\n"
++        if not is_worker_available():
++            message += " Worker or Blob classes are not available in this environment."  # Defensive: this is always False in browsers that we test in
++        if streaming_ready() is False:
++            message += """ Streaming fetch worker isn't ready. If you want to be sure that streaming fetch
++is working, you need to call: 'await urllib3.contrib.emscripten.fetch.wait_for_streaming_ready()`"""
++        from js import console
++
++        console.warn(message)
++
++
++def send_request(request: EmscriptenRequest) -> EmscriptenResponse:
++    try:
++        js_xhr = js.XMLHttpRequest.new()
++
++        if not is_in_browser_main_thread():
++            js_xhr.responseType = "arraybuffer"
++            if request.timeout:
++                js_xhr.timeout = int(request.timeout * 1000)
++        else:
++            js_xhr.overrideMimeType("text/plain; charset=ISO-8859-15")
++            if request.timeout:
++                # timeout isn't available on the main thread - show a warning in console
++                # if it is set
++                _show_timeout_warning()
++
++        js_xhr.open(request.method, request.url, False)
++        for name, value in request.headers.items():
++            if name.lower() not in HEADERS_TO_IGNORE:
++                js_xhr.setRequestHeader(name, value)
++
++        js_xhr.send(to_js(request.body))
++
++        headers = dict(Parser().parsestr(js_xhr.getAllResponseHeaders()))
++
++        if not is_in_browser_main_thread():
++            body = js_xhr.response.to_py().tobytes()
++        else:
++            body = js_xhr.response.encode("ISO-8859-15")
++        return EmscriptenResponse(
++            status_code=js_xhr.status, headers=headers, body=body, request=request
++        )
++    except JsException as err:
++        if err.name == "TimeoutError":
++            raise _TimeoutError(err.message, request=request)
++        elif err.name == "NetworkError":
++            raise _RequestError(err.message, request=request)
++        else:
++            # general http error
++            raise _RequestError(err.message, request=request)
++
++
++def streaming_ready() -> bool | None:
++    if _fetcher:
++        return _fetcher.streaming_ready
++    else:
++        return None  # no fetcher, return None to signify that
++
++
++async def wait_for_streaming_ready() -> bool:
++    if _fetcher:
++        await _fetcher.js_worker_ready_promise
++        return True
++    else:
++        return False
+
+diff --git a/src/urllib3/contrib/emscripten/request.py b/src/urllib3/contrib/emscripten/request.py
+new file mode 100644
+index 0000000..e692e69
+--- /dev/null
++++ b/src/urllib3/contrib/emscripten/request.py
+@@ -0,0 +1,22 @@
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++
++from ..._base_connection import _TYPE_BODY
++
++
++@dataclass
++class EmscriptenRequest:
++    method: str
++    url: str
++    params: dict[str, str] | None = None
++    body: _TYPE_BODY | None = None
++    headers: dict[str, str] = field(default_factory=dict)
++    timeout: float = 0
++    decode_content: bool = True
++
++    def set_header(self, name: str, value: str) -> None:
++        self.headers[name.capitalize()] = value
++
++    def set_body(self, body: _TYPE_BODY | None) -> None:
++        self.body = body
+
+diff --git a/src/urllib3/contrib/emscripten/response.py b/src/urllib3/contrib/emscripten/response.py
+new file mode 100644
+index 0000000..303b4ee
+--- /dev/null
++++ b/src/urllib3/contrib/emscripten/response.py
+@@ -0,0 +1,276 @@
++from __future__ import annotations
++
++import json as _json
++import logging
++import typing
++from contextlib import contextmanager
++from dataclasses import dataclass
++from http.client import HTTPException as HTTPException
++from io import BytesIO, IOBase
++
++from ...exceptions import InvalidHeader, TimeoutError
++from ...response import BaseHTTPResponse
++from ...util.retry import Retry
++from .request import EmscriptenRequest
++
++if typing.TYPE_CHECKING:
++    from ..._base_connection import BaseHTTPConnection, BaseHTTPSConnection
++
++log = logging.getLogger(__name__)
++
++
++@dataclass
++class EmscriptenResponse:
++    status_code: int
++    headers: dict[str, str]
++    body: IOBase | bytes
++    request: EmscriptenRequest
++
++
++class EmscriptenHttpResponseWrapper(BaseHTTPResponse):
++    def __init__(
++        self,
++        internal_response: EmscriptenResponse,
++        url: str | None = None,
++        connection: BaseHTTPConnection | BaseHTTPSConnection | None = None,
++    ):
++        self._pool = None  # set by pool class
++        self._body = None
++        self._response = internal_response
++        self._url = url
++        self._connection = connection
++        self._closed = False
++        super().__init__(
++            headers=internal_response.headers,
++            status=internal_response.status_code,
++            request_url=url,
++            version=0,
++            reason="",
++            decode_content=True,
++        )
++        self.length_remaining = self._init_length(self._response.request.method)
++        self.length_is_certain = False
++
++    @property
++    def url(self) -> str | None:
++        return self._url
++
++    @url.setter
++    def url(self, url: str | None) -> None:
++        self._url = url
++
++    @property
++    def connection(self) -> BaseHTTPConnection | BaseHTTPSConnection | None:
++        return self._connection
++
++    @property
++    def retries(self) -> Retry | None:
++        return self._retries
++
++    @retries.setter
++    def retries(self, retries: Retry | None) -> None:
++        # Override the request_url if retries has a redirect location.
++        self._retries = retries
++
++    def stream(
++        self, amt: int | None = 2**16, decode_content: bool | None = None
++    ) -> typing.Generator[bytes, None, None]:
++        """
++        A generator wrapper for the read() method. A call will block until
++        ``amt`` bytes have been read from the connection or until the
++        connection is closed.
++
++        :param amt:
++            How much of the content to read. The generator will return up to
++            much data per iteration, but may return less. This is particularly
++            likely when using compressed data. However, the empty string will
++            never be returned.
++
++        :param decode_content:
++            If True, will attempt to decode the body based on the
++            'content-encoding' header.
++        """
++        while True:
++            data = self.read(amt=amt, decode_content=decode_content)
++
++            if data:
++                yield data
++            else:
++                break
++
++    def _init_length(self, request_method: str | None) -> int | None:
++        length: int | None
++        content_length: str | None = self.headers.get("content-length")
++
++        if content_length is not None:
++            try:
++                # RFC 7230 section 3.3.2 specifies multiple content lengths can
++                # be sent in a single Content-Length header
++                # (e.g. Content-Length: 42, 42). This line ensures the values
++                # are all valid ints and that as long as the `set` length is 1,
++                # all values are the same. Otherwise, the header is invalid.
++                lengths = {int(val) for val in content_length.split(",")}
++                if len(lengths) > 1:
++                    raise InvalidHeader(
++                        "Content-Length contained multiple "
++                        "unmatching values (%s)" % content_length
++                    )
++                length = lengths.pop()
++            except ValueError:
++                length = None
++            else:
++                if length < 0:
++                    length = None
++
++        else:  # if content_length is None
++            length = None
++
++        # Check for responses that shouldn't include a body
++        if (
++            self.status in (204, 304)
++            or 100 <= self.status < 200
++            or request_method == "HEAD"
++        ):
++            length = 0
++
++        return length
++
++    def read(
++        self,
++        amt: int | None = None,
++        decode_content: bool | None = None,  # ignored because browser decodes always
++        cache_content: bool = False,
++    ) -> bytes:
++        if (
++            self._closed
++            or self._response is None
++            or (isinstance(self._response.body, IOBase) and self._response.body.closed)
++        ):
++            return b""
++
++        with self._error_catcher():
++            # body has been preloaded as a string by XmlHttpRequest
++            if not isinstance(self._response.body, IOBase):
++                self.length_remaining = len(self._response.body)
++                self.length_is_certain = True
++                # wrap body in IOStream
++                self._response.body = BytesIO(self._response.body)
++            if amt is not None:
++                # don't cache partial content
++                cache_content = False
++                data = self._response.body.read(amt)
++                if self.length_remaining is not None:
++                    self.length_remaining = max(self.length_remaining - len(data), 0)
++                if (self.length_is_certain and self.length_remaining == 0) or len(
++                    data
++                ) < amt:
++                    # definitely finished reading, close response stream
++                    self._response.body.close()
++                return typing.cast(bytes, data)
++            else:  # read all we can (and cache it)
++                data = self._response.body.read()
++                if cache_content:
++                    self._body = data
++                if self.length_remaining is not None:
++                    self.length_remaining = max(self.length_remaining - len(data), 0)
++                if len(data) == 0 or (
++                    self.length_is_certain and self.length_remaining == 0
++                ):
++                    # definitely finished reading, close response stream
++                    self._response.body.close()
++                return typing.cast(bytes, data)
++
++    def read_chunked(
++        self,
++        amt: int | None = None,
++        decode_content: bool | None = None,
++    ) -> typing.Generator[bytes, None, None]:
++        # chunked is handled by browser
++        while True:
++            bytes = self.read(amt, decode_content)
++            if not bytes:
++                break
++            yield bytes
++
++    def release_conn(self) -> None:
++        if not self._pool or not self._connection:
++            return None
++
++        self._pool._put_conn(self._connection)
++        self._connection = None
++
++    def drain_conn(self) -> None:
++        self.close()
++
++    @property
++    def data(self) -> bytes:
++        if self._body:
++            return self._body
++        else:
++            return self.read(cache_content=True)
++
++    def json(self) -> typing.Any:
++        """
++        Parses the body of the HTTP response as JSON.
++
++        To use a custom JSON decoder pass the result of :attr:`HTTPResponse.data` to the decoder.
++
++        This method can raise either `UnicodeDecodeError` or `json.JSONDecodeError`.
++
++        Read more :ref:`here <json>`.
++        """
++        data = self.data.decode("utf-8")
++        return _json.loads(data)
++
++    def close(self) -> None:
++        if not self._closed:
++            if isinstance(self._response.body, IOBase):
++                self._response.body.close()
++            if self._connection:
++                self._connection.close()
++                self._connection = None
++            self._closed = True
++
++    @contextmanager
++    def _error_catcher(self) -> typing.Generator[None, None, None]:
++        """
++        Catch Emscripten specific exceptions thrown by fetch.py,
++        instead re-raising urllib3 variants, so that low-level exceptions
++        are not leaked in the high-level api.
++
++        On exit, release the connection back to the pool.
++        """
++        from .fetch import _RequestError, _TimeoutError  # avoid circular import
++
++        clean_exit = False
++
++        try:
++            yield
++            # If no exception is thrown, we should avoid cleaning up
++            # unnecessarily.
++            clean_exit = True
++        except _TimeoutError as e:
++            raise TimeoutError(str(e))
++        except _RequestError as e:
++            raise HTTPException(str(e))
++        finally:
++            # If we didn't terminate cleanly, we need to throw away our
++            # connection.
++            if not clean_exit:
++                # The response may not be closed but we're not going to use it
++                # anymore so close it now
++                if (
++                    isinstance(self._response.body, IOBase)
++                    and not self._response.body.closed
++                ):
++                    self._response.body.close()
++                # release the connection back to the pool
++                self.release_conn()
++            else:
++                # If we have read everything from the response stream,
++                # return the connection back to the pool.
++                if (
++                    isinstance(self._response.body, IOBase)
++                    and self._response.body.closed
++                ):
++                    self.release_conn()
+
+diff --git a/src/urllib3/contrib/socks.py b/src/urllib3/contrib/socks.py
+index 6c3bb76..8c3b57b 100644
+--- a/src/urllib3/contrib/socks.py
++++ b/src/urllib3/contrib/socks.py
+@@ -51,7 +51,7 @@ except ImportError:
+         (
+             "SOCKS support in urllib3 requires the installation of optional "
+             "dependencies: specifically, PySocks.  For more information, see "
+-            "https://urllib3.readthedocs.io/en/latest/contrib.html#socks-proxies"
++            "https://urllib3.readthedocs.io/en/latest/advanced-usage.html#socks-proxies"
+         ),
+         DependencyWarning,
+     )
+
+diff --git a/src/urllib3/http2.py b/src/urllib3/http2.py
+new file mode 100644
+index 0000000..3f1eeef
+--- /dev/null
++++ b/src/urllib3/http2.py
+@@ -0,0 +1,231 @@
++from __future__ import annotations
++
++import threading
++import types
++import typing
++
++import h2.config  # type: ignore[import]
++import h2.connection  # type: ignore[import]
++import h2.events  # type: ignore[import]
++
++import urllib3.connection
++import urllib3.util.ssl_
++from urllib3.response import BaseHTTPResponse
++
++from ._collections import HTTPHeaderDict
++from .connection import HTTPSConnection
++from .connectionpool import HTTPSConnectionPool
++
++orig_HTTPSConnection = HTTPSConnection
++
++T = typing.TypeVar("T")
++
++
++class _LockedObject(typing.Generic[T]):
++    """
++    A wrapper class that hides a specific object behind a lock.
++
++    The goal here is to provide a simple way to protect access to an object
++    that cannot safely be simultaneously accessed from multiple threads. The
++    intended use of this class is simple: take hold of it with a context
++    manager, which returns the protected object.
++    """
++
++    def __init__(self, obj: T):
++        self.lock = threading.RLock()
++        self._obj = obj
++
++    def __enter__(self) -> T:
++        self.lock.acquire()
++        return self._obj
++
++    def __exit__(
++        self,
++        exc_type: type[BaseException] | None,
++        exc_val: BaseException | None,
++        exc_tb: types.TracebackType | None,
++    ) -> None:
++        self.lock.release()
++
++
++class HTTP2Connection(HTTPSConnection):
++    def __init__(
++        self, host: str, port: int | None = None, **kwargs: typing.Any
++    ) -> None:
++        self._h2_conn = self._new_h2_conn()
++        self._h2_stream: int | None = None
++        self._h2_headers: list[tuple[bytes, bytes]] = []
++
++        if "proxy" in kwargs or "proxy_config" in kwargs:  # Defensive:
++            raise NotImplementedError("Proxies aren't supported with HTTP/2")
++
++        super().__init__(host, port, **kwargs)
++
++    def _new_h2_conn(self) -> _LockedObject[h2.connection.H2Connection]:
++        config = h2.config.H2Configuration(client_side=True)
++        return _LockedObject(h2.connection.H2Connection(config=config))
++
++    def connect(self) -> None:
++        super().connect()
++
++        with self._h2_conn as h2_conn:
++            h2_conn.initiate_connection()
++            self.sock.sendall(h2_conn.data_to_send())
++
++    def putrequest(
++        self,
++        method: str,
++        url: str,
++        skip_host: bool = False,
++        skip_accept_encoding: bool = False,
++    ) -> None:
++        with self._h2_conn as h2_conn:
++            self._request_url = url
++            self._h2_stream = h2_conn.get_next_available_stream_id()
++
++            if ":" in self.host:
++                authority = f"[{self.host}]:{self.port or 443}"
++            else:
++                authority = f"{self.host}:{self.port or 443}"
++
++            self._h2_headers.extend(
++                (
++                    (b":scheme", b"https"),
++                    (b":method", method.encode()),
++                    (b":authority", authority.encode()),
++                    (b":path", url.encode()),
++                )
++            )
++
++    def putheader(self, header: str, *values: str) -> None:
++        for value in values:
++            self._h2_headers.append(
++                (header.encode("utf-8").lower(), value.encode("utf-8"))
++            )
++
++    def endheaders(self) -> None:  # type: ignore[override]
++        with self._h2_conn as h2_conn:
++            h2_conn.send_headers(
++                stream_id=self._h2_stream,
++                headers=self._h2_headers,
++                end_stream=True,
++            )
++            if data_to_send := h2_conn.data_to_send():
++                self.sock.sendall(data_to_send)
++
++    def send(self, data: bytes) -> None:  # type: ignore[override]  # Defensive:
++        if not data:
++            return
++        raise NotImplementedError("Sending data isn't supported yet")
++
++    def getresponse(  # type: ignore[override]
++        self,
++    ) -> HTTP2Response:
++        status = None
++        data = bytearray()
++        with self._h2_conn as h2_conn:
++            end_stream = False
++            while not end_stream:
++                # TODO: Arbitrary read value.
++                if received_data := self.sock.recv(65535):
++                    events = h2_conn.receive_data(received_data)
++                    for event in events:
++                        if isinstance(
++                            event, h2.events.InformationalResponseReceived
++                        ):  # Defensive:
++                            continue  # TODO: Does the stdlib do anything with these responses?
++
++                        elif isinstance(event, h2.events.ResponseReceived):
++                            headers = HTTPHeaderDict()
++                            for header, value in event.headers:
++                                if header == b":status":
++                                    status = int(value.decode())
++                                else:
++                                    headers.add(
++                                        header.decode("ascii"), value.decode("ascii")
++                                    )
++
++                        elif isinstance(event, h2.events.DataReceived):
++                            data += event.data
++                            h2_conn.acknowledge_received_data(
++                                event.flow_controlled_length, event.stream_id
++                            )
++
++                        elif isinstance(event, h2.events.StreamEnded):
++                            end_stream = True
++
++                if data_to_send := h2_conn.data_to_send():
++                    self.sock.sendall(data_to_send)
++
++        # We always close to not have to handle connection management.
++        self.close()
++
++        assert status is not None
++        return HTTP2Response(
++            status=status,
++            headers=headers,
++            request_url=self._request_url,
++            data=bytes(data),
++        )
++
++    def close(self) -> None:
++        with self._h2_conn as h2_conn:
++            try:
++                h2_conn.close_connection()
++                if data := h2_conn.data_to_send():
++                    self.sock.sendall(data)
++            except Exception:
++                pass
++
++        # Reset all our HTTP/2 connection state.
++        self._h2_conn = self._new_h2_conn()
++        self._h2_stream = None
++        self._h2_headers = []
++
++        super().close()
++
++
++class HTTP2Response(BaseHTTPResponse):
++    # TODO: This is a woefully incomplete response object, but works for non-streaming.
++    def __init__(
++        self,
++        status: int,
++        headers: HTTPHeaderDict,
++        request_url: str,
++        data: bytes,
++        decode_content: bool = False,  # TODO: support decoding
++    ) -> None:
++        super().__init__(
++            status=status,
++            headers=headers,
++            # Following CPython, we map HTTP versions to major * 10 + minor integers
++            version=20,
++            # No reason phrase in HTTP/2
++            reason=None,
++            decode_content=decode_content,
++            request_url=request_url,
++        )
++        self._data = data
++        self.length_remaining = 0
++
++    @property
++    def data(self) -> bytes:
++        return self._data
++
++    def get_redirect_location(self) -> None:
++        return None
++
++
++def inject_into_urllib3() -> None:
++    HTTPSConnectionPool.ConnectionCls = HTTP2Connection
++    urllib3.connection.HTTPSConnection = HTTP2Connection  # type: ignore[misc]
++
++    # TODO: Offer 'http/1.1' as well, but for testing purposes this is handy.
++    urllib3.util.ssl_.ALPN_PROTOCOLS = ["h2"]
++
++
++def extract_from_urllib3() -> None:
++    HTTPSConnectionPool.ConnectionCls = orig_HTTPSConnection
++    urllib3.connection.HTTPSConnection = orig_HTTPSConnection  # type: ignore[misc]
++
++    urllib3.util.ssl_.ALPN_PROTOCOLS = ["http/1.1"]
+
+diff --git a/src/urllib3/response.py b/src/urllib3/response.py
+index 37936f9..47e75fd 100644
+--- a/src/urllib3/response.py
++++ b/src/urllib3/response.py
+@@ -14,6 +14,9 @@ from http.client import HTTPMessage as _HttplibHTTPMessage
+ from http.client import HTTPResponse as _HttplibHTTPResponse
+ from socket import timeout as SocketTimeout
+ 
++if typing.TYPE_CHECKING:
++    from ._base_connection import BaseHTTPConnection
++
+ try:
+     try:
+         import brotlicffi as brotli  # type: ignore[import]
+@@ -280,6 +283,20 @@ class BytesQueueBuffer:
+ 
+         return ret.getvalue()
+ 
++    def get_all(self) -> bytes:
++        buffer = self.buffer
++        if not buffer:
++            assert self._size == 0
++            return b""
++        if len(buffer) == 1:
++            result = buffer.pop()
++        else:
++            ret = io.BytesIO()
++            ret.writelines(buffer.popleft() for _ in range(len(buffer)))
++            result = ret.getvalue()
++        self._size = 0
++        return result
++
+ 
+ class BaseHTTPResponse(io.IOBase):
+     CONTENT_DECODERS = ["gzip", "x-gzip", "deflate"]
+@@ -327,6 +344,7 @@ class BaseHTTPResponse(io.IOBase):
+             self.chunked = True
+ 
+         self._decoder: ContentDecoder | None = None
++        self.length_remaining: int | None
+ 
+     def get_redirect_location(self) -> str | None | Literal[False]:
+         """
+@@ -366,7 +384,7 @@ class BaseHTTPResponse(io.IOBase):
+         raise NotImplementedError()
+ 
+     @property
+-    def connection(self) -> HTTPConnection | None:
++    def connection(self) -> BaseHTTPConnection | None:
+         raise NotImplementedError()
+ 
+     @property
+@@ -393,6 +411,13 @@ class BaseHTTPResponse(io.IOBase):
+     ) -> bytes:
+         raise NotImplementedError()
+ 
++    def read1(
++        self,
++        amt: int | None = None,
++        decode_content: bool | None = None,
++    ) -> bytes:
++        raise NotImplementedError()
++
+     def read_chunked(
+         self,
+         amt: int | None = None,
+@@ -752,7 +777,12 @@ class HTTPResponse(BaseHTTPResponse):
+             if self._original_response and self._original_response.isclosed():
+                 self.release_conn()
+ 
+-    def _fp_read(self, amt: int | None = None) -> bytes:
++    def _fp_read(
++        self,
++        amt: int | None = None,
++        *,
++        read1: bool = False,
++    ) -> bytes:
+         """
+         Read a response with the thought that reading the number of bytes
+         larger than can fit in a 32-bit int at a time via SSL in some
+@@ -770,8 +800,14 @@ class HTTPResponse(BaseHTTPResponse):
+         c_int_max = 2**31 - 1
+         if (
+             (amt and amt > c_int_max)
+-            or (self.length_remaining and self.length_remaining > c_int_max)
++            or (
++                amt is None
++                and self.length_remaining
++                and self.length_remaining > c_int_max
++            )
+         ) and (util.IS_PYOPENSSL or sys.version_info < (3, 10)):
++            if read1:
++                return self._fp.read1(c_int_max)
+             buffer = io.BytesIO()
+             # Besides `max_chunk_amt` being a maximum chunk size, it
+             # affects memory overhead of reading a response by this
+@@ -792,6 +828,8 @@ class HTTPResponse(BaseHTTPResponse):
+                 buffer.write(data)
+                 del data  # to reduce peak memory usage by `max_chunk_amt`.
+             return buffer.getvalue()
++        elif read1:
++            return self._fp.read1(amt) if amt is not None else self._fp.read1()
+         else:
+             # StringIO doesn't like amt=None
+             return self._fp.read(amt) if amt is not None else self._fp.read()
+@@ -799,6 +837,8 @@ class HTTPResponse(BaseHTTPResponse):
+     def _raw_read(
+         self,
+         amt: int | None = None,
++        *,
++        read1: bool = False,
+     ) -> bytes:
+         """
+         Reads `amt` of bytes from the socket.
+@@ -809,7 +849,7 @@ class HTTPResponse(BaseHTTPResponse):
+         fp_closed = getattr(self._fp, "closed", False)
+ 
+         with self._error_catcher():
+-            data = self._fp_read(amt) if not fp_closed else b""
++            data = self._fp_read(amt, read1=read1) if not fp_closed else b""
+             if amt is not None and amt != 0 and not data:
+                 # Platform-specific: Buggy versions of Python.
+                 # Close the connection when no data is returned
+@@ -831,6 +871,14 @@ class HTTPResponse(BaseHTTPResponse):
+                     # raised during streaming, so all calls with incorrect
+                     # Content-Length are caught.
+                     raise IncompleteRead(self._fp_bytes_read, self.length_remaining)
++            elif read1 and (
++                (amt != 0 and not data) or self.length_remaining == len(data)
++            ):
++                # All data has been read, but `self._fp.read1` in
++                # CPython 3.12 and older doesn't always close
++                # `http.client.HTTPResponse`, so we close it here.
++                # See https://github.com/python/cpython/issues/113199
++                self._fp.close()
+ 
+         if data:
+             self._fp_bytes_read += len(data)
+@@ -909,6 +957,57 @@ class HTTPResponse(BaseHTTPResponse):
+ 
+         return data
+ 
++    def read1(
++        self,
++        amt: int | None = None,
++        decode_content: bool | None = None,
++    ) -> bytes:
++        """
++        Similar to ``http.client.HTTPResponse.read1`` and documented
++        in :meth:`io.BufferedReader.read1`, but with an additional parameter:
++        ``decode_content``.
++
++        :param amt:
++            How much of the content to read.
++
++        :param decode_content:
++            If True, will attempt to decode the body based on the
++            'content-encoding' header.
++        """
++        if decode_content is None:
++            decode_content = self.decode_content
++        # try and respond without going to the network
++        if self._has_decoded_content:
++            if not decode_content:
++                raise RuntimeError(
++                    "Calling read1(decode_content=False) is not supported after "
++                    "read1(decode_content=True) was called."
++                )
++            if len(self._decoded_buffer) > 0:
++                if amt is None:
++                    return self._decoded_buffer.get_all()
++                return self._decoded_buffer.get(amt)
++        if amt == 0:
++            return b""
++
++        # FIXME, this method's type doesn't say returning None is possible
++        data = self._raw_read(amt, read1=True)
++        if not decode_content or data is None:
++            return data
++
++        self._init_decoder()
++        while True:
++            flush_decoder = not data
++            decoded_data = self._decode(data, decode_content, flush_decoder)
++            self._decoded_buffer.put(decoded_data)
++            if decoded_data or flush_decoder:
++                break
++            data = self._raw_read(8192, read1=True)
++
++        if amt is None:
++            return self._decoded_buffer.get_all()
++        return self._decoded_buffer.get(amt)
++
+     def stream(
+         self, amt: int | None = 2**16, decode_content: bool | None = None
+     ) -> typing.Generator[bytes, None, None]:
+
+diff --git a/src/urllib3/util/ssl_.py b/src/urllib3/util/ssl_.py
+index e0a7c04..b14cf27 100644
+--- a/src/urllib3/util/ssl_.py
++++ b/src/urllib3/util/ssl_.py
+@@ -319,14 +319,9 @@ def create_urllib3_context(
+ 
+     # Enable post-handshake authentication for TLS 1.3, see GH #1634. PHA is
+     # necessary for conditional client cert authentication with TLS 1.3.
+-    # The attribute is None for OpenSSL <= 1.1.0 or does not exist in older
+-    # versions of Python. We only enable if certificate verification is enabled to work
+-    # around Python issue #37428
+-    # See: https://bugs.python.org/issue37428
+-    if (
+-        cert_reqs == ssl.CERT_REQUIRED
+-        and getattr(context, "post_handshake_auth", None) is not None
+-    ):
++    # The attribute is None for OpenSSL <= 1.1.0 or does not exist when using
++    # an SSLContext created by pyOpenSSL.
++    if getattr(context, "post_handshake_auth", None) is not None:
+         context.post_handshake_auth = True
+ 
+     # The order of the below lines setting verify_mode and check_hostname
+
+diff --git a/src/urllib3/util/timeout.py b/src/urllib3/util/timeout.py
+index f044625..4bb1be1 100644
+--- a/src/urllib3/util/timeout.py
++++ b/src/urllib3/util/timeout.py
+@@ -101,10 +101,6 @@ class Timeout:
+         the case; if a server streams one byte every fifteen seconds, a timeout
+         of 20 seconds will not trigger, even though the request will take
+         several minutes to complete.
+-
+-        If your goal is to cut off any request after a set amount of wall clock
+-        time, consider having a second "watcher" thread to cut off a slow
+-        request.
+     """
+ 
+     #: A sentinel object representing the default timeout value

@@ -1,0 +1,841 @@
+{
+  "old_dir": ".packages/urllib3/2.5.0",
+  "new_dir": ".packages/urllib3/2.6.0",
+  "extracted_at": "2026-05-02T02:18:35.094711",
+  "diff_file": "confirmed/urllib3/2.6.0/differences/test_diff_v2.5.0_to_v2.6.0.diff",
+  "diff_content": "diff --git a/test/__init__.py b/test/__init__.py\nindex 281e411..33f567e 100644\n--- a/test/__init__.py\n+++ b/test/__init__.py\n@@ -26,18 +26,12 @@ except ImportError:\n     brotli = None\n \n try:\n-    # Python 3.14\n-    from compression import (  # type: ignore[import-not-found] # noqa: F401\n-        zstd as _unused_module_zstd,\n-    )\n-except ImportError:\n-    # Python 3.13 and earlier require the 'zstandard' module.\n-    try:\n-        import zstandard as _unused_module_zstd  # noqa: F401\n-    except ImportError:\n-        HAS_ZSTD = False\n+    if sys.version_info >= (3, 14):\n+        from compression import zstd as _unused_module_zstd  # noqa: F401\n     else:\n-        HAS_ZSTD = True\n+        from backports import zstd as _unused_module_zstd  # noqa: F401\n+except ImportError:\n+    HAS_ZSTD = False\n else:\n     HAS_ZSTD = True\n \n@@ -137,14 +131,14 @@ def notBrotli() -> typing.Callable[[_TestFuncT], _TestFuncT]:\n def onlyZstd() -> typing.Callable[[_TestFuncT], _TestFuncT]:\n     return pytest.mark.skipif(\n         not HAS_ZSTD,\n-        reason=\"only run if a python-zstandard library is installed or Python 3.14 and later\",\n+        reason=\"only run if backports.zstd library is installed or Python 3.14 and later\",\n     )\n \n \n def notZstd() -> typing.Callable[[_TestFuncT], _TestFuncT]:\n     return pytest.mark.skipif(\n         HAS_ZSTD,\n-        reason=\"only run if a python-zstandard library is not installed or Python 3.13 and earlier\",\n+        reason=\"only run if backports.zstd library is not installed and Python 3.13 and earlier\",\n     )\n \n \n@@ -188,7 +182,7 @@ def requires_network() -> typing.Callable[[_TestFuncT], _TestFuncT]:\n         return typing.cast(_TestFuncT, wrapper)\n \n     def _decorator_requires_internet(\n-        decorator: typing.Callable[[_TestFuncT], _TestFuncT]\n+        decorator: typing.Callable[[_TestFuncT], _TestFuncT],\n     ) -> typing.Callable[[_TestFuncT], _TestFuncT]:\n         \"\"\"Mark a decorator with the \"requires_internet\" mark\"\"\"\n \n\ndiff --git a/test/contrib/emscripten/conftest.py b/test/contrib/emscripten/conftest.py\nindex 09b08ee..a2cda88 100644\n--- a/test/contrib/emscripten/conftest.py\n+++ b/test/contrib/emscripten/conftest.py\n@@ -57,19 +57,75 @@ class PyodideServerInfo:\n     pyodide_dist_dir: Path\n \n \n+def _get_coverage_code() -> tuple[str, str]:\n+    begin = textwrap.dedent(\n+        \"\"\"\n+        import coverage\n+\n+        _coverage = coverage.Coverage(source_pkgs=[\"urllib3\"])\n+        _coverage.start()\n+        \"\"\"\n+    )\n+    end = textwrap.dedent(\n+        \"\"\"\n+        _coverage.stop()\n+        _coverage.save()\n+\n+        _coverage_datafile = open(\".coverage\", \"rb\")\n+        _coverage_outdata = _coverage_datafile.read()\n+        _coverage_datafile.close()\n+\n+        # avoid polluting main namespace too much\n+        import js as _coverage_js\n+        # convert to js Array (as default conversion is TypedArray which does\n+        # bad things in firefox)\n+        _coverage_js.Array.from_(_coverage_outdata)\n+        \"\"\"\n+    )\n+    return begin, end\n+\n+\n+def _get_jspi_monkeypatch_code(runtime: str, prefer_jspi: bool) -> tuple[str, str]:\n+    \"\"\"\n+    Return code to make Pyodide think JSPI is disabled in Chrome when a\n+    test needs this to check some code paths.\n+    \"\"\"\n+    if runtime != \"chrome\" or prefer_jspi:\n+        return \"\", \"\"\n+    monkeypatch_code = textwrap.dedent(\n+        \"\"\"\n+        import pyodide.ffi\n+\n+        original_can_run_sync = pyodide.ffi.can_run_sync\n+        if pyodide.ffi.can_run_sync():\n+            pyodide.ffi.can_run_sync = lambda: False\n+        \"\"\"\n+    )\n+    unmonkeypatch_code = \"pyodide.ffi.can_run_sync = original_can_run_sync\"\n+    return monkeypatch_code, unmonkeypatch_code\n+\n+\n @pytest.fixture()\n def selenium_with_jspi_if_possible(\n-    request: pytest.FixtureRequest, runtime: str, has_jspi: bool\n+    request: pytest.FixtureRequest, runtime: str, prefer_jspi: bool\n ) -> Generator[Any]:\n-    if runtime.startswith(\"firefox\") or not has_jspi:\n-        fixture_name = \"selenium\"\n-        with_jspi = False\n-    else:\n+    if runtime == \"node\" and prefer_jspi:\n         fixture_name = \"selenium_jspi\"\n-        with_jspi = True\n+    else:\n+        fixture_name = \"selenium\"\n     selenium_obj = request.getfixturevalue(fixture_name)\n-    selenium_obj.with_jspi = with_jspi\n-    yield selenium_obj\n+\n+    jspi_monkeypatch_code, jspi_unmonkeypatch_code = _get_jspi_monkeypatch_code(\n+        runtime, prefer_jspi\n+    )\n+    if jspi_monkeypatch_code:\n+        selenium_obj.run_async(jspi_monkeypatch_code)\n+\n+    try:\n+        yield selenium_obj\n+    finally:\n+        if jspi_unmonkeypatch_code:\n+            selenium_obj.run_async(jspi_unmonkeypatch_code)\n \n \n @pytest.fixture()\n@@ -84,29 +140,8 @@ def selenium_coverage(\n         result = self.run_js(\n             f'await pyodide.loadPackage(\"http://{testserver_http.http_host}:{testserver_http.http_port}/dist/urllib3.whl\")'\n         )\n-        if not self.with_jspi:\n-            # force Chrome to execute the current test without JSPI\n-            # even though it is always enabled in\n-            # chrome >= 137. We do this by monkeypatching\n-            # pyodide.ffi.can_run_sync\n-            self.run_async(\n-                \"\"\"\n-                import pyodide.ffi\n-                if pyodide.ffi.can_run_sync():\n-                    pyodide.ffi.can_run_sync = lambda: False\n-                \"\"\"\n-            )\n-\n         print(\"Installed package:\", result)\n-        self.run_js(\n-            \"\"\"\n-            await pyodide.loadPackage(\"coverage\")\n-            await pyodide.runPythonAsync(`import coverage\n-_coverage= coverage.Coverage(source_pkgs=['urllib3'])\n-_coverage.start()\n-        `\n-        )\"\"\"\n-        )\n+        self.run_js(\"await pyodide.loadPackage('coverage')\")\n \n     setattr(\n         selenium_with_jspi_if_possible,\n@@ -117,23 +152,18 @@ _coverage.start()\n     )\n \n     selenium_with_jspi_if_possible._install_packages()\n+\n+    coverage_begin, coverage_end = _get_coverage_code()\n+    selenium_with_jspi_if_possible.run_js(\n+        f\"await pyodide.runPythonAsync(`{coverage_begin}`)\"\n+    )\n+\n     yield selenium_with_jspi_if_possible\n+\n     # on teardown, save _coverage output\n     coverage_out_binary = bytes(\n         selenium_with_jspi_if_possible.run_js(\n-            \"\"\"\n-return await pyodide.runPythonAsync(`\n-_coverage.stop()\n-_coverage.save()\n-_coverage_datafile = open(\".coverage\",\"rb\")\n-_coverage_outdata = _coverage_datafile.read()\n-# avoid polluting main namespace too much\n-import js as _coverage_js\n-# convert to js Array (as default conversion is TypedArray which does\n-# bad things in firefox)\n-_coverage_js.Array.from_(_coverage_outdata)\n-`)\n-    \"\"\"\n+            f\"return await pyodide.runPythonAsync(`{coverage_end}`)\"\n         )\n     )\n     with open(f\"{_get_coverage_filename('.coverage.emscripten.')}\", \"wb\") as outfile:\n@@ -142,53 +172,22 @@ _coverage_js.Array.from_(_coverage_outdata)\n \n class ServerRunnerInfo:\n     def __init__(\n-        self, host: str, port: int, selenium: Any, dist_dir: Path, has_jspi: bool\n+        self, host: str, port: int, selenium: Any, dist_dir: Path, prefer_jspi: bool\n     ) -> None:\n         self.host = host\n         self.port = port\n         self.selenium = selenium\n         self.dist_dir = dist_dir\n-        self.has_jspi = has_jspi\n+        self.prefer_jspi = prefer_jspi\n \n     def run_webworker(self, code: str) -> Any:\n         if isinstance(code, str) and code.startswith(\"\\n\"):\n             # we have a multiline string, fix indentation\n             code = textwrap.dedent(code)\n \n-        # add coverage collection to this code\n-        coverage_init_code = textwrap.dedent(\n-            \"\"\"\n-            import coverage\n-            _coverage= coverage.Coverage(source_pkgs=['urllib3'])\n-            _coverage.start()\n-            \"\"\"\n-        )\n-\n-        # Monkeypatch pyodide to force disable JSPI in newer chrome\n-        # so those code paths get tested\n-        if self.has_jspi is False:\n-            jspi_fix_code = textwrap.dedent(\n-                \"\"\"\n-                import pyodide.ffi\n-                if pyodide.ffi.can_run_sync():\n-                    pyodide.ffi.can_run_sync = lambda: False\n-                \"\"\"\n-            )\n-        else:\n-            jspi_fix_code = \"\"\n-\n-        coverage_end_code = textwrap.dedent(\n-            \"\"\"\n-            _coverage.stop()\n-            _coverage.save()\n-            _coverage_datafile = open(\".coverage\",\"rb\")\n-            _coverage_outdata = _coverage_datafile.read()\n-            # avoid polluting main namespace too much\n-            import js as _coverage_js\n-            # convert to js Array (as default conversion is TypedArray which does\n-            # bad things in firefox)\n-            _coverage_js.Array.from_(_coverage_outdata)\n-            \"\"\"\n+        coverage_init_code, coverage_end_code = _get_coverage_code()\n+        jspi_monkeypatch_code, jspi_unmonkeypatch_code = _get_jspi_monkeypatch_code(\n+            self.selenium.browser, self.prefer_jspi\n         )\n \n         # the ordering of these code blocks is important - makes sure\n@@ -196,9 +195,13 @@ class ServerRunnerInfo:\n         code = (\n             coverage_init_code\n             + \"\\n\"\n-            + jspi_fix_code\n+            + jspi_monkeypatch_code\n+            + \"\\n\"\n+            + \"try:\\n\"\n+            + textwrap.indent(code, \"    \")\n             + \"\\n\"\n-            + code\n+            + \"finally:\\n\"\n+            + textwrap.indent(jspi_unmonkeypatch_code or \"pass\", \"    \")\n             + \"\\n\"\n             + coverage_end_code\n         )\n@@ -250,51 +253,88 @@ class ServerRunnerInfo:\n # we are at the same origin as web requests to server_host\n @pytest.fixture()\n def run_from_server(\n-    selenium_coverage: Any, testserver_http: PyodideServerInfo\n+    selenium: Any, testserver_http: PyodideServerInfo, prefer_jspi: bool\n ) -> Generator[ServerRunnerInfo]:\n-    if selenium_coverage.browser != \"node\":\n+    if selenium.browser != \"node\":\n         # on node, we don't need to be on the same origin\n         # so we can ignore all this\n         addr = f\"https://{testserver_http.http_host}:{testserver_http.https_port}/pyodide/test.html\"\n-        selenium_coverage.goto(addr)\n-        selenium_coverage.javascript_setup()\n-        selenium_coverage.load_pyodide()\n-        selenium_coverage.initialize_pyodide()\n-        selenium_coverage.save_state()\n-        selenium_coverage.restore_state()\n-        selenium_coverage._install_packages()\n+        selenium.goto(addr)\n+        selenium.javascript_setup()\n+        selenium.load_pyodide()\n+        selenium.initialize_pyodide()\n+        selenium.save_state()\n+        selenium.restore_state()\n     dist_dir = testserver_http.pyodide_dist_dir\n     yield ServerRunnerInfo(\n         testserver_http.http_host,\n         testserver_http.https_port,\n-        selenium_coverage,\n+        selenium,\n         dist_dir,\n-        selenium_coverage.with_jspi,\n+        prefer_jspi,\n     )\n \n \n+def pytest_collection_modifyitems(\n+    config: pytest.Config, items: list[pytest.Item]\n+) -> None:\n+    \"\"\"\n+    A pytest hook modifying collected test items for Emscripten.\n+    \"\"\"\n+    selected_tests = []\n+    deselected_tests = []\n+\n+    runtime = config.getoption(\"--runtime\", default=None)\n+    if not runtime:\n+        return\n+\n+    for item in items:\n+        # Deselect tests which Node.js cannot run.\n+        if runtime.startswith(\"node\"):\n+            if (\n+                item.get_closest_marker(\"webworkers\")\n+                or item.get_closest_marker(\"in_webbrowser\")\n+                or item.get_closest_marker(\"without_jspi\")\n+            ):\n+                deselected_tests.append(item)\n+                continue\n+        # Tests marked with `in_webbrowser` are only for Node.js.\n+        elif item.get_closest_marker(\"node_without_jspi\"):\n+            deselected_tests.append(item)\n+            continue\n+\n+        # Firefox cannot run JSPI tests.\n+        if runtime.startswith(\"firefox\") and item.get_closest_marker(\"with_jspi\"):\n+            deselected_tests.append(item)\n+            continue\n+\n+        selected_tests.append(item)\n+\n+    config.hook.pytest_deselected(items=deselected_tests)\n+    items[:] = selected_tests\n+\n+\n def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:\n-    \"\"\"Generate tests with WebAssembly JavaScript Promise Integration both\n-     enabled and disabled depending on browser/node.js support for features.\n-     Also drops any test that requires a browser or web-workers in Node.js.\n-    ).\n     \"\"\"\n-    if \"has_jspi\" in metafunc.fixturenames:\n-        can_run_with_jspi = False\n-        can_run_without_jspi = False\n+    A pytest hook generating parametrized calls to a test function.\n+    \"\"\"\n+\n+    # Set proper `prefer_jspi` values for tests with WebAssembly\n+    # JavaScript Promise Integration both enabled and disabled depending\n+    # on browser/Node.js support for features.\n+    if \"prefer_jspi\" in metafunc.fixturenames:\n         # node only supports JSPI and doesn't support workers or\n         # webbrowser specific tests\n         if metafunc.config.getoption(\"--runtime\").startswith(\"node\"):\n-            if (\n-                metafunc.definition.get_closest_marker(\"webworkers\") is None\n-                and metafunc.definition.get_closest_marker(\"in_webbrowser\") is None\n-            ):\n-                can_run_with_jspi = True\n             if metafunc.definition.get_closest_marker(\"node_without_jspi\"):\n-                can_run_without_jspi = True\n                 can_run_with_jspi = False\n+                can_run_without_jspi = True\n+            else:\n+                can_run_with_jspi = True\n+                can_run_without_jspi = False\n         # firefox doesn't support JSPI\n         elif metafunc.config.getoption(\"--runtime\").startswith(\"firefox\"):\n+            can_run_with_jspi = False\n             can_run_without_jspi = True\n         else:\n             # chrome supports JSPI on or off\n@@ -313,4 +353,4 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:\n             jspi_options.append(False)\n         if can_run_with_jspi:\n             jspi_options.append(True)\n-        metafunc.parametrize(\"has_jspi\", jspi_options)\n+        metafunc.parametrize(\"prefer_jspi\", jspi_options)\n\ndiff --git a/test/contrib/emscripten/test_emscripten.py b/test/contrib/emscripten/test_emscripten.py\nindex dbe1f02..b4d8b21 100644\n--- a/test/contrib/emscripten/test_emscripten.py\n+++ b/test/contrib/emscripten/test_emscripten.py\n@@ -29,15 +29,15 @@ pyodide_config.set_flags(\n \n \n def test_index(\n-    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, has_jspi: bool\n+    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, prefer_jspi: bool\n ) -> None:\n     @run_in_pyodide  # type: ignore[misc]\n-    def pyodide_test(selenium_coverage, host: str, port: int, has_jspi: bool) -> None:  # type: ignore[no-untyped-def]\n+    def pyodide_test(selenium_coverage, host: str, port: int, prefer_jspi: bool) -> None:  # type: ignore[no-untyped-def]\n         import urllib3.contrib.emscripten.fetch\n         from urllib3.connection import HTTPConnection\n         from urllib3.response import BaseHTTPResponse\n \n-        assert urllib3.contrib.emscripten.fetch.has_jspi() == has_jspi\n+        assert urllib3.contrib.emscripten.fetch.has_jspi() == prefer_jspi\n         conn = HTTPConnection(host, port)\n         url = f\"http://{host}:{port}/\"\n         conn.request(\"GET\", url)\n@@ -59,20 +59,20 @@ def test_index(\n         selenium_coverage,\n         testserver_http.http_host,\n         testserver_http.http_port,\n-        has_jspi,\n+        prefer_jspi,\n     )\n \n \n def test_pool_requests(\n-    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, has_jspi: bool\n+    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, prefer_jspi: bool\n ) -> None:\n     @run_in_pyodide  # type: ignore[misc]\n-    def pyodide_test(selenium_coverage, host: str, port: int, https_port: int, has_jspi: bool) -> None:  # type: ignore[no-untyped-def]\n+    def pyodide_test(selenium_coverage, host: str, port: int, https_port: int, prefer_jspi: bool) -> None:  # type: ignore[no-untyped-def]\n         # first with PoolManager\n         import urllib3\n         import urllib3.contrib.emscripten.fetch\n \n-        assert urllib3.contrib.emscripten.fetch.has_jspi() == has_jspi\n+        assert urllib3.contrib.emscripten.fetch.has_jspi() == prefer_jspi\n \n         http = urllib3.PoolManager()\n         resp = http.request(\"GET\", f\"http://{host}:{port}/\")\n@@ -127,13 +127,13 @@ def test_pool_requests(\n         testserver_http.http_host,\n         testserver_http.http_port,\n         testserver_http.https_port,\n-        has_jspi,\n+        prefer_jspi,\n     )\n \n \n # wrong protocol / protocol error etc. should raise an exception of http.client.HTTPException\n def test_wrong_protocol(\n-    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, has_jspi: bool\n+    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo\n ) -> None:\n     @run_in_pyodide  # type: ignore[misc]\n     def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]\n@@ -154,7 +154,7 @@ def test_wrong_protocol(\n \n # wrong protocol / protocol error etc. should raise an exception of http.client.HTTPException\n def test_bad_method(\n-    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, has_jspi: bool\n+    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo\n ) -> None:\n     @run_in_pyodide  # type: ignore[misc]\n     def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]\n@@ -175,7 +175,7 @@ def test_bad_method(\n \n # no connection - should raise\n def test_no_response(\n-    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, has_jspi: bool\n+    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo\n ) -> None:\n     @run_in_pyodide  # type: ignore[misc]\n     def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]\n@@ -193,9 +193,7 @@ def test_no_response(\n     pyodide_test(selenium_coverage, testserver_http.http_host, find_unused_port())\n \n \n-def test_404(\n-    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, has_jspi: bool\n-) -> None:\n+def test_404(selenium_coverage: typing.Any, testserver_http: PyodideServerInfo) -> None:\n     @run_in_pyodide  # type: ignore[misc]\n     def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]\n         from urllib3.connection import HTTPConnection\n@@ -251,10 +249,8 @@ def test_timeout_warning(\n \n @pytest.mark.webworkers\n def test_timeout_in_worker_non_streaming(\n-    selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n     run_from_server: ServerRunnerInfo,\n-    has_jspi: bool,\n ) -> None:\n     worker_code = f\"\"\"\n         from urllib3.exceptions import TimeoutError\n@@ -283,10 +279,8 @@ def test_timeout_in_worker_non_streaming(\n \n @pytest.mark.webworkers\n def test_timeout_in_worker_streaming(\n-    selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n     run_from_server: ServerRunnerInfo,\n-    has_jspi: bool,\n ) -> None:\n     worker_code = f\"\"\"\n         import urllib3.contrib.emscripten.fetch\n@@ -309,7 +303,7 @@ def test_timeout_in_worker_streaming(\n \n \n def test_index_https(\n-    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, has_jspi: bool\n+    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo\n ) -> None:\n     @run_in_pyodide  # type: ignore[misc]\n     def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]\n@@ -415,8 +409,6 @@ def test_streaming_fallback_warning(\n def test_specific_method(\n     selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n-    run_from_server: ServerRunnerInfo,\n-    has_jspi: bool,\n ) -> None:\n     @run_in_pyodide  # type: ignore[misc]\n     def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]\n@@ -437,10 +429,9 @@ def test_specific_method(\n \n @pytest.mark.webworkers\n def test_streaming_download(\n-    selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n     run_from_server: ServerRunnerInfo,\n-    has_jspi: bool,\n+    prefer_jspi: bool,\n ) -> None:\n     # test streaming download, which must be in a webworker\n     # as you can't do it on main thread\n@@ -461,7 +452,7 @@ def test_streaming_download(\n             response = conn.getresponse()\n             assert isinstance(response, BaseHTTPResponse)\n             assert urllib3.contrib.emscripten.fetch._SHOWN_STREAMING_WARNING==False\n-            assert(urllib3.contrib.emscripten.fetch.has_jspi() == {has_jspi})\n+            assert(urllib3.contrib.emscripten.fetch.has_jspi() == {prefer_jspi})\n             data=response.data.decode('utf-8')\n             assert len(data) == 17825792\n \"\"\"\n@@ -470,10 +461,9 @@ def test_streaming_download(\n \n @pytest.mark.webworkers\n def test_streaming_close(\n-    selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n     run_from_server: ServerRunnerInfo,\n-    has_jspi: bool,\n+    prefer_jspi: bool,\n ) -> None:\n     # test streaming download, which must be in a webworker\n     # as you can't do it on main thread\n@@ -497,7 +487,7 @@ def test_streaming_close(\n             assert(body_internal.writable() is False)\n             assert(body_internal.seekable() is False)\n             assert(body_internal.readable() is True)\n-            assert(urllib3.contrib.emscripten.fetch.has_jspi() == {has_jspi})\n+            assert(urllib3.contrib.emscripten.fetch.has_jspi() == {prefer_jspi})\n \n             response.drain_conn()\n             x=response.read()\n@@ -515,10 +505,8 @@ def test_streaming_close(\n \n @pytest.mark.webworkers\n def test_streaming_bad_url(\n-    selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n     run_from_server: ServerRunnerInfo,\n-    has_jspi: bool,\n ) -> None:\n     # this should cause an error\n     # because the protocol is bad\n@@ -542,10 +530,8 @@ def test_streaming_bad_url(\n \n @pytest.mark.webworkers\n def test_streaming_bad_method(\n-    selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n     run_from_server: ServerRunnerInfo,\n-    has_jspi: bool,\n ) -> None:\n     # this should cause an error\n     # because the protocol is bad\n@@ -572,7 +558,6 @@ def test_streaming_bad_method(\n @pytest.mark.webworkers\n @pytest.mark.without_jspi\n def test_streaming_notready_warning(\n-    selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n     run_from_server: ServerRunnerInfo,\n ) -> None:\n@@ -607,7 +592,7 @@ def test_streaming_notready_warning(\n \n \n def test_post_receive_json(\n-    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, has_jspi: bool\n+    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo\n ) -> None:\n     @run_in_pyodide  # type: ignore[misc]\n     def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]\n@@ -680,7 +665,6 @@ def test_streaming_not_ready_in_browser(\n def test_requests_with_micropip(\n     selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n-    run_from_server: ServerRunnerInfo,\n ) -> None:\n     @run_in_pyodide(packages=[\"micropip\"])  # type: ignore[misc]\n     async def test_fn(\n@@ -751,7 +735,6 @@ def test_open_close(\n @pytest.mark.webworkers\n @pytest.mark.without_jspi\n def test_break_worker_streaming(\n-    selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n     run_from_server: ServerRunnerInfo,\n ) -> None:\n@@ -1032,36 +1015,34 @@ def test_insecure_requests_warning(\n \n @pytest.mark.webworkers\n def test_has_jspi_worker(\n-    selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n     run_from_server: ServerRunnerInfo,\n-    has_jspi: bool,\n+    prefer_jspi: bool,\n ) -> None:\n     worker_code = f\"\"\"\n     import urllib3.contrib.emscripten.fetch\n-    assert(urllib3.contrib.emscripten.fetch.has_jspi() == {has_jspi})\n+    assert(urllib3.contrib.emscripten.fetch.has_jspi() == {prefer_jspi})\n     \"\"\"\n \n     run_from_server.run_webworker(worker_code)\n \n \n def test_has_jspi(\n-    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, has_jspi: bool\n+    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, prefer_jspi: bool\n ) -> None:\n     @run_in_pyodide\n-    def pyodide_test(selenium, has_jspi):  # type: ignore[no-untyped-def]\n+    def pyodide_test(selenium, prefer_jspi):  # type: ignore[no-untyped-def]\n         import urllib3.contrib.emscripten.fetch\n \n-        assert urllib3.contrib.emscripten.fetch.has_jspi() == has_jspi\n+        assert urllib3.contrib.emscripten.fetch.has_jspi() == prefer_jspi\n \n-    pyodide_test(selenium_coverage, has_jspi)\n+    pyodide_test(selenium_coverage, prefer_jspi)\n \n \n @pytest.mark.with_jspi\n def test_timeout_jspi(\n     selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n-    run_from_server: ServerRunnerInfo,\n ) -> None:\n     @run_in_pyodide\n     def pyodide_test(selenium, host, port):  # type: ignore[no-untyped-def]\n@@ -1289,3 +1270,23 @@ def test_has_jspi_exception(\n     pyodide_test(\n         selenium_coverage, testserver_http.http_host, testserver_http.http_port\n     )\n+\n+\n+@run_in_pyodide  # type: ignore[misc]\n+def test_pool_no_port(selenium_coverage: typing.Any) -> None:\n+    from unittest.mock import patch\n+\n+    from urllib3 import HTTPConnectionPool\n+    from urllib3.contrib.emscripten.request import EmscriptenRequest\n+    from urllib3.contrib.emscripten.response import EmscriptenResponse\n+\n+    def send_request(request: EmscriptenRequest) -> EmscriptenResponse:\n+        assert request.url == \"http://example.com/\"\n+        return EmscriptenResponse(\n+            status_code=200, headers={}, body=b\"\", request=request\n+        )\n+\n+    with patch(\"urllib3.contrib.emscripten.connection.send_request\", new=send_request):\n+        pool = HTTPConnectionPool(\"example.com\", maxsize=10, block=True)\n+\n+        pool.request(\"GET\", \"/\")\n\ndiff --git a/test/contrib/test_pyopenssl.py b/test/contrib/test_pyopenssl.py\nindex eaca77b..966c4c7 100644\n--- a/test/contrib/test_pyopenssl.py\n+++ b/test/contrib/test_pyopenssl.py\n@@ -7,7 +7,7 @@ import pytest\n \n try:\n     from cryptography import x509\n-    from OpenSSL.crypto import (  # type: ignore[import-untyped]\n+    from OpenSSL.crypto import (  # type: ignore[import-not-found]\n         FILETYPE_PEM,\n         load_certificate,\n     )\n\ndiff --git a/test/contrib/test_socks.py b/test/contrib/test_socks.py\nindex 083854d..c00d51b 100644\n--- a/test/contrib/test_socks.py\n+++ b/test/contrib/test_socks.py\n@@ -9,7 +9,7 @@ from test import SHORT_TIMEOUT\n from unittest.mock import Mock, patch\n \n import pytest\n-import socks as py_socks  # type: ignore[import-not-found]\n+import socks as py_socks  # type: ignore[import-untyped]\n \n from dummyserver.socketserver import DEFAULT_CA, DEFAULT_CERTS\n from dummyserver.testcase import IPV4SocketDummyServerTestCase\n@@ -112,7 +112,7 @@ def _set_up_fake_getaddrinfo(monkeypatch: pytest.MonkeyPatch) -> None:\n             socket.SocketKind,\n             int,\n             str,\n-            tuple[str, int] | tuple[str, int, int, int],\n+            tuple[str, int] | tuple[str, int, int, int] | tuple[int, bytes],\n         ]\n     ]:\n         gai_list = real_getaddrinfo(addr, port, family, socket_type)\n\ndiff --git a/test/test_collections.py b/test/test_collections.py\nindex ae896e2..1492c95 100644\n--- a/test/test_collections.py\n+++ b/test/test_collections.py\n@@ -230,6 +230,10 @@ class TestHTTPHeaderDict:\n         assert \"cookie\" not in d\n         assert \"COOKIE\" not in d\n \n+    def test_delitem_with_bytes_key(self, d: HTTPHeaderDict) -> None:\n+        del d[b\"cookie\"]  # type: ignore[arg-type]\n+        assert \"cookie\" not in d\n+\n     def test_add_well_known_multiheader(self, d: HTTPHeaderDict) -> None:\n         d.add(\"COOKIE\", \"asdf\")\n         assert d.getlist(\"cookie\") == [\"foo\", \"bar\", \"asdf\"]\n@@ -318,6 +322,20 @@ class TestHTTPHeaderDict:\n         d.add(\"b\", \"asdf\")\n         assert d.getlist(\"b\") == [\"asdf\"]\n \n+    def test_getlist_with_bytes_key(self, d: HTTPHeaderDict) -> None:\n+        assert d.getlist(b\"cookie\") == [\"foo\", \"bar\"]  # type: ignore[call-overload]\n+\n+    def test_getitem_with_bytes(self, d: HTTPHeaderDict) -> None:\n+        d[\"Content-Type\"] = \"application/json\"\n+        d.add(\"Content-Type\", \"charset=utf-8\")\n+        result = d[b\"Content-Type\"]  # type: ignore[index]\n+        assert result == \"application/json, charset=utf-8\"\n+\n+    def test_contains_with_bytes(self, d: HTTPHeaderDict) -> None:\n+        d[\"Content-Type\"] = \"application/json\"\n+        assert b\"Content-Type\" in d  # type: ignore[comparison-overlap]\n+        assert b\"X-Not-There\" not in d  # type: ignore[comparison-overlap]\n+\n     def test_getlist_after_copy(self, d: HTTPHeaderDict) -> None:\n         assert d.getlist(\"cookie\") == HTTPHeaderDict(d).getlist(\"cookie\")\n \n\ndiff --git a/test/test_connection.py b/test/test_connection.py\nindex a4bd873..c8c423a 100644\n--- a/test/test_connection.py\n+++ b/test/test_connection.py\n@@ -23,7 +23,10 @@ from urllib3.util.request import SKIP_HEADER\n from urllib3.util.ssl_match_hostname import (\n     CertificateError as ImplementationCertificateError,\n )\n-from urllib3.util.ssl_match_hostname import _dnsname_match, match_hostname\n+from urllib3.util.ssl_match_hostname import (\n+    _dnsname_match,\n+    match_hostname,\n+)\n \n if typing.TYPE_CHECKING:\n     from urllib3.util.ssl_ import _TYPE_PEER_CERT_RET_DICT\n\ndiff --git a/test/test_fields.py b/test/test_fields.py\nindex faf74a3..8d36b14 100644\n--- a/test/test_fields.py\n+++ b/test/test_fields.py\n@@ -93,7 +93,7 @@ class TestRequestField:\n             (\"näme\", \"näme\"),\n             (b\"n\\xc3\\xa4me\", \"näme\"),\n             (\"ski ⛷.txt\", \"ski ⛷.txt\"),\n-            (\"control \\x1A\\x1B\\x1C\", \"control \\x1A\\x1B\\x1C\"),\n+            (\"control \\x1a\\x1b\\x1c\", \"control \\x1a\\x1b\\x1c\"),\n             (\"backslash \\\\\", \"backslash \\\\\"),\n             (\"quotes '\\\"\", \"quotes '%22\"),\n             (\"newline \\n\\r\", \"newline %0A%0D\"),\n\ndiff --git a/test/test_response.py b/test/test_response.py\nindex 9552689..d824ae7 100644\n--- a/test/test_response.py\n+++ b/test/test_response.py\n@@ -1,9 +1,11 @@\n from __future__ import annotations\n \n import contextlib\n+import gzip\n import http.client as httplib\n import socket\n import ssl\n+import sys\n import typing\n import zlib\n from base64 import b64decode\n@@ -14,7 +16,6 @@ from unittest import mock\n \n import pytest\n \n-from urllib3 import HTTPHeaderDict\n from urllib3.exceptions import (\n     BodyNotHttplibCompatible,\n     DecodeError,\n@@ -36,11 +37,31 @@ from urllib3.util.retry import RequestHistory, Retry\n \n \n def zstd_compress(data: bytes) -> bytes:\n+    if sys.version_info >= (3, 14):\n+        from compression import zstd\n+    else:\n+        from backports import zstd\n+    return zstd.compress(data)\n+\n+\n+def deflate2_compress(data: bytes) -> bytes:\n+    compressor = zlib.compressobj(6, zlib.DEFLATED, -zlib.MAX_WBITS)\n+    return compressor.compress(data) + compressor.flush()\n+\n+\n+if brotli:\n     try:\n-        from compression import zstd  # type: ignore[import-not-found] # noqa: F401\n-    except ImportError:\n-        import zstandard as zstd\n-    return zstd.compress(data)  # type: ignore[no-any-return]\n+        brotli.Decompressor().process(b\"\", output_buffer_limit=1024)\n+        _brotli_gte_1_2_0_available = True\n+    except (AttributeError, TypeError):\n+        _brotli_gte_1_2_0_available = False\n+else:\n+    _brotli_gte_1_2_0_available = False\n+try:\n+    zstd_compress(b\"\")\n+    _zstd_available = True\n+except ModuleNotFoundError:\n+    _zstd_available = False\n \n \n class TestBytesQueueBuffer:\n@@ -108,7 +129,7 @@ class TestBytesQueueBuffer:\n         \"12.5 MB\", current_thread_only=True\n     )  # assert that we're not doubling memory usagelimit_mem\n     def test_memory_usage(\n-        self, get_func: typing.Callable[[BytesQueueBuffer], str]\n+        self, get_func: typing.Callable[[BytesQueueBuffer], bytes]\n     ) -> None:\n         # Allocate 10 1MiB chunks\n         buffer = BytesQueueBuffer()\n@@ -116,14 +137,45 @@ class TestBytesQueueBuffer:\n             # This allocates 2MiB, putting the max at around 12MiB. Not sure why.\n             buffer.put(bytes(2**20))\n \n-        assert len(get_func(buffer)) == 10 * 2**20\n+        result = get_func(buffer)\n+        assert type(result) is bytes\n+        assert len(result) == 10 * 2**20\n \n+    @pytest.mark.parametrize(\n+        \"get_func\",\n+        (lambda b: b.get(len(b)), lambda b: b.get_all()),\n+        ids=(\"get\", \"get_all\"),\n+    )\n     @pytest.mark.limit_memory(\"10.01 MB\", current_thread_only=True)\n-    def test_get_all_memory_usage_single_chunk(self) -> None:\n+    def test_memory_usage_single_chunk(\n+        self, get_func: typing.Callable[[BytesQueueBuffer], bytes]\n+    ) -> None:\n+        buffer = BytesQueueBuffer()\n+        chunk = bytes(10 * 2**20)  # 10 MiB\n+        buffer.put(chunk)\n+        assert get_func(buffer) is chunk\n+\n+    @pytest.mark.parametrize(\n+        \"finish_with_get_all\",\n+        (True, False),\n+        ids=(\"finish_with_get_all\", \"finish_with_get\"),\n+    )\n+    @pytest.mark.limit_memory(\"11.01 MB\", current_thread_only=True)\n+    def test_memory_usage_splitting_chunk(self, finish_with_get_all: bool) -> None:\n+        # Allocate a single 10MiB chunk, then read it in two parts.\n+        # Verifies that splitting a chunk doesn't cause additional memory allocation.\n         buffer = BytesQueueBuffer()\n         chunk = bytes(10 * 2**20)  # 10 MiB\n         buffer.put(chunk)\n-        assert buffer.get_all() is chunk\n+        for i in range(10):\n+            if finish_with_get_all and i == 9:\n+                result = buffer.get_all()\n+            else:\n+                result = buffer.get(2**20)\n+            assert type(result) is bytes\n+            assert len(result) == 2**20\n+            del result\n+        assert len(buffer) == 0\n \n \n # A known random (i.e, not-too-compressible) payload generated with:\n@@ -151,26 +203,6 @@ def sock() -> typing.Generator[socket.socket]:\n     s.close()\n \n \n-class TestLegacyResponse:\n-    def test_getheaders(self) -> None:\n-        headers = {\"host\": \"example.com\"}\n-        r = HTTPResponse(headers=headers)\n-        with pytest.warns(\n-            DeprecationWarning,\n-            match=r\"HTTPResponse.getheaders\\(\\) is deprecated\",\n-        ):\n-            assert r.getheaders() == HTTPHeaderDict(headers)\n-\n-    def test_getheader(self) -> None:\n-        headers = {\"host\": \"example.com\"}\n-        r = HTTPResponse(headers=headers)\n-        with pytest.warns(\n-            DeprecationWarning,\n-            match=r\"HTTPResponse.getheader\\(\\) is deprecated\",\n-        ):\n-            assert r.getheader(\"host\") == \"example.com\"\n-\n-\n class TestResponse:\n     def test_cache_content(self) -> None:\n         r = HTTPResponse(b\"foo\")\n@@ -426,7 +458,26 @@ class TestResponse:\n         assert r.data == b\"foo\"\n \n     @onlyZstd()\n-    def test_decode_multiframe_zstd(self) -> None:\n+    @pytest.mark.parametrize(\n+        \"read_amt\",\n+        (\n+            # Read all data at once.\n+            None,\n+            # Read one byte at a time, data of frames will be returned\n+            # separately.\n+            1,\n+            # Read two bytes at a time, the second read should return\n+            # data from both frames.\n+            2,\n+            # Read three bytes at a time, the whole frames will be\n+            # returned separately in two calls.\n+            3,\n+            # Read four bytes at a time, the first read should return\n+            # data from the first frame and a part of the second frame.\n+            4,\n+        ),\n+    )\n+    def test_decode_multiframe_zstd(self, read_amt: int | None) -> None:\n         data = (\n             # Zstandard frame\n             zstd_compress(b\"foo\")\n@@ -441,8 +492,57 @@ class TestResponse:\n         )\n \n         fp = BytesIO(data)\n-        r = HTTPResponse(fp, headers={\"content-encoding\": \"zstd\"})\n-        assert r.data == b\"foobar\"\n+        result = bytearray()\n+        r = HTTPResponse(\n+            fp, headers={\"content-encoding\": \"zstd\"}, preload_content=False\n+        )\n+        total_length = 6\n+        while len(result) < total_length:\n+            chunk = r.read(read_amt, decode_content=True)\n+            if read_amt is None:\n+                assert len(chunk) == total_length\n+            else:\n+                assert len(chunk) == min(read_amt, total_length - len(result))\n+            result += chunk\n+        assert bytes(result) == b\"foobar\"\n+\n+    @onlyZstd()\n+    def test_decode_multiframe_zstd_with_max_length_close_to_compressed_data_size(\n+        self,\n+    ) -> None:\n+        \"\"\"\n+        Test decoding when the first read from the socket returns all\n+        the compressed frames, but then it has to be decompressed in a\n+        couple of read calls.\n+        \"\"\"\n+        data = (\n+            # Zstandard frame\n+            zstd_compress(b\"x\" * 1024)\n+            # skippable frame (must be ignored)\n+            + bytes.fromhex(\n+                \"50 2A 4D 18\"  # Magic_Number (little-endian)\n+                \"07 00 00 00\"  # Frame_Size (little-endian)\n+                \"00 00 00 00 00 00 00\"  # User_Data\n+            )\n+            # Zstandard frame\n+            + zstd_compress(b\"y\" * 1024)\n+        )\n+\n+        fp = BytesIO(data)\n+        r = HTTPResponse(\n+            fp, headers={\"content-encoding\": \"zstd\"}, preload_content=False\n+        )\n+        # Read the whole first frame.\n+        assert r.read(1024) == b\"x\" * 1024\n+        assert len(r._decoded_buffer) == 0\n+        # Read the whole second frame in two reads.\n+        assert r.read(512) == b\"y\" * 512\n+        assert len(r._decoded_buffer) == 0\n+        assert r.read(512) == b\"y\" * 512\n+        assert len(r._decoded_buffer) == 0\n+        # Ensure no more data is left.\n+        assert r.read() == b\"\"\n+        assert len(r._decoded_buffer) == 0\n \n     @onlyZstd()\n     def test_chunked_decoding_zstd(self) -> None:\n@@ -535,6 +635,169 @@ class TestResponse:\n             decoded_data += part\n         assert decoded_data == data\n \n+    _test_compressor_params: list[\n+        tuple[str, tuple[str, typing.Callable[[bytes], bytes]] | None]\n+    ] = [\n+        (\"deflate1\", (\"deflate\", zlib.compress)),\n+        (\"deflate2\", (\"deflate\", deflate2_compress)),\n+        (\"gzip\", (\"gzip\", gzip.compress)),\n+    ]\n+    if _brotli_gte_1_2_0_available:\n+        _test_compressor_params.append((\"brotli\", (\"br\", brotli.compress)))\n+    else:\n+        _test_compressor_params.append((\"brotli\", None))\n+    if _zstd_available:\n+        _test_compressor_params.append((\"zstd\", (\"zstd\", zstd_compress)))\n+    else:\n+        _test_compressor_params.append((\"zstd\", None))\n+\n+    @pytest.mark.parametrize(\"read_method\", (\"read\", \"read1\"))\n+    @pytest.mark.parametrize(\n+        \"data\",\n+        [d[1] for d in _test_compressor_params],\n+        ids=[d[0] for d in _test_compressor_params],\n+    )\n+    def test_read_with_all_data_already_in_decompressor(\n+        self,\n+        request: pytest.FixtureRequest,\n+        read_method: str,\n+        data: tuple[str, typing.Callable[[bytes], bytes]] | None,\n+    ) -> None:\n+        if data is None:\n+            pytest.skip(f\"Proper {request.node.callspec.id} decoder is not available\")\n+        original_data = b\"bar\" * 1000\n+        name, compress_func = data\n+        compressed_data = compress_func(original_data)\n+        fp = mock.Mock(read=mock.Mock(return_value=b\"\"))\n+        r = HTTPResponse(fp, headers={\"content-encoding\": name}, preload_content=False)\n+        # Put all data in the decompressor's buffer.\n+        r._init_decoder()\n+        assert r._decoder is not None  # for mypy\n+        decoded = r._decoder.decompress(compressed_data, max_length=0)\n+        if name == \"br\":\n+            # It's known that some Brotli libraries do not respect\n+            # `max_length`.\n+            r._decoded_buffer.put(decoded)\n+        else:\n+            assert decoded == b\"\"\n+        # Read the data via `HTTPResponse`.\n+        read = getattr(r, read_method)\n+        assert read(0) == b\"\"\n+        assert read(2500) == original_data[:2500]\n+        assert read(500) == original_data[2500:]\n+        assert read(0) == b\"\"\n+        assert read() == b\"\"\n+\n+    @pytest.mark.parametrize(\n+        \"delta\",\n+        (\n+            0,  # First read from socket returns all compressed data.\n+            -1,  # First read from socket returns all but one byte of compressed data.\n+        ),\n+    )\n+    @pytest.mark.parametrize(\"read_method\", (\"read\", \"read1\"))\n+    @pytest.mark.parametrize(\n+        \"data\",\n+        [d[1] for d in _test_compressor_params],\n+        ids=[d[0] for d in _test_compressor_params],\n+    )\n+    def test_decode_with_max_length_close_to_compressed_data_size(\n+        self,\n+        request: pytest.FixtureRequest,\n+        delta: int,\n+        read_method: str,\n+        data: tuple[str, typing.Callable[[bytes], bytes]] | None,\n+    ) -> None:\n+        \"\"\"\n+        Test decoding when the first read from the socket returns all or\n+        almost all the compressed data, but then it has to be\n+        decompressed in a couple of read calls.\n+        \"\"\"\n+        if data is None:\n+            pytest.skip(f\"Proper {request.node.callspec.id} decoder is not available\")\n+\n+        original_data = b\"foo\" * 1000\n+        name, compress_func = data\n+        compressed_data = compress_func(original_data)\n+        fp = BytesIO(compressed_data)\n+        r = HTTPResponse(fp, headers={\"content-encoding\": name}, preload_content=False)\n+        initial_limit = len(compressed_data) + delta\n+        read = getattr(r, read_method)\n+        initial_chunk = read(amt=initial_limit, decode_content=True)\n+        assert len(initial_chunk) == initial_limit\n+        assert (\n+            len(read(amt=len(original_data), decode_content=True))\n+            == len(original_data) - initial_limit\n+        )\n+\n+    # Prepare 50 MB of compressed data outside of the test measuring\n+    # memory usage.\n+    _test_memory_usage_decode_with_max_length_params: list[\n+        tuple[str, tuple[str, bytes] | None]\n+    ] = [\n+        (\n+            params[0],\n+            (params[1][0], params[1][1](b\"A\" * (50 * 2**20))) if params[1] else None,\n+        )\n+        for params in _test_compressor_params\n+    ]\n+\n+    @pytest.mark.parametrize(\n+        \"data\",\n+        [d[1] for d in _test_memory_usage_decode_with_max_length_params],\n+        ids=[d[0] for d in _test_memory_usage_decode_with_max_length_params],\n+    )\n+    @pytest.mark.parametrize(\"read_method\", (\"read\", \"read1\", \"read_chunked\", \"stream\"))\n+    # Decoders consume different amounts of memory during decompression.\n+    # We set the 10 MB limit to ensure that the whole decompressed data\n+    # is not stored unnecessarily.\n+    #\n+    # FYI, the following consumption was observed for the test with\n+    # `read` on CPython 3.14.0:\n+    #   - deflate: 2.3 MiB\n+    #   - deflate2: 2.1 MiB\n+    #   - gzip: 2.1 MiB\n+    #   - brotli:\n+    #     - brotli v1.2.0: 9 MiB\n+    #     - brotlicffi v1.2.0.0: 6 MiB\n+    #     - brotlipy v0.7.0: 105.8 MiB\n+    #   - zstd: 4.5 MiB\n+    @pytest.mark.limit_memory(\"10 MB\", current_thread_only=True)\n+    def test_memory_usage_decode_with_max_length(\n+        self,\n+        request: pytest.FixtureRequest,\n+        read_method: str,\n+        data: tuple[str, bytes] | None,\n+    ) -> None:\n+        if data is None:\n+            pytest.skip(f\"Proper {request.node.callspec.id} decoder is not available\")\n+\n+        name, compressed_data = data\n+        limit = 1024 * 1024  # 1 MiB\n+        if read_method in (\"read_chunked\", \"stream\"):\n+            httplib_r = httplib.HTTPResponse(MockSock)  # type: ignore[arg-type]\n+            httplib_r.fp = MockChunkedEncodingResponse([compressed_data])  # type: ignore[assignment]\n+            r = HTTPResponse(\n+                httplib_r,\n+                preload_content=False,\n+                headers={\"transfer-encoding\": \"chunked\", \"content-encoding\": name},\n+            )\n+            next(getattr(r, read_method)(amt=limit, decode_content=True))\n+        else:\n+            fp = BytesIO(compressed_data)\n+            r = HTTPResponse(\n+                fp, headers={\"content-encoding\": name}, preload_content=False\n+            )\n+            getattr(r, read_method)(amt=limit, decode_content=True)\n+\n+        # Check that the internal decoded buffer is empty unless brotli\n+        # is used.\n+        # Google's brotli library does not fully respect the output\n+        # buffer limit: https://github.com/google/brotli/issues/1396\n+        # And unmaintained brotlipy cannot limit the output buffer size.\n+        if name != \"br\" or brotli.__name__ == \"brotlicffi\":\n+            assert len(r._decoded_buffer) == 0\n+\n     def test_multi_decoding_deflate_deflate(self) -> None:\n         data = zlib.compress(zlib.compress(b\"foo\"))\n \n@@ -584,6 +847,16 @@ class TestResponse:\n         assert r.read(9 * 37) == b\"foobarbaz\" * 37\n         assert r.read() == b\"\"\n \n+    def test_read_multi_decoding_too_many_links(self) -> None:\n+        fp = BytesIO(b\"foo\")\n+        with pytest.raises(\n+            DecodeError, match=\"Too many content encodings in the chain: 6 > 5\"\n+        ):\n+            HTTPResponse(\n+                fp,\n+                headers={\"content-encoding\": \"gzip, deflate, br, zstd, gzip, deflate\"},\n+            )\n+\n     def test_body_blob(self) -> None:\n         resp = HTTPResponse(b\"foo\")\n         assert resp.data == b\"foo\"\n@@ -761,7 +1034,7 @@ class TestResponse:\n     def test_io_bufferedreader(self) -> None:\n         fp = BytesIO(b\"foo\")\n         resp = HTTPResponse(fp, preload_content=False)\n-        br = BufferedReader(resp)  # type: ignore[arg-type]\n+        br = BufferedReader(resp)  # type: ignore[type-var]\n \n         assert br.read() == b\"foo\"\n \n@@ -773,12 +1046,12 @@ class TestResponse:\n         fp = BytesIO(b\"hello\\nworld\")\n         resp = HTTPResponse(fp, preload_content=False)\n         with pytest.raises(ValueError, match=\"readline of closed file\"):\n-            list(BufferedReader(resp))  # type: ignore[arg-type]\n+            list(BufferedReader(resp))  # type: ignore[type-var]\n \n         b = b\"fooandahalf\"\n         fp = BytesIO(b)\n         resp = HTTPResponse(fp, preload_content=False)\n-        br = BufferedReader(resp, 5)  # type: ignore[arg-type]\n+        br = BufferedReader(resp, 5)  # type: ignore[type-var]\n \n         br.read(1)  # sets up the buffer, reading 5\n         assert len(fp.read()) == (len(b) - 5)\n@@ -791,7 +1064,7 @@ class TestResponse:\n     def test_io_not_autoclose_bufferedreader(self) -> None:\n         fp = BytesIO(b\"hello\\nworld\")\n         resp = HTTPResponse(fp, preload_content=False, auto_close=False)\n-        reader = BufferedReader(resp)  # type: ignore[arg-type]\n+        reader = BufferedReader(resp)  # type: ignore[type-var]\n         assert list(reader) == [b\"hello\\n\", b\"world\"]\n \n         assert not reader.closed\n\ndiff --git a/test/test_util.py b/test/test_util.py\nindex 49c1b27..0084df4 100644\n--- a/test/test_util.py\n+++ b/test/test_util.py\n@@ -162,11 +162,11 @@ class TestUtil:\n             \"http://google.com:65536\",\n             \"http://google.com:\\xb2\\xb2\",  # \\xb2 = ^2\n             # Invalid IDNA labels\n-            \"http://\\uD7FF.com\",\n+            \"http://\\ud7ff.com\",\n             \"http://❤️\",\n             # Unicode surrogates\n-            \"http://\\uD800.com\",\n-            \"http://\\uDC00.com\",\n+            \"http://\\ud800.com\",\n+            \"http://\\udc00.com\",\n         ],\n     )\n     def test_invalid_url(self, url: str) -> None:\n@@ -217,7 +217,7 @@ class TestUtil:\n         actual_normalized_url = parse_url(url).url\n         assert actual_normalized_url == expected_normalized_url\n \n-    @pytest.mark.parametrize(\"char\", [chr(i) for i in range(0x00, 0x21)] + [\"\\x7F\"])\n+    @pytest.mark.parametrize(\"char\", [chr(i) for i in range(0x00, 0x21)] + [\"\\x7f\"])\n     def test_control_characters_are_percent_encoded(self, char: str) -> None:\n         percent_char = \"%\" + (hex(ord(char))[2:].zfill(2).upper())\n         url = parse_url(\n@@ -295,13 +295,13 @@ class TestUtil:\n             Url(\"http\", auth=\"user%22:quoted\", host=\"example.com\", path=\"/\"),\n         ),\n         # Unicode Surrogates\n-        (\"http://google.com/\\uD800\", Url(\"http\", host=\"google.com\", path=\"%ED%A0%80\")),\n+        (\"http://google.com/\\ud800\", Url(\"http\", host=\"google.com\", path=\"%ED%A0%80\")),\n         (\n-            \"http://google.com?q=\\uDC00\",\n+            \"http://google.com?q=\\udc00\",\n             Url(\"http\", host=\"google.com\", path=\"\", query=\"q=%ED%B0%80\"),\n         ),\n         (\n-            \"http://google.com#\\uDC00\",\n+            \"http://google.com#\\udc00\",\n             Url(\"http\", host=\"google.com\", path=\"\", fragment=\"%ED%B0%80\"),\n         ),\n     ]\n@@ -1121,6 +1121,6 @@ class TestUtilWithoutIdna:\n         module_stash.pop()\n \n     def test_parse_url_without_idna(self) -> None:\n-        url = \"http://\\uD7FF.com\"\n+        url = \"http://\\ud7ff.com\"\n         with pytest.raises(LocationParseError, match=f\"Failed to parse: {url}\"):\n             parse_url(url)\n\ndiff --git a/test/with_dummyserver/test_chunked_transfer.py b/test/with_dummyserver/test_chunked_transfer.py\nindex 13dd6fd..750c172 100644\n--- a/test/with_dummyserver/test_chunked_transfer.py\n+++ b/test/with_dummyserver/test_chunked_transfer.py\n@@ -98,7 +98,7 @@ class TestChunkedTransfer(SocketDummyServerTestCase):\n \n     def test_unicode_body(self) -> None:\n         self._test_body(\n-            \"thisshouldbeonechunk\\r\\näöüß\\xFF\",\n+            \"thisshouldbeonechunk\\r\\näöüß\\xff\",\n             expected_data=b\"thisshouldbeonechunk\\r\\n\\xc3\\xa4\\xc3\\xb6\\xc3\\xbc\\xc3\\x9f\\xc3\\xbf\",\n         )\n \n@@ -114,7 +114,7 @@ class TestChunkedTransfer(SocketDummyServerTestCase):\n \n     def test_unicode_body_fileio(self) -> None:\n         self._test_body(\n-            io.StringIO(\"thisshouldbeonechunk\\r\\näöüß\\xFF\"),\n+            io.StringIO(\"thisshouldbeonechunk\\r\\näöüß\\xff\"),\n             expected_data=b\"thisshouldbeonechunk\\r\\n\\xc3\\xa4\\xc3\\xb6\\xc3\\xbc\\xc3\\x9f\\xc3\\xbf\",\n         )\n \n@@ -133,7 +133,7 @@ class TestChunkedTransfer(SocketDummyServerTestCase):\n \n     def test_unicode_body_iterable(self) -> None:\n         def send_body() -> typing.Iterable[str]:\n-            yield \"thisshouldbeonechunk\\r\\näöüß\\xFF\"\n+            yield \"thisshouldbeonechunk\\r\\näöüß\\xff\"\n \n         self._test_body(\n             send_body(),\n\ndiff --git a/test/with_dummyserver/test_https.py b/test/with_dummyserver/test_https.py\nindex 95d8970..b1e0406 100644\n--- a/test/with_dummyserver/test_https.py\n+++ b/test/with_dummyserver/test_https.py\n@@ -6,6 +6,7 @@ import datetime\n import os.path\n import shutil\n import ssl\n+import sys\n import tempfile\n import time\n import typing\n@@ -912,14 +913,25 @@ class BaseTestHTTPS(HTTPSHypercornDummyServerTestCase):\n                 finally:\n                     conn.close()\n \n+    @pytest.mark.parametrize(\"use_env_var_expansion\", [True, False])\n     def test_sslkeylogfile(\n-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch\n+        self,\n+        tmp_path: Path,\n+        monkeypatch: pytest.MonkeyPatch,\n+        use_env_var_expansion: bool,\n     ) -> None:\n         if not hasattr(util.SSLContext, \"keylog_filename\"):\n             pytest.skip(\"requires OpenSSL 1.1.1+\")\n \n         keylog_file = tmp_path / \"keylogfile.txt\"\n-        monkeypatch.setenv(\"SSLKEYLOGFILE\", str(keylog_file))\n+        if use_env_var_expansion:\n+            monkeypatch.setenv(\"FILEPATH\", str(keylog_file))\n+            if sys.platform == \"win32\":\n+                monkeypatch.setenv(\"SSLKEYLOGFILE\", \"%FILEPATH%\")\n+            else:\n+                monkeypatch.setenv(\"SSLKEYLOGFILE\", \"${FILEPATH}\")\n+        else:\n+            monkeypatch.setenv(\"SSLKEYLOGFILE\", str(keylog_file))\n \n         with HTTPSConnectionPool(\n             self.host,\n\ndiff --git a/test/with_dummyserver/test_poolmanager.py b/test/with_dummyserver/test_poolmanager.py\nindex 7f163ab..8b9ae65 100644\n--- a/test/with_dummyserver/test_poolmanager.py\n+++ b/test/with_dummyserver/test_poolmanager.py\n@@ -26,8 +26,12 @@ class TestPoolManager(HypercornDummyServerTestCase):\n         cls.base_url = f\"http://{cls.host}:{cls.port}\"\n         cls.base_url_alt = f\"http://{cls.host_alt}:{cls.port}\"\n \n-    def test_redirect(self) -> None:\n-        with PoolManager() as http:\n+    @pytest.mark.parametrize(\n+        \"pool_manager_kwargs\",\n+        ({}, {\"retries\": None}, {\"retries\": 1}, {\"retries\": Retry(1)}),\n+    )\n+    def test_redirect(self, pool_manager_kwargs: dict[str, typing.Any]) -> None:\n+        with PoolManager(**pool_manager_kwargs) as http:\n             r = http.request(\n                 \"GET\",\n                 f\"{self.base_url}/redirect\",\n@@ -46,8 +50,12 @@ class TestPoolManager(HypercornDummyServerTestCase):\n             assert r.status == 200\n             assert r.data == b\"Dummy server!\"\n \n-    def test_redirect_twice(self) -> None:\n-        with PoolManager() as http:\n+    @pytest.mark.parametrize(\n+        \"pool_manager_kwargs\",\n+        ({}, {\"retries\": None}, {\"retries\": 2}, {\"retries\": Retry(2)}),\n+    )\n+    def test_redirect_twice(self, pool_manager_kwargs: dict[str, typing.Any]) -> None:\n+        with PoolManager(**pool_manager_kwargs) as http:\n             r = http.request(\n                 \"GET\",\n                 f\"{self.base_url}/redirect\",\n\ndiff --git a/test/with_dummyserver/test_socketlevel.py b/test/with_dummyserver/test_socketlevel.py\nindex 2968669..016484d 100644\n--- a/test/with_dummyserver/test_socketlevel.py\n+++ b/test/with_dummyserver/test_socketlevel.py\n@@ -2041,7 +2041,7 @@ class TestHeaders(SocketDummyServerTestCase):\n         ]\n \n         def filter_non_x_headers(\n-            d: typing.OrderedDict[str, str]\n+            d: typing.OrderedDict[str, str],\n         ) -> list[tuple[str, str]]:\n             return [(k, v) for (k, v) in d.items() if k.startswith(\"X-Header-\")]\n \n",
+  "structured_diff": {
+    "test/__init__.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -26,18 +26,12 @@",
+          "snippet": " except ImportError:\n     brotli = None\n \n try:\n-    # Python 3.14\n-    from compression import (  # type: ignore[import-not-found] # noqa: F401\n-        zstd as _unused_module_zstd,\n-    )\n-except ImportError:\n-    # Python 3.13 and earlier require the 'zstandard' module.\n-    try:\n-        import zstandard as _unused_module_zstd  # noqa: F401\n-    except ImportError:\n-        HAS_ZSTD = False\n+    if sys.version_info >= (3, 14):\n+        from compression import zstd as _unused_module_zstd  # noqa: F401\n     else:\n-        HAS_ZSTD = True\n+        from backports import zstd as _unused_module_zstd  # noqa: F401\n+except ImportError:\n+    HAS_ZSTD = False\n else:\n     HAS_ZSTD = True\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "test/__init__.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -137,14 +131,14 @@",
+          "snippet": " def notBrotli() -> typing.Callable[[_TestFuncT], _TestFuncT]:\n def onlyZstd() -> typing.Callable[[_TestFuncT], _TestFuncT]:\n     return pytest.mark.skipif(\n         not HAS_ZSTD,\n-        reason=\"only run if a python-zstandard library is installed or Python 3.14 and later\",\n+        reason=\"only run if backports.zstd library is installed or Python 3.14 and later\",\n     )\n \n \n def notZstd() -> typing.Callable[[_TestFuncT], _TestFuncT]:\n     return pytest.mark.skipif(\n         HAS_ZSTD,\n-        reason=\"only run if a python-zstandard library is not installed or Python 3.13 and earlier\",\n+        reason=\"only run if backports.zstd library is not installed and Python 3.13 and earlier\",\n     )\n \n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/__init__.py::onlyZstd"
+            },
+            {
+              "kind": "function",
+              "node": "test/__init__.py::notZstd"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -188,7 +182,7 @@",
+          "snippet": " def requires_network() -> typing.Callable[[_TestFuncT], _TestFuncT]:\n         return typing.cast(_TestFuncT, wrapper)\n \n     def _decorator_requires_internet(\n-        decorator: typing.Callable[[_TestFuncT], _TestFuncT]\n+        decorator: typing.Callable[[_TestFuncT], _TestFuncT],\n     ) -> typing.Callable[[_TestFuncT], _TestFuncT]:\n         \"\"\"Mark a decorator with the \"requires_internet\" mark\"\"\"\n \n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/__init__.py::_decorator_requires_internet"
+            }
+          ]
+        }
+      ]
+    },
+    "test/contrib/emscripten/conftest.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -57,19 +57,75 @@",
+          "snippet": " class PyodideServerInfo:\n     pyodide_dist_dir: Path\n \n \n+def _get_coverage_code() -> tuple[str, str]:\n+    begin = textwrap.dedent(\n+        \"\"\"\n+        import coverage\n+\n+        _coverage = coverage.Coverage(source_pkgs=[\"urllib3\"])\n+        _coverage.start()\n+        \"\"\"\n+    )\n+    end = textwrap.dedent(\n+        \"\"\"\n+        _coverage.stop()\n+        _coverage.save()\n+\n+        _coverage_datafile = open(\".coverage\", \"rb\")\n+        _coverage_outdata = _coverage_datafile.read()\n+        _coverage_datafile.close()\n+\n+        # avoid polluting main namespace too much\n+        import js as _coverage_js\n+        # convert to js Array (as default conversion is TypedArray which does\n+        # bad things in firefox)\n+        _coverage_js.Array.from_(_coverage_outdata)\n+        \"\"\"\n+    )\n+    return begin, end\n+\n+\n+def _get_jspi_monkeypatch_code(runtime: str, prefer_jspi: bool) -> tuple[str, str]:\n+    \"\"\"\n+    Return code to make Pyodide think JSPI is disabled in Chrome when a\n+    test needs this to check some code paths.\n+    \"\"\"\n+    if runtime != \"chrome\" or prefer_jspi:\n+        return \"\", \"\"\n+    monkeypatch_code = textwrap.dedent(\n+        \"\"\"\n+        import pyodide.ffi\n+\n+        original_can_run_sync = pyodide.ffi.can_run_sync\n+        if pyodide.ffi.can_run_sync():\n+            pyodide.ffi.can_run_sync = lambda: False\n+        \"\"\"\n+    )\n+    unmonkeypatch_code = \"pyodide.ffi.can_run_sync = original_can_run_sync\"\n+    return monkeypatch_code, unmonkeypatch_code\n+\n+\n @pytest.fixture()\n def selenium_with_jspi_if_possible(\n-    request: pytest.FixtureRequest, runtime: str, has_jspi: bool\n+    request: pytest.FixtureRequest, runtime: str, prefer_jspi: bool\n ) -> Generator[Any]:\n-    if runtime.startswith(\"firefox\") or not has_jspi:\n-        fixture_name = \"selenium\"\n-        with_jspi = False\n-    else:\n+    if runtime == \"node\" and prefer_jspi:\n         fixture_name = \"selenium_jspi\"\n-        with_jspi = True\n+    else:\n+        fixture_name = \"selenium\"\n     selenium_obj = request.getfixturevalue(fixture_name)\n-    selenium_obj.with_jspi = with_jspi\n-    yield selenium_obj\n+\n+    jspi_monkeypatch_code, jspi_unmonkeypatch_code = _get_jspi_monkeypatch_code(\n+        runtime, prefer_jspi\n+    )\n+    if jspi_monkeypatch_code:\n+        selenium_obj.run_async(jspi_monkeypatch_code)\n+\n+    try:\n+        yield selenium_obj\n+    finally:\n+        if jspi_unmonkeypatch_code:\n+            selenium_obj.run_async(jspi_unmonkeypatch_code)\n \n \n @pytest.fixture()",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/conftest.py::_get_coverage_code"
+            },
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/conftest.py::_get_jspi_monkeypatch_code"
+            },
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/conftest.py::selenium_with_jspi_if_possible"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -84,29 +140,8 @@",
+          "snippet": " def selenium_coverage(\n         result = self.run_js(\n             f'await pyodide.loadPackage(\"http://{testserver_http.http_host}:{testserver_http.http_port}/dist/urllib3.whl\")'\n         )\n-        if not self.with_jspi:\n-            # force Chrome to execute the current test without JSPI\n-            # even though it is always enabled in\n-            # chrome >= 137. We do this by monkeypatching\n-            # pyodide.ffi.can_run_sync\n-            self.run_async(\n-                \"\"\"\n-                import pyodide.ffi\n-                if pyodide.ffi.can_run_sync():\n-                    pyodide.ffi.can_run_sync = lambda: False\n-                \"\"\"\n-            )\n-\n         print(\"Installed package:\", result)\n-        self.run_js(\n-            \"\"\"\n-            await pyodide.loadPackage(\"coverage\")\n-            await pyodide.runPythonAsync(`import coverage\n-_coverage= coverage.Coverage(source_pkgs=['urllib3'])\n-_coverage.start()\n-        `\n-        )\"\"\"\n-        )\n+        self.run_js(\"await pyodide.loadPackage('coverage')\")\n \n     setattr(\n         selenium_with_jspi_if_possible,",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/conftest.py::_install_packages"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -117,23 +152,18 @@",
+          "snippet": " _coverage.start()\n     )\n \n     selenium_with_jspi_if_possible._install_packages()\n+\n+    coverage_begin, coverage_end = _get_coverage_code()\n+    selenium_with_jspi_if_possible.run_js(\n+        f\"await pyodide.runPythonAsync(`{coverage_begin}`)\"\n+    )\n+\n     yield selenium_with_jspi_if_possible\n+\n     # on teardown, save _coverage output\n     coverage_out_binary = bytes(\n         selenium_with_jspi_if_possible.run_js(\n-            \"\"\"\n-return await pyodide.runPythonAsync(`\n-_coverage.stop()\n-_coverage.save()\n-_coverage_datafile = open(\".coverage\",\"rb\")\n-_coverage_outdata = _coverage_datafile.read()\n-# avoid polluting main namespace too much\n-import js as _coverage_js\n-# convert to js Array (as default conversion is TypedArray which does\n-# bad things in firefox)\n-_coverage_js.Array.from_(_coverage_outdata)\n-`)\n-    \"\"\"\n+            f\"return await pyodide.runPythonAsync(`{coverage_end}`)\"\n         )\n     )\n     with open(f\"{_get_coverage_filename('.coverage.emscripten.')}\", \"wb\") as outfile:",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/conftest.py::selenium_coverage"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -142,53 +172,22 @@",
+          "snippet": " _coverage_js.Array.from_(_coverage_outdata)\n \n class ServerRunnerInfo:\n     def __init__(\n-        self, host: str, port: int, selenium: Any, dist_dir: Path, has_jspi: bool\n+        self, host: str, port: int, selenium: Any, dist_dir: Path, prefer_jspi: bool\n     ) -> None:\n         self.host = host\n         self.port = port\n         self.selenium = selenium\n         self.dist_dir = dist_dir\n-        self.has_jspi = has_jspi\n+        self.prefer_jspi = prefer_jspi\n \n     def run_webworker(self, code: str) -> Any:\n         if isinstance(code, str) and code.startswith(\"\\n\"):\n             # we have a multiline string, fix indentation\n             code = textwrap.dedent(code)\n \n-        # add coverage collection to this code\n-        coverage_init_code = textwrap.dedent(\n-            \"\"\"\n-            import coverage\n-            _coverage= coverage.Coverage(source_pkgs=['urllib3'])\n-            _coverage.start()\n-            \"\"\"\n-        )\n-\n-        # Monkeypatch pyodide to force disable JSPI in newer chrome\n-        # so those code paths get tested\n-        if self.has_jspi is False:\n-            jspi_fix_code = textwrap.dedent(\n-                \"\"\"\n-                import pyodide.ffi\n-                if pyodide.ffi.can_run_sync():\n-                    pyodide.ffi.can_run_sync = lambda: False\n-                \"\"\"\n-            )\n-        else:\n-            jspi_fix_code = \"\"\n-\n-        coverage_end_code = textwrap.dedent(\n-            \"\"\"\n-            _coverage.stop()\n-            _coverage.save()\n-            _coverage_datafile = open(\".coverage\",\"rb\")\n-            _coverage_outdata = _coverage_datafile.read()\n-            # avoid polluting main namespace too much\n-            import js as _coverage_js\n-            # convert to js Array (as default conversion is TypedArray which does\n-            # bad things in firefox)\n-            _coverage_js.Array.from_(_coverage_outdata)\n-            \"\"\"\n+        coverage_init_code, coverage_end_code = _get_coverage_code()\n+        jspi_monkeypatch_code, jspi_unmonkeypatch_code = _get_jspi_monkeypatch_code(\n+            self.selenium.browser, self.prefer_jspi\n         )\n \n         # the ordering of these code blocks is important - makes sure",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/contrib/emscripten/conftest.py::ServerRunnerInfo::__init__"
+            },
+            {
+              "kind": "method",
+              "node": "test/contrib/emscripten/conftest.py::ServerRunnerInfo::run_webworker"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -196,9 +195,13 @@",
+          "snippet": " class ServerRunnerInfo:\n         code = (\n             coverage_init_code\n             + \"\\n\"\n-            + jspi_fix_code\n+            + jspi_monkeypatch_code\n+            + \"\\n\"\n+            + \"try:\\n\"\n+            + textwrap.indent(code, \"    \")\n             + \"\\n\"\n-            + code\n+            + \"finally:\\n\"\n+            + textwrap.indent(jspi_unmonkeypatch_code or \"pass\", \"    \")\n             + \"\\n\"\n             + coverage_end_code\n         )",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/contrib/emscripten/conftest.py::ServerRunnerInfo::run_webworker"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -250,51 +253,88 @@",
+          "snippet": " class ServerRunnerInfo:\n # we are at the same origin as web requests to server_host\n @pytest.fixture()\n def run_from_server(\n-    selenium_coverage: Any, testserver_http: PyodideServerInfo\n+    selenium: Any, testserver_http: PyodideServerInfo, prefer_jspi: bool\n ) -> Generator[ServerRunnerInfo]:\n-    if selenium_coverage.browser != \"node\":\n+    if selenium.browser != \"node\":\n         # on node, we don't need to be on the same origin\n         # so we can ignore all this\n         addr = f\"https://{testserver_http.http_host}:{testserver_http.https_port}/pyodide/test.html\"\n-        selenium_coverage.goto(addr)\n-        selenium_coverage.javascript_setup()\n-        selenium_coverage.load_pyodide()\n-        selenium_coverage.initialize_pyodide()\n-        selenium_coverage.save_state()\n-        selenium_coverage.restore_state()\n-        selenium_coverage._install_packages()\n+        selenium.goto(addr)\n+        selenium.javascript_setup()\n+        selenium.load_pyodide()\n+        selenium.initialize_pyodide()\n+        selenium.save_state()\n+        selenium.restore_state()\n     dist_dir = testserver_http.pyodide_dist_dir\n     yield ServerRunnerInfo(\n         testserver_http.http_host,\n         testserver_http.https_port,\n-        selenium_coverage,\n+        selenium,\n         dist_dir,\n-        selenium_coverage.with_jspi,\n+        prefer_jspi,\n     )\n \n \n+def pytest_collection_modifyitems(\n+    config: pytest.Config, items: list[pytest.Item]\n+) -> None:\n+    \"\"\"\n+    A pytest hook modifying collected test items for Emscripten.\n+    \"\"\"\n+    selected_tests = []\n+    deselected_tests = []\n+\n+    runtime = config.getoption(\"--runtime\", default=None)\n+    if not runtime:\n+        return\n+\n+    for item in items:\n+        # Deselect tests which Node.js cannot run.\n+        if runtime.startswith(\"node\"):\n+            if (\n+                item.get_closest_marker(\"webworkers\")\n+                or item.get_closest_marker(\"in_webbrowser\")\n+                or item.get_closest_marker(\"without_jspi\")\n+            ):\n+                deselected_tests.append(item)\n+                continue\n+        # Tests marked with `in_webbrowser` are only for Node.js.\n+        elif item.get_closest_marker(\"node_without_jspi\"):\n+            deselected_tests.append(item)\n+            continue\n+\n+        # Firefox cannot run JSPI tests.\n+        if runtime.startswith(\"firefox\") and item.get_closest_marker(\"with_jspi\"):\n+            deselected_tests.append(item)\n+            continue\n+\n+        selected_tests.append(item)\n+\n+    config.hook.pytest_deselected(items=deselected_tests)\n+    items[:] = selected_tests\n+\n+\n def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:\n-    \"\"\"Generate tests with WebAssembly JavaScript Promise Integration both\n-     enabled and disabled depending on browser/node.js support for features.\n-     Also drops any test that requires a browser or web-workers in Node.js.\n-    ).\n     \"\"\"\n-    if \"has_jspi\" in metafunc.fixturenames:\n-        can_run_with_jspi = False\n-        can_run_without_jspi = False\n+    A pytest hook generating parametrized calls to a test function.\n+    \"\"\"\n+\n+    # Set proper `prefer_jspi` values for tests with WebAssembly\n+    # JavaScript Promise Integration both enabled and disabled depending\n+    # on browser/Node.js support for features.\n+    if \"prefer_jspi\" in metafunc.fixturenames:\n         # node only supports JSPI and doesn't support workers or\n         # webbrowser specific tests\n         if metafunc.config.getoption(\"--runtime\").startswith(\"node\"):\n-            if (\n-                metafunc.definition.get_closest_marker(\"webworkers\") is None\n-                and metafunc.definition.get_closest_marker(\"in_webbrowser\") is None\n-            ):\n-                can_run_with_jspi = True\n             if metafunc.definition.get_closest_marker(\"node_without_jspi\"):\n-                can_run_without_jspi = True\n                 can_run_with_jspi = False\n+                can_run_without_jspi = True\n+            else:\n+                can_run_with_jspi = True\n+                can_run_without_jspi = False\n         # firefox doesn't support JSPI\n         elif metafunc.config.getoption(\"--runtime\").startswith(\"firefox\"):\n+            can_run_with_jspi = False\n             can_run_without_jspi = True\n         else:\n             # chrome supports JSPI on or off",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/conftest.py::run_from_server"
+            },
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/conftest.py::pytest_collection_modifyitems"
+            },
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/conftest.py::pytest_generate_tests"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -313,4 +353,4 @@",
+          "snippet": " def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:\n             jspi_options.append(False)\n         if can_run_with_jspi:\n             jspi_options.append(True)\n-        metafunc.parametrize(\"has_jspi\", jspi_options)\n+        metafunc.parametrize(\"prefer_jspi\", jspi_options)\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/conftest.py::pytest_generate_tests"
+            }
+          ]
+        }
+      ]
+    },
+    "test/contrib/emscripten/test_emscripten.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -29,15 +29,15 @@",
+          "snippet": " pyodide_config.set_flags(\n \n \n def test_index(\n-    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, has_jspi: bool\n+    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, prefer_jspi: bool\n ) -> None:\n     @run_in_pyodide  # type: ignore[misc]\n-    def pyodide_test(selenium_coverage, host: str, port: int, has_jspi: bool) -> None:  # type: ignore[no-untyped-def]\n+    def pyodide_test(selenium_coverage, host: str, port: int, prefer_jspi: bool) -> None:  # type: ignore[no-untyped-def]\n         import urllib3.contrib.emscripten.fetch\n         from urllib3.connection import HTTPConnection\n         from urllib3.response import BaseHTTPResponse\n \n-        assert urllib3.contrib.emscripten.fetch.has_jspi() == has_jspi\n+        assert urllib3.contrib.emscripten.fetch.has_jspi() == prefer_jspi\n         conn = HTTPConnection(host, port)\n         url = f\"http://{host}:{port}/\"\n         conn.request(\"GET\", url)",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_index"
+            },
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::pyodide_test"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -59,20 +59,20 @@",
+          "snippet": " def test_index(\n         selenium_coverage,\n         testserver_http.http_host,\n         testserver_http.http_port,\n-        has_jspi,\n+        prefer_jspi,\n     )\n \n \n def test_pool_requests(\n-    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, has_jspi: bool\n+    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, prefer_jspi: bool\n ) -> None:\n     @run_in_pyodide  # type: ignore[misc]\n-    def pyodide_test(selenium_coverage, host: str, port: int, https_port: int, has_jspi: bool) -> None:  # type: ignore[no-untyped-def]\n+    def pyodide_test(selenium_coverage, host: str, port: int, https_port: int, prefer_jspi: bool) -> None:  # type: ignore[no-untyped-def]\n         # first with PoolManager\n         import urllib3\n         import urllib3.contrib.emscripten.fetch\n \n-        assert urllib3.contrib.emscripten.fetch.has_jspi() == has_jspi\n+        assert urllib3.contrib.emscripten.fetch.has_jspi() == prefer_jspi\n \n         http = urllib3.PoolManager()\n         resp = http.request(\"GET\", f\"http://{host}:{port}/\")",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_index"
+            },
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_pool_requests"
+            },
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::pyodide_test"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -127,13 +127,13 @@",
+          "snippet": " def test_pool_requests(\n         testserver_http.http_host,\n         testserver_http.http_port,\n         testserver_http.https_port,\n-        has_jspi,\n+        prefer_jspi,\n     )\n \n \n # wrong protocol / protocol error etc. should raise an exception of http.client.HTTPException\n def test_wrong_protocol(\n-    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, has_jspi: bool\n+    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo\n ) -> None:\n     @run_in_pyodide  # type: ignore[misc]\n     def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_pool_requests"
+            },
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_wrong_protocol"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -154,7 +154,7 @@",
+          "snippet": " def test_wrong_protocol(\n \n # wrong protocol / protocol error etc. should raise an exception of http.client.HTTPException\n def test_bad_method(\n-    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, has_jspi: bool\n+    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo\n ) -> None:\n     @run_in_pyodide  # type: ignore[misc]\n     def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_bad_method"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -175,7 +175,7 @@",
+          "snippet": " def test_bad_method(\n \n # no connection - should raise\n def test_no_response(\n-    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, has_jspi: bool\n+    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo\n ) -> None:\n     @run_in_pyodide  # type: ignore[misc]\n     def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_no_response"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -193,9 +193,7 @@",
+          "snippet": " def test_no_response(\n     pyodide_test(selenium_coverage, testserver_http.http_host, find_unused_port())\n \n \n-def test_404(\n-    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, has_jspi: bool\n-) -> None:\n+def test_404(selenium_coverage: typing.Any, testserver_http: PyodideServerInfo) -> None:\n     @run_in_pyodide  # type: ignore[misc]\n     def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]\n         from urllib3.connection import HTTPConnection",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_404"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -251,10 +249,8 @@",
+          "snippet": " def test_timeout_warning(\n \n @pytest.mark.webworkers\n def test_timeout_in_worker_non_streaming(\n-    selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n     run_from_server: ServerRunnerInfo,\n-    has_jspi: bool,\n ) -> None:\n     worker_code = f\"\"\"\n         from urllib3.exceptions import TimeoutError",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_timeout_in_worker_non_streaming"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -283,10 +279,8 @@",
+          "snippet": " def test_timeout_in_worker_non_streaming(\n \n @pytest.mark.webworkers\n def test_timeout_in_worker_streaming(\n-    selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n     run_from_server: ServerRunnerInfo,\n-    has_jspi: bool,\n ) -> None:\n     worker_code = f\"\"\"\n         import urllib3.contrib.emscripten.fetch",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_timeout_in_worker_streaming"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -309,7 +303,7 @@",
+          "snippet": " def test_timeout_in_worker_streaming(\n \n \n def test_index_https(\n-    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, has_jspi: bool\n+    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo\n ) -> None:\n     @run_in_pyodide  # type: ignore[misc]\n     def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_index_https"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -415,8 +409,6 @@",
+          "snippet": " def test_streaming_fallback_warning(\n def test_specific_method(\n     selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n-    run_from_server: ServerRunnerInfo,\n-    has_jspi: bool,\n ) -> None:\n     @run_in_pyodide  # type: ignore[misc]\n     def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_specific_method"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -437,10 +429,9 @@",
+          "snippet": " def test_specific_method(\n \n @pytest.mark.webworkers\n def test_streaming_download(\n-    selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n     run_from_server: ServerRunnerInfo,\n-    has_jspi: bool,\n+    prefer_jspi: bool,\n ) -> None:\n     # test streaming download, which must be in a webworker\n     # as you can't do it on main thread",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_streaming_download"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -461,7 +452,7 @@",
+          "snippet": " def test_streaming_download(\n             response = conn.getresponse()\n             assert isinstance(response, BaseHTTPResponse)\n             assert urllib3.contrib.emscripten.fetch._SHOWN_STREAMING_WARNING==False\n-            assert(urllib3.contrib.emscripten.fetch.has_jspi() == {has_jspi})\n+            assert(urllib3.contrib.emscripten.fetch.has_jspi() == {prefer_jspi})\n             data=response.data.decode('utf-8')\n             assert len(data) == 17825792\n \"\"\"",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_streaming_download"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -470,10 +461,9 @@",
+          "snippet": " def test_streaming_download(\n \n @pytest.mark.webworkers\n def test_streaming_close(\n-    selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n     run_from_server: ServerRunnerInfo,\n-    has_jspi: bool,\n+    prefer_jspi: bool,\n ) -> None:\n     # test streaming download, which must be in a webworker\n     # as you can't do it on main thread",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_streaming_close"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -497,7 +487,7 @@",
+          "snippet": " def test_streaming_close(\n             assert(body_internal.writable() is False)\n             assert(body_internal.seekable() is False)\n             assert(body_internal.readable() is True)\n-            assert(urllib3.contrib.emscripten.fetch.has_jspi() == {has_jspi})\n+            assert(urllib3.contrib.emscripten.fetch.has_jspi() == {prefer_jspi})\n \n             response.drain_conn()\n             x=response.read()",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_streaming_close"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -515,10 +505,8 @@",
+          "snippet": " def test_streaming_close(\n \n @pytest.mark.webworkers\n def test_streaming_bad_url(\n-    selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n     run_from_server: ServerRunnerInfo,\n-    has_jspi: bool,\n ) -> None:\n     # this should cause an error\n     # because the protocol is bad",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_streaming_bad_url"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -542,10 +530,8 @@",
+          "snippet": " def test_streaming_bad_url(\n \n @pytest.mark.webworkers\n def test_streaming_bad_method(\n-    selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n     run_from_server: ServerRunnerInfo,\n-    has_jspi: bool,\n ) -> None:\n     # this should cause an error\n     # because the protocol is bad",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_streaming_bad_method"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -572,7 +558,6 @@",
+          "snippet": " def test_streaming_bad_method(\n @pytest.mark.webworkers\n @pytest.mark.without_jspi\n def test_streaming_notready_warning(\n-    selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n     run_from_server: ServerRunnerInfo,\n ) -> None:",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_streaming_notready_warning"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -607,7 +592,7 @@",
+          "snippet": " def test_streaming_notready_warning(\n \n \n def test_post_receive_json(\n-    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, has_jspi: bool\n+    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo\n ) -> None:\n     @run_in_pyodide  # type: ignore[misc]\n     def pyodide_test(selenium_coverage, host: str, port: int) -> None:  # type: ignore[no-untyped-def]",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_post_receive_json"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -680,7 +665,6 @@",
+          "snippet": " def test_streaming_not_ready_in_browser(\n def test_requests_with_micropip(\n     selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n-    run_from_server: ServerRunnerInfo,\n ) -> None:\n     @run_in_pyodide(packages=[\"micropip\"])  # type: ignore[misc]\n     async def test_fn(",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_requests_with_micropip"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -751,7 +735,6 @@",
+          "snippet": " def test_open_close(\n @pytest.mark.webworkers\n @pytest.mark.without_jspi\n def test_break_worker_streaming(\n-    selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n     run_from_server: ServerRunnerInfo,\n ) -> None:",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_break_worker_streaming"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1032,36 +1015,34 @@",
+          "snippet": " def test_insecure_requests_warning(\n \n @pytest.mark.webworkers\n def test_has_jspi_worker(\n-    selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n     run_from_server: ServerRunnerInfo,\n-    has_jspi: bool,\n+    prefer_jspi: bool,\n ) -> None:\n     worker_code = f\"\"\"\n     import urllib3.contrib.emscripten.fetch\n-    assert(urllib3.contrib.emscripten.fetch.has_jspi() == {has_jspi})\n+    assert(urllib3.contrib.emscripten.fetch.has_jspi() == {prefer_jspi})\n     \"\"\"\n \n     run_from_server.run_webworker(worker_code)\n \n \n def test_has_jspi(\n-    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, has_jspi: bool\n+    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo, prefer_jspi: bool\n ) -> None:\n     @run_in_pyodide\n-    def pyodide_test(selenium, has_jspi):  # type: ignore[no-untyped-def]\n+    def pyodide_test(selenium, prefer_jspi):  # type: ignore[no-untyped-def]\n         import urllib3.contrib.emscripten.fetch\n \n-        assert urllib3.contrib.emscripten.fetch.has_jspi() == has_jspi\n+        assert urllib3.contrib.emscripten.fetch.has_jspi() == prefer_jspi\n \n-    pyodide_test(selenium_coverage, has_jspi)\n+    pyodide_test(selenium_coverage, prefer_jspi)\n \n \n @pytest.mark.with_jspi\n def test_timeout_jspi(\n     selenium_coverage: typing.Any,\n     testserver_http: PyodideServerInfo,\n-    run_from_server: ServerRunnerInfo,\n ) -> None:\n     @run_in_pyodide\n     def pyodide_test(selenium, host, port):  # type: ignore[no-untyped-def]",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_has_jspi_worker"
+            },
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_has_jspi"
+            },
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::pyodide_test"
+            },
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_timeout_jspi"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1289,3 +1270,23 @@",
+          "snippet": " def test_has_jspi_exception(\n     pyodide_test(\n         selenium_coverage, testserver_http.http_host, testserver_http.http_port\n     )\n+\n+\n+@run_in_pyodide  # type: ignore[misc]\n+def test_pool_no_port(selenium_coverage: typing.Any) -> None:\n+    from unittest.mock import patch\n+\n+    from urllib3 import HTTPConnectionPool\n+    from urllib3.contrib.emscripten.request import EmscriptenRequest\n+    from urllib3.contrib.emscripten.response import EmscriptenResponse\n+\n+    def send_request(request: EmscriptenRequest) -> EmscriptenResponse:\n+        assert request.url == \"http://example.com/\"\n+        return EmscriptenResponse(\n+            status_code=200, headers={}, body=b\"\", request=request\n+        )\n+\n+    with patch(\"urllib3.contrib.emscripten.connection.send_request\", new=send_request):\n+        pool = HTTPConnectionPool(\"example.com\", maxsize=10, block=True)\n+\n+        pool.request(\"GET\", \"/\")\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::test_pool_no_port"
+            },
+            {
+              "kind": "function",
+              "node": "test/contrib/emscripten/test_emscripten.py::send_request"
+            }
+          ]
+        }
+      ]
+    },
+    "test/contrib/test_pyopenssl.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -7,7 +7,7 @@",
+          "snippet": " import pytest\n \n try:\n     from cryptography import x509\n-    from OpenSSL.crypto import (  # type: ignore[import-untyped]\n+    from OpenSSL.crypto import (  # type: ignore[import-not-found]\n         FILETYPE_PEM,\n         load_certificate,\n     )\n",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "test/contrib/test_pyopenssl.py::<module>"
+            }
+          ]
+        }
+      ]
+    },
+    "test/contrib/test_socks.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -9,7 +9,7 @@",
+          "snippet": " from test import SHORT_TIMEOUT\n from unittest.mock import Mock, patch\n \n import pytest\n-import socks as py_socks  # type: ignore[import-not-found]\n+import socks as py_socks  # type: ignore[import-untyped]\n \n from dummyserver.socketserver import DEFAULT_CA, DEFAULT_CERTS\n from dummyserver.testcase import IPV4SocketDummyServerTestCase",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "test/contrib/test_socks.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -112,7 +112,7 @@",
+          "snippet": " def _set_up_fake_getaddrinfo(monkeypatch: pytest.MonkeyPatch) -> None:\n             socket.SocketKind,\n             int,\n             str,\n-            tuple[str, int] | tuple[str, int, int, int],\n+            tuple[str, int] | tuple[str, int, int, int] | tuple[int, bytes],\n         ]\n     ]:\n         gai_list = real_getaddrinfo(addr, port, family, socket_type)\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/contrib/test_socks.py::fake_getaddrinfo"
+            }
+          ]
+        }
+      ]
+    },
+    "test/test_collections.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -230,6 +230,10 @@",
+          "snippet": " class TestHTTPHeaderDict:\n         assert \"cookie\" not in d\n         assert \"COOKIE\" not in d\n \n+    def test_delitem_with_bytes_key(self, d: HTTPHeaderDict) -> None:\n+        del d[b\"cookie\"]  # type: ignore[arg-type]\n+        assert \"cookie\" not in d\n+\n     def test_add_well_known_multiheader(self, d: HTTPHeaderDict) -> None:\n         d.add(\"COOKIE\", \"asdf\")\n         assert d.getlist(\"cookie\") == [\"foo\", \"bar\", \"asdf\"]",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/test_collections.py::TestHTTPHeaderDict::test_delitem_with_bytes_key"
+            },
+            {
+              "kind": "class",
+              "node": "test/test_collections.py::TestHTTPHeaderDict"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -318,6 +322,20 @@",
+          "snippet": " class TestHTTPHeaderDict:\n         d.add(\"b\", \"asdf\")\n         assert d.getlist(\"b\") == [\"asdf\"]\n \n+    def test_getlist_with_bytes_key(self, d: HTTPHeaderDict) -> None:\n+        assert d.getlist(b\"cookie\") == [\"foo\", \"bar\"]  # type: ignore[call-overload]\n+\n+    def test_getitem_with_bytes(self, d: HTTPHeaderDict) -> None:\n+        d[\"Content-Type\"] = \"application/json\"\n+        d.add(\"Content-Type\", \"charset=utf-8\")\n+        result = d[b\"Content-Type\"]  # type: ignore[index]\n+        assert result == \"application/json, charset=utf-8\"\n+\n+    def test_contains_with_bytes(self, d: HTTPHeaderDict) -> None:\n+        d[\"Content-Type\"] = \"application/json\"\n+        assert b\"Content-Type\" in d  # type: ignore[comparison-overlap]\n+        assert b\"X-Not-There\" not in d  # type: ignore[comparison-overlap]\n+\n     def test_getlist_after_copy(self, d: HTTPHeaderDict) -> None:\n         assert d.getlist(\"cookie\") == HTTPHeaderDict(d).getlist(\"cookie\")\n \n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/test_collections.py::TestHTTPHeaderDict::test_getlist_with_bytes_key"
+            },
+            {
+              "kind": "class",
+              "node": "test/test_collections.py::TestHTTPHeaderDict"
+            },
+            {
+              "kind": "method",
+              "node": "test/test_collections.py::TestHTTPHeaderDict::test_getitem_with_bytes"
+            },
+            {
+              "kind": "method",
+              "node": "test/test_collections.py::TestHTTPHeaderDict::test_contains_with_bytes"
+            }
+          ]
+        }
+      ]
+    },
+    "test/test_connection.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -23,7 +23,10 @@",
+          "snippet": " from urllib3.util.request import SKIP_HEADER\n from urllib3.util.ssl_match_hostname import (\n     CertificateError as ImplementationCertificateError,\n )\n-from urllib3.util.ssl_match_hostname import _dnsname_match, match_hostname\n+from urllib3.util.ssl_match_hostname import (\n+    _dnsname_match,\n+    match_hostname,\n+)\n \n if typing.TYPE_CHECKING:\n     from urllib3.util.ssl_ import _TYPE_PEER_CERT_RET_DICT\n",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "test/test_connection.py::<module>"
+            }
+          ]
+        }
+      ]
+    },
+    "test/test_fields.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -93,7 +93,7 @@",
+          "snippet": " class TestRequestField:\n             (\"näme\", \"näme\"),\n             (b\"n\\xc3\\xa4me\", \"näme\"),\n             (\"ski ⛷.txt\", \"ski ⛷.txt\"),\n-            (\"control \\x1A\\x1B\\x1C\", \"control \\x1A\\x1B\\x1C\"),\n+            (\"control \\x1a\\x1b\\x1c\", \"control \\x1a\\x1b\\x1c\"),\n             (\"backslash \\\\\", \"backslash \\\\\"),\n             (\"quotes '\\\"\", \"quotes '%22\"),\n             (\"newline \\n\\r\", \"newline %0A%0D\"),\n",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "test/test_fields.py::TestRequestField"
+            }
+          ]
+        }
+      ]
+    },
+    "test/test_response.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,9 +1,11 @@",
+          "snippet": " from __future__ import annotations\n \n import contextlib\n+import gzip\n import http.client as httplib\n import socket\n import ssl\n+import sys\n import typing\n import zlib\n from base64 import b64decode",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "test/test_response.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -14,7 +16,6 @@",
+          "snippet": " from unittest import mock\n \n import pytest\n \n-from urllib3 import HTTPHeaderDict\n from urllib3.exceptions import (\n     BodyNotHttplibCompatible,\n     DecodeError,",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "test/test_response.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -36,11 +37,31 @@",
+          "snippet": " from urllib3.util.retry import RequestHistory, Retry\n \n \n def zstd_compress(data: bytes) -> bytes:\n+    if sys.version_info >= (3, 14):\n+        from compression import zstd\n+    else:\n+        from backports import zstd\n+    return zstd.compress(data)\n+\n+\n+def deflate2_compress(data: bytes) -> bytes:\n+    compressor = zlib.compressobj(6, zlib.DEFLATED, -zlib.MAX_WBITS)\n+    return compressor.compress(data) + compressor.flush()\n+\n+\n+if brotli:\n     try:\n-        from compression import zstd  # type: ignore[import-not-found] # noqa: F401\n-    except ImportError:\n-        import zstandard as zstd\n-    return zstd.compress(data)  # type: ignore[no-any-return]\n+        brotli.Decompressor().process(b\"\", output_buffer_limit=1024)\n+        _brotli_gte_1_2_0_available = True\n+    except (AttributeError, TypeError):\n+        _brotli_gte_1_2_0_available = False\n+else:\n+    _brotli_gte_1_2_0_available = False\n+try:\n+    zstd_compress(b\"\")\n+    _zstd_available = True\n+except ModuleNotFoundError:\n+    _zstd_available = False\n \n \n class TestBytesQueueBuffer:",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "test/test_response.py::zstd_compress"
+            },
+            {
+              "kind": "function",
+              "node": "test/test_response.py::deflate2_compress"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -108,7 +129,7 @@",
+          "snippet": " class TestBytesQueueBuffer:\n         \"12.5 MB\", current_thread_only=True\n     )  # assert that we're not doubling memory usagelimit_mem\n     def test_memory_usage(\n-        self, get_func: typing.Callable[[BytesQueueBuffer], str]\n+        self, get_func: typing.Callable[[BytesQueueBuffer], bytes]\n     ) -> None:\n         # Allocate 10 1MiB chunks\n         buffer = BytesQueueBuffer()",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/test_response.py::TestBytesQueueBuffer::test_memory_usage"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -116,14 +137,45 @@",
+          "snippet": " class TestBytesQueueBuffer:\n             # This allocates 2MiB, putting the max at around 12MiB. Not sure why.\n             buffer.put(bytes(2**20))\n \n-        assert len(get_func(buffer)) == 10 * 2**20\n+        result = get_func(buffer)\n+        assert type(result) is bytes\n+        assert len(result) == 10 * 2**20\n \n+    @pytest.mark.parametrize(\n+        \"get_func\",\n+        (lambda b: b.get(len(b)), lambda b: b.get_all()),\n+        ids=(\"get\", \"get_all\"),\n+    )\n     @pytest.mark.limit_memory(\"10.01 MB\", current_thread_only=True)\n-    def test_get_all_memory_usage_single_chunk(self) -> None:\n+    def test_memory_usage_single_chunk(\n+        self, get_func: typing.Callable[[BytesQueueBuffer], bytes]\n+    ) -> None:\n+        buffer = BytesQueueBuffer()\n+        chunk = bytes(10 * 2**20)  # 10 MiB\n+        buffer.put(chunk)\n+        assert get_func(buffer) is chunk\n+\n+    @pytest.mark.parametrize(\n+        \"finish_with_get_all\",\n+        (True, False),\n+        ids=(\"finish_with_get_all\", \"finish_with_get\"),\n+    )\n+    @pytest.mark.limit_memory(\"11.01 MB\", current_thread_only=True)\n+    def test_memory_usage_splitting_chunk(self, finish_with_get_all: bool) -> None:\n+        # Allocate a single 10MiB chunk, then read it in two parts.\n+        # Verifies that splitting a chunk doesn't cause additional memory allocation.\n         buffer = BytesQueueBuffer()\n         chunk = bytes(10 * 2**20)  # 10 MiB\n         buffer.put(chunk)\n-        assert buffer.get_all() is chunk\n+        for i in range(10):\n+            if finish_with_get_all and i == 9:\n+                result = buffer.get_all()\n+            else:\n+                result = buffer.get(2**20)\n+            assert type(result) is bytes\n+            assert len(result) == 2**20\n+            del result\n+        assert len(buffer) == 0\n \n \n # A known random (i.e, not-too-compressible) payload generated with:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/test_response.py::TestBytesQueueBuffer::test_memory_usage"
+            },
+            {
+              "kind": "class",
+              "node": "test/test_response.py::TestBytesQueueBuffer"
+            },
+            {
+              "kind": "method",
+              "node": "test/test_response.py::TestBytesQueueBuffer::test_memory_usage_single_chunk"
+            },
+            {
+              "kind": "method",
+              "node": "test/test_response.py::TestBytesQueueBuffer::test_memory_usage_splitting_chunk"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -151,26 +203,6 @@",
+          "snippet": " def sock() -> typing.Generator[socket.socket]:\n     s.close()\n \n \n-class TestLegacyResponse:\n-    def test_getheaders(self) -> None:\n-        headers = {\"host\": \"example.com\"}\n-        r = HTTPResponse(headers=headers)\n-        with pytest.warns(\n-            DeprecationWarning,\n-            match=r\"HTTPResponse.getheaders\\(\\) is deprecated\",\n-        ):\n-            assert r.getheaders() == HTTPHeaderDict(headers)\n-\n-    def test_getheader(self) -> None:\n-        headers = {\"host\": \"example.com\"}\n-        r = HTTPResponse(headers=headers)\n-        with pytest.warns(\n-            DeprecationWarning,\n-            match=r\"HTTPResponse.getheader\\(\\) is deprecated\",\n-        ):\n-            assert r.getheader(\"host\") == \"example.com\"\n-\n-\n class TestResponse:\n     def test_cache_content(self) -> None:\n         r = HTTPResponse(b\"foo\")",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "test/test_response.py::TestResponse"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -426,7 +458,26 @@",
+          "snippet": " class TestResponse:\n         assert r.data == b\"foo\"\n \n     @onlyZstd()\n-    def test_decode_multiframe_zstd(self) -> None:\n+    @pytest.mark.parametrize(\n+        \"read_amt\",\n+        (\n+            # Read all data at once.\n+            None,\n+            # Read one byte at a time, data of frames will be returned\n+            # separately.\n+            1,\n+            # Read two bytes at a time, the second read should return\n+            # data from both frames.\n+            2,\n+            # Read three bytes at a time, the whole frames will be\n+            # returned separately in two calls.\n+            3,\n+            # Read four bytes at a time, the first read should return\n+            # data from the first frame and a part of the second frame.\n+            4,\n+        ),\n+    )\n+    def test_decode_multiframe_zstd(self, read_amt: int | None) -> None:\n         data = (\n             # Zstandard frame\n             zstd_compress(b\"foo\")",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "test/test_response.py::TestResponse"
+            },
+            {
+              "kind": "method",
+              "node": "test/test_response.py::TestResponse::test_decode_multiframe_zstd"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -441,8 +492,57 @@",
+          "snippet": " class TestResponse:\n         )\n \n         fp = BytesIO(data)\n-        r = HTTPResponse(fp, headers={\"content-encoding\": \"zstd\"})\n-        assert r.data == b\"foobar\"\n+        result = bytearray()\n+        r = HTTPResponse(\n+            fp, headers={\"content-encoding\": \"zstd\"}, preload_content=False\n+        )\n+        total_length = 6\n+        while len(result) < total_length:\n+            chunk = r.read(read_amt, decode_content=True)\n+            if read_amt is None:\n+                assert len(chunk) == total_length\n+            else:\n+                assert len(chunk) == min(read_amt, total_length - len(result))\n+            result += chunk\n+        assert bytes(result) == b\"foobar\"\n+\n+    @onlyZstd()\n+    def test_decode_multiframe_zstd_with_max_length_close_to_compressed_data_size(\n+        self,\n+    ) -> None:\n+        \"\"\"\n+        Test decoding when the first read from the socket returns all\n+        the compressed frames, but then it has to be decompressed in a\n+        couple of read calls.\n+        \"\"\"\n+        data = (\n+            # Zstandard frame\n+            zstd_compress(b\"x\" * 1024)\n+            # skippable frame (must be ignored)\n+            + bytes.fromhex(\n+                \"50 2A 4D 18\"  # Magic_Number (little-endian)\n+                \"07 00 00 00\"  # Frame_Size (little-endian)\n+                \"00 00 00 00 00 00 00\"  # User_Data\n+            )\n+            # Zstandard frame\n+            + zstd_compress(b\"y\" * 1024)\n+        )\n+\n+        fp = BytesIO(data)\n+        r = HTTPResponse(\n+            fp, headers={\"content-encoding\": \"zstd\"}, preload_content=False\n+        )\n+        # Read the whole first frame.\n+        assert r.read(1024) == b\"x\" * 1024\n+        assert len(r._decoded_buffer) == 0\n+        # Read the whole second frame in two reads.\n+        assert r.read(512) == b\"y\" * 512\n+        assert len(r._decoded_buffer) == 0\n+        assert r.read(512) == b\"y\" * 512\n+        assert len(r._decoded_buffer) == 0\n+        # Ensure no more data is left.\n+        assert r.read() == b\"\"\n+        assert len(r._decoded_buffer) == 0\n \n     @onlyZstd()\n     def test_chunked_decoding_zstd(self) -> None:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/test_response.py::TestResponse::test_decode_multiframe_zstd"
+            },
+            {
+              "kind": "class",
+              "node": "test/test_response.py::TestResponse"
+            },
+            {
+              "kind": "method",
+              "node": "test/test_response.py::TestResponse::test_decode_multiframe_zstd_with_max_length_close_to_compressed_data_size"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -535,6 +635,169 @@",
+          "snippet": " class TestResponse:\n             decoded_data += part\n         assert decoded_data == data\n \n+    _test_compressor_params: list[\n+        tuple[str, tuple[str, typing.Callable[[bytes], bytes]] | None]\n+    ] = [\n+        (\"deflate1\", (\"deflate\", zlib.compress)),\n+        (\"deflate2\", (\"deflate\", deflate2_compress)),\n+        (\"gzip\", (\"gzip\", gzip.compress)),\n+    ]\n+    if _brotli_gte_1_2_0_available:\n+        _test_compressor_params.append((\"brotli\", (\"br\", brotli.compress)))\n+    else:\n+        _test_compressor_params.append((\"brotli\", None))\n+    if _zstd_available:\n+        _test_compressor_params.append((\"zstd\", (\"zstd\", zstd_compress)))\n+    else:\n+        _test_compressor_params.append((\"zstd\", None))\n+\n+    @pytest.mark.parametrize(\"read_method\", (\"read\", \"read1\"))\n+    @pytest.mark.parametrize(\n+        \"data\",\n+        [d[1] for d in _test_compressor_params],\n+        ids=[d[0] for d in _test_compressor_params],\n+    )\n+    def test_read_with_all_data_already_in_decompressor(\n+        self,\n+        request: pytest.FixtureRequest,\n+        read_method: str,\n+        data: tuple[str, typing.Callable[[bytes], bytes]] | None,\n+    ) -> None:\n+        if data is None:\n+            pytest.skip(f\"Proper {request.node.callspec.id} decoder is not available\")\n+        original_data = b\"bar\" * 1000\n+        name, compress_func = data\n+        compressed_data = compress_func(original_data)\n+        fp = mock.Mock(read=mock.Mock(return_value=b\"\"))\n+        r = HTTPResponse(fp, headers={\"content-encoding\": name}, preload_content=False)\n+        # Put all data in the decompressor's buffer.\n+        r._init_decoder()\n+        assert r._decoder is not None  # for mypy\n+        decoded = r._decoder.decompress(compressed_data, max_length=0)\n+        if name == \"br\":\n+            # It's known that some Brotli libraries do not respect\n+            # `max_length`.\n+            r._decoded_buffer.put(decoded)\n+        else:\n+            assert decoded == b\"\"\n+        # Read the data via `HTTPResponse`.\n+        read = getattr(r, read_method)\n+        assert read(0) == b\"\"\n+        assert read(2500) == original_data[:2500]\n+        assert read(500) == original_data[2500:]\n+        assert read(0) == b\"\"\n+        assert read() == b\"\"\n+\n+    @pytest.mark.parametrize(\n+        \"delta\",\n+        (\n+            0,  # First read from socket returns all compressed data.\n+            -1,  # First read from socket returns all but one byte of compressed data.\n+        ),\n+    )\n+    @pytest.mark.parametrize(\"read_method\", (\"read\", \"read1\"))\n+    @pytest.mark.parametrize(\n+        \"data\",\n+        [d[1] for d in _test_compressor_params],\n+        ids=[d[0] for d in _test_compressor_params],\n+    )\n+    def test_decode_with_max_length_close_to_compressed_data_size(\n+        self,\n+        request: pytest.FixtureRequest,\n+        delta: int,\n+        read_method: str,\n+        data: tuple[str, typing.Callable[[bytes], bytes]] | None,\n+    ) -> None:\n+        \"\"\"\n+        Test decoding when the first read from the socket returns all or\n+        almost all the compressed data, but then it has to be\n+        decompressed in a couple of read calls.\n+        \"\"\"\n+        if data is None:\n+            pytest.skip(f\"Proper {request.node.callspec.id} decoder is not available\")\n+\n+        original_data = b\"foo\" * 1000\n+        name, compress_func = data\n+        compressed_data = compress_func(original_data)\n+        fp = BytesIO(compressed_data)\n+        r = HTTPResponse(fp, headers={\"content-encoding\": name}, preload_content=False)\n+        initial_limit = len(compressed_data) + delta\n+        read = getattr(r, read_method)\n+        initial_chunk = read(amt=initial_limit, decode_content=True)\n+        assert len(initial_chunk) == initial_limit\n+        assert (\n+            len(read(amt=len(original_data), decode_content=True))\n+            == len(original_data) - initial_limit\n+        )\n+\n+    # Prepare 50 MB of compressed data outside of the test measuring\n+    # memory usage.\n+    _test_memory_usage_decode_with_max_length_params: list[\n+        tuple[str, tuple[str, bytes] | None]\n+    ] = [\n+        (\n+            params[0],\n+            (params[1][0], params[1][1](b\"A\" * (50 * 2**20))) if params[1] else None,\n+        )\n+        for params in _test_compressor_params\n+    ]\n+\n+    @pytest.mark.parametrize(\n+        \"data\",\n+        [d[1] for d in _test_memory_usage_decode_with_max_length_params],\n+        ids=[d[0] for d in _test_memory_usage_decode_with_max_length_params],\n+    )\n+    @pytest.mark.parametrize(\"read_method\", (\"read\", \"read1\", \"read_chunked\", \"stream\"))\n+    # Decoders consume different amounts of memory during decompression.\n+    # We set the 10 MB limit to ensure that the whole decompressed data\n+    # is not stored unnecessarily.\n+    #\n+    # FYI, the following consumption was observed for the test with\n+    # `read` on CPython 3.14.0:\n+    #   - deflate: 2.3 MiB\n+    #   - deflate2: 2.1 MiB\n+    #   - gzip: 2.1 MiB\n+    #   - brotli:\n+    #     - brotli v1.2.0: 9 MiB\n+    #     - brotlicffi v1.2.0.0: 6 MiB\n+    #     - brotlipy v0.7.0: 105.8 MiB\n+    #   - zstd: 4.5 MiB\n+    @pytest.mark.limit_memory(\"10 MB\", current_thread_only=True)\n+    def test_memory_usage_decode_with_max_length(\n+        self,\n+        request: pytest.FixtureRequest,\n+        read_method: str,\n+        data: tuple[str, bytes] | None,\n+    ) -> None:\n+        if data is None:\n+            pytest.skip(f\"Proper {request.node.callspec.id} decoder is not available\")\n+\n+        name, compressed_data = data\n+        limit = 1024 * 1024  # 1 MiB\n+        if read_method in (\"read_chunked\", \"stream\"):\n+            httplib_r = httplib.HTTPResponse(MockSock)  # type: ignore[arg-type]\n+            httplib_r.fp = MockChunkedEncodingResponse([compressed_data])  # type: ignore[assignment]\n+            r = HTTPResponse(\n+                httplib_r,\n+                preload_content=False,\n+                headers={\"transfer-encoding\": \"chunked\", \"content-encoding\": name},\n+            )\n+            next(getattr(r, read_method)(amt=limit, decode_content=True))\n+        else:\n+            fp = BytesIO(compressed_data)\n+            r = HTTPResponse(\n+                fp, headers={\"content-encoding\": name}, preload_content=False\n+            )\n+            getattr(r, read_method)(amt=limit, decode_content=True)\n+\n+        # Check that the internal decoded buffer is empty unless brotli\n+        # is used.\n+        # Google's brotli library does not fully respect the output\n+        # buffer limit: https://github.com/google/brotli/issues/1396\n+        # And unmaintained brotlipy cannot limit the output buffer size.\n+        if name != \"br\" or brotli.__name__ == \"brotlicffi\":\n+            assert len(r._decoded_buffer) == 0\n+\n     def test_multi_decoding_deflate_deflate(self) -> None:\n         data = zlib.compress(zlib.compress(b\"foo\"))\n ",
+          "affect": [
+            {
+              "kind": "attribute",
+              "node": "test/test_response.py::TestResponse::_test_compressor_params"
+            },
+            {
+              "kind": "class",
+              "node": "test/test_response.py::TestResponse"
+            },
+            {
+              "kind": "method",
+              "node": "test/test_response.py::TestResponse::test_read_with_all_data_already_in_decompressor"
+            },
+            {
+              "kind": "method",
+              "node": "test/test_response.py::TestResponse::test_decode_with_max_length_close_to_compressed_data_size"
+            },
+            {
+              "kind": "attribute",
+              "node": "test/test_response.py::TestResponse::_test_memory_usage_decode_with_max_length_params"
+            },
+            {
+              "kind": "method",
+              "node": "test/test_response.py::TestResponse::test_memory_usage_decode_with_max_length"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -584,6 +847,16 @@",
+          "snippet": " class TestResponse:\n         assert r.read(9 * 37) == b\"foobarbaz\" * 37\n         assert r.read() == b\"\"\n \n+    def test_read_multi_decoding_too_many_links(self) -> None:\n+        fp = BytesIO(b\"foo\")\n+        with pytest.raises(\n+            DecodeError, match=\"Too many content encodings in the chain: 6 > 5\"\n+        ):\n+            HTTPResponse(\n+                fp,\n+                headers={\"content-encoding\": \"gzip, deflate, br, zstd, gzip, deflate\"},\n+            )\n+\n     def test_body_blob(self) -> None:\n         resp = HTTPResponse(b\"foo\")\n         assert resp.data == b\"foo\"",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/test_response.py::TestResponse::test_read_multi_decoding_too_many_links"
+            },
+            {
+              "kind": "class",
+              "node": "test/test_response.py::TestResponse"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -761,7 +1034,7 @@",
+          "snippet": " class TestResponse:\n     def test_io_bufferedreader(self) -> None:\n         fp = BytesIO(b\"foo\")\n         resp = HTTPResponse(fp, preload_content=False)\n-        br = BufferedReader(resp)  # type: ignore[arg-type]\n+        br = BufferedReader(resp)  # type: ignore[type-var]\n \n         assert br.read() == b\"foo\"\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/test_response.py::TestResponse::test_io_bufferedreader"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -773,12 +1046,12 @@",
+          "snippet": " class TestResponse:\n         fp = BytesIO(b\"hello\\nworld\")\n         resp = HTTPResponse(fp, preload_content=False)\n         with pytest.raises(ValueError, match=\"readline of closed file\"):\n-            list(BufferedReader(resp))  # type: ignore[arg-type]\n+            list(BufferedReader(resp))  # type: ignore[type-var]\n \n         b = b\"fooandahalf\"\n         fp = BytesIO(b)\n         resp = HTTPResponse(fp, preload_content=False)\n-        br = BufferedReader(resp, 5)  # type: ignore[arg-type]\n+        br = BufferedReader(resp, 5)  # type: ignore[type-var]\n \n         br.read(1)  # sets up the buffer, reading 5\n         assert len(fp.read()) == (len(b) - 5)",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/test_response.py::TestResponse::test_io_bufferedreader"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -791,7 +1064,7 @@",
+          "snippet": " class TestResponse:\n     def test_io_not_autoclose_bufferedreader(self) -> None:\n         fp = BytesIO(b\"hello\\nworld\")\n         resp = HTTPResponse(fp, preload_content=False, auto_close=False)\n-        reader = BufferedReader(resp)  # type: ignore[arg-type]\n+        reader = BufferedReader(resp)  # type: ignore[type-var]\n         assert list(reader) == [b\"hello\\n\", b\"world\"]\n \n         assert not reader.closed\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/test_response.py::TestResponse::test_io_not_autoclose_bufferedreader"
+            }
+          ]
+        }
+      ]
+    },
+    "test/test_util.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -162,11 +162,11 @@",
+          "snippet": " class TestUtil:\n             \"http://google.com:65536\",\n             \"http://google.com:\\xb2\\xb2\",  # \\xb2 = ^2\n             # Invalid IDNA labels\n-            \"http://\\uD7FF.com\",\n+            \"http://\\ud7ff.com\",\n             \"http://❤️\",\n             # Unicode surrogates\n-            \"http://\\uD800.com\",\n-            \"http://\\uDC00.com\",\n+            \"http://\\ud800.com\",\n+            \"http://\\udc00.com\",\n         ],\n     )\n     def test_invalid_url(self, url: str) -> None:",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "test/test_util.py::TestUtil"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -217,7 +217,7 @@",
+          "snippet": " class TestUtil:\n         actual_normalized_url = parse_url(url).url\n         assert actual_normalized_url == expected_normalized_url\n \n-    @pytest.mark.parametrize(\"char\", [chr(i) for i in range(0x00, 0x21)] + [\"\\x7F\"])\n+    @pytest.mark.parametrize(\"char\", [chr(i) for i in range(0x00, 0x21)] + [\"\\x7f\"])\n     def test_control_characters_are_percent_encoded(self, char: str) -> None:\n         percent_char = \"%\" + (hex(ord(char))[2:].zfill(2).upper())\n         url = parse_url(",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "test/test_util.py::TestUtil"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -295,13 +295,13 @@",
+          "snippet": " class TestUtil:\n             Url(\"http\", auth=\"user%22:quoted\", host=\"example.com\", path=\"/\"),\n         ),\n         # Unicode Surrogates\n-        (\"http://google.com/\\uD800\", Url(\"http\", host=\"google.com\", path=\"%ED%A0%80\")),\n+        (\"http://google.com/\\ud800\", Url(\"http\", host=\"google.com\", path=\"%ED%A0%80\")),\n         (\n-            \"http://google.com?q=\\uDC00\",\n+            \"http://google.com?q=\\udc00\",\n             Url(\"http\", host=\"google.com\", path=\"\", query=\"q=%ED%B0%80\"),\n         ),\n         (\n-            \"http://google.com#\\uDC00\",\n+            \"http://google.com#\\udc00\",\n             Url(\"http\", host=\"google.com\", path=\"\", fragment=\"%ED%B0%80\"),\n         ),\n     ]",
+          "affect": [
+            {
+              "kind": "attribute",
+              "node": "test/test_util.py::TestUtil::non_round_tripping_parse_url_host_map"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1121,6 +1121,6 @@",
+          "snippet": " class TestUtilWithoutIdna:\n         module_stash.pop()\n \n     def test_parse_url_without_idna(self) -> None:\n-        url = \"http://\\uD7FF.com\"\n+        url = \"http://\\ud7ff.com\"\n         with pytest.raises(LocationParseError, match=f\"Failed to parse: {url}\"):\n             parse_url(url)\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/test_util.py::TestUtilWithoutIdna::test_parse_url_without_idna"
+            }
+          ]
+        }
+      ]
+    },
+    "test/with_dummyserver/test_chunked_transfer.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -98,7 +98,7 @@",
+          "snippet": " class TestChunkedTransfer(SocketDummyServerTestCase):\n \n     def test_unicode_body(self) -> None:\n         self._test_body(\n-            \"thisshouldbeonechunk\\r\\näöüß\\xFF\",\n+            \"thisshouldbeonechunk\\r\\näöüß\\xff\",\n             expected_data=b\"thisshouldbeonechunk\\r\\n\\xc3\\xa4\\xc3\\xb6\\xc3\\xbc\\xc3\\x9f\\xc3\\xbf\",\n         )\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/with_dummyserver/test_chunked_transfer.py::TestChunkedTransfer::test_unicode_body"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -114,7 +114,7 @@",
+          "snippet": " class TestChunkedTransfer(SocketDummyServerTestCase):\n \n     def test_unicode_body_fileio(self) -> None:\n         self._test_body(\n-            io.StringIO(\"thisshouldbeonechunk\\r\\näöüß\\xFF\"),\n+            io.StringIO(\"thisshouldbeonechunk\\r\\näöüß\\xff\"),\n             expected_data=b\"thisshouldbeonechunk\\r\\n\\xc3\\xa4\\xc3\\xb6\\xc3\\xbc\\xc3\\x9f\\xc3\\xbf\",\n         )\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/with_dummyserver/test_chunked_transfer.py::TestChunkedTransfer::test_unicode_body_fileio"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -133,7 +133,7 @@",
+          "snippet": " class TestChunkedTransfer(SocketDummyServerTestCase):\n \n     def test_unicode_body_iterable(self) -> None:\n         def send_body() -> typing.Iterable[str]:\n-            yield \"thisshouldbeonechunk\\r\\näöüß\\xFF\"\n+            yield \"thisshouldbeonechunk\\r\\näöüß\\xff\"\n \n         self._test_body(\n             send_body(),\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/with_dummyserver/test_chunked_transfer.py::TestChunkedTransfer::send_body"
+            }
+          ]
+        }
+      ]
+    },
+    "test/with_dummyserver/test_https.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -6,6 +6,7 @@",
+          "snippet": " import datetime\n import os.path\n import shutil\n import ssl\n+import sys\n import tempfile\n import time\n import typing",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "test/with_dummyserver/test_https.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -912,14 +913,25 @@",
+          "snippet": " class BaseTestHTTPS(HTTPSHypercornDummyServerTestCase):\n                 finally:\n                     conn.close()\n \n+    @pytest.mark.parametrize(\"use_env_var_expansion\", [True, False])\n     def test_sslkeylogfile(\n-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch\n+        self,\n+        tmp_path: Path,\n+        monkeypatch: pytest.MonkeyPatch,\n+        use_env_var_expansion: bool,\n     ) -> None:\n         if not hasattr(util.SSLContext, \"keylog_filename\"):\n             pytest.skip(\"requires OpenSSL 1.1.1+\")\n \n         keylog_file = tmp_path / \"keylogfile.txt\"\n-        monkeypatch.setenv(\"SSLKEYLOGFILE\", str(keylog_file))\n+        if use_env_var_expansion:\n+            monkeypatch.setenv(\"FILEPATH\", str(keylog_file))\n+            if sys.platform == \"win32\":\n+                monkeypatch.setenv(\"SSLKEYLOGFILE\", \"%FILEPATH%\")\n+            else:\n+                monkeypatch.setenv(\"SSLKEYLOGFILE\", \"${FILEPATH}\")\n+        else:\n+            monkeypatch.setenv(\"SSLKEYLOGFILE\", str(keylog_file))\n \n         with HTTPSConnectionPool(\n             self.host,\n",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "test/with_dummyserver/test_https.py::BaseTestHTTPS"
+            },
+            {
+              "kind": "method",
+              "node": "test/with_dummyserver/test_https.py::BaseTestHTTPS::test_sslkeylogfile"
+            }
+          ]
+        }
+      ]
+    },
+    "test/with_dummyserver/test_poolmanager.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -26,8 +26,12 @@",
+          "snippet": " class TestPoolManager(HypercornDummyServerTestCase):\n         cls.base_url = f\"http://{cls.host}:{cls.port}\"\n         cls.base_url_alt = f\"http://{cls.host_alt}:{cls.port}\"\n \n-    def test_redirect(self) -> None:\n-        with PoolManager() as http:\n+    @pytest.mark.parametrize(\n+        \"pool_manager_kwargs\",\n+        ({}, {\"retries\": None}, {\"retries\": 1}, {\"retries\": Retry(1)}),\n+    )\n+    def test_redirect(self, pool_manager_kwargs: dict[str, typing.Any]) -> None:\n+        with PoolManager(**pool_manager_kwargs) as http:\n             r = http.request(\n                 \"GET\",\n                 f\"{self.base_url}/redirect\",",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "test/with_dummyserver/test_poolmanager.py::TestPoolManager"
+            },
+            {
+              "kind": "method",
+              "node": "test/with_dummyserver/test_poolmanager.py::TestPoolManager::test_redirect"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -46,8 +50,12 @@",
+          "snippet": " class TestPoolManager(HypercornDummyServerTestCase):\n             assert r.status == 200\n             assert r.data == b\"Dummy server!\"\n \n-    def test_redirect_twice(self) -> None:\n-        with PoolManager() as http:\n+    @pytest.mark.parametrize(\n+        \"pool_manager_kwargs\",\n+        ({}, {\"retries\": None}, {\"retries\": 2}, {\"retries\": Retry(2)}),\n+    )\n+    def test_redirect_twice(self, pool_manager_kwargs: dict[str, typing.Any]) -> None:\n+        with PoolManager(**pool_manager_kwargs) as http:\n             r = http.request(\n                 \"GET\",\n                 f\"{self.base_url}/redirect\",\n",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "test/with_dummyserver/test_poolmanager.py::TestPoolManager"
+            },
+            {
+              "kind": "method",
+              "node": "test/with_dummyserver/test_poolmanager.py::TestPoolManager::test_redirect_twice"
+            }
+          ]
+        }
+      ]
+    },
+    "test/with_dummyserver/test_socketlevel.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -2041,7 +2041,7 @@",
+          "snippet": " class TestHeaders(SocketDummyServerTestCase):\n         ]\n \n         def filter_non_x_headers(\n-            d: typing.OrderedDict[str, str]\n+            d: typing.OrderedDict[str, str],\n         ) -> list[tuple[str, str]]:\n             return [(k, v) for (k, v) in d.items() if k.startswith(\"X-Header-\")]\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "test/with_dummyserver/test_socketlevel.py::TestHeaders::filter_non_x_headers"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

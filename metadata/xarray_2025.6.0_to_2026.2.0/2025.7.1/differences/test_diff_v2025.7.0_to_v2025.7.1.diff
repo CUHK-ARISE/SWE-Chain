@@ -1,0 +1,617 @@
+diff --git a/xarray/tests/__init__.py b/xarray/tests/__init__.py
+index fe76df7..4de9e42 100644
+--- a/xarray/tests/__init__.py
++++ b/xarray/tests/__init__.py
+@@ -130,6 +130,20 @@ has_bottleneck, requires_bottleneck = _importorskip("bottleneck")
+ has_rasterio, requires_rasterio = _importorskip("rasterio")
+ has_zarr, requires_zarr = _importorskip("zarr")
+ has_zarr_v3, requires_zarr_v3 = _importorskip("zarr", "3.0.0")
++has_zarr_v3_dtypes, requires_zarr_v3_dtypes = _importorskip("zarr", "3.1.0")
++if has_zarr_v3:
++    import zarr
++
++    # manual update by checking attrs for now
++    # TODO: use version specifier
++    # installing from git main is giving me a lower version than the
++    # most recently released zarr
++    has_zarr_v3_dtypes = hasattr(zarr.core, "dtype")
++
++    requires_zarr_v3_dtypes = pytest.mark.skipif(
++        not has_zarr_v3_dtypes, reason="requires zarr>3.1.0"
++    )
++
+ has_fsspec, requires_fsspec = _importorskip("fsspec")
+ has_iris, requires_iris = _importorskip("iris")
+ has_numbagg, requires_numbagg = _importorskip("numbagg")
+
+diff --git a/xarray/tests/test_backends.py b/xarray/tests/test_backends.py
+index 785b06a..32ebe52 100644
+--- a/xarray/tests/test_backends.py
++++ b/xarray/tests/test_backends.py
+@@ -55,6 +55,7 @@ from xarray.coding.strings import check_vlen_dtype, create_vlen_dtype
+ from xarray.coding.variables import SerializationWarning
+ from xarray.conventions import encode_dataset_coordinates
+ from xarray.core import indexing
++from xarray.core.indexes import PandasIndex
+ from xarray.core.options import set_options
+ from xarray.core.types import PDDatetimeUnitOptions
+ from xarray.core.utils import module_available
+@@ -72,6 +73,7 @@ from xarray.tests import (
+     has_scipy,
+     has_zarr,
+     has_zarr_v3,
++    has_zarr_v3_dtypes,
+     mock,
+     network,
+     requires_cftime,
+@@ -2066,6 +2068,26 @@ class NetCDF4Base(NetCDFBase):
+                         with self.roundtrip(original):
+                             pass
+ 
++    @pytest.mark.parametrize("create_default_indexes", [True, False])
++    def test_create_default_indexes(self, tmp_path, create_default_indexes) -> None:
++        store_path = tmp_path / "tmp.nc"
++        original_ds = xr.Dataset(
++            {"data": ("x", np.arange(3))}, coords={"x": [-1, 0, 1]}
++        )
++        original_ds.to_netcdf(store_path, engine=self.engine, mode="w")
++
++        with open_dataset(
++            store_path,
++            engine=self.engine,
++            create_default_indexes=create_default_indexes,
++        ) as loaded_ds:
++            if create_default_indexes:
++                assert list(loaded_ds.xindexes) == ["x"] and isinstance(
++                    loaded_ds.xindexes["x"], PandasIndex
++                )
++            else:
++                assert len(loaded_ds.xindexes) == 0
++
+ 
+ @requires_netCDF4
+ class TestNetCDF4Data(NetCDF4Base):
+@@ -2416,7 +2438,7 @@ class ZarrBase(CFEncodedBase):
+     def test_non_existent_store(self) -> None:
+         with pytest.raises(
+             FileNotFoundError,
+-            match="(No such file or directory|Unable to find group|No group found)",
++            match="(No such file or directory|Unable to find group|No group found in store)",
+         ):
+             xr.open_zarr(f"{uuid.uuid4()}")
+ 
+@@ -2498,6 +2520,7 @@ class ZarrBase(CFEncodedBase):
+                 assert_identical(actual.load(), auto.load())
+ 
+     @requires_dask
++    @pytest.mark.filterwarnings("ignore:.*does not have a Zarr V3 specification.*")
+     def test_warning_on_bad_chunks(self) -> None:
+         original = create_test_data().chunk({"dim1": 4, "dim2": 3, "dim3": 3})
+ 
+@@ -2906,7 +2929,9 @@ class ZarrBase(CFEncodedBase):
+ 
+     @pytest.mark.parametrize("dtype", ["U", "S"])
+     def test_append_string_length_mismatch_raises(self, dtype) -> None:
+-        skip_if_zarr_format_3("This actually works fine with Zarr format 3")
++        if has_zarr_v3 and not has_zarr_v3_dtypes:
++            skip_if_zarr_format_3("This actually works fine with Zarr format 3")
++
+         ds, ds_to_append = create_append_string_length_mismatch_test_data(dtype)
+         with self.create_zarr_target() as store_target:
+             ds.to_zarr(store_target, mode="w", **self.version_kwargs)
+@@ -2919,8 +2944,12 @@ class ZarrBase(CFEncodedBase):
+     def test_append_string_length_mismatch_works(self, dtype) -> None:
+         skip_if_zarr_format_2("This doesn't work with Zarr format 2")
+         # ...but it probably would if we used object dtype
++        if has_zarr_v3_dtypes:
++            pytest.skip("This works on pre ZDtype Zarr-Python, but fails after.")
++
+         ds, ds_to_append = create_append_string_length_mismatch_test_data(dtype)
+         expected = xr.concat([ds, ds_to_append], dim="time")
++
+         with self.create_zarr_target() as store_target:
+             ds.to_zarr(store_target, mode="w", **self.version_kwargs)
+             ds_to_append.to_zarr(store_target, append_dim="time", **self.version_kwargs)
+@@ -4063,6 +4092,26 @@ class TestScipyFileObject(CFEncodedBase, NetCDF3Only):
+     def test_pickle_dataarray(self) -> None:
+         pass
+ 
++    @pytest.mark.parametrize("create_default_indexes", [True, False])
++    def test_create_default_indexes(self, tmp_path, create_default_indexes) -> None:
++        store_path = tmp_path / "tmp.nc"
++        original_ds = xr.Dataset(
++            {"data": ("x", np.arange(3))}, coords={"x": [-1, 0, 1]}
++        )
++        original_ds.to_netcdf(store_path, engine=self.engine, mode="w")
++
++        with open_dataset(
++            store_path,
++            engine=self.engine,
++            create_default_indexes=create_default_indexes,
++        ) as loaded_ds:
++            if create_default_indexes:
++                assert list(loaded_ds.xindexes) == ["x"] and isinstance(
++                    loaded_ds.xindexes["x"], PandasIndex
++                )
++            else:
++                assert len(loaded_ds.xindexes) == 0
++
+ 
+ @requires_scipy
+ class TestScipyFilePath(CFEncodedBase, NetCDF3Only):
+@@ -6434,6 +6483,26 @@ def test_zarr_closing_internal_zip_store():
+         assert_identical(original_da, loaded_da)
+ 
+ 
++@requires_zarr
++@pytest.mark.parametrize("create_default_indexes", [True, False])
++def test_zarr_create_default_indexes(tmp_path, create_default_indexes) -> None:
++    from xarray.core.indexes import PandasIndex
++
++    store_path = tmp_path / "tmp.zarr"
++    original_ds = xr.Dataset({"data": ("x", np.arange(3))}, coords={"x": [-1, 0, 1]})
++    original_ds.to_zarr(store_path, mode="w")
++
++    with open_dataset(
++        store_path, engine="zarr", create_default_indexes=create_default_indexes
++    ) as loaded_ds:
++        if create_default_indexes:
++            assert list(loaded_ds.xindexes) == ["x"] and isinstance(
++                loaded_ds.xindexes["x"], PandasIndex
++            )
++        else:
++            assert len(loaded_ds.xindexes) == 0
++
++
+ @requires_zarr
+ @pytest.mark.usefixtures("default_zarr_format")
+ def test_raises_key_error_on_invalid_zarr_store(tmp_path):
+
+diff --git a/xarray/tests/test_backends_api.py b/xarray/tests/test_backends_api.py
+index 9342423..778e800 100644
+--- a/xarray/tests/test_backends_api.py
++++ b/xarray/tests/test_backends_api.py
+@@ -201,3 +201,39 @@ class TestPreferredChunks:
+                 chunks=dict(zip(initial[self.var_name].dims, req_chunks, strict=True)),
+             )
+         self.check_dataset(initial, final, explicit_chunks(req_chunks, shape))
++
++    @pytest.mark.parametrize("create_default_indexes", [True, False])
++    def test_default_indexes(self, create_default_indexes):
++        """Create default indexes if the backend does not create them."""
++        coords = xr.Coordinates({"x": ("x", [0, 1]), "y": list("abc")}, indexes={})
++        initial = xr.Dataset({"a": ("x", [1, 2])}, coords=coords)
++
++        with assert_no_warnings():
++            final = xr.open_dataset(
++                initial,
++                engine=PassThroughBackendEntrypoint,
++                create_default_indexes=create_default_indexes,
++            )
++
++        if create_default_indexes:
++            assert all(name in final.xindexes for name in ["x", "y"])
++        else:
++            assert len(final.xindexes) == 0
++
++    @pytest.mark.parametrize("create_default_indexes", [True, False])
++    def test_default_indexes_passthrough(self, create_default_indexes):
++        """Allow creating indexes in the backend."""
++
++        initial = xr.Dataset(
++            {"a": (["x", "y"], [[1, 2, 3], [4, 5, 6]])},
++            coords={"x": ("x", [0, 1]), "y": ("y", list("abc"))},
++        ).stack(z=["x", "y"])
++
++        with assert_no_warnings():
++            final = xr.open_dataset(
++                initial,
++                engine=PassThroughBackendEntrypoint,
++                create_default_indexes=create_default_indexes,
++            )
++
++        assert initial.coords.equals(final.coords)
+
+diff --git a/xarray/tests/test_coding.py b/xarray/tests/test_coding.py
+index acb3250..24ef2c8 100644
+--- a/xarray/tests/test_coding.py
++++ b/xarray/tests/test_coding.py
+@@ -94,8 +94,8 @@ def test_coder_roundtrip() -> None:
+     assert_identical(original, roundtripped)
+ 
+ 
+-@pytest.mark.parametrize("dtype", "u1 u2 i1 i2 f2 f4".split())
+-@pytest.mark.parametrize("dtype2", "f4 f8".split())
++@pytest.mark.parametrize("dtype", ["u1", "u2", "i1", "i2", "f2", "f4"])
++@pytest.mark.parametrize("dtype2", ["f4", "f8"])
+ def test_scaling_converts_to_float(dtype: str, dtype2: str) -> None:
+     dt = np.dtype(dtype2)
+     original = xr.Variable(
+
+diff --git a/xarray/tests/test_coordinate_transform.py b/xarray/tests/test_coordinate_transform.py
+index 386ce42..627063e 100644
+--- a/xarray/tests/test_coordinate_transform.py
++++ b/xarray/tests/test_coordinate_transform.py
+@@ -123,6 +123,17 @@ def test_coordinate_transform_variable_repr_inline() -> None:
+     )
+ 
+ 
++def test_coordinate_transform_variable_repr() -> None:
++    var = create_coords(scale=2.0, shape=(2, 2))["x"].variable
++
++    actual = repr(var)
++    expected = """
++<xarray.Variable (y: 2, x: 2)> Size: 32B
++[4 values with dtype=float64]
++    """.strip()
++    assert actual == expected
++
++
+ def test_coordinate_transform_variable_basic_outer_indexing() -> None:
+     var = create_coords(scale=2.0, shape=(4, 4))["x"].variable
+ 
+
+diff --git a/xarray/tests/test_dask.py b/xarray/tests/test_dask.py
+index eefa3c2..9024f2a 100644
+--- a/xarray/tests/test_dask.py
++++ b/xarray/tests/test_dask.py
+@@ -1129,7 +1129,8 @@ def test_unify_chunks(map_ds):
+ def test_unify_chunks_shallow_copy(obj, transform):
+     obj = transform(obj)
+     unified = obj.unify_chunks()
+-    assert_identical(obj, unified) and obj is not obj.unify_chunks()
++    assert_identical(obj, unified)
++    # assert obj is not unified
+ 
+ 
+ @pytest.mark.parametrize("obj", [make_da()])
+@@ -1636,7 +1637,7 @@ def test_normalize_token_with_backend(map_ds):
+     with create_tmp_file(allow_cleanup_failure=ON_WINDOWS) as tmp_file:
+         map_ds.to_netcdf(tmp_file)
+         read = xr.open_dataset(tmp_file)
+-        assert not dask.base.tokenize(map_ds) == dask.base.tokenize(read)
++        assert dask.base.tokenize(map_ds) != dask.base.tokenize(read)
+         read.close()
+ 
+ 
+
+diff --git a/xarray/tests/test_formatting.py b/xarray/tests/test_formatting.py
+index 88c2c81..c2ab114 100644
+--- a/xarray/tests/test_formatting.py
++++ b/xarray/tests/test_formatting.py
+@@ -1189,3 +1189,46 @@ Dimensions without coordinates: x
+ Dimensions without coordinates: x
+         """.strip()
+     assert actual == expected
++
++
++def test_repr_pandas_range_index() -> None:
++    # lazy data repr but values shown in inline repr
++    xidx = xr.indexes.PandasIndex(pd.RangeIndex(10), "x")
++    ds = xr.Dataset(coords=xr.Coordinates.from_xindex(xidx))
++    actual = repr(ds.x)
++    expected = """
++<xarray.DataArray 'x' (x: 10)> Size: 80B
++[10 values with dtype=int64]
++Coordinates:
++  * x        (x) int64 80B 0 1 2 3 4 5 6 7 8 9
++    """.strip()
++    assert actual == expected
++
++
++def test_repr_pandas_multi_index() -> None:
++    # lazy data repr but values shown in inline repr
++    midx = pd.MultiIndex.from_product([["a", "b"], [1, 2]], names=["foo", "bar"])
++    coords = xr.Coordinates.from_pandas_multiindex(midx, "x")
++    ds = xr.Dataset(coords=coords)
++
++    actual = repr(ds.x)
++    expected = """
++<xarray.DataArray 'x' (x: 4)> Size: 32B
++[4 values with dtype=object]
++Coordinates:
++  * x        (x) object 32B MultiIndex
++  * foo      (x) object 32B 'a' 'a' 'b' 'b'
++  * bar      (x) int64 32B 1 2 1 2
++    """.strip()
++    assert actual == expected
++
++    actual = repr(ds.foo)
++    expected = """
++<xarray.DataArray 'foo' (x: 4)> Size: 32B
++[4 values with dtype=object]
++Coordinates:
++  * x        (x) object 32B MultiIndex
++  * foo      (x) object 32B 'a' 'a' 'b' 'b'
++  * bar      (x) int64 32B 1 2 1 2
++    """.strip()
++    assert actual == expected
+
+diff --git a/xarray/tests/test_groupby.py b/xarray/tests/test_groupby.py
+index 54cc21b..731574b 100644
+--- a/xarray/tests/test_groupby.py
++++ b/xarray/tests/test_groupby.py
+@@ -3235,7 +3235,7 @@ def test_shuffle_simple() -> None:
+     da = xr.DataArray(
+         dims="x",
+         data=dask.array.from_array([1, 2, 3, 4, 5, 6], chunks=2),
+-        coords={"label": ("x", "a b c a b c".split(" "))},
++        coords={"label": ("x", ["a", "b", "c", "a", "b", "c"])},
+     )
+     actual = da.groupby(label=UniqueGrouper()).shuffle_to_chunks()
+     expected = da.isel(x=[0, 3, 1, 4, 2, 5])
+
+diff --git a/xarray/tests/test_indexes.py b/xarray/tests/test_indexes.py
+index 2b7900d..9f2eea4 100644
+--- a/xarray/tests/test_indexes.py
++++ b/xarray/tests/test_indexes.py
+@@ -729,3 +729,54 @@ def test_restore_dtype_on_multiindexes(dtype: str) -> None:
+     foo = xr.Dataset(coords={"bar": ("bar", np.array([0, 1], dtype=dtype))})
+     foo = foo.stack(baz=("bar",))
+     assert str(foo["bar"].values.dtype) == dtype
++
++
++class IndexWithExtraVariables(Index):
++    @classmethod
++    def from_variables(cls, variables, *, options=None):
++        return cls()
++
++    def create_variables(self, variables=None):
++        if variables is None:
++            # For Coordinates.from_xindex(), return all variables the index can create
++            return {
++                "time": Variable(dims=("time",), data=[1, 2, 3]),
++                "valid_time": Variable(
++                    dims=("time",),
++                    data=[2, 3, 4],  # time + 1
++                    attrs={"description": "time + 1"},
++                ),
++            }
++
++        result = dict(variables)
++        if "time" in variables:
++            result["valid_time"] = Variable(
++                dims=("time",),
++                data=variables["time"].data + 1,
++                attrs={"description": "time + 1"},
++            )
++        return result
++
++
++def test_set_xindex_with_extra_variables() -> None:
++    """Test that set_xindex raises an error when custom index creates extra variables."""
++
++    ds = xr.Dataset(coords={"time": [1, 2, 3]}).reset_index("time")
++
++    # Test that set_xindex raises error for extra variables
++    with pytest.raises(ValueError, match="extra variables 'valid_time'"):
++        ds.set_xindex("time", IndexWithExtraVariables)
++
++
++def test_set_xindex_factory_method_pattern() -> None:
++    ds = xr.Dataset(coords={"time": [1, 2, 3]}).reset_index("time")
++
++    # Test the recommended factory method pattern
++    coord_vars = {"time": ds._variables["time"]}
++    index = IndexWithExtraVariables.from_variables(coord_vars)
++    coords = xr.Coordinates.from_xindex(index)
++    result = ds.assign_coords(coords)
++
++    assert "time" in result.variables
++    assert "valid_time" in result.variables
++    assert_array_equal(result.valid_time.data, result.time.data + 1)
+
+diff --git a/xarray/tests/test_nd_point_index.py b/xarray/tests/test_nd_point_index.py
+new file mode 100644
+index 0000000..eb497aa
+--- /dev/null
++++ b/xarray/tests/test_nd_point_index.py
+@@ -0,0 +1,183 @@
++import numpy as np
++import pytest
++
++import xarray as xr
++from xarray.indexes import NDPointIndex
++from xarray.tests import assert_identical
++
++pytest.importorskip("scipy")
++
++
++def test_tree_index_init() -> None:
++    from xarray.indexes.nd_point_index import ScipyKDTreeAdapter
++
++    xx, yy = np.meshgrid([1.0, 2.0], [3.0, 4.0])
++    ds = xr.Dataset(coords={"xx": (("y", "x"), xx), "yy": (("y", "x"), yy)})
++
++    ds_indexed1 = ds.set_xindex(("xx", "yy"), NDPointIndex)
++    assert "xx" in ds_indexed1.xindexes
++    assert "yy" in ds_indexed1.xindexes
++    assert isinstance(ds_indexed1.xindexes["xx"], NDPointIndex)
++    assert ds_indexed1.xindexes["xx"] is ds_indexed1.xindexes["yy"]
++
++    ds_indexed2 = ds.set_xindex(
++        ("xx", "yy"), NDPointIndex, tree_adapter_cls=ScipyKDTreeAdapter
++    )
++    assert ds_indexed1.xindexes["xx"].equals(ds_indexed2.xindexes["yy"])
++
++
++def test_tree_index_init_errors() -> None:
++    xx, yy = np.meshgrid([1.0, 2.0], [3.0, 4.0])
++    ds = xr.Dataset(coords={"xx": (("y", "x"), xx), "yy": (("y", "x"), yy)})
++
++    with pytest.raises(ValueError, match="number of variables"):
++        ds.set_xindex("xx", NDPointIndex)
++
++    ds2 = ds.assign_coords(yy=(("u", "v"), [[3.0, 3.0], [4.0, 4.0]]))
++
++    with pytest.raises(ValueError, match="same dimensions"):
++        ds2.set_xindex(("xx", "yy"), NDPointIndex)
++
++
++def test_tree_index_sel() -> None:
++    xx, yy = np.meshgrid([1.0, 2.0], [3.0, 4.0])
++    ds = xr.Dataset(coords={"xx": (("y", "x"), xx), "yy": (("y", "x"), yy)}).set_xindex(
++        ("xx", "yy"), NDPointIndex
++    )
++
++    # 1-dimensional labels
++    actual = ds.sel(
++        xx=xr.Variable("u", [1.1, 1.1, 1.1]),
++        yy=xr.Variable("u", [3.1, 3.1, 3.1]),
++        method="nearest",
++    )
++    expected = xr.Dataset(
++        coords={"xx": ("u", [1.0, 1.0, 1.0]), "yy": ("u", [3.0, 3.0, 3.0])}
++    )
++    assert_identical(actual, expected)
++
++    # 2-dimensional labels
++    actual = ds.sel(
++        xx=xr.Variable(("u", "v"), [[1.1, 1.1, 1.1], [1.9, 1.9, 1.9]]),
++        yy=xr.Variable(("u", "v"), [[3.1, 3.1, 3.1], [3.9, 3.9, 3.9]]),
++        method="nearest",
++    )
++    expected = xr.Dataset(
++        coords={
++            "xx": (("u", "v"), [[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]]),
++            "yy": (("u", "v"), [[3.0, 3.0, 3.0], [4.0, 4.0, 4.0]]),
++        },
++    )
++    assert_identical(actual, expected)
++
++    # all scalar labels
++    actual = ds.sel(xx=1.1, yy=3.1, method="nearest")
++    expected = xr.Dataset(coords={"xx": 1.0, "yy": 3.0})
++    assert_identical(actual, expected)
++
++    # broadcast scalar to label shape and dimensions
++    actual = ds.sel(xx=1.1, yy=xr.Variable("u", [3.1, 3.1, 3.1]), method="nearest")
++    expected = ds.sel(
++        xx=xr.Variable("u", [1.1, 1.1, 1.1]),
++        yy=xr.Variable("u", [3.1, 3.1, 3.1]),
++        method="nearest",
++    )
++    assert_identical(actual, expected)
++
++    # broadcast orthogonal 1-dimensional labels
++    actual = ds.sel(
++        xx=xr.Variable("u", [1.1, 1.1]),
++        yy=xr.Variable("v", [3.1, 3.1]),
++        method="nearest",
++    )
++    expected = xr.Dataset(
++        coords={
++            "xx": (("u", "v"), [[1.0, 1.0], [1.0, 1.0]]),
++            "yy": (("u", "v"), [[3.0, 3.0], [3.0, 3.0]]),
++        },
++    )
++    assert_identical(actual, expected)
++
++    # implicit dimension array-like labels
++    actual = ds.sel(
++        xx=[[1.1, 1.1, 1.1], [1.9, 1.9, 1.9]],
++        yy=[[3.1, 3.1, 3.1], [3.9, 3.9, 3.9]],
++        method="nearest",
++    )
++    expected = ds.sel(
++        xx=xr.Variable(ds.xx.dims, [[1.1, 1.1, 1.1], [1.9, 1.9, 1.9]]),
++        yy=xr.Variable(ds.yy.dims, [[3.1, 3.1, 3.1], [3.9, 3.9, 3.9]]),
++        method="nearest",
++    )
++    assert_identical(actual, expected)
++
++
++def test_tree_index_sel_errors() -> None:
++    xx, yy = np.meshgrid([1.0, 2.0], [3.0, 4.0])
++    ds = xr.Dataset(coords={"xx": (("y", "x"), xx), "yy": (("y", "x"), yy)}).set_xindex(
++        ("xx", "yy"), NDPointIndex
++    )
++
++    with pytest.raises(ValueError, match="method='nearest'"):
++        ds.sel(xx=1.1, yy=3.1)
++
++    with pytest.raises(ValueError, match="missing labels"):
++        ds.sel(xx=1.1, method="nearest")
++
++    with pytest.raises(ValueError, match="invalid label value"):
++        # invalid array-like dimensions
++        ds.sel(xx=[1.1, 1.9], yy=[3.1, 3.9], method="nearest")
++
++    # error while trying to broadcast labels
++    with pytest.raises(xr.AlignmentError, match=".*conflicting dimension sizes"):
++        ds.sel(
++            xx=xr.Variable("u", [1.1, 1.1, 1.1]),
++            yy=xr.Variable("u", [3.1, 3.1]),
++            method="nearest",
++        )
++
++
++def test_tree_index_equals() -> None:
++    xx1, yy1 = np.meshgrid([1.0, 2.0], [3.0, 4.0])
++    ds1 = xr.Dataset(
++        coords={"xx": (("y", "x"), xx1), "yy": (("y", "x"), yy1)}
++    ).set_xindex(("xx", "yy"), NDPointIndex)
++
++    xx2, yy2 = np.meshgrid([1.0, 2.0], [3.0, 4.0])
++    ds2 = xr.Dataset(
++        coords={"xx": (("y", "x"), xx2), "yy": (("y", "x"), yy2)}
++    ).set_xindex(("xx", "yy"), NDPointIndex)
++
++    xx3, yy3 = np.meshgrid([10.0, 20.0], [30.0, 40.0])
++    ds3 = xr.Dataset(
++        coords={"xx": (("y", "x"), xx3), "yy": (("y", "x"), yy3)}
++    ).set_xindex(("xx", "yy"), NDPointIndex)
++
++    assert ds1.xindexes["xx"].equals(ds2.xindexes["xx"])
++    assert not ds1.xindexes["xx"].equals(ds3.xindexes["xx"])
++
++
++def test_tree_index_rename() -> None:
++    xx, yy = np.meshgrid([1.0, 2.0], [3.0, 4.0])
++    ds = xr.Dataset(coords={"xx": (("y", "x"), xx), "yy": (("y", "x"), yy)}).set_xindex(
++        ("xx", "yy"), NDPointIndex
++    )
++
++    ds_renamed = ds.rename_dims(y="u").rename_vars(yy="uu")
++    assert "uu" in ds_renamed.xindexes
++    assert isinstance(ds_renamed.xindexes["uu"], NDPointIndex)
++    assert ds_renamed.xindexes["xx"] is ds_renamed.xindexes["uu"]
++
++    # test via sel() with implicit dimension array-like labels, which relies on
++    # NDPointIndex._coord_names and NDPointIndex._dims internal attrs
++    actual = ds_renamed.sel(
++        xx=[[1.1, 1.1, 1.1], [1.9, 1.9, 1.9]],
++        uu=[[3.1, 3.1, 3.1], [3.9, 3.9, 3.9]],
++        method="nearest",
++    )
++    expected = ds_renamed.sel(
++        xx=xr.Variable(ds_renamed.xx.dims, [[1.1, 1.1, 1.1], [1.9, 1.9, 1.9]]),
++        uu=xr.Variable(ds_renamed.uu.dims, [[3.1, 3.1, 3.1], [3.9, 3.9, 3.9]]),
++        method="nearest",
++    )
++    assert_identical(actual, expected)
+
+diff --git a/xarray/tests/test_units.py b/xarray/tests/test_units.py
+index d98d72d..7635dde 100644
+--- a/xarray/tests/test_units.py
++++ b/xarray/tests/test_units.py
+@@ -234,9 +234,7 @@ def convert_units(obj, to):
+     elif isinstance(obj, xr.DataArray):
+         name = obj.name
+ 
+-        new_units = (
+-            to.get(name, None) or to.get("data", None) or to.get(None, None) or None
+-        )
++        new_units = to.get(name) or to.get("data") or to.get(None) or None
+         data = convert_units(obj.variable, {None: new_units})
+ 
+         coords = {
+@@ -5637,7 +5635,7 @@ class TestPintWrappingDask:
+ 
+         assert_units_equal(expected, actual)
+         # Don't use isinstance b/c we don't want to allow subclasses through
+-        assert type(expected.data) == type(actual.data)  # noqa: E721
++        assert type(expected.data) is type(actual.data)
+ 
+ 
+ @requires_matplotlib

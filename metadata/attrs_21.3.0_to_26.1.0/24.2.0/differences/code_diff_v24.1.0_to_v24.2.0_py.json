@@ -1,0 +1,135 @@
+{
+  "old_dir": ".packages/attrs/24.1.0",
+  "new_dir": ".packages/attrs/24.2.0",
+  "extracted_at": "2026-04-12T22:48:03.387885",
+  "diff_file": "confirmed/attrs/24.2.0/differences/code_diff_v24.1.0_to_v24.2.0_py.diff",
+  "diff_content": "diff --git a/src/attr/_compat.py b/src/attr/_compat.py\nindex b7d7a4b..104eeb0 100644\n--- a/src/attr/_compat.py\n+++ b/src/attr/_compat.py\n@@ -13,8 +13,10 @@ PYPY = platform.python_implementation() == \"PyPy\"\n PY_3_8_PLUS = sys.version_info[:2] >= (3, 8)\n PY_3_9_PLUS = sys.version_info[:2] >= (3, 9)\n PY_3_10_PLUS = sys.version_info[:2] >= (3, 10)\n+PY_3_11_PLUS = sys.version_info[:2] >= (3, 11)\n PY_3_12_PLUS = sys.version_info[:2] >= (3, 12)\n PY_3_13_PLUS = sys.version_info[:2] >= (3, 13)\n+PY_3_14_PLUS = sys.version_info[:2] >= (3, 14)\n \n \n if sys.version_info < (3, 8):\n@@ -25,6 +27,19 @@ if sys.version_info < (3, 8):\n else:\n     from typing import Protocol  # noqa: F401\n \n+if PY_3_14_PLUS:  # pragma: no cover\n+    import annotationlib\n+\n+    _get_annotations = annotationlib.get_annotations\n+\n+else:\n+\n+    def _get_annotations(cls):\n+        \"\"\"\n+        Get annotations for *cls*.\n+        \"\"\"\n+        return cls.__dict__.get(\"__annotations__\", {})\n+\n \n class _AnnotationExtractor:\n     \"\"\"\n\ndiff --git a/src/attr/_make.py b/src/attr/_make.py\nindex 0e09281..bf00c5f 100644\n--- a/src/attr/_make.py\n+++ b/src/attr/_make.py\n@@ -22,7 +22,9 @@ from . import _compat, _config, setters\n from ._compat import (\n     PY_3_8_PLUS,\n     PY_3_10_PLUS,\n+    PY_3_11_PLUS,\n     _AnnotationExtractor,\n+    _get_annotations,\n     get_generic_base,\n )\n from .exceptions import (\n@@ -308,13 +310,6 @@ def _has_own_attribute(cls, attrib_name):\n     return attrib_name in cls.__dict__\n \n \n-def _get_annotations(cls):\n-    \"\"\"\n-    Get annotations for *cls*.\n-    \"\"\"\n-    return cls.__dict__.get(\"__annotations__\", {})\n-\n-\n def _collect_base_attrs(cls, taken_attr_names):\n     \"\"\"\n     Collect attr.ibs from base classes of *cls*, except *taken_attr_names*.\n@@ -1284,16 +1279,7 @@ def attrs(\n \n     eq_, order_ = _determine_attrs_eq_order(cmp, eq, order, None)\n \n-    # hash is deprecated & unsafe_hash takes precedence due to PEP 681.\n-    if hash is not None:\n-        import warnings\n-\n-        warnings.warn(\n-            DeprecationWarning(\n-                \"The `hash` argument is deprecated in favor of `unsafe_hash` and will be removed in or after August 2025.\"\n-            ),\n-            stacklevel=2,\n-        )\n+    #  unsafe_hash takes precedence due to PEP 681.\n     if unsafe_hash is not None:\n         hash = unsafe_hash\n \n@@ -2720,9 +2706,27 @@ class Converter:\n         self.takes_self = takes_self\n         self.takes_field = takes_field\n \n-        self._first_param_type = _AnnotationExtractor(\n-            converter\n-        ).get_first_param_type()\n+        ex = _AnnotationExtractor(converter)\n+        self._first_param_type = ex.get_first_param_type()\n+\n+        if not (self.takes_self or self.takes_field):\n+            self.__call__ = lambda value, _, __: self.converter(value)\n+        elif self.takes_self and not self.takes_field:\n+            self.__call__ = lambda value, instance, __: self.converter(\n+                value, instance\n+            )\n+        elif not self.takes_self and self.takes_field:\n+            self.__call__ = lambda value, __, field: self.converter(\n+                value, field\n+            )\n+        else:\n+            self.__call__ = lambda value, instance, field: self.converter(\n+                value, instance, field\n+            )\n+\n+        rt = ex.get_return_type()\n+        if rt is not None:\n+            self.__call__.__annotations__[\"return\"] = rt\n \n     @staticmethod\n     def _get_global_name(attr_name: str) -> str:\n@@ -2864,19 +2868,6 @@ def make_class(\n         True,\n     )\n \n-    hash = attributes_arguments.pop(\"hash\", _SENTINEL)\n-    if hash is not _SENTINEL:\n-        import warnings\n-\n-        warnings.warn(\n-            DeprecationWarning(\n-                \"The `hash` argument is deprecated in favor of `unsafe_hash` and will be removed in or after August 2025.\"\n-            ),\n-            stacklevel=2,\n-        )\n-\n-        attributes_arguments[\"unsafe_hash\"] = hash\n-\n     cls = _attrs(these=cls_dict, **attributes_arguments)(type_)\n     # Only add type annotations now or \"_attrs()\" will complain:\n     cls.__annotations__ = {\n@@ -2943,18 +2934,7 @@ def pipe(*converters):\n \n     def pipe_converter(val, inst, field):\n         for c in converters:\n-            if isinstance(c, Converter):\n-                val = c.converter(\n-                    val,\n-                    *{\n-                        (False, False): (),\n-                        (True, False): (c.takes_self,),\n-                        (False, True): (c.takes_field,),\n-                        (True, True): (c.takes_self, c.takes_field),\n-                    }[c.takes_self, c.takes_field],\n-                )\n-            else:\n-                val = c(val)\n+            val = c(val, inst, field) if isinstance(c, Converter) else c(val)\n \n         return val\n \n@@ -2968,8 +2948,12 @@ def pipe(*converters):\n         if t:\n             pipe_converter.__annotations__[\"val\"] = t\n \n+        last = converters[-1]\n+        if not PY_3_11_PLUS and isinstance(last, Converter):\n+            last = last.__call__\n+\n         # Get return type from last converter.\n-        rt = _AnnotationExtractor(converters[-1]).get_return_type()\n+        rt = _AnnotationExtractor(last).get_return_type()\n         if rt:\n             pipe_converter.__annotations__[\"return\"] = rt\n \n\ndiff --git a/src/attr/setters.py b/src/attr/setters.py\nindex 3922adb..a9ce016 100644\n--- a/src/attr/setters.py\n+++ b/src/attr/setters.py\n@@ -4,7 +4,6 @@\n Commonly used hooks for on_setattr.\n \"\"\"\n \n-\n from . import _config\n from .exceptions import FrozenAttributeError\n \n@@ -56,14 +55,20 @@ def validate(instance, attrib, new_value):\n \n def convert(instance, attrib, new_value):\n     \"\"\"\n-    Run *attrib*'s converter -- if it has one --  on *new_value* and return the\n+    Run *attrib*'s converter -- if it has one -- on *new_value* and return the\n     result.\n \n     .. versionadded:: 20.1.0\n     \"\"\"\n     c = attrib.converter\n     if c:\n-        return c(new_value)\n+        # This can be removed once we drop 3.8 and use attrs.Converter instead.\n+        from ._make import Converter\n+\n+        if not isinstance(c, Converter):\n+            return c(new_value)\n+\n+        return c(new_value, instance, attrib)\n \n     return new_value\n \n",
+  "structured_diff": {
+    "src/attr/_compat.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -13,8 +13,10 @@",
+          "snippet": " PYPY = platform.python_implementation() == \"PyPy\"\n PY_3_8_PLUS = sys.version_info[:2] >= (3, 8)\n PY_3_9_PLUS = sys.version_info[:2] >= (3, 9)\n PY_3_10_PLUS = sys.version_info[:2] >= (3, 10)\n+PY_3_11_PLUS = sys.version_info[:2] >= (3, 11)\n PY_3_12_PLUS = sys.version_info[:2] >= (3, 12)\n PY_3_13_PLUS = sys.version_info[:2] >= (3, 13)\n+PY_3_14_PLUS = sys.version_info[:2] >= (3, 14)\n \n \n if sys.version_info < (3, 8):",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "src/attr/_compat.py::PY_3_11_PLUS"
+            },
+            {
+              "kind": "variable",
+              "node": "src/attr/_compat.py::PY_3_14_PLUS"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -25,6 +27,19 @@",
+          "snippet": " if sys.version_info < (3, 8):\n else:\n     from typing import Protocol  # noqa: F401\n \n+if PY_3_14_PLUS:  # pragma: no cover\n+    import annotationlib\n+\n+    _get_annotations = annotationlib.get_annotations\n+\n+else:\n+\n+    def _get_annotations(cls):\n+        \"\"\"\n+        Get annotations for *cls*.\n+        \"\"\"\n+        return cls.__dict__.get(\"__annotations__\", {})\n+\n \n class _AnnotationExtractor:\n     \"\"\"\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_compat.py::_get_annotations"
+            }
+          ]
+        }
+      ]
+    },
+    "src/attr/_make.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -22,7 +22,9 @@",
+          "snippet": " from . import _compat, _config, setters\n from ._compat import (\n     PY_3_8_PLUS,\n     PY_3_10_PLUS,\n+    PY_3_11_PLUS,\n     _AnnotationExtractor,\n+    _get_annotations,\n     get_generic_base,\n )\n from .exceptions import (",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/attr/_make.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -308,13 +310,6 @@",
+          "snippet": " def _has_own_attribute(cls, attrib_name):\n     return attrib_name in cls.__dict__\n \n \n-def _get_annotations(cls):\n-    \"\"\"\n-    Get annotations for *cls*.\n-    \"\"\"\n-    return cls.__dict__.get(\"__annotations__\", {})\n-\n-\n def _collect_base_attrs(cls, taken_attr_names):\n     \"\"\"\n     Collect attr.ibs from base classes of *cls*, except *taken_attr_names*.",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::_collect_base_attrs"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1284,16 +1279,7 @@",
+          "snippet": " def attrs(\n \n     eq_, order_ = _determine_attrs_eq_order(cmp, eq, order, None)\n \n-    # hash is deprecated & unsafe_hash takes precedence due to PEP 681.\n-    if hash is not None:\n-        import warnings\n-\n-        warnings.warn(\n-            DeprecationWarning(\n-                \"The `hash` argument is deprecated in favor of `unsafe_hash` and will be removed in or after August 2025.\"\n-            ),\n-            stacklevel=2,\n-        )\n+    #  unsafe_hash takes precedence due to PEP 681.\n     if unsafe_hash is not None:\n         hash = unsafe_hash\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::attrs"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2720,9 +2706,27 @@",
+          "snippet": " class Converter:\n         self.takes_self = takes_self\n         self.takes_field = takes_field\n \n-        self._first_param_type = _AnnotationExtractor(\n-            converter\n-        ).get_first_param_type()\n+        ex = _AnnotationExtractor(converter)\n+        self._first_param_type = ex.get_first_param_type()\n+\n+        if not (self.takes_self or self.takes_field):\n+            self.__call__ = lambda value, _, __: self.converter(value)\n+        elif self.takes_self and not self.takes_field:\n+            self.__call__ = lambda value, instance, __: self.converter(\n+                value, instance\n+            )\n+        elif not self.takes_self and self.takes_field:\n+            self.__call__ = lambda value, __, field: self.converter(\n+                value, field\n+            )\n+        else:\n+            self.__call__ = lambda value, instance, field: self.converter(\n+                value, instance, field\n+            )\n+\n+        rt = ex.get_return_type()\n+        if rt is not None:\n+            self.__call__.__annotations__[\"return\"] = rt\n \n     @staticmethod\n     def _get_global_name(attr_name: str) -> str:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/attr/_make.py::Converter::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2864,19 +2868,6 @@",
+          "snippet": " def make_class(\n         True,\n     )\n \n-    hash = attributes_arguments.pop(\"hash\", _SENTINEL)\n-    if hash is not _SENTINEL:\n-        import warnings\n-\n-        warnings.warn(\n-            DeprecationWarning(\n-                \"The `hash` argument is deprecated in favor of `unsafe_hash` and will be removed in or after August 2025.\"\n-            ),\n-            stacklevel=2,\n-        )\n-\n-        attributes_arguments[\"unsafe_hash\"] = hash\n-\n     cls = _attrs(these=cls_dict, **attributes_arguments)(type_)\n     # Only add type annotations now or \"_attrs()\" will complain:\n     cls.__annotations__ = {",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::make_class"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2943,18 +2934,7 @@",
+          "snippet": " def pipe(*converters):\n \n     def pipe_converter(val, inst, field):\n         for c in converters:\n-            if isinstance(c, Converter):\n-                val = c.converter(\n-                    val,\n-                    *{\n-                        (False, False): (),\n-                        (True, False): (c.takes_self,),\n-                        (False, True): (c.takes_field,),\n-                        (True, True): (c.takes_self, c.takes_field),\n-                    }[c.takes_self, c.takes_field],\n-                )\n-            else:\n-                val = c(val)\n+            val = c(val, inst, field) if isinstance(c, Converter) else c(val)\n \n         return val\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::pipe_converter"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2968,8 +2948,12 @@",
+          "snippet": " def pipe(*converters):\n         if t:\n             pipe_converter.__annotations__[\"val\"] = t\n \n+        last = converters[-1]\n+        if not PY_3_11_PLUS and isinstance(last, Converter):\n+            last = last.__call__\n+\n         # Get return type from last converter.\n-        rt = _AnnotationExtractor(converters[-1]).get_return_type()\n+        rt = _AnnotationExtractor(last).get_return_type()\n         if rt:\n             pipe_converter.__annotations__[\"return\"] = rt\n \n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/_make.py::pipe"
+            }
+          ]
+        }
+      ]
+    },
+    "src/attr/setters.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -4,7 +4,6 @@",
+          "snippet": " Commonly used hooks for on_setattr.\n \"\"\"\n \n-\n from . import _config\n from .exceptions import FrozenAttributeError\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/attr/setters.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -56,14 +55,20 @@",
+          "snippet": " def validate(instance, attrib, new_value):\n \n def convert(instance, attrib, new_value):\n     \"\"\"\n-    Run *attrib*'s converter -- if it has one --  on *new_value* and return the\n+    Run *attrib*'s converter -- if it has one -- on *new_value* and return the\n     result.\n \n     .. versionadded:: 20.1.0\n     \"\"\"\n     c = attrib.converter\n     if c:\n-        return c(new_value)\n+        # This can be removed once we drop 3.8 and use attrs.Converter instead.\n+        from ._make import Converter\n+\n+        if not isinstance(c, Converter):\n+            return c(new_value)\n+\n+        return c(new_value, instance, attrib)\n \n     return new_value\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/attr/setters.py::convert"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

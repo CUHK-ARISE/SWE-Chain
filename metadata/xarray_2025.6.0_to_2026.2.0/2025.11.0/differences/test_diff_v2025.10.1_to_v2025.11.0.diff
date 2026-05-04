@@ -1,0 +1,2197 @@
+diff --git a/xarray/tests/__init__.py b/xarray/tests/__init__.py
+index ce0d39b..eb3550f 100644
+--- a/xarray/tests/__init__.py
++++ b/xarray/tests/__init__.py
+@@ -233,6 +233,10 @@ has_h5netcdf_1_4_0_or_above, requires_h5netcdf_1_4_0_or_above = _importorskip(
+     "h5netcdf", "1.4.0.dev"
+ )
+ 
++has_h5netcdf_1_7_0_or_above, requires_h5netcdf_1_7_0_or_above = _importorskip(
++    "h5netcdf", "1.7.0.dev"
++)
++
+ has_netCDF4_1_7_0_or_above, requires_netCDF4_1_7_0_or_above = _importorskip(
+     "netCDF4", "1.7.0"
+ )
+
+diff --git a/xarray/tests/test_assertions.py b/xarray/tests/test_assertions.py
+index 222a01a..6e18e47 100644
+--- a/xarray/tests/test_assertions.py
++++ b/xarray/tests/test_assertions.py
+@@ -62,6 +62,19 @@ def test_allclose_regression() -> None:
+             xr.Coordinates({"x": [0, 3]}),
+             id="Coordinates",
+         ),
++        pytest.param(
++            xr.DataTree.from_dict(
++                {
++                    "/b": xr.Dataset({"a": ("x", [1e-17, 2]), "b": ("y", [-2e-18, 2])}),
++                }
++            ),
++            xr.DataTree.from_dict(
++                {
++                    "/b": xr.Dataset({"a": ("x", [0, 2]), "b": ("y", [0, 1])}),
++                }
++            ),
++            id="DataTree",
++        ),
+     ),
+ )
+ def test_assert_allclose(obj1, obj2) -> None:
+
+diff --git a/xarray/tests/test_backends.py b/xarray/tests/test_backends.py
+index 612a3a1..36a1e35 100644
+--- a/xarray/tests/test_backends.py
++++ b/xarray/tests/test_backends.py
+@@ -60,6 +60,7 @@ from xarray.coding.strings import check_vlen_dtype, create_vlen_dtype
+ from xarray.coding.variables import SerializationWarning
+ from xarray.conventions import encode_dataset_coordinates
+ from xarray.core import indexing
++from xarray.core.common import _contains_cftime_datetimes
+ from xarray.core.indexes import PandasIndex
+ from xarray.core.options import set_options
+ from xarray.core.types import PDDatetimeUnitOptions
+@@ -76,6 +77,7 @@ from xarray.tests import (
+     has_h5netcdf_1_4_0_or_above,
+     has_netCDF4,
+     has_numpy_2,
++    has_pydap,
+     has_scipy,
+     has_zarr,
+     has_zarr_v3,
+@@ -89,6 +91,7 @@ from xarray.tests import (
+     requires_fsspec,
+     requires_h5netcdf,
+     requires_h5netcdf_1_4_0_or_above,
++    requires_h5netcdf_1_7_0_or_above,
+     requires_h5netcdf_or_netCDF4,
+     requires_h5netcdf_ros3,
+     requires_iris,
+@@ -460,6 +463,7 @@ class DatasetIOBase:
+             save_kwargs = {}
+         if open_kwargs is None:
+             open_kwargs = {}
++
+         with create_tmp_file(allow_cleanup_failure=allow_cleanup_failure) as path:
+             self.save(data, path, **save_kwargs)
+             with self.open(path, **open_kwargs) as ds:
+@@ -982,6 +986,15 @@ class DatasetIOBase:
+             actual = on_disk.isel(dim2=on_disk["dim2"] < 3)
+             assert_identical(expected, actual)
+ 
++    def test_empty_isel(self) -> None:
++        # Make sure isel works lazily with empty indexer.
++        # GH:issue:10867
++        in_memory = xr.Dataset({"a": ("x", np.arange(4))}, coords={"x": np.arange(4)})
++        with self.roundtrip(in_memory) as on_disk:
++            expected = in_memory.isel(x=[])
++            actual = on_disk.isel(x=[])
++            assert_identical(expected, actual)
++
+     def validate_array_type(self, ds):
+         # Make sure that only NumpyIndexingAdapter stores a bare np.ndarray.
+         def find_and_validate_array(obj):
+@@ -4735,6 +4748,54 @@ class TestNetCDF4ClassicViaNetCDF4Data(NetCDF3Only, CFEncodedBase):
+             ) as store:
+                 yield store
+ 
++    @requires_h5netcdf
++    def test_string_attributes_stored_as_char(self, tmp_path):
++        import h5netcdf
++
++        original = Dataset(attrs={"foo": "bar"})
++        store_path = tmp_path / "tmp.nc"
++        original.to_netcdf(store_path, engine=self.engine, format=self.file_format)
++        with h5netcdf.File(store_path, "r") as ds:
++            # Check that the attribute is stored as a char array
++            assert ds._h5file.attrs["foo"].dtype == np.dtype("S3")
++
++
++@requires_h5netcdf_1_7_0_or_above
++class TestNetCDF4ClassicViaH5NetCDFData(TestNetCDF4ClassicViaNetCDF4Data):
++    engine: T_NetcdfEngine = "h5netcdf"
++    file_format: T_NetcdfTypes = "NETCDF4_CLASSIC"
++
++    @contextlib.contextmanager
++    def create_store(self):
++        with create_tmp_file() as tmp_file:
++            with backends.H5NetCDFStore.open(
++                tmp_file, mode="w", format="NETCDF4_CLASSIC"
++            ) as store:
++                yield store
++
++    @requires_netCDF4
++    def test_cross_engine_read_write_netcdf4(self) -> None:
++        # Drop dim3, because its labels include strings. These appear to be
++        # not properly read with python-netCDF4, which converts them into
++        # unicode instead of leaving them as bytes.
++        data = create_test_data().drop_vars("dim3")
++        data.attrs["foo"] = "bar"
++        valid_engines: list[T_NetcdfEngine] = ["netcdf4", "h5netcdf"]
++        for write_engine in valid_engines:
++            with create_tmp_file() as tmp_file:
++                data.to_netcdf(tmp_file, engine=write_engine, format=self.file_format)
++                for read_engine in valid_engines:
++                    with open_dataset(tmp_file, engine=read_engine) as actual:
++                        assert_identical(data, actual)
++
++    def test_group_fails(self):
++        # Check writing group data fails with CLASSIC format
++        original = create_test_data()
++        with pytest.raises(
++            ValueError, match=r"Cannot create sub-groups in `NETCDF4_CLASSIC` format."
++        ):
++            original.to_netcdf(group="sub", format=self.file_format, engine=self.engine)
++
+ 
+ @requires_scipy_or_netCDF4
+ class TestGenericNetCDFData(NetCDF3Only, CFEncodedBase):
+@@ -6238,6 +6299,32 @@ class TestDask(DatasetIOBase):
+             ) as actual:
+                 assert_identical(expected, actual)
+ 
++    @requires_cftime
++    def test_open_dataset_cftime_autochunk(self) -> None:
++        """Create a dataset with cftime datetime objects and
++        ensure that auto-chunking works correctly."""
++        import cftime
++
++        original = xr.Dataset(
++            {
++                "foo": ("time", [0.0]),
++                "time_bnds": (
++                    ("time", "bnds"),
++                    [
++                        [
++                            cftime.Datetime360Day(2005, 12, 1, 0, 0, 0, 0),
++                            cftime.Datetime360Day(2005, 12, 2, 0, 0, 0, 0),
++                        ]
++                    ],
++                ),
++            },
++            {"time": [cftime.Datetime360Day(2005, 12, 1, 12, 0, 0, 0)]},
++        )
++        with self.roundtrip(original, open_kwargs={"chunks": "auto"}) as actual:
++            assert isinstance(actual.time_bnds.variable.data, da.Array)
++            assert _contains_cftime_datetimes(actual.time)
++            assert_identical(original, actual)
++
+     # Flaky test. Very open to contributions on fixing this
+     @pytest.mark.flaky
+     def test_dask_roundtrip(self) -> None:
+@@ -7167,7 +7254,10 @@ def test_netcdf4_entrypoint(tmp_path: Path) -> None:
+     _check_guess_can_open_and_open(entrypoint, path, engine="netcdf4", expected=ds)
+     _check_guess_can_open_and_open(entrypoint, str(path), engine="netcdf4", expected=ds)
+ 
+-    assert entrypoint.guess_can_open("http://something/remote")
++    # Remote URLs without extensions are no longer claimed (stricter detection)
++    assert not entrypoint.guess_can_open("http://something/remote")
++    # Remote URLs with netCDF extensions are claimed
++    assert entrypoint.guess_can_open("http://something/remote.nc")
+     assert entrypoint.guess_can_open("something-local.nc")
+     assert entrypoint.guess_can_open("something-local.nc4")
+     assert entrypoint.guess_can_open("something-local.cdf")
+@@ -7210,6 +7300,10 @@ def test_scipy_entrypoint(tmp_path: Path) -> None:
+     assert entrypoint.guess_can_open("something-local.nc.gz")
+     assert not entrypoint.guess_can_open("not-found-and-no-extension")
+     assert not entrypoint.guess_can_open(b"not-a-netcdf-file")
++    # Should not claim .gz files that aren't netCDF
++    assert not entrypoint.guess_can_open("something.zarr.gz")
++    assert not entrypoint.guess_can_open("something.tar.gz")
++    assert not entrypoint.guess_can_open("something.txt.gz")
+ 
+ 
+ @requires_h5netcdf
+@@ -7260,6 +7354,85 @@ def test_zarr_entrypoint(tmp_path: Path) -> None:
+     assert not entrypoint.guess_can_open("something.zarr.txt")
+ 
+ 
++@requires_h5netcdf
++@requires_netCDF4
++@requires_zarr
++def test_remote_url_backend_auto_detection() -> None:
++    """
++    Test that remote URLs are correctly selected by the backend resolution system.
++
++    This tests the fix for issue where netCDF4, h5netcdf, and pydap backends were
++    claiming ALL remote URLs, preventing remote Zarr stores from being
++    auto-detected.
++
++    See: https://github.com/pydata/xarray/issues/10801
++    """
++    from xarray.backends.plugins import guess_engine
++
++    # Test cases: (url, expected_backend)
++    test_cases = [
++        # Remote Zarr URLs
++        ("https://example.com/store.zarr", "zarr"),
++        ("http://example.com/data.zarr/", "zarr"),
++        ("s3://bucket/path/to/data.zarr", "zarr"),
++        # Remote netCDF URLs (non-DAP) - netcdf4 wins (first in order, no query params)
++        ("https://example.com/file.nc", "netcdf4"),
++        ("http://example.com/data.nc4", "netcdf4"),
++        ("https://example.com/test.cdf", "netcdf4"),
++        ("s3://bucket/path/to/data.nc", "netcdf4"),
++        # Remote netCDF URLs with query params - netcdf4 wins
++        # Note: Query params are typically indicative of DAP URLs (e.g., OPeNDAP constraint expressions),
++        # so we prefer netcdf4 (which has DAP support) over h5netcdf (which doesn't)
++        ("https://example.com/data.nc?var=temperature&time=0", "netcdf4"),
++        (
++            "http://test.opendap.org/opendap/dap4/StaggeredGrid.nc4?dap4.ce=/time[0:1:0]",
++            "netcdf4",
++        ),
++        # DAP URLs with .nc extensions (no query params) - netcdf4 wins (first in order)
++        ("http://test.opendap.org/opendap/dap4/StaggeredGrid.nc4", "netcdf4"),
++        ("https://example.com/DAP4/data.nc", "netcdf4"),
++        ("http://example.com/data/Dap4/file.nc", "netcdf4"),
++    ]
++
++    for url, expected_backend in test_cases:
++        engine = guess_engine(url)
++        assert engine == expected_backend, (
++            f"URL {url!r} should select {expected_backend!r} but got {engine!r}"
++        )
++
++    # DAP URLs without extensions - pydap wins if available, netcdf4 otherwise
++    # When pydap is not installed, netCDF4 should handle these DAP URLs
++    expected_dap_backend = "pydap" if has_pydap else "netcdf4"
++    dap_urls = [
++        "dap2://opendap.earthdata.nasa.gov/collections/dataset",
++        "dap4://opendap.earthdata.nasa.gov/collections/dataset",
++        "DAP2://example.com/dataset",  # uppercase scheme
++        "DAP4://example.com/dataset",  # uppercase scheme
++        "https://example.com/services/DAP2/dataset",  # uppercase in path
++    ]
++
++    for url in dap_urls:
++        engine = guess_engine(url)
++        assert engine == expected_dap_backend, (
++            f"URL {url!r} should select {expected_dap_backend!r} but got {engine!r}"
++        )
++
++    # URLs that should raise ValueError (no backend can open them)
++    invalid_urls = [
++        "http://test.opendap.org/opendap/data/nc/coads_climatology.nc.dap",  # .dap suffix
++        "https://example.com/data.dap",  # .dap suffix
++        "http://opendap.example.com/data",  # no extension, no DAP indicators
++        "https://test.opendap.org/dataset",  # no extension, no DAP indicators
++    ]
++
++    for url in invalid_urls:
++        with pytest.raises(
++            ValueError,
++            match=r"did not find a match in any of xarray's currently installed IO backends",
++        ):
++            guess_engine(url)
++
++
+ @requires_netCDF4
+ @pytest.mark.parametrize("str_type", (str, np.str_))
+ def test_write_file_from_np_str(str_type: type[str | np.str_], tmpdir: str) -> None:
+
+diff --git a/xarray/tests/test_backends_datatree.py b/xarray/tests/test_backends_datatree.py
+index 818e9a5..f534752 100644
+--- a/xarray/tests/test_backends_datatree.py
++++ b/xarray/tests/test_backends_datatree.py
+@@ -569,6 +569,8 @@ class TestH5NetCDFDatatreeIO(NetCDFIOBase):
+ class TestPyDAPDatatreeIO:
+     """Test PyDAP backend for DataTree."""
+ 
++    pytestmark = pytest.mark.xfail(reason="test.opendap.org reports a 404 error")
++
+     engine: T_DataTreeNetcdfEngine | None = "pydap"
+     # you can check these by adding a .dmr to urls, and replacing dap4 with http
+     unaligned_datatree_url = (
+
+diff --git a/xarray/tests/test_coarsen.py b/xarray/tests/test_coarsen.py
+index 3b24a7e..d303b85 100644
+--- a/xarray/tests/test_coarsen.py
++++ b/xarray/tests/test_coarsen.py
+@@ -100,7 +100,7 @@ def test_coarsen_keep_attrs(funcname, argument) -> None:
+         attrs=global_attrs,
+     )
+ 
+-    # attrs are now kept per default
++    # attrs are kept by default
+     func = getattr(ds.coarsen(dim={"coord": 5}), funcname)
+     result = func(*argument)
+     assert result.attrs == global_attrs
+@@ -199,7 +199,7 @@ def test_coarsen_da_keep_attrs(funcname, argument) -> None:
+         name="name",
+     )
+ 
+-    # attrs are now kept per default
++    # attrs are kept by default
+     func = getattr(da.coarsen(dim={"coord": 5}), funcname)
+     result = func(*argument)
+     assert result.attrs == attrs_da
+
+diff --git a/xarray/tests/test_computation.py b/xarray/tests/test_computation.py
+index 5785d73..fa75f9c 100644
+--- a/xarray/tests/test_computation.py
++++ b/xarray/tests/test_computation.py
+@@ -694,10 +694,7 @@ def test_broadcast_compat_data_2d() -> None:
+ 
+ def test_keep_attrs() -> None:
+     def add(a, b, keep_attrs):
+-        if keep_attrs:
+-            return apply_ufunc(operator.add, a, b, keep_attrs=keep_attrs)
+-        else:
+-            return apply_ufunc(operator.add, a, b)
++        return apply_ufunc(operator.add, a, b, keep_attrs=keep_attrs)
+ 
+     a = xr.DataArray([0, 1], [("x", [0, 1])])
+     a.attrs["attr"] = "da"
+@@ -733,7 +730,7 @@ def test_keep_attrs() -> None:
+         pytest.param(
+             None,
+             [{"a": 1}, {"a": 2}, {"a": 3}],
+-            {},
++            {"a": 1},
+             False,
+             id="default",
+         ),
+@@ -802,7 +799,7 @@ def test_keep_attrs_strategies_variable(strategy, attrs, expected, error) -> Non
+         pytest.param(
+             None,
+             [{"a": 1}, {"a": 2}, {"a": 3}],
+-            {},
++            {"a": 1},
+             False,
+             id="default",
+         ),
+@@ -872,7 +869,7 @@ def test_keep_attrs_strategies_dataarray(strategy, attrs, expected, error) -> No
+         pytest.param(
+             None,
+             [{"a": 1}, {"a": 2}, {"a": 3}],
+-            {},
++            {"a": 1},
+             False,
+             id="default",
+         ),
+@@ -967,7 +964,7 @@ def test_keep_attrs_strategies_dataarray_variables(
+         pytest.param(
+             None,
+             [{"a": 1}, {"a": 2}, {"a": 3}],
+-            {},
++            {"a": 1},
+             False,
+             id="default",
+         ),
+@@ -1037,7 +1034,7 @@ def test_keep_attrs_strategies_dataset(strategy, attrs, expected, error) -> None
+         pytest.param(
+             None,
+             [{"a": 1}, {"a": 2}, {"a": 3}],
+-            {},
++            {"a": 1},
+             False,
+             id="default",
+         ),
+
+diff --git a/xarray/tests/test_concat.py b/xarray/tests/test_concat.py
+index 2c36928..8c61d7b 100644
+--- a/xarray/tests/test_concat.py
++++ b/xarray/tests/test_concat.py
+@@ -9,9 +9,18 @@ import numpy as np
+ import pandas as pd
+ import pytest
+ 
+-from xarray import AlignmentError, DataArray, Dataset, Variable, concat, set_options
++from xarray import (
++    AlignmentError,
++    DataArray,
++    Dataset,
++    Variable,
++    concat,
++    open_dataset,
++    set_options,
++)
+ from xarray.core import dtypes, types
+ from xarray.core.coordinates import Coordinates
++from xarray.core.datatree import DataTree
+ from xarray.core.indexes import PandasIndex
+ from xarray.structure import merge
+ from xarray.tests import (
+@@ -23,6 +32,7 @@ from xarray.tests import (
+     assert_identical,
+     requires_dask,
+     requires_pyarrow,
++    requires_scipy_or_netCDF4,
+ )
+ from xarray.tests.indexes import XYIndex
+ from xarray.tests.test_dataset import create_test_data
+@@ -1119,6 +1129,47 @@ class TestConcatDataset:
+         assert_identical(actual, expected, check_default_indexes=False)
+         assert actual.indexes == {}
+ 
++    @requires_scipy_or_netCDF4
++    def test_concat_combine_attrs_nan_after_netcdf_roundtrip(self, tmp_path) -> None:
++        # Test for issue #10833: NaN attributes should be preserved
++        # with combine_attrs="drop_conflicts" after NetCDF roundtrip
++        import numpy as np
++
++        # Create arrays with matching NaN fill_value attribute
++        ds1 = Dataset(
++            {"a": ("x", [0, 1])},
++            attrs={"fill_value": np.nan, "sensor": "G18", "field": "CTH"},
++        )
++        ds2 = Dataset(
++            {"a": ("x", [2, 3])},
++            attrs={"fill_value": np.nan, "sensor": "G16", "field": "CTH"},
++        )
++
++        # Save to NetCDF and reload (converts Python float NaN to NumPy scalar NaN)
++        path1 = tmp_path / "ds1.nc"
++        path2 = tmp_path / "ds2.nc"
++        ds1.to_netcdf(path1)
++        ds2.to_netcdf(path2)
++
++        ds1_loaded = open_dataset(path1)
++        ds2_loaded = open_dataset(path2)
++
++        # Verify that NaN attributes are preserved after concat
++        actual = concat(
++            [ds1_loaded, ds2_loaded], dim="y", combine_attrs="drop_conflicts"
++        )
++
++        # fill_value should be preserved (not dropped) since both have NaN
++        assert "fill_value" in actual.attrs
++        assert np.isnan(actual.attrs["fill_value"])
++        # field should be preserved (identical in both)
++        assert actual.attrs["field"] == "CTH"
++        # sensor should be dropped (conflicts)
++        assert "sensor" not in actual.attrs
++
++        ds1_loaded.close()
++        ds2_loaded.close()
++
+ 
+ class TestConcatDataArray:
+     def test_concat(self) -> None:
+@@ -1409,12 +1460,12 @@ def test_concat_typing_check() -> None:
+         TypeError,
+         match="The elements in the input list need to be either all 'Dataset's or all 'DataArray's",
+     ):
+-        concat([ds, da], dim="foo")  # type: ignore[type-var]
++        concat([ds, da], dim="foo")  # type: ignore[list-item]
+     with pytest.raises(
+         TypeError,
+         match="The elements in the input list need to be either all 'Dataset's or all 'DataArray's",
+     ):
+-        concat([da, ds], dim="foo")  # type: ignore[type-var]
++        concat([da, ds], dim="foo")  # type: ignore[list-item]
+ 
+ 
+ def test_concat_not_all_indexes() -> None:
+@@ -1586,3 +1637,169 @@ def test_concat_multi_dim_index() -> None:
+         joins_lr: list[types.JoinOptions] = ["left", "right"]
+         for join in joins_lr:
+             actual = concat([ds1, ds2], dim="x", join=join)
++
++
++class TestConcatDataTree:
++    def test_concat_datatree_along_existing_dim(self):
++        dt1 = DataTree.from_dict(data={"/a": ("x", [1]), "/b": 3}, coords={"/x": [0]})
++        dt2 = DataTree.from_dict(data={"/a": ("x", [2]), "/b": 3}, coords={"/x": [1]})
++        expected = DataTree.from_dict(
++            data={"/a": ("x", [1, 2]), "/b": 3}, coords={"/x": [0, 1]}
++        )
++        actual = concat([dt1, dt2], dim="x", data_vars="minimal", coords="minimal")
++        assert actual.identical(expected)
++
++    def test_concat_datatree_along_existing_dim_defaults(self):
++        # scalar coordinate
++        dt1 = DataTree.from_dict(data={"/a": ("x", [1])}, coords={"/x": [0], "/b": 3})
++        dt2 = DataTree.from_dict(data={"/a": ("x", [2])}, coords={"/x": [1], "/b": 3})
++        expected = DataTree.from_dict(
++            data={"/a": ("x", [1, 2])}, coords={"/x": [0, 1], "b": 3}
++        )
++        actual = concat([dt1, dt2], dim="x")
++        assert actual.identical(expected)
++
++        # scalar data variable
++        dt1 = DataTree.from_dict(data={"/a": ("x", [1]), "/b": 3}, coords={"/x": [0]})
++        dt2 = DataTree.from_dict(data={"/a": ("x", [2]), "/b": 3}, coords={"/x": [1]})
++        expected = DataTree.from_dict(
++            data={"/a": ("x", [1, 2]), "/b": ("x", [3, 3])}, coords={"/x": [0, 1]}
++        )
++        with pytest.warns(
++            FutureWarning, match="will change from data_vars='all' to data_vars=None"
++        ):
++            actual = concat([dt1, dt2], dim="x")
++        assert actual.identical(expected)
++
++    def test_concat_datatree_isomorphic_error(self):
++        dt1 = DataTree.from_dict(data={"/data": ("x", [1]), "/a": None})
++        dt2 = DataTree.from_dict(data={"/data": ("x", [2]), "/b": None})
++        with pytest.raises(
++            ValueError, match="All trees must be isomorphic to be concatenated"
++        ):
++            concat([dt1, dt2], dim="x", data_vars="minimal", coords="minimal")
++
++    def test_concat_datatree_datavars_all(self):
++        dt1 = DataTree.from_dict(data={"/a": 1, "/c/b": ("y", [10])})
++        dt2 = DataTree.from_dict(data={"/a": 2, "/c/b": ("y", [20])})
++        dim = pd.Index([100, 200], name="x")
++        actual = concat([dt1, dt2], dim=dim, data_vars="all", coords="minimal")
++        expected = DataTree.from_dict(
++            data={
++                "/a": (("x",), [1, 2]),
++                "/c/b": (("x", "y"), [[10], [20]]),
++            },
++            coords={"/x": dim},
++        )
++        assert actual.identical(expected)
++
++    def test_concat_datatree_coords_all(self):
++        dt1 = DataTree.from_dict(data={"/child/d": ("y", [10])}, coords={"/c": 1})
++        dt2 = DataTree.from_dict(data={"/child/d": ("y", [10])}, coords={"/c": 2})
++        dim = pd.Index([0, 1], name="x")
++        actual = concat(
++            [dt1, dt2], dim=dim, data_vars="minimal", coords="all", compat="equals"
++        )
++        expected = DataTree.from_dict(
++            data={"/child/d": ("y", [10])},
++            coords={
++                "/c": (("x",), [1, 2]),
++                "/x": dim,
++                "/child/x": dim,
++            },
++        )
++        assert actual.identical(expected)
++
++    def test_concat_datatree_datavars_different(self):
++        dt1 = DataTree.from_dict(data={"/a": 0, "/b": 1})
++        dt2 = DataTree.from_dict(data={"/a": 0, "/b": 2})
++        dim = pd.Index([0, 1], name="x")
++        actual = concat(
++            [dt1, dt2],
++            dim=dim,
++            data_vars="different",
++            coords="minimal",
++            compat="equals",
++        )
++        expected = DataTree.from_dict(
++            data={"/a": 0, "/b": (("x",), [1, 2])}, coords={"/x": dim}
++        )
++        assert actual.identical(expected)
++
++    def test_concat_datatree_nodes(self):
++        dt1 = DataTree.from_dict(data={"/a/d": ("x", [1])}, coords={"/x": [0]})
++        dt2 = DataTree.from_dict(data={"/a/d": ("x", [2])}, coords={"/x": [1]})
++        actual = concat([dt1, dt2], dim="x", data_vars="minimal", coords="minimal")
++        expected = DataTree.from_dict(
++            data={"/a/d": ("x", [1, 2])}, coords={"/x": [0, 1]}
++        )
++        assert actual.identical(expected)
++
++    def test_concat_datatree_names(self):
++        dt1 = DataTree(Dataset({"a": ("x", [1])}), name="a")
++        dt2 = DataTree(Dataset({"a": ("x", [2])}), name="b")
++        result = concat(
++            [dt1, dt2], dim="x", data_vars="minimal", coords="minimal", compat="equals"
++        )
++        assert result.name == "a"
++        expected = DataTree(Dataset({"a": ("x", [1, 2])}), name="a")
++        assert result.identical(expected)
++
++        with pytest.raises(ValueError, match="DataTree names not identical"):
++            concat(
++                [dt1, dt2],
++                dim="x",
++                data_vars="minimal",
++                coords="minimal",
++                compat="identical",
++            )
++
++    def test_concat_along_new_dim_raises_for_minimal(self):
++        dt1 = DataTree.from_dict({"/a/d": 1})
++        dt2 = DataTree.from_dict({"/a/d": 2})
++        with pytest.raises(
++            ValueError, match="data_vars='minimal' and coords='minimal'"
++        ):
++            concat([dt1, dt2], dim="y", data_vars="minimal", coords="minimal")
++
++    def test_concat_data_in_child_only(self):
++        dt1 = DataTree.from_dict(
++            data={"/child/a": ("x", [1])}, coords={"/child/x": [0]}
++        )
++        dt2 = DataTree.from_dict(
++            data={"/child/a": ("x", [2])}, coords={"/child/x": [1]}
++        )
++        actual = concat([dt1, dt2], dim="x", data_vars="minimal", coords="minimal")
++        expected = DataTree.from_dict(
++            data={"/child/a": ("x", [1, 2])}, coords={"/child/x": [0, 1]}
++        )
++        assert actual.identical(expected)
++
++    def test_concat_data_in_child_only_defaults(self):
++        dt1 = DataTree.from_dict(
++            data={"/child/a": ("x", [1])}, coords={"/child/x": [0]}
++        )
++        dt2 = DataTree.from_dict(
++            data={"/child/a": ("x", [2])}, coords={"/child/x": [1]}
++        )
++        actual = concat([dt1, dt2], dim="x")
++        expected = DataTree.from_dict(
++            data={"/child/a": ("x", [1, 2])}, coords={"/child/x": [0, 1]}
++        )
++        assert actual.identical(expected)
++
++    def test_concat_data_in_child_new_dim(self):
++        dt1 = DataTree.from_dict(data={"/child/a": 1}, coords={"/child/x": 0})
++        dt2 = DataTree.from_dict(data={"/child/a": 2}, coords={"/child/x": 1})
++        actual = concat([dt1, dt2], dim="x")
++        expected = DataTree.from_dict(
++            data={"/child/a": ("x", [1, 2])}, coords={"/child/x": [0, 1]}
++        )
++        assert actual.identical(expected)
++
++    def test_concat_different_dims_in_different_child(self):
++        dt1 = DataTree.from_dict(coords={"/first/x": [1], "/second/x": [2]})
++        dt2 = DataTree.from_dict(coords={"/first/x": [3], "/second/x": [4]})
++        actual = concat([dt1, dt2], dim="x")
++        expected = DataTree.from_dict(coords={"/first/x": [1, 3], "/second/x": [2, 4]})
++        assert actual.identical(expected)
+
+diff --git a/xarray/tests/test_conventions.py b/xarray/tests/test_conventions.py
+index 45574bf..6523b30 100644
+--- a/xarray/tests/test_conventions.py
++++ b/xarray/tests/test_conventions.py
+@@ -658,8 +658,11 @@ def test_scalar_units() -> None:
+ 
+ 
+ def test_decode_cf_error_includes_variable_name():
+-    ds = Dataset({"invalid": ([], 1e36, {"units": "days since 2000-01-01"})})
+-    with pytest.raises(ValueError, match="Failed to decode variable 'invalid'"):
++    ds = Dataset({"my_invalid_var": ([], 1e36, {"units": "days since 2000-01-01"})})
++    with pytest.raises(
++        ValueError,
++        match=r"unable to decode(?s:.*)my_invalid_var",
++    ):
+         decode_cf(ds)
+ 
+ 
+
+diff --git a/xarray/tests/test_dask.py b/xarray/tests/test_dask.py
+index 72d1af6..ccbfc06 100644
+--- a/xarray/tests/test_dask.py
++++ b/xarray/tests/test_dask.py
+@@ -1161,6 +1161,21 @@ def test_auto_chunk_da(obj):
+     assert actual.chunks == expected.chunks
+ 
+ 
++def test_auto_chunk_da_cftime():
++    yrs = np.arange(2000, 2120)
++    cftime_dates = xr.date_range(
++        start=f"{yrs[0]}-01-01", end=f"{yrs[-1]}-12-31", freq="1YE", use_cftime=True
++    )
++    yr_array = np.tile(cftime_dates.values, (10, 1))
++    da = xr.DataArray(
++        yr_array, dims=["x", "t"], coords={"x": np.arange(10), "t": cftime_dates}
++    ).chunk({"x": 4, "t": 5})
++    actual = da.chunk("auto").data
++    expected = da.data.rechunk({0: 10, 1: 120})
++    np.testing.assert_array_equal(actual, expected)
++    assert actual.chunks == expected.chunks
++
++
+ def test_map_blocks_error(map_da, map_ds):
+     def bad_func(darray):
+         return (darray * darray.x + 5 * darray.y)[:1, :1]
+
+diff --git a/xarray/tests/test_dataarray.py b/xarray/tests/test_dataarray.py
+index b191b3f..5eec7b8 100644
+--- a/xarray/tests/test_dataarray.py
++++ b/xarray/tests/test_dataarray.py
+@@ -3062,16 +3062,21 @@ class TestDataArray:
+                 da.quantile(q, method=method, interpolation=method)
+ 
+     def test_reduce_keep_attrs(self) -> None:
+-        # Test dropped attrs
++        # Test default behavior (keeps attrs for reduction operations)
+         vm = self.va.mean()
+-        assert len(vm.attrs) == 0
+-        assert vm.attrs == {}
++        assert len(vm.attrs) == len(self.attrs)
++        assert vm.attrs == self.attrs
+ 
+-        # Test kept attrs
++        # Test explicitly keeping attrs
+         vm = self.va.mean(keep_attrs=True)
+         assert len(vm.attrs) == len(self.attrs)
+         assert vm.attrs == self.attrs
+ 
++        # Test explicitly dropping attrs
++        vm = self.va.mean(keep_attrs=False)
++        assert len(vm.attrs) == 0
++        assert vm.attrs == {}
++
+     def test_assign_attrs(self) -> None:
+         expected = DataArray([], attrs=dict(a=1, b=2))
+         expected.attrs["a"] = 1
+@@ -4970,20 +4975,25 @@ class TestReduce1D(TestReduce):
+         result0 = ar.min(keep_attrs=True)
+         assert_identical(result0, expected0)
+ 
++        # Default keeps attrs for reduction operations
+         result1 = ar.min()
+         expected1 = expected0.copy()
+-        expected1.attrs = {}
+         assert_identical(result1, expected1)
+ 
+         result2 = ar.min(skipna=False)
+         if nanindex is not None and ar.dtype.kind != "O":
+             expected2 = ar.isel(x=nanindex, drop=True)
+-            expected2.attrs = {}
+         else:
+             expected2 = expected1
+ 
+         assert_identical(result2, expected2)
+ 
++        # Test explicitly dropping attrs
++        result3 = ar.min(keep_attrs=False)
++        expected3 = expected0.copy()
++        expected3.attrs = {}
++        assert_identical(result3, expected3)
++
+     def test_max(
+         self,
+         x: np.ndarray,
+@@ -5002,20 +5012,25 @@ class TestReduce1D(TestReduce):
+         result0 = ar.max(keep_attrs=True)
+         assert_identical(result0, expected0)
+ 
++        # Default keeps attrs for reduction operations
+         result1 = ar.max()
+         expected1 = expected0.copy()
+-        expected1.attrs = {}
+         assert_identical(result1, expected1)
+ 
+         result2 = ar.max(skipna=False)
+         if nanindex is not None and ar.dtype.kind != "O":
+             expected2 = ar.isel(x=nanindex, drop=True)
+-            expected2.attrs = {}
+         else:
+             expected2 = expected1
+ 
+         assert_identical(result2, expected2)
+ 
++        # Test explicitly dropping attrs
++        result3 = ar.max(keep_attrs=False)
++        expected3 = expected0.copy()
++        expected3.attrs = {}
++        assert_identical(result3, expected3)
++
+     @pytest.mark.filterwarnings(
+         "ignore:Behaviour of argmin/argmax with neither dim nor :DeprecationWarning"
+     )
+@@ -5037,6 +5052,7 @@ class TestReduce1D(TestReduce):
+             return
+ 
+         expected0 = indarr[minindex]
++        expected0.attrs = self.attrs  # argmin should preserve attrs from input
+         result0 = ar.argmin()
+         assert_identical(result0, expected0)
+ 
+@@ -5048,7 +5064,7 @@ class TestReduce1D(TestReduce):
+         result2 = ar.argmin(skipna=False)
+         if nanindex is not None and ar.dtype.kind != "O":
+             expected2 = indarr.isel(x=nanindex, drop=True)
+-            expected2.attrs = {}
++            expected2.attrs = self.attrs  # Default keeps attrs for reduction operations
+         else:
+             expected2 = expected0
+ 
+@@ -5075,6 +5091,7 @@ class TestReduce1D(TestReduce):
+             return
+ 
+         expected0 = indarr[maxindex]
++        expected0.attrs = self.attrs  # Default keeps attrs for reduction operations
+         result0 = ar.argmax()
+         assert_identical(result0, expected0)
+ 
+@@ -5086,7 +5103,7 @@ class TestReduce1D(TestReduce):
+         result2 = ar.argmax(skipna=False)
+         if nanindex is not None and ar.dtype.kind != "O":
+             expected2 = indarr.isel(x=nanindex, drop=True)
+-            expected2.attrs = {}
++            expected2.attrs = self.attrs  # Default keeps attrs for reduction operations
+         else:
+             expected2 = expected0
+ 
+@@ -5144,6 +5161,7 @@ class TestReduce1D(TestReduce):
+             (coordarr1 * fill_value_0).isel(x=minindex, drop=True).astype("float")
+         )
+         expected0.name = "x"
++        expected0.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         # Default fill value (NaN)
+         result0 = ar0.idxmin()
+@@ -5163,7 +5181,7 @@ class TestReduce1D(TestReduce):
+         if nanindex is not None and ar0.dtype.kind != "O":
+             expected3 = coordarr0.isel(x=nanindex, drop=True).astype("float")
+             expected3.name = "x"
+-            expected3.attrs = {}
++            expected3.attrs = self.attrs  # Default keeps attrs for reduction operations
+         else:
+             expected3 = expected0.copy()
+ 
+@@ -5182,6 +5200,7 @@ class TestReduce1D(TestReduce):
+ 
+         expected5 = (coordarr1 * fill_value_5).isel(x=minindex, drop=True)
+         expected5.name = "x"
++        expected5.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         result5 = ar0.idxmin(fill_value=-1.1)
+         assert_identical(result5, expected5)
+@@ -5194,6 +5213,7 @@ class TestReduce1D(TestReduce):
+ 
+         expected6 = (coordarr1 * fill_value_6).isel(x=minindex, drop=True)
+         expected6.name = "x"
++        expected6.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         result6 = ar0.idxmin(fill_value=-1)
+         assert_identical(result6, expected6)
+@@ -5206,6 +5226,7 @@ class TestReduce1D(TestReduce):
+ 
+         expected7 = (coordarr1 * fill_value_7).isel(x=minindex, drop=True)
+         expected7.name = "x"
++        expected7.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         result7 = ar0.idxmin(fill_value=-1j)
+         assert_identical(result7, expected7)
+@@ -5259,6 +5280,7 @@ class TestReduce1D(TestReduce):
+             (coordarr1 * fill_value_0).isel(x=maxindex, drop=True).astype("float")
+         )
+         expected0.name = "x"
++        expected0.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         # Default fill value (NaN)
+         result0 = ar0.idxmax()
+@@ -5278,7 +5300,7 @@ class TestReduce1D(TestReduce):
+         if nanindex is not None and ar0.dtype.kind != "O":
+             expected3 = coordarr0.isel(x=nanindex, drop=True).astype("float")
+             expected3.name = "x"
+-            expected3.attrs = {}
++            expected3.attrs = self.attrs  # Default keeps attrs for reduction operations
+         else:
+             expected3 = expected0.copy()
+ 
+@@ -5297,6 +5319,7 @@ class TestReduce1D(TestReduce):
+ 
+         expected5 = (coordarr1 * fill_value_5).isel(x=maxindex, drop=True)
+         expected5.name = "x"
++        expected5.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         result5 = ar0.idxmax(fill_value=-1.1)
+         assert_identical(result5, expected5)
+@@ -5309,6 +5332,7 @@ class TestReduce1D(TestReduce):
+ 
+         expected6 = (coordarr1 * fill_value_6).isel(x=maxindex, drop=True)
+         expected6.name = "x"
++        expected6.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         result6 = ar0.idxmax(fill_value=-1)
+         assert_identical(result6, expected6)
+@@ -5321,6 +5345,7 @@ class TestReduce1D(TestReduce):
+ 
+         expected7 = (coordarr1 * fill_value_7).isel(x=maxindex, drop=True)
+         expected7.name = "x"
++        expected7.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         result7 = ar0.idxmax(fill_value=-1j)
+         assert_identical(result7, expected7)
+@@ -5346,6 +5371,8 @@ class TestReduce1D(TestReduce):
+             return
+ 
+         expected0 = {"x": indarr[minindex]}
++        for da in expected0.values():
++            da.attrs = self.attrs  # Default keeps attrs for reduction operations
+         result0 = ar.argmin(...)
+         for key in expected0:
+             assert_identical(result0[key], expected0[key])
+@@ -5360,7 +5387,9 @@ class TestReduce1D(TestReduce):
+         result2 = ar.argmin(..., skipna=False)
+         if nanindex is not None and ar.dtype.kind != "O":
+             expected2 = {"x": indarr.isel(x=nanindex, drop=True)}
+-            expected2["x"].attrs = {}
++            expected2[
++                "x"
++            ].attrs = self.attrs  # Default keeps attrs for reduction operations
+         else:
+             expected2 = expected0
+ 
+@@ -5388,6 +5417,8 @@ class TestReduce1D(TestReduce):
+             return
+ 
+         expected0 = {"x": indarr[maxindex]}
++        for da in expected0.values():
++            da.attrs = self.attrs  # Default keeps attrs for reduction operations
+         result0 = ar.argmax(...)
+         for key in expected0:
+             assert_identical(result0[key], expected0[key])
+@@ -5402,7 +5433,9 @@ class TestReduce1D(TestReduce):
+         result2 = ar.argmax(..., skipna=False)
+         if nanindex is not None and ar.dtype.kind != "O":
+             expected2 = {"x": indarr.isel(x=nanindex, drop=True)}
+-            expected2["x"].attrs = {}
++            expected2[
++                "x"
++            ].attrs = self.attrs  # Default keeps attrs for reduction operations
+         else:
+             expected2 = expected0
+ 
+@@ -5495,13 +5528,18 @@ class TestReduce2D(TestReduce):
+         result0 = ar.min(dim="x", keep_attrs=True)
+         assert_identical(result0, expected0)
+ 
++        # Default keeps attrs for reduction operations
+         result1 = ar.min(dim="x")
+-        expected1 = expected0
++        assert_identical(result1, expected0)
++
++        # Test explicitly dropping attrs
++        result1_no_attrs = ar.min(dim="x", keep_attrs=False)
++        expected1 = expected0.copy()
+         expected1.attrs = {}
+-        assert_identical(result1, expected1)
++        assert_identical(result1_no_attrs, expected1)
+ 
+         result2 = ar.min(axis=1)
+-        assert_identical(result2, expected1)
++        assert_identical(result2, expected0)  # Default keeps attrs
+ 
+         minindex = [
+             x if y is None or ar.dtype.kind == "O" else y
+@@ -5511,7 +5549,7 @@ class TestReduce2D(TestReduce):
+             ar.isel(y=yi).isel(x=indi, drop=True) for yi, indi in enumerate(minindex)
+         ]
+         expected2 = xr.concat(expected2list, dim="y")
+-        expected2.attrs = {}
++        expected2.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         result3 = ar.min(dim="x", skipna=False)
+ 
+@@ -5540,13 +5578,18 @@ class TestReduce2D(TestReduce):
+         result0 = ar.max(dim="x", keep_attrs=True)
+         assert_identical(result0, expected0)
+ 
++        # Default keeps attrs for reduction operations
+         result1 = ar.max(dim="x")
++        assert_identical(result1, expected0)
++
++        # Test explicitly dropping attrs
++        result1_no_attrs = ar.max(dim="x", keep_attrs=False)
+         expected1 = expected0.copy()
+         expected1.attrs = {}
+-        assert_identical(result1, expected1)
++        assert_identical(result1_no_attrs, expected1)
+ 
+         result2 = ar.max(axis=1)
+-        assert_identical(result2, expected1)
++        assert_identical(result2, expected0)  # Default keeps attrs
+ 
+         maxindex = [
+             x if y is None or ar.dtype.kind == "O" else y
+@@ -5556,7 +5599,7 @@ class TestReduce2D(TestReduce):
+             ar.isel(y=yi).isel(x=indi, drop=True) for yi, indi in enumerate(maxindex)
+         ]
+         expected2 = xr.concat(expected2list, dim="y")
+-        expected2.attrs = {}
++        expected2.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         result3 = ar.max(dim="x", skipna=False)
+ 
+@@ -5588,6 +5631,7 @@ class TestReduce2D(TestReduce):
+             for yi, indi in enumerate(minindex)
+         ]
+         expected0 = xr.concat(expected0list, dim="y")
++        expected0.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         result0 = ar.argmin(dim="x")
+         assert_identical(result0, expected0)
+@@ -5609,7 +5653,7 @@ class TestReduce2D(TestReduce):
+             for yi, indi in enumerate(minindex)
+         ]
+         expected2 = xr.concat(expected2list, dim="y")
+-        expected2.attrs = {}
++        expected2.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         result3 = ar.argmin(dim="x", skipna=False)
+ 
+@@ -5641,6 +5685,7 @@ class TestReduce2D(TestReduce):
+             for yi, indi in enumerate(maxindex)
+         ]
+         expected0 = xr.concat(expected0list, dim="y")
++        expected0.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         result0 = ar.argmax(dim="x")
+         assert_identical(result0, expected0)
+@@ -5662,7 +5707,7 @@ class TestReduce2D(TestReduce):
+             for yi, indi in enumerate(maxindex)
+         ]
+         expected2 = xr.concat(expected2list, dim="y")
+-        expected2.attrs = {}
++        expected2.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         result3 = ar.argmax(dim="x", skipna=False)
+ 
+@@ -5730,6 +5775,7 @@ class TestReduce2D(TestReduce):
+         ]
+         expected0 = xr.concat(expected0list, dim="y")
+         expected0.name = "x"
++        expected0.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         # Default fill value (NaN)
+         with raise_if_dask_computes(max_computes=max_computes):
+@@ -5759,7 +5805,7 @@ class TestReduce2D(TestReduce):
+         ]
+         expected3 = xr.concat(expected3list, dim="y")
+         expected3.name = "x"
+-        expected3.attrs = {}
++        expected3.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         with raise_if_dask_computes(max_computes=max_computes):
+             result3 = ar0.idxmin(dim="x", skipna=False)
+@@ -5778,6 +5824,7 @@ class TestReduce2D(TestReduce):
+         ]
+         expected5 = xr.concat(expected5list, dim="y")
+         expected5.name = "x"
++        expected5.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         with raise_if_dask_computes(max_computes=max_computes):
+             result5 = ar0.idxmin(dim="x", fill_value=-1.1)
+@@ -5791,6 +5838,7 @@ class TestReduce2D(TestReduce):
+         ]
+         expected6 = xr.concat(expected6list, dim="y")
+         expected6.name = "x"
++        expected6.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         with raise_if_dask_computes(max_computes=max_computes):
+             result6 = ar0.idxmin(dim="x", fill_value=-1)
+@@ -5804,6 +5852,7 @@ class TestReduce2D(TestReduce):
+         ]
+         expected7 = xr.concat(expected7list, dim="y")
+         expected7.name = "x"
++        expected7.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         with raise_if_dask_computes(max_computes=max_computes):
+             result7 = ar0.idxmin(dim="x", fill_value=-5j)
+@@ -5872,6 +5921,7 @@ class TestReduce2D(TestReduce):
+         ]
+         expected0 = xr.concat(expected0list, dim="y")
+         expected0.name = "x"
++        expected0.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         # Default fill value (NaN)
+         with raise_if_dask_computes(max_computes=max_computes):
+@@ -5901,7 +5951,7 @@ class TestReduce2D(TestReduce):
+         ]
+         expected3 = xr.concat(expected3list, dim="y")
+         expected3.name = "x"
+-        expected3.attrs = {}
++        expected3.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         with raise_if_dask_computes(max_computes=max_computes):
+             result3 = ar0.idxmax(dim="x", skipna=False)
+@@ -5920,6 +5970,7 @@ class TestReduce2D(TestReduce):
+         ]
+         expected5 = xr.concat(expected5list, dim="y")
+         expected5.name = "x"
++        expected5.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         with raise_if_dask_computes(max_computes=max_computes):
+             result5 = ar0.idxmax(dim="x", fill_value=-1.1)
+@@ -5933,6 +5984,7 @@ class TestReduce2D(TestReduce):
+         ]
+         expected6 = xr.concat(expected6list, dim="y")
+         expected6.name = "x"
++        expected6.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         with raise_if_dask_computes(max_computes=max_computes):
+             result6 = ar0.idxmax(dim="x", fill_value=-1)
+@@ -5946,6 +5998,7 @@ class TestReduce2D(TestReduce):
+         ]
+         expected7 = xr.concat(expected7list, dim="y")
+         expected7.name = "x"
++        expected7.attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         with raise_if_dask_computes(max_computes=max_computes):
+             result7 = ar0.idxmax(dim="x", fill_value=-5j)
+@@ -5980,6 +6033,9 @@ class TestReduce2D(TestReduce):
+             for yi, indi in enumerate(minindex)
+         ]
+         expected0 = {"x": xr.concat(expected0list, dim="y")}
++        expected0[
++            "x"
++        ].attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         result0 = ar.argmin(dim=["x"])
+         for key in expected0:
+@@ -6000,7 +6056,9 @@ class TestReduce2D(TestReduce):
+             for yi, indi in enumerate(minindex)
+         ]
+         expected2 = {"x": xr.concat(expected2list, dim="y")}
+-        expected2["x"].attrs = {}
++        expected2[
++            "x"
++        ].attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         result2 = ar.argmin(dim=["x"], skipna=False)
+ 
+@@ -6011,8 +6069,8 @@ class TestReduce2D(TestReduce):
+         # TODO: remove cast once argmin typing is overloaded
+         min_xind = cast(DataArray, ar.isel(expected0).argmin())
+         expected3 = {
+-            "y": DataArray(min_xind),
+-            "x": DataArray(minindex[min_xind.item()]),
++            "y": DataArray(min_xind, attrs=self.attrs),
++            "x": DataArray(minindex[min_xind.item()], attrs=self.attrs),
+         }
+ 
+         for key in expected3:
+@@ -6047,6 +6105,9 @@ class TestReduce2D(TestReduce):
+             for yi, indi in enumerate(maxindex)
+         ]
+         expected0 = {"x": xr.concat(expected0list, dim="y")}
++        expected0[
++            "x"
++        ].attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         result0 = ar.argmax(dim=["x"])
+         for key in expected0:
+@@ -6067,7 +6128,9 @@ class TestReduce2D(TestReduce):
+             for yi, indi in enumerate(maxindex)
+         ]
+         expected2 = {"x": xr.concat(expected2list, dim="y")}
+-        expected2["x"].attrs = {}
++        expected2[
++            "x"
++        ].attrs = self.attrs  # Default keeps attrs for reduction operations
+ 
+         result2 = ar.argmax(dim=["x"], skipna=False)
+ 
+@@ -6078,8 +6141,8 @@ class TestReduce2D(TestReduce):
+         # TODO: remove cast once argmax typing is overloaded
+         max_xind = cast(DataArray, ar.isel(expected0).argmax())
+         expected3 = {
+-            "y": DataArray(max_xind),
+-            "x": DataArray(maxindex[max_xind.item()]),
++            "y": DataArray(max_xind, attrs=self.attrs),
++            "x": DataArray(maxindex[max_xind.item()], attrs=self.attrs),
+         }
+ 
+         for key in expected3:
+@@ -6309,7 +6372,7 @@ class TestReduce3D(TestReduce):
+         result0 = ar.argmin(dim=["x"])
+         assert isinstance(result0, dict)
+         expected0 = {
+-            key: xr.DataArray(value, dims=("y", "z"))
++            key: xr.DataArray(value, dims=("y", "z"), attrs=self.attrs)
+             for key, value in minindices_x.items()
+         }
+         for key in expected0:
+@@ -6318,7 +6381,7 @@ class TestReduce3D(TestReduce):
+         result1 = ar.argmin(dim=["y"])
+         assert isinstance(result1, dict)
+         expected1 = {
+-            key: xr.DataArray(value, dims=("x", "z"))
++            key: xr.DataArray(value, dims=("x", "z"), attrs=self.attrs)
+             for key, value in minindices_y.items()
+         }
+         for key in expected1:
+@@ -6327,7 +6390,7 @@ class TestReduce3D(TestReduce):
+         result2 = ar.argmin(dim=["z"])
+         assert isinstance(result2, dict)
+         expected2 = {
+-            key: xr.DataArray(value, dims=("x", "y"))
++            key: xr.DataArray(value, dims=("x", "y"), attrs=self.attrs)
+             for key, value in minindices_z.items()
+         }
+         for key in expected2:
+@@ -6336,7 +6399,8 @@ class TestReduce3D(TestReduce):
+         result3 = ar.argmin(dim=("x", "y"))
+         assert isinstance(result3, dict)
+         expected3 = {
+-            key: xr.DataArray(value, dims=("z")) for key, value in minindices_xy.items()
++            key: xr.DataArray(value, dims=("z"), attrs=self.attrs)
++            for key, value in minindices_xy.items()
+         }
+         for key in expected3:
+             assert_identical(result3[key].drop_vars("z"), expected3[key])
+@@ -6344,7 +6408,8 @@ class TestReduce3D(TestReduce):
+         result4 = ar.argmin(dim=("x", "z"))
+         assert isinstance(result4, dict)
+         expected4 = {
+-            key: xr.DataArray(value, dims=("y")) for key, value in minindices_xz.items()
++            key: xr.DataArray(value, dims=("y"), attrs=self.attrs)
++            for key, value in minindices_xz.items()
+         }
+         for key in expected4:
+             assert_identical(result4[key].drop_vars("y"), expected4[key])
+@@ -6352,14 +6417,18 @@ class TestReduce3D(TestReduce):
+         result5 = ar.argmin(dim=("y", "z"))
+         assert isinstance(result5, dict)
+         expected5 = {
+-            key: xr.DataArray(value, dims=("x")) for key, value in minindices_yz.items()
++            key: xr.DataArray(value, dims=("x"), attrs=self.attrs)
++            for key, value in minindices_yz.items()
+         }
+         for key in expected5:
+             assert_identical(result5[key].drop_vars("x"), expected5[key])
+ 
+         result6 = ar.argmin(...)
+         assert isinstance(result6, dict)
+-        expected6 = {key: xr.DataArray(value) for key, value in minindices_xyz.items()}
++        expected6 = {
++            key: xr.DataArray(value, attrs=self.attrs)
++            for key, value in minindices_xyz.items()
++        }
+         for key in expected6:
+             assert_identical(result6[key], expected6[key])
+ 
+@@ -6372,7 +6441,7 @@ class TestReduce3D(TestReduce):
+             for key in minindices_x
+         }
+         expected7 = {
+-            key: xr.DataArray(value, dims=("y", "z"))
++            key: xr.DataArray(value, dims=("y", "z"), attrs=self.attrs)
+             for key, value in minindices_x.items()
+         }
+ 
+@@ -6390,7 +6459,7 @@ class TestReduce3D(TestReduce):
+             for key in minindices_y
+         }
+         expected8 = {
+-            key: xr.DataArray(value, dims=("x", "z"))
++            key: xr.DataArray(value, dims=("x", "z"), attrs=self.attrs)
+             for key, value in minindices_y.items()
+         }
+ 
+@@ -6408,7 +6477,7 @@ class TestReduce3D(TestReduce):
+             for key in minindices_z
+         }
+         expected9 = {
+-            key: xr.DataArray(value, dims=("x", "y"))
++            key: xr.DataArray(value, dims=("x", "y"), attrs=self.attrs)
+             for key, value in minindices_z.items()
+         }
+ 
+@@ -6426,7 +6495,8 @@ class TestReduce3D(TestReduce):
+             for key in minindices_xy
+         }
+         expected10 = {
+-            key: xr.DataArray(value, dims="z") for key, value in minindices_xy.items()
++            key: xr.DataArray(value, dims="z", attrs=self.attrs)
++            for key, value in minindices_xy.items()
+         }
+ 
+         result10 = ar.argmin(dim=("x", "y"), skipna=False)
+@@ -6443,7 +6513,8 @@ class TestReduce3D(TestReduce):
+             for key in minindices_xz
+         }
+         expected11 = {
+-            key: xr.DataArray(value, dims="y") for key, value in minindices_xz.items()
++            key: xr.DataArray(value, dims="y", attrs=self.attrs)
++            for key, value in minindices_xz.items()
+         }
+ 
+         result11 = ar.argmin(dim=("x", "z"), skipna=False)
+@@ -6460,7 +6531,8 @@ class TestReduce3D(TestReduce):
+             for key in minindices_yz
+         }
+         expected12 = {
+-            key: xr.DataArray(value, dims="x") for key, value in minindices_yz.items()
++            key: xr.DataArray(value, dims="x", attrs=self.attrs)
++            for key, value in minindices_yz.items()
+         }
+ 
+         result12 = ar.argmin(dim=("y", "z"), skipna=False)
+@@ -6476,7 +6548,10 @@ class TestReduce3D(TestReduce):
+             )
+             for key in minindices_xyz
+         }
+-        expected13 = {key: xr.DataArray(value) for key, value in minindices_xyz.items()}
++        expected13 = {
++            key: xr.DataArray(value, attrs=self.attrs)
++            for key, value in minindices_xyz.items()
++        }
+ 
+         result13 = ar.argmin(..., skipna=False)
+         assert isinstance(result13, dict)
+@@ -6536,7 +6611,7 @@ class TestReduce3D(TestReduce):
+         result0 = ar.argmax(dim=["x"])
+         assert isinstance(result0, dict)
+         expected0 = {
+-            key: xr.DataArray(value, dims=("y", "z"))
++            key: xr.DataArray(value, dims=("y", "z"), attrs=self.attrs)
+             for key, value in maxindices_x.items()
+         }
+         for key in expected0:
+@@ -6545,7 +6620,7 @@ class TestReduce3D(TestReduce):
+         result1 = ar.argmax(dim=["y"])
+         assert isinstance(result1, dict)
+         expected1 = {
+-            key: xr.DataArray(value, dims=("x", "z"))
++            key: xr.DataArray(value, dims=("x", "z"), attrs=self.attrs)
+             for key, value in maxindices_y.items()
+         }
+         for key in expected1:
+@@ -6554,7 +6629,7 @@ class TestReduce3D(TestReduce):
+         result2 = ar.argmax(dim=["z"])
+         assert isinstance(result2, dict)
+         expected2 = {
+-            key: xr.DataArray(value, dims=("x", "y"))
++            key: xr.DataArray(value, dims=("x", "y"), attrs=self.attrs)
+             for key, value in maxindices_z.items()
+         }
+         for key in expected2:
+@@ -6563,7 +6638,8 @@ class TestReduce3D(TestReduce):
+         result3 = ar.argmax(dim=("x", "y"))
+         assert isinstance(result3, dict)
+         expected3 = {
+-            key: xr.DataArray(value, dims=("z")) for key, value in maxindices_xy.items()
++            key: xr.DataArray(value, dims=("z"), attrs=self.attrs)
++            for key, value in maxindices_xy.items()
+         }
+         for key in expected3:
+             assert_identical(result3[key].drop_vars("z"), expected3[key])
+@@ -6571,7 +6647,8 @@ class TestReduce3D(TestReduce):
+         result4 = ar.argmax(dim=("x", "z"))
+         assert isinstance(result4, dict)
+         expected4 = {
+-            key: xr.DataArray(value, dims=("y")) for key, value in maxindices_xz.items()
++            key: xr.DataArray(value, dims=("y"), attrs=self.attrs)
++            for key, value in maxindices_xz.items()
+         }
+         for key in expected4:
+             assert_identical(result4[key].drop_vars("y"), expected4[key])
+@@ -6579,14 +6656,18 @@ class TestReduce3D(TestReduce):
+         result5 = ar.argmax(dim=("y", "z"))
+         assert isinstance(result5, dict)
+         expected5 = {
+-            key: xr.DataArray(value, dims=("x")) for key, value in maxindices_yz.items()
++            key: xr.DataArray(value, dims=("x"), attrs=self.attrs)
++            for key, value in maxindices_yz.items()
+         }
+         for key in expected5:
+             assert_identical(result5[key].drop_vars("x"), expected5[key])
+ 
+         result6 = ar.argmax(...)
+         assert isinstance(result6, dict)
+-        expected6 = {key: xr.DataArray(value) for key, value in maxindices_xyz.items()}
++        expected6 = {
++            key: xr.DataArray(value, attrs=self.attrs)
++            for key, value in maxindices_xyz.items()
++        }
+         for key in expected6:
+             assert_identical(result6[key], expected6[key])
+ 
+@@ -6599,7 +6680,7 @@ class TestReduce3D(TestReduce):
+             for key in maxindices_x
+         }
+         expected7 = {
+-            key: xr.DataArray(value, dims=("y", "z"))
++            key: xr.DataArray(value, dims=("y", "z"), attrs=self.attrs)
+             for key, value in maxindices_x.items()
+         }
+ 
+@@ -6617,7 +6698,7 @@ class TestReduce3D(TestReduce):
+             for key in maxindices_y
+         }
+         expected8 = {
+-            key: xr.DataArray(value, dims=("x", "z"))
++            key: xr.DataArray(value, dims=("x", "z"), attrs=self.attrs)
+             for key, value in maxindices_y.items()
+         }
+ 
+@@ -6635,7 +6716,7 @@ class TestReduce3D(TestReduce):
+             for key in maxindices_z
+         }
+         expected9 = {
+-            key: xr.DataArray(value, dims=("x", "y"))
++            key: xr.DataArray(value, dims=("x", "y"), attrs=self.attrs)
+             for key, value in maxindices_z.items()
+         }
+ 
+@@ -6653,7 +6734,8 @@ class TestReduce3D(TestReduce):
+             for key in maxindices_xy
+         }
+         expected10 = {
+-            key: xr.DataArray(value, dims="z") for key, value in maxindices_xy.items()
++            key: xr.DataArray(value, dims="z", attrs=self.attrs)
++            for key, value in maxindices_xy.items()
+         }
+ 
+         result10 = ar.argmax(dim=("x", "y"), skipna=False)
+@@ -6670,7 +6752,8 @@ class TestReduce3D(TestReduce):
+             for key in maxindices_xz
+         }
+         expected11 = {
+-            key: xr.DataArray(value, dims="y") for key, value in maxindices_xz.items()
++            key: xr.DataArray(value, dims="y", attrs=self.attrs)
++            for key, value in maxindices_xz.items()
+         }
+ 
+         result11 = ar.argmax(dim=("x", "z"), skipna=False)
+@@ -6687,7 +6770,8 @@ class TestReduce3D(TestReduce):
+             for key in maxindices_yz
+         }
+         expected12 = {
+-            key: xr.DataArray(value, dims="x") for key, value in maxindices_yz.items()
++            key: xr.DataArray(value, dims="x", attrs=self.attrs)
++            for key, value in maxindices_yz.items()
+         }
+ 
+         result12 = ar.argmax(dim=("y", "z"), skipna=False)
+@@ -6703,7 +6787,10 @@ class TestReduce3D(TestReduce):
+             )
+             for key in maxindices_xyz
+         }
+-        expected13 = {key: xr.DataArray(value) for key, value in maxindices_xyz.items()}
++        expected13 = {
++            key: xr.DataArray(value, attrs=self.attrs)
++            for key, value in maxindices_xyz.items()
++        }
+ 
+         result13 = ar.argmax(..., skipna=False)
+         assert isinstance(result13, dict)
+@@ -6755,6 +6842,33 @@ def test_raise_no_warning_for_nan_in_binary_ops() -> None:
+         _ = xr.DataArray([1, 2, np.nan]) > 0
+ 
+ 
++def test_binary_ops_attrs_drop_conflicts() -> None:
++    # Test that binary operations combine attrs with drop_conflicts behavior
++    attrs_a = {"units": "meters", "long_name": "distance", "source": "sensor_a"}
++    attrs_b = {"units": "feet", "resolution": "high", "source": "sensor_b"}
++    da1 = xr.DataArray([1, 2, 3], attrs=attrs_a)
++    da2 = xr.DataArray([4, 5, 6], attrs=attrs_b)
++
++    # With keep_attrs=True (default), should combine attrs dropping conflicts
++    result = da1 + da2
++    # "units" and "source" conflict, so they're dropped
++    # "long_name" only in da1, "resolution" only in da2, so they're kept
++    assert result.attrs == {"long_name": "distance", "resolution": "high"}
++
++    # Test with identical values for some attrs
++    attrs_c = {"units": "meters", "type": "data", "source": "sensor_c"}
++    da3 = xr.DataArray([7, 8, 9], attrs=attrs_c)
++    result2 = da1 + da3
++    # "units" has same value, so kept; "source" conflicts, so dropped
++    # "long_name" from da1, "type" from da3
++    assert result2.attrs == {"units": "meters", "long_name": "distance", "type": "data"}
++
++    # With keep_attrs=False, attrs should be empty
++    with xr.set_options(keep_attrs=False):
++        result3 = da1 + da2
++        assert result3.attrs == {}
++
++
+ @pytest.mark.filterwarnings("error")
+ def test_no_warning_for_all_nan() -> None:
+     _ = xr.DataArray([np.nan, np.nan]).mean()
+
+diff --git a/xarray/tests/test_dataset.py b/xarray/tests/test_dataset.py
+index 0538acc..e677430 100644
+--- a/xarray/tests/test_dataset.py
++++ b/xarray/tests/test_dataset.py
+@@ -2980,6 +2980,21 @@ class TestDataset:
+             actual = data.drop_vars("level_1")
+         assert_identical(expected, actual)
+ 
++    def test_drop_multiindex_labels(self) -> None:
++        data = create_test_multiindex()
++        mindex = pd.MultiIndex.from_tuples(
++            [
++                ("a", 2),
++                ("b", 1),
++                ("b", 2),
++            ],
++            names=("level_1", "level_2"),
++        )
++        expected = Dataset({}, Coordinates.from_pandas_multiindex(mindex, "x"))
++
++        actual = data.drop_sel(x=("a", 1))
++        assert_identical(expected, actual)
++
+     def test_drop_index_labels(self) -> None:
+         data = Dataset({"A": (["x", "y"], np.random.randn(2, 3)), "x": ["a", "b"]})
+ 
+@@ -4135,6 +4150,10 @@ class TestDataset:
+         expected3 = ds.unstack("index").fillna({"var": -1, "other_var": 1}).astype(int)
+         assert_equal(actual3, expected3)
+ 
++        actual4 = ds.unstack("index", fill_value={"var": -1})
++        expected4 = ds.unstack("index").fillna({"var": -1, "other_var": np.nan})
++        assert_equal(actual4, expected4)
++
+     @requires_sparse
+     def test_unstack_sparse(self) -> None:
+         ds = xr.Dataset(
+@@ -6057,18 +6076,24 @@ class TestDataset:
+         attrs = dict(_attrs)
+         data.attrs = attrs
+ 
+-        # Test dropped attrs
++        # Test default behavior (keeps attrs for reduction operations)
+         ds = data.mean()
+-        assert ds.attrs == {}
+-        for v in ds.data_vars.values():
+-            assert v.attrs == {}
++        assert ds.attrs == attrs
++        for k, v in ds.data_vars.items():
++            assert v.attrs == data[k].attrs
+ 
+-        # Test kept attrs
++        # Test explicitly keeping attrs
+         ds = data.mean(keep_attrs=True)
+         assert ds.attrs == attrs
+         for k, v in ds.data_vars.items():
+             assert v.attrs == data[k].attrs
+ 
++        # Test explicitly dropping attrs
++        ds = data.mean(keep_attrs=False)
++        assert ds.attrs == {}
++        for v in ds.data_vars.values():
++            assert v.attrs == {}
++
+     @pytest.mark.filterwarnings(
+         "ignore:Once the behaviour of DataArray:DeprecationWarning"
+     )
+@@ -6251,6 +6276,7 @@ class TestDataset:
+         data = create_test_data()
+         data.attrs["foo"] = "bar"
+ 
++        # data.map keeps all attrs by default
+         assert_identical(data.map(np.mean), data.mean())
+ 
+         expected = data.mean(keep_attrs=True)
+@@ -6302,11 +6328,37 @@ class TestDataset:
+         ds["x"].attrs["y"] = "x"
+         assert ds["x"].attrs != actual["x"].attrs
+ 
++    def test_map_non_dataarray_outputs(self) -> None:
++        # Test that map handles non-DataArray outputs by converting them
++        # Regression test for GH10835
++        ds = xr.Dataset({"foo": ("x", [1, 2, 3]), "bar": ("y", [4, 5])})
++
++        # Scalar output
++        result = ds.map(lambda x: 1)
++        expected = xr.Dataset({"foo": 1, "bar": 1})
++        assert_identical(result, expected)
++
++        # Numpy array output with same shape
++        result = ds.map(lambda x: x.values)
++        expected = ds.copy()
++        assert_identical(result, expected)
++
++        # Mixed: some return scalars, some return arrays
++        def mixed_func(x):
++            if "x" in x.dims:
++                return 42
++            return x
++
++        result = ds.map(mixed_func)
++        expected = xr.Dataset({"foo": 42, "bar": ("y", [4, 5])})
++        assert_identical(result, expected)
++
+     def test_apply_pending_deprecated_map(self) -> None:
+         data = create_test_data()
+         data.attrs["foo"] = "bar"
+ 
+         with pytest.warns(PendingDeprecationWarning):
++            # data.apply keeps all attrs by default
+             assert_identical(data.apply(np.mean), data.mean())
+ 
+     def make_example_math_dataset(self):
+@@ -6786,7 +6838,9 @@ class TestDataset:
+         ["keep_attrs", "expected"],
+         (
+             pytest.param(False, {}, id="False"),
+-            pytest.param(True, {"foo": "a", "bar": "b"}, id="True"),
++            pytest.param(
++                True, {"foo": "a", "bar": "b", "baz": "c"}, id="True"
++            ),  # drop_conflicts combines non-conflicting attrs
+         ),
+     )
+     def test_binary_ops_keep_attrs(self, keep_attrs, expected) -> None:
+@@ -6797,6 +6851,36 @@ class TestDataset:
+ 
+         assert ds_result.attrs == expected
+ 
++    def test_binary_ops_attrs_drop_conflicts(self) -> None:
++        # Test that binary operations combine attrs with drop_conflicts behavior
++        attrs1 = {"units": "meters", "long_name": "distance", "source": "sensor_a"}
++        attrs2 = {"units": "feet", "resolution": "high", "source": "sensor_b"}
++        ds1 = xr.Dataset({"a": 1}, attrs=attrs1)
++        ds2 = xr.Dataset({"a": 2}, attrs=attrs2)
++
++        # With keep_attrs=True (default), should combine attrs dropping conflicts
++        result = ds1 + ds2
++        # "units" and "source" conflict, so they're dropped
++        # "long_name" only in ds1, "resolution" only in ds2, so they're kept
++        assert result.attrs == {"long_name": "distance", "resolution": "high"}
++
++        # Test with identical values for some attrs
++        attrs3 = {"units": "meters", "type": "data", "source": "sensor_c"}
++        ds3 = xr.Dataset({"a": 3}, attrs=attrs3)
++        result2 = ds1 + ds3
++        # "units" has same value, so kept; "source" conflicts, so dropped
++        # "long_name" from ds1, "type" from ds3
++        assert result2.attrs == {
++            "units": "meters",
++            "long_name": "distance",
++            "type": "data",
++        }
++
++        # With keep_attrs=False, attrs should be empty
++        with xr.set_options(keep_attrs=False):
++            result3 = ds1 + ds2
++            assert result3.attrs == {}
++
+     def test_full_like(self) -> None:
+         # For more thorough tests, see test_variable.py
+         # Note: testing data_vars with mismatched dtypes
+
+diff --git a/xarray/tests/test_datatree.py b/xarray/tests/test_datatree.py
+index 97cdf90..0cd888f 100644
+--- a/xarray/tests/test_datatree.py
++++ b/xarray/tests/test_datatree.py
+@@ -1116,14 +1116,14 @@ class TestDatasetView:
+         expected = dt.mean(keep_attrs=True)
+         xr.testing.assert_identical(result, expected)
+ 
+-        # per default DatasetView.map does not keep attrs
++        # DatasetView.map keeps attrs by default
+         def func(ds):
+-            # x.mean() removes the attrs of the data_vars
++            # ds.map and x.mean() both keep attrs by default
+             return ds.map(lambda x: x.mean())
+ 
+         result = xr.map_over_datasets(func, dt)
+         expected = dt.mean()
+-        xr.testing.assert_identical(result, expected.mean())
++        xr.testing.assert_identical(result, expected)
+ 
+ 
+ class TestAccess:
+@@ -2219,13 +2219,17 @@ class TestIndexing:
+ 
+         with pytest.raises(
+             KeyError,
+-            match="Raised whilst mapping function over node with path 'second'",
++            match=re.escape(
++                "Raised whilst mapping function over node(s) with path 'second'"
++            ),
+         ):
+             tree.sel(x=1)
+ 
+         with pytest.raises(
+             IndexError,
+-            match="Raised whilst mapping function over node with path 'first'",
++            match=re.escape(
++                "Raised whilst mapping function over node(s) with path 'first'"
++            ),
+         ):
+             tree.isel(x=4)
+ 
+
+diff --git a/xarray/tests/test_datatree_mapping.py b/xarray/tests/test_datatree_mapping.py
+index 277a198..2956802 100644
+--- a/xarray/tests/test_datatree_mapping.py
++++ b/xarray/tests/test_datatree_mapping.py
+@@ -192,7 +192,7 @@ class TestMapOverSubTree:
+         with pytest.raises(
+             ValueError,
+             match=re.escape(
+-                r"Raised whilst mapping function over node with path 'set1'"
++                r"Raised whilst mapping function over node(s) with path 'set1'"
+             ),
+         ):
+             dt.map_over_datasets(fail_on_specific_node)
+
+diff --git a/xarray/tests/test_groupby.py b/xarray/tests/test_groupby.py
+index da935f1..e8f9ea4 100644
+--- a/xarray/tests/test_groupby.py
++++ b/xarray/tests/test_groupby.py
+@@ -955,8 +955,11 @@ def test_groupby_dataset_math() -> None:
+     actual = grouped + ds.coords["dim1"]
+     assert_identical(expected, reorder_dims(actual))
+ 
++    # Order matters for attrs - coord + grouped will not have attrs
++    # since coord has no attrs and binary ops keep attrs from first operand
++    expected_reversed = reorder_dims(ds.coords["dim1"] + ds)
+     actual = ds.coords["dim1"] + grouped
+-    assert_identical(expected, reorder_dims(actual))
++    assert_identical(expected_reversed, reorder_dims(actual))
+ 
+     ds2 = 2 * ds
+     expected = reorder_dims(ds + ds2)
+
+diff --git a/xarray/tests/test_merge.py b/xarray/tests/test_merge.py
+index 427d827..68db0ba 100644
+--- a/xarray/tests/test_merge.py
++++ b/xarray/tests/test_merge.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import re
+ import warnings
+ 
+ import numpy as np
+@@ -867,3 +868,95 @@ class TestNewDefaults:
+         with set_options(use_new_combine_kwarg_defaults=True):
+             with pytest.raises(ValueError, match="might be related to new default"):
+                 expected.identical(ds2.merge(ds1))
++
++
++class TestMergeDataTree:
++    def test_mixed(self) -> None:
++        tree = xr.DataTree()
++        ds = xr.Dataset()
++        with pytest.raises(
++            TypeError,
++            match="merge does not support mixed type arguments when one argument is a DataTree",
++        ):
++            xr.merge([tree, ds])  # type: ignore[list-item]
++
++    def test_distinct(self) -> None:
++        tree1 = xr.DataTree.from_dict({"/a/b/c": 1})
++        tree2 = xr.DataTree.from_dict({"/a/d/e": 2})
++        expected = xr.DataTree.from_dict({"/a/b/c": 1, "/a/d/e": 2})
++        merged = xr.merge([tree1, tree2])
++        assert_equal(merged, expected)
++
++    def test_overlap(self) -> None:
++        tree1 = xr.DataTree.from_dict({"/a/b": 1})
++        tree2 = xr.DataTree.from_dict({"/a/c": 2})
++        tree3 = xr.DataTree.from_dict({"/a/d": 3})
++        expected = xr.DataTree.from_dict({"/a/b": 1, "/a/c": 2, "/a/d": 3})
++        merged = xr.merge([tree1, tree2, tree3])
++        assert_equal(merged, expected)
++
++    def test_inherited(self) -> None:
++        tree1 = xr.DataTree.from_dict({"/a/b": ("x", [1])}, coords={"x": [0]})
++        tree2 = xr.DataTree.from_dict({"/a/c": ("x", [2])})
++        expected = xr.DataTree.from_dict(
++            {"/a/b": ("x", [1]), "a/c": ("x", [2])}, coords={"x": [0]}
++        )
++        merged = xr.merge([tree1, tree2])
++        assert_equal(merged, expected)
++
++    def test_inherited_join(self) -> None:
++        tree1 = xr.DataTree.from_dict({"/a/b": ("x", [0, 1])}, coords={"x": [0, 1]})
++        tree2 = xr.DataTree.from_dict({"/a/c": ("x", [1, 2])}, coords={"x": [1, 2]})
++
++        expected = xr.DataTree.from_dict(
++            {"/a/b": ("x", [0, 1]), "a/c": ("x", [np.nan, 1])}, coords={"x": [0, 1]}
++        )
++        merged = xr.merge([tree1, tree2], join="left")
++        assert_equal(merged, expected)
++
++        expected = xr.DataTree.from_dict(
++            {"/a/b": ("x", [1, np.nan]), "a/c": ("x", [1, 2])}, coords={"x": [1, 2]}
++        )
++        merged = xr.merge([tree1, tree2], join="right")
++        assert_equal(merged, expected)
++
++        expected = xr.DataTree.from_dict(
++            {"/a/b": ("x", [1]), "a/c": ("x", [1])}, coords={"x": [1]}
++        )
++        merged = xr.merge([tree1, tree2], join="inner")
++        assert_equal(merged, expected)
++
++        expected = xr.DataTree.from_dict(
++            {"/a/b": ("x", [0, 1, np.nan]), "a/c": ("x", [np.nan, 1, 2])},
++            coords={"x": [0, 1, 2]},
++        )
++        merged = xr.merge([tree1, tree2], join="outer")
++        assert_equal(merged, expected)
++
++        with pytest.raises(
++            xr.AlignmentError,
++            match=re.escape("cannot align objects with join='exact'"),
++        ):
++            xr.merge([tree1, tree2], join="exact")
++
++    def test_merge_error_includes_path(self) -> None:
++        tree1 = xr.DataTree.from_dict({"/a/b": ("x", [0, 1])})
++        tree2 = xr.DataTree.from_dict({"/a/b": ("x", [1, 2])})
++        with pytest.raises(
++            xr.MergeError,
++            match=re.escape(
++                "Raised whilst mapping function over node(s) with path 'a'"
++            ),
++        ):
++            xr.merge([tree1, tree2], join="exact")
++
++    def test_fill_value_errors(self) -> None:
++        trees = [xr.DataTree(), xr.DataTree()]
++
++        with pytest.raises(
++            NotImplementedError,
++            match=re.escape(
++                "fill_value is not yet supported for DataTree objects in merge"
++            ),
++        ):
++            xr.merge(trees, fill_value=None)
+
+diff --git a/xarray/tests/test_namedarray.py b/xarray/tests/test_namedarray.py
+index ceb0741..568f8ec 100644
+--- a/xarray/tests/test_namedarray.py
++++ b/xarray/tests/test_namedarray.py
+@@ -18,6 +18,8 @@ from xarray.namedarray._typing import (
+     _ShapeType_co,
+ )
+ from xarray.namedarray.core import NamedArray, from_array
++from xarray.namedarray.utils import fake_target_chunksize
++from xarray.tests import requires_cftime
+ 
+ if TYPE_CHECKING:
+     from types import ModuleType
+@@ -26,6 +28,7 @@ if TYPE_CHECKING:
+ 
+     from xarray.namedarray._typing import (
+         Default,
++        DuckArray,
+         _AttrsLike,
+         _Dim,
+         _DimsLike,
+@@ -609,3 +612,57 @@ def test_repr() -> None:
+ 
+     # Basic comparison:
+     assert r == "<xarray.NamedArray (x: 1)> Size: 8B\narray([0], dtype=uint64)"
++
++
++@pytest.mark.parametrize(
++    "input_array, expected_chunksize_faked, expected_dtype",
++    [
++        (np.arange(100).reshape(10, 10), 1024, np.int64),
++        (np.arange(100).reshape(10, 10).astype(np.float32), 1024, np.float32),
++    ],
++)
++def test_fake_target_chunksize(
++    input_array: DuckArray[Any],
++    expected_chunksize_faked: int,
++    expected_dtype: DTypeLike,
++) -> None:
++    """
++    Check that `fake_target_chunksize` returns the expected chunksize and dtype.
++    - It pretends to dask we are chunking an array with an 8-byte dtype, ie. a float64.
++    As such, it will *double* the amount of memory a 4-byte dtype (like float32) would try to use,
++    fooling it into actually using the correct amount of memory. For object dtypes, which are
++    generally larger, it will reduce the effective dask configuration chunksize, reducing the size of
++    the arrays per chunk such that we get the same amount of memory used.
++    """
++    target_chunksize = 1024
++
++    faked_chunksize, dtype = fake_target_chunksize(input_array, target_chunksize)
++
++    assert faked_chunksize == expected_chunksize_faked
++    assert dtype == expected_dtype
++
++
++@requires_cftime
++def test_fake_target_chunksize_cftime() -> None:
++    """
++    Check that `fake_target_chunksize` returns the expected chunksize and dtype.
++    - It pretends to dask we are chunking an array with an 8-byte dtype, ie. a float64.
++    - This is the same as the above test, but specifically for a CFTime array case - split for testing reasons
++    """
++    import cftime
++
++    target_chunksize = 1024
++
++    input_array = np.array(
++        [
++            cftime.Datetime360Day(2000, month, day, 0, 0, 0, 0)
++            for month in range(1, 11)
++            for day in range(1, 11)
++        ],
++        dtype=object,
++    ).reshape(10, 10)
++
++    faked_chunksize, dtype = fake_target_chunksize(input_array, target_chunksize)  # type: ignore[arg-type,unused-ignore]
++
++    assert faked_chunksize == 73
++    assert dtype == np.float64
+
+diff --git a/xarray/tests/test_options.py b/xarray/tests/test_options.py
+index 315ae6a..ca9c1fd 100644
+--- a/xarray/tests/test_options.py
++++ b/xarray/tests/test_options.py
+@@ -112,12 +112,14 @@ class TestAttrRetention:
+         ds = create_test_dataset_attrs()
+         original_attrs = ds.attrs
+ 
+-        # Test default behaviour
++        # Test default behaviour (keeps attrs for reduction operations)
+         result = ds.mean()
+-        assert result.attrs == {}
++        assert result.attrs == original_attrs
+         with xarray.set_options(keep_attrs="default"):
+             result = ds.mean()
+-            assert result.attrs == {}
++            assert (
++                result.attrs == original_attrs
++            )  # "default" uses operation's default which is True for reduce
+ 
+         with xarray.set_options(keep_attrs=True):
+             result = ds.mean()
+@@ -132,12 +134,14 @@ class TestAttrRetention:
+         da = create_test_dataarray_attrs()
+         original_attrs = da.attrs
+ 
+-        # Test default behaviour
++        # Test default behaviour (keeps attrs for reduction operations)
+         result = da.mean()
+-        assert result.attrs == {}
++        assert result.attrs == original_attrs
+         with xarray.set_options(keep_attrs="default"):
+             result = da.mean()
+-            assert result.attrs == {}
++            assert (
++                result.attrs == original_attrs
++            )  # "default" uses operation's default which is True for reduce
+ 
+         with xarray.set_options(keep_attrs=True):
+             result = da.mean()
+
+diff --git a/xarray/tests/test_plot.py b/xarray/tests/test_plot.py
+index cfb8a0a..40f950d 100644
+--- a/xarray/tests/test_plot.py
++++ b/xarray/tests/test_plot.py
+@@ -482,21 +482,20 @@ class TestPlot(PlotTestCase):
+     def test_contourf_cmap_set_with_bad_under_over(self) -> None:
+         a = DataArray(easy_array((4, 4)), dims=["z", "time"])
+ 
+-        # make a copy here because we want a local cmap that we will modify.
+-        cmap_expected = copy(mpl.colormaps["viridis"])
++        # make a copy using with_extremes because we want a local cmap:
++        cmap_expected = mpl.colormaps["viridis"].with_extremes(
++            bad="w", under="r", over="g"
++        )
+ 
+-        cmap_expected.set_bad("w")
+         # check we actually changed the set_bad color
+         assert np.all(
+             cmap_expected(np.ma.masked_invalid([np.nan]))[0]
+             != mpl.colormaps["viridis"](np.ma.masked_invalid([np.nan]))[0]
+         )
+ 
+-        cmap_expected.set_under("r")
+         # check we actually changed the set_under color
+         assert cmap_expected(-np.inf) != mpl.colormaps["viridis"](-np.inf)
+ 
+-        cmap_expected.set_over("g")
+         # check we actually changed the set_over color
+         assert cmap_expected(np.inf) != mpl.colormaps["viridis"](-np.inf)
+ 
+@@ -1481,7 +1480,9 @@ class Common2dMixin:
+ 
+     def test_non_linked_coords(self) -> None:
+         # plot with coordinate names that are not dimensions
+-        self.darray.coords["newy"] = self.darray.y + 150
++        newy = self.darray.y + 150
++        newy.attrs = {}  # Clear attrs since binary ops keep them by default
++        self.darray.coords["newy"] = newy
+         # Normal case, without transpose
+         self.plotfunc(self.darray, x="x", y="newy")
+         ax = plt.gca()
+@@ -1496,7 +1497,9 @@ class Common2dMixin:
+         # and with transposed y and x axes
+         # This used to raise an error with pcolormesh and contour
+         # https://github.com/pydata/xarray/issues/788
+-        self.darray.coords["newy"] = self.darray.y + 150
++        newy = self.darray.y + 150
++        newy.attrs = {}  # Clear attrs since binary ops keep them by default
++        self.darray.coords["newy"] = newy
+         self.plotfunc(self.darray, x="newy", y="x")
+         ax = plt.gca()
+         assert "newy" == ax.get_xlabel()
+
+diff --git a/xarray/tests/test_rolling.py b/xarray/tests/test_rolling.py
+index d93216a..fed62c8 100644
+--- a/xarray/tests/test_rolling.py
++++ b/xarray/tests/test_rolling.py
+@@ -391,7 +391,7 @@ class TestDataArrayRolling:
+             data, dims=("coord"), coords={"coord": coords}, attrs=attrs_da, name="name"
+         )
+ 
+-        # attrs are now kept per default
++        # attrs are kept by default
+         func = getattr(da.rolling(dim={"coord": 5}), funcname)
+         result = func(*argument)
+         assert result.attrs == attrs_da
+@@ -550,7 +550,7 @@ class TestDatasetRolling:
+         ds.da.attrs = da_attrs
+         ds.da_not_rolled.attrs = da_not_rolled_attrs
+ 
+-        # attrs are now kept per default
++        # attrs are kept by default
+         func = getattr(ds.rolling(dim={"coord": 5}), funcname)
+         result = func(*argument)
+         assert result.attrs == global_attrs
+
+diff --git a/xarray/tests/test_utils.py b/xarray/tests/test_utils.py
+index 1261df4..90fdcb7 100644
+--- a/xarray/tests/test_utils.py
++++ b/xarray/tests/test_utils.py
+@@ -80,6 +80,15 @@ class TestDictionaries:
+         assert utils.equivalent(np.array([0]), [0])
+         assert utils.equivalent(np.arange(3), 1.0 * np.arange(3))
+         assert not utils.equivalent(0, np.zeros(3))
++        # Test NaN comparisons (issue #10833)
++        # Python float NaN
++        assert utils.equivalent(float("nan"), float("nan"))
++        # NumPy scalar NaN (various dtypes)
++        assert utils.equivalent(np.float64(np.nan), np.float64(np.nan))
++        assert utils.equivalent(np.float32(np.nan), np.float32(np.nan))
++        # Mixed: Python float NaN vs NumPy scalar NaN
++        assert utils.equivalent(float("nan"), np.float64(np.nan))
++        assert utils.equivalent(np.float64(np.nan), float("nan"))
+ 
+     def test_safe(self):
+         # should not raise exception:
+
+diff --git a/xarray/tests/test_variable.py b/xarray/tests/test_variable.py
+index ce566e0..187a2f7 100644
+--- a/xarray/tests/test_variable.py
++++ b/xarray/tests/test_variable.py
+@@ -372,7 +372,10 @@ class VariableSubclassobjects(NamedArraySubclassobjects, ABC):
+         # binary ops with all variables
+         assert_array_equal(v + v, 2 * v)
+         w = self.cls(["x"], y, {"foo": "bar"})
+-        assert_identical(v + w, self.cls(["x"], x + y).to_base_variable())
++        # With drop_conflicts, v (no attrs) + w (has attrs) should keep w's attrs
++        # Note: IndexVariable ops return Variable, not IndexVariable
++        expected = self.cls(["x"], x + y, {"foo": "bar"}).to_base_variable()
++        assert_identical(v + w, expected)
+         assert_array_equal((v * w).values, x * y)
+ 
+         # something complicated
+@@ -1852,15 +1855,24 @@ class TestVariable(VariableSubclassobjects):
+ 
+     def test_reduce(self):
+         v = Variable(["x", "y"], self.d, {"ignored": "attributes"})
+-        assert_identical(v.reduce(np.std, "x"), Variable(["y"], self.d.std(axis=0)))
++        # Reduce keeps attrs by default
++        expected = Variable(["y"], self.d.std(axis=0), {"ignored": "attributes"})
++        assert_identical(v.reduce(np.std, "x"), expected)
+         assert_identical(v.reduce(np.std, axis=0), v.reduce(np.std, dim="x"))
+         assert_identical(
+-            v.reduce(np.std, ["y", "x"]), Variable([], self.d.std(axis=(0, 1)))
++            v.reduce(np.std, ["y", "x"]),
++            Variable([], self.d.std(axis=(0, 1)), {"ignored": "attributes"}),
++        )
++        assert_identical(
++            v.reduce(np.std), Variable([], self.d.std(), {"ignored": "attributes"})
++        )
++        # Chained reductions both keep attrs
++        expected_chained = Variable(
++            [], self.d.mean(axis=0).std(), {"ignored": "attributes"}
+         )
+-        assert_identical(v.reduce(np.std), Variable([], self.d.std()))
+         assert_identical(
+             v.reduce(np.mean, "x").reduce(np.std, "y"),
+-            Variable([], self.d.mean(axis=0).std()),
++            expected_chained,
+         )
+         assert_allclose(v.mean("x"), v.reduce(np.mean, "x"))
+ 
+@@ -2107,27 +2119,62 @@ class TestVariable(VariableSubclassobjects):
+ 
+         v = Variable(["x", "y"], self.d, _attrs)
+ 
+-        # Test dropped attrs
++        # Test default behavior (keeps attrs for reduction operations)
+         vm = v.mean()
+-        assert len(vm.attrs) == 0
+-        assert vm.attrs == {}
++        assert len(vm.attrs) == len(_attrs)
++        assert vm.attrs == _attrs
+ 
+-        # Test kept attrs
++        # Test explicitly keeping attrs
+         vm = v.mean(keep_attrs=True)
+         assert len(vm.attrs) == len(_attrs)
+         assert vm.attrs == _attrs
+ 
++        # Test explicitly dropping attrs
++        vm = v.mean(keep_attrs=False)
++        assert len(vm.attrs) == 0
++        assert vm.attrs == {}
++
+     def test_binary_ops_keep_attrs(self):
+         _attrs = {"units": "test", "long_name": "testing"}
+         a = Variable(["x", "y"], np.random.randn(3, 3), _attrs)
+         b = Variable(["x", "y"], np.random.randn(3, 3), _attrs)
+-        # Test dropped attrs
++        # Test kept attrs (now default)
+         d = a - b  # just one operation
+-        assert d.attrs == {}
+-        # Test kept attrs
+-        with set_options(keep_attrs=True):
+-            d = a - b
+         assert d.attrs == _attrs
++        # Test dropped attrs
++        with set_options(keep_attrs=False):
++            d = a - b
++        assert d.attrs == {}
++
++    def test_binary_ops_attrs_drop_conflicts(self):
++        # Test that binary operations combine attrs with drop_conflicts behavior
++        attrs_a = {"units": "meters", "long_name": "distance", "source": "sensor_a"}
++        attrs_b = {"units": "feet", "resolution": "high", "source": "sensor_b"}
++        a = Variable(["x"], [1, 2, 3], attrs_a)
++        b = Variable(["x"], [4, 5, 6], attrs_b)
++
++        # With keep_attrs=True (default), should combine attrs dropping conflicts
++        result = a + b
++        # "units" and "source" conflict, so they're dropped
++        # "long_name" only in a, "resolution" only in b, so they're kept
++        assert result.attrs == {"long_name": "distance", "resolution": "high"}
++
++        # Test with identical values for some attrs
++        attrs_c = {"units": "meters", "type": "data", "source": "sensor_c"}
++        c = Variable(["x"], [7, 8, 9], attrs_c)
++        result2 = a + c
++        # "units" has same value, so kept; "source" conflicts, so dropped
++        # "long_name" from a, "type" from c
++        assert result2.attrs == {
++            "units": "meters",
++            "long_name": "distance",
++            "type": "data",
++        }
++
++        # With keep_attrs=False, attrs should be empty
++        with set_options(keep_attrs=False):
++            result3 = a + b
++            assert result3.attrs == {}
+ 
+     def test_count(self):
+         expected = Variable([], 3)
+
+diff --git a/xarray/tests/test_weighted.py b/xarray/tests/test_weighted.py
+index 7295148..5e913c0 100644
+--- a/xarray/tests/test_weighted.py
++++ b/xarray/tests/test_weighted.py
+@@ -746,12 +746,13 @@ def test_weighted_operations_keep_attr(operation, as_dataset, keep_attrs):
+ 
+     result = getattr(data.weighted(weights), operation)(**kwargs)
+ 
++    # When keep_attrs is None, it defaults to True
++    expected_keep = keep_attrs if keep_attrs is not None else True
++
+     if operation == "sum_of_weights":
+-        assert result.attrs == (weights.attrs if keep_attrs else {})
+-        assert result.attrs == (weights.attrs if keep_attrs else {})
++        assert result.attrs == (weights.attrs if expected_keep else {})
+     else:
+-        assert result.attrs == (weights.attrs if keep_attrs else {})
+-        assert result.attrs == (data.attrs if keep_attrs else {})
++        assert result.attrs == (data.attrs if expected_keep else {})
+ 
+ 
+ @pytest.mark.parametrize(

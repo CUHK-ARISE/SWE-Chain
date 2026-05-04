@@ -1,0 +1,222 @@
+diff --git a/testing/test_doctest.py b/testing/test_doctest.py
+index dfe5699..665bdb7 100644
+--- a/testing/test_doctest.py
++++ b/testing/test_doctest.py
+@@ -482,6 +482,27 @@ class TestDoctests:
+         reprec = pytester.inline_run(p, "--doctest-modules")
+         reprec.assertoutcome(failed=1)
+ 
++    @pytest.mark.skipif(
++        sys.version_info[:2] <= (3, 7), reason="Only Python 3.7 or less"
++    )
++    def test_doctest_cached_property(self, pytester: Pytester):
++        p = pytester.makepyfile(
++            """
++            import functools
++
++            class Foo:
++                @functools.cached_property
++                def foo(self):
++                    '''
++                    >>> assert False, "Tacos!"
++                    '''
++                    ...
++        """
++        )
++        result = pytester.runpytest(p, "--doctest-modules")
++        result.assert_outcomes(failed=1)
++        assert "Tacos!" in result.stdout.str()
++
+     def test_doctestmodule_external_and_issue116(self, pytester: Pytester):
+         p = pytester.mkpydir("hello")
+         p.joinpath("__init__.py").write_text(
+
+diff --git a/testing/test_junitxml.py b/testing/test_junitxml.py
+index 6908303..3f88c21 100644
+--- a/testing/test_junitxml.py
++++ b/testing/test_junitxml.py
+@@ -1228,6 +1228,36 @@ def test_record_property(pytester: Pytester, run_and_parse: RunAndParse) -> None
+     result.stdout.fnmatch_lines(["*= 1 passed in *"])
+ 
+ 
++def test_record_property_on_test_and_teardown_failure(
++    pytester: Pytester, run_and_parse: RunAndParse
++) -> None:
++    pytester.makepyfile(
++        """
++        import pytest
++
++        @pytest.fixture
++        def other(record_property):
++            record_property("bar", 1)
++            yield
++            assert 0
++
++        def test_record(record_property, other):
++            record_property("foo", "<1")
++            assert 0
++    """
++    )
++    result, dom = run_and_parse()
++    node = dom.find_first_by_tag("testsuite")
++    tnodes = node.find_by_tag("testcase")
++    for tnode in tnodes:
++        psnode = tnode.find_first_by_tag("properties")
++        assert psnode, f"testcase didn't had expected properties:\n{tnode}"
++        pnodes = psnode.find_by_tag("property")
++        pnodes[0].assert_attr(name="bar", value="1")
++        pnodes[1].assert_attr(name="foo", value="<1")
++    result.stdout.fnmatch_lines(["*= 1 failed, 1 error *"])
++
++
+ def test_record_property_same_name(
+     pytester: Pytester, run_and_parse: RunAndParse
+ ) -> None:
+
+diff --git a/testing/test_main.py b/testing/test_main.py
+index 7159762..3c8998c 100644
+--- a/testing/test_main.py
++++ b/testing/test_main.py
+@@ -262,3 +262,34 @@ def test_module_full_path_without_drive(pytester: Pytester) -> None:
+             "* 1 passed in *",
+         ]
+     )
++
++
++def test_very_long_cmdline_arg(pytester: Pytester) -> None:
++    """
++    Regression test for #11394.
++
++    Note: we could not manage to actually reproduce the error with this code, we suspect
++    GitHub runners are configured to support very long paths, however decided to leave
++    the test in place in case this ever regresses in the future.
++    """
++    pytester.makeconftest(
++        """
++        import pytest
++
++        def pytest_addoption(parser):
++            parser.addoption("--long-list", dest="long_list", action="store", default="all", help="List of things")
++
++        @pytest.fixture(scope="module")
++        def specified_feeds(request):
++            list_string = request.config.getoption("--long-list")
++            return list_string.split(',')
++        """
++    )
++    pytester.makepyfile(
++        """
++        def test_foo(specified_feeds):
++            assert len(specified_feeds) == 100_000
++        """
++    )
++    result = pytester.runpytest("--long-list", ",".join(["helloworld"] * 100_000))
++    result.stdout.fnmatch_lines("* 1 passed *")
+
+diff --git a/testing/test_pathlib.py b/testing/test_pathlib.py
+index 3d574e8..678fd27 100644
+--- a/testing/test_pathlib.py
++++ b/testing/test_pathlib.py
+@@ -1,3 +1,4 @@
++import errno
+ import os.path
+ import pickle
+ import sys
+@@ -18,11 +19,13 @@ from _pytest.pathlib import fnmatch_ex
+ from _pytest.pathlib import get_extended_length_path_str
+ from _pytest.pathlib import get_lock_path
+ from _pytest.pathlib import import_path
++from _pytest.pathlib import ImportMode
+ from _pytest.pathlib import ImportPathMismatchError
+ from _pytest.pathlib import insert_missing_modules
+ from _pytest.pathlib import maybe_delete_a_numbered_dir
+ from _pytest.pathlib import module_name_from_path
+ from _pytest.pathlib import resolve_package_path
++from _pytest.pathlib import safe_exists
+ from _pytest.pathlib import symlink_or_skip
+ from _pytest.pathlib import visit
+ from _pytest.tmpdir import TempPathFactory
+@@ -585,6 +588,10 @@ class TestImportLibMode:
+         result = module_name_from_path(Path("/home/foo/test_foo.py"), Path("/bar"))
+         assert result == "home.foo.test_foo"
+ 
++        # Importing __init__.py files should return the package as module name.
++        result = module_name_from_path(tmp_path / "src/app/__init__.py", tmp_path)
++        assert result == "src.app"
++
+     def test_insert_missing_modules(
+         self, monkeypatch: MonkeyPatch, tmp_path: Path
+     ) -> None:
+@@ -615,3 +622,72 @@ class TestImportLibMode:
+         assert sorted(modules) == ["xxx", "xxx.tests", "xxx.tests.foo"]
+         assert modules["xxx"].tests is modules["xxx.tests"]
+         assert modules["xxx.tests"].foo is modules["xxx.tests.foo"]
++
++    def test_importlib_package(self, monkeypatch: MonkeyPatch, tmp_path: Path):
++        """
++        Importing a package using --importmode=importlib should not import the
++        package's __init__.py file more than once (#11306).
++        """
++        monkeypatch.chdir(tmp_path)
++        monkeypatch.syspath_prepend(tmp_path)
++
++        package_name = "importlib_import_package"
++        tmp_path.joinpath(package_name).mkdir()
++        init = tmp_path.joinpath(f"{package_name}/__init__.py")
++        init.write_text(
++            dedent(
++                """
++                from .singleton import Singleton
++
++                instance = Singleton()
++                """
++            ),
++            encoding="ascii",
++        )
++        singleton = tmp_path.joinpath(f"{package_name}/singleton.py")
++        singleton.write_text(
++            dedent(
++                """
++                class Singleton:
++                    INSTANCES = []
++
++                    def __init__(self) -> None:
++                        self.INSTANCES.append(self)
++                        if len(self.INSTANCES) > 1:
++                            raise RuntimeError("Already initialized")
++                """
++            ),
++            encoding="ascii",
++        )
++
++        mod = import_path(init, root=tmp_path, mode=ImportMode.importlib)
++        assert len(mod.instance.INSTANCES) == 1
++
++
++def test_safe_exists(tmp_path: Path) -> None:
++    d = tmp_path.joinpath("some_dir")
++    d.mkdir()
++    assert safe_exists(d) is True
++
++    f = tmp_path.joinpath("some_file")
++    f.touch()
++    assert safe_exists(f) is True
++
++    # Use unittest.mock() as a context manager to have a very narrow
++    # patch lifetime.
++    p = tmp_path.joinpath("some long filename" * 100)
++    with unittest.mock.patch.object(
++        Path,
++        "exists",
++        autospec=True,
++        side_effect=OSError(errno.ENAMETOOLONG, "name too long"),
++    ):
++        assert safe_exists(p) is False
++
++    with unittest.mock.patch.object(
++        Path,
++        "exists",
++        autospec=True,
++        side_effect=ValueError("name too long"),
++    ):
++        assert safe_exists(p) is False

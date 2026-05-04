@@ -1,0 +1,325 @@
+{
+  "old_dir": ".packages/poetry/1.5.0",
+  "new_dir": ".packages/poetry/1.5.1",
+  "extracted_at": "2026-04-24T01:19:29.935069",
+  "diff_file": "confirmed/poetry_1.5.0_to_1.8.5/1.5.1/differences/code_diff_v1.5.0_to_v1.5.1_py.diff",
+  "diff_content": "diff --git a/src/poetry/installation/wheel_installer.py b/src/poetry/installation/wheel_installer.py\nindex 18e42e9..d25811f 100644\n--- a/src/poetry/installation/wheel_installer.py\n+++ b/src/poetry/installation/wheel_installer.py\n@@ -101,7 +101,10 @@ class WheelInstaller:\n     def install(self, wheel: Path) -> None:\n         with WheelFile.open(wheel) as source:\n             try:\n-                source.validate_record()\n+                # Content validation is temporarily disabled because of\n+                # pypa/installer's out of memory issues with big wheels. See\n+                # https://github.com/python-poetry/poetry/issues/7983\n+                source.validate_record(validate_contents=False)\n             except _WheelFileValidationError as e:\n                 self.invalid_wheels[wheel] = e.issues\n             install(\n\ndiff --git a/src/poetry/mixology/version_solver.py b/src/poetry/mixology/version_solver.py\nindex 6671c68..e3c1228 100644\n--- a/src/poetry/mixology/version_solver.py\n+++ b/src/poetry/mixology/version_solver.py\n@@ -1,9 +1,12 @@\n from __future__ import annotations\n \n+import collections\n import functools\n import time\n \n from typing import TYPE_CHECKING\n+from typing import Optional\n+from typing import Tuple\n \n from poetry.core.packages.dependency import Dependency\n \n@@ -28,6 +31,11 @@ if TYPE_CHECKING:\n _conflict = object()\n \n \n+DependencyCacheKey = Tuple[\n+    str, Optional[str], Optional[str], Optional[str], Optional[str]\n+]\n+\n+\n class DependencyCache:\n     \"\"\"\n     A cache of the valid dependencies.\n@@ -38,15 +46,58 @@ class DependencyCache:\n     \"\"\"\n \n     def __init__(self, provider: Provider) -> None:\n-        self.provider = provider\n-        self.cache: dict[\n-            tuple[str, str | None, str | None, str | None, str | None],\n-            list[DependencyPackage],\n-        ] = {}\n+        self._provider = provider\n+\n+        # self._cache maps a package name to a stack of cached package lists,\n+        # ordered by the decision level which added them to the cache. This is\n+        # done so that when backtracking we can maintain cache entries from\n+        # previous decision levels, while clearing cache entries from only the\n+        # rolled back levels.\n+        #\n+        # In order to maintain the integrity of the cache, `clear_level()`\n+        # needs to be called in descending order as decision levels are\n+        # backtracked so that the correct items can be popped from the stack.\n+        self._cache: dict[DependencyCacheKey, list[list[DependencyPackage]]] = (\n+            collections.defaultdict(list)\n+        )\n+        self._cached_dependencies_by_level: dict[int, list[DependencyCacheKey]] = (\n+            collections.defaultdict(list)\n+        )\n \n-        self.search_for = functools.lru_cache(maxsize=128)(self._search_for)\n+        self._search_for_cached = functools.lru_cache(maxsize=128)(self._search_for)\n \n-    def _search_for(self, dependency: Dependency) -> list[DependencyPackage]:\n+    def _search_for(\n+        self,\n+        dependency: Dependency,\n+        key: DependencyCacheKey,\n+    ) -> list[DependencyPackage]:\n+        cache_entries = self._cache[key]\n+        if cache_entries:\n+            packages = [\n+                p\n+                for p in cache_entries[-1]\n+                if dependency.constraint.allows(p.package.version)\n+            ]\n+        else:\n+            packages = None\n+\n+        # provider.search_for() normally does not include pre-release packages\n+        # (unless requested), but will include them if there are no other\n+        # eligible package versions for a version constraint.\n+        #\n+        # Therefore, if the eligible versions have been filtered down to\n+        # nothing, we need to call provider.search_for() again as it may return\n+        # additional results this time.\n+        if not packages:\n+            packages = self._provider.search_for(dependency)\n+\n+        return packages\n+\n+    def search_for(\n+        self,\n+        dependency: Dependency,\n+        decision_level: int,\n+    ) -> list[DependencyPackage]:\n         key = (\n             dependency.complete_name,\n             dependency.source_type,\n@@ -55,20 +106,18 @@ class DependencyCache:\n             dependency.source_subdirectory,\n         )\n \n-        packages = self.cache.get(key)\n-        if packages is None:\n-            packages = self.provider.search_for(dependency)\n-        else:\n-            packages = [\n-                p for p in packages if dependency.constraint.allows(p.package.version)\n-            ]\n-\n-        self.cache[key] = packages\n+        packages = self._search_for_cached(dependency, key)\n+        if not self._cache[key] or self._cache[key][-1] is not packages:\n+            self._cache[key].append(packages)\n+            self._cached_dependencies_by_level[decision_level].append(key)\n \n         return packages\n \n-    def clear(self) -> None:\n-        self.cache.clear()\n+    def clear_level(self, level: int) -> None:\n+        if level in self._cached_dependencies_by_level:\n+            self._search_for_cached.cache_clear()\n+            for key in self._cached_dependencies_by_level.pop(level):\n+                self._cache[key].pop()\n \n \n class VersionSolver:\n@@ -86,6 +135,9 @@ class VersionSolver:\n         self._dependency_cache = DependencyCache(provider)\n         self._incompatibilities: dict[str, list[Incompatibility]] = {}\n         self._contradicted_incompatibilities: set[Incompatibility] = set()\n+        self._contradicted_incompatibilities_by_level: dict[\n+            int, set[Incompatibility]\n+        ] = collections.defaultdict(set)\n         self._solution = PartialSolution()\n \n     @property\n@@ -184,6 +236,9 @@ class VersionSolver:\n                 # incompatibility is contradicted as well and there's nothing new we\n                 # can deduce from it.\n                 self._contradicted_incompatibilities.add(incompatibility)\n+                self._contradicted_incompatibilities_by_level[\n+                    self._solution.decision_level\n+                ].add(incompatibility)\n                 return None\n             elif relation == SetRelation.OVERLAPPING:\n                 # If more than one term is inconclusive, we can't deduce anything about\n@@ -202,6 +257,9 @@ class VersionSolver:\n             return _conflict\n \n         self._contradicted_incompatibilities.add(incompatibility)\n+        self._contradicted_incompatibilities_by_level[\n+            self._solution.decision_level\n+        ].add(incompatibility)\n \n         adverb = \"not \" if unsatisfied.is_positive() else \"\"\n         self._log(f\"derived: {adverb}{unsatisfied.dependency}\")\n@@ -295,9 +353,16 @@ class VersionSolver:\n                 previous_satisfier_level < most_recent_satisfier.decision_level\n                 or most_recent_satisfier.cause is None\n             ):\n+                for level in range(\n+                    self._solution.decision_level, previous_satisfier_level, -1\n+                ):\n+                    if level in self._contradicted_incompatibilities_by_level:\n+                        self._contradicted_incompatibilities.difference_update(\n+                            self._contradicted_incompatibilities_by_level.pop(level),\n+                        )\n+                    self._dependency_cache.clear_level(level)\n+\n                 self._solution.backtrack(previous_satisfier_level)\n-                self._contradicted_incompatibilities.clear()\n-                self._dependency_cache.clear()\n                 if new_incompatibility:\n                     self._add_incompatibility(incompatibility)\n \n@@ -395,7 +460,11 @@ class VersionSolver:\n                 if locked:\n                     return is_specific_marker, Preference.LOCKED, 1\n \n-            num_packages = len(self._dependency_cache.search_for(dependency))\n+            num_packages = len(\n+                self._dependency_cache.search_for(\n+                    dependency, self._solution.decision_level\n+                )\n+            )\n \n             if num_packages < 2:\n                 preference = Preference.NO_CHOICE\n@@ -412,7 +481,9 @@ class VersionSolver:\n \n         locked = self._provider.get_locked(dependency)\n         if locked is None:\n-            packages = self._dependency_cache.search_for(dependency)\n+            packages = self._dependency_cache.search_for(\n+                dependency, self._solution.decision_level\n+            )\n             package = next(iter(packages), None)\n \n             if package is None:\n\ndiff --git a/src/poetry/puzzle/provider.py b/src/poetry/puzzle/provider.py\nindex 3c3b738..ea1eb8d 100644\n--- a/src/poetry/puzzle/provider.py\n+++ b/src/poetry/puzzle/provider.py\n@@ -280,12 +280,8 @@ class Provider:\n         #\n         # We rely on the VersionSolver resolving direct-origin dependencies first.\n         direct_origin_package = self._direct_origin_packages.get(dependency.name)\n-        if direct_origin_package is not None:\n-            packages = (\n-                [direct_origin_package]\n-                if dependency.constraint.allows(direct_origin_package.version)\n-                else []\n-            )\n+        if direct_origin_package and direct_origin_package.satisfies(dependency):\n+            packages = [direct_origin_package]\n             return PackageCollection(dependency, packages)\n \n         packages = self._pool.find_packages(dependency)\n\ndiff --git a/src/poetry/repositories/http_repository.py b/src/poetry/repositories/http_repository.py\nindex ae96481..9427d72 100644\n--- a/src/poetry/repositories/http_repository.py\n+++ b/src/poetry/repositories/http_repository.py\n@@ -76,15 +76,11 @@ class HTTPRepository(CachedRepository):\n \n     @contextmanager\n     def _cached_or_downloaded_file(self, link: Link) -> Iterator[Path]:\n-        filepath = self._authenticator.get_cached_file_for_url(link.url)\n-        if filepath:\n+        self._log(f\"Downloading: {link.url}\", level=\"debug\")\n+        with temporary_directory() as temp_dir:\n+            filepath = Path(temp_dir) / link.filename\n+            self._download(link.url, filepath)\n             yield filepath\n-        else:\n-            self._log(f\"Downloading: {link.url}\", level=\"debug\")\n-            with temporary_directory() as temp_dir:\n-                filepath = Path(temp_dir) / link.filename\n-                self._download(link.url, filepath)\n-                yield filepath\n \n     def _get_info_from_wheel(self, url: str) -> PackageInfo:\n         from poetry.inspection.info import PackageInfo\n\ndiff --git a/src/poetry/utils/authenticator.py b/src/poetry/utils/authenticator.py\nindex beb2034..edf6fe0 100644\n--- a/src/poetry/utils/authenticator.py\n+++ b/src/poetry/utils/authenticator.py\n@@ -19,7 +19,6 @@ import requests.exceptions\n \n from cachecontrol import CacheControlAdapter\n from cachecontrol.caches import FileCache\n-from cachecontrol.caches.file_cache import url_to_file_path\n from filelock import FileLock\n \n from poetry.config.config import Config\n@@ -464,13 +463,6 @@ class Authenticator:\n             return selected.certs(config=self._config)\n         return RepositoryCertificateConfig()\n \n-    def get_cached_file_for_url(self, url: str) -> Path | None:\n-        if self._cache_control is None:\n-            return None\n-\n-        path = Path(url_to_file_path(url, self._cache_control))\n-        return path if path.exists() else None\n-\n \n _authenticator: Authenticator | None = None\n \n\ndiff --git a/src/poetry/utils/env.py b/src/poetry/utils/env.py\nindex 4cd3acf..5f77475 100644\n--- a/src/poetry/utils/env.py\n+++ b/src/poetry/utils/env.py\n@@ -698,7 +698,7 @@ class EnvManager:\n \n         if not in_venv or env is not None:\n             # Checking if a local virtualenv exists\n-            if self.use_in_project_venv():\n+            if self.in_project_venv_exists():\n                 venv = self.in_project_venv\n \n                 return VirtualEnv(venv)\n@@ -736,7 +736,7 @@ class EnvManager:\n         venv_path = self._poetry.config.virtualenvs_path\n         env_list = [VirtualEnv(p) for p in sorted(venv_path.glob(f\"{venv_name}-py*\"))]\n \n-        if self.use_in_project_venv():\n+        if self.in_project_venv_exists():\n             venv = self.in_project_venv\n             env_list.insert(0, VirtualEnv(venv))\n         return env_list\n@@ -855,6 +855,14 @@ class EnvManager:\n         in_project: bool | None = self._poetry.config.get(\"virtualenvs.in-project\")\n         if in_project is not None:\n             return in_project\n+\n+        return self.in_project_venv.is_dir()\n+\n+    def in_project_venv_exists(self) -> bool:\n+        in_project: bool | None = self._poetry.config.get(\"virtualenvs.in-project\")\n+        if in_project is False:\n+            return False\n+\n         return self.in_project_venv.is_dir()\n \n     def create_venv(\n@@ -1246,7 +1254,7 @@ class Env:\n         \"\"\"\n         Path to current python executable\n         \"\"\"\n-        return self._bin(self._executable)\n+        return Path(self._bin(self._executable))\n \n     @property\n     def marker_env(self) -> dict[str, Any]:\n@@ -1314,7 +1322,7 @@ class Env:\n         \"\"\"\n         # we do not use as_posix() here due to issues with windows pathlib2\n         # implementation\n-        path = self._bin(self._pip_executable)\n+        path = Path(self._bin(self._pip_executable))\n         if not path.exists():\n             return self.pip_embedded\n         return path\n@@ -1434,7 +1442,7 @@ class Env:\n         raise NotImplementedError()\n \n     def get_pip_command(self, embedded: bool = False) -> list[str]:\n-        if embedded or not self._bin(self._pip_executable).exists():\n+        if embedded or not Path(self._bin(self._pip_executable)).exists():\n             return [str(self.python), str(self.pip_embedded)]\n         # run as module so that pip can update itself on Windows\n         return [str(self.python), \"-m\", \"pip\"]\n@@ -1464,7 +1472,7 @@ class Env:\n             # embedded pip when pip is not available in the environment\n             return self.get_pip_command()\n \n-        return [str(self._bin(bin))]\n+        return [self._bin(bin)]\n \n     def run(self, bin: str, *args: str, **kwargs: Any) -> str:\n         cmd = self.get_command_from_bin(bin) + list(args)\n@@ -1544,7 +1552,7 @@ class Env:\n                 self._script_dirs.append(self.userbase / self._script_dirs[0].name)\n         return self._script_dirs\n \n-    def _bin(self, bin: str) -> Path:\n+    def _bin(self, bin: str) -> str:\n         \"\"\"\n         Return path to the given executable.\n         \"\"\"\n@@ -1565,11 +1573,11 @@ class Env:\n                     bin_path = self._path / bin\n \n                 if bin_path.exists():\n-                    return bin_path\n+                    return str(bin_path)\n \n-            return Path(bin)\n+            return bin\n \n-        return bin_path\n+        return str(bin_path)\n \n     def __eq__(self, other: object) -> bool:\n         if not isinstance(other, Env):\n@@ -1883,8 +1891,8 @@ class NullEnv(SystemEnv):\n             return super().execute(bin, *args, **kwargs)\n         return 0\n \n-    def _bin(self, bin: str) -> Path:\n-        return Path(bin)\n+    def _bin(self, bin: str) -> str:\n+        return bin\n \n \n @contextmanager\n\ndiff --git a/src/poetry/utils/helpers.py b/src/poetry/utils/helpers.py\nindex b39e823..ab2f369 100644\n--- a/src/poetry/utils/helpers.py\n+++ b/src/poetry/utils/helpers.py\n@@ -121,7 +121,7 @@ def download_file(\n             # but skip the updating\n             set_indicator = total_size > 1024 * 1024\n \n-        with dest.open(\"wb\") as f:\n+        with atomic_open(dest) as f:\n             for chunk in response.iter_content(chunk_size=chunk_size):\n                 if chunk:\n                     f.write(chunk)\n",
+  "structured_diff": {
+    "src/poetry/installation/wheel_installer.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -101,7 +101,10 @@",
+          "snippet": " class WheelInstaller:\n     def install(self, wheel: Path) -> None:\n         with WheelFile.open(wheel) as source:\n             try:\n-                source.validate_record()\n+                # Content validation is temporarily disabled because of\n+                # pypa/installer's out of memory issues with big wheels. See\n+                # https://github.com/python-poetry/poetry/issues/7983\n+                source.validate_record(validate_contents=False)\n             except _WheelFileValidationError as e:\n                 self.invalid_wheels[wheel] = e.issues\n             install(\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/installation/wheel_installer.py::WheelInstaller::install"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/mixology/version_solver.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,9 +1,12 @@",
+          "snippet": " from __future__ import annotations\n \n+import collections\n import functools\n import time\n \n from typing import TYPE_CHECKING\n+from typing import Optional\n+from typing import Tuple\n \n from poetry.core.packages.dependency import Dependency\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/mixology/version_solver.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -28,6 +31,11 @@",
+          "snippet": " if TYPE_CHECKING:\n _conflict = object()\n \n \n+DependencyCacheKey = Tuple[\n+    str, Optional[str], Optional[str], Optional[str], Optional[str]\n+]\n+\n+\n class DependencyCache:\n     \"\"\"\n     A cache of the valid dependencies.",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "src/poetry/mixology/version_solver.py::DependencyCacheKey"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -38,15 +46,58 @@",
+          "snippet": " class DependencyCache:\n     \"\"\"\n \n     def __init__(self, provider: Provider) -> None:\n-        self.provider = provider\n-        self.cache: dict[\n-            tuple[str, str | None, str | None, str | None, str | None],\n-            list[DependencyPackage],\n-        ] = {}\n+        self._provider = provider\n+\n+        # self._cache maps a package name to a stack of cached package lists,\n+        # ordered by the decision level which added them to the cache. This is\n+        # done so that when backtracking we can maintain cache entries from\n+        # previous decision levels, while clearing cache entries from only the\n+        # rolled back levels.\n+        #\n+        # In order to maintain the integrity of the cache, `clear_level()`\n+        # needs to be called in descending order as decision levels are\n+        # backtracked so that the correct items can be popped from the stack.\n+        self._cache: dict[DependencyCacheKey, list[list[DependencyPackage]]] = (\n+            collections.defaultdict(list)\n+        )\n+        self._cached_dependencies_by_level: dict[int, list[DependencyCacheKey]] = (\n+            collections.defaultdict(list)\n+        )\n \n-        self.search_for = functools.lru_cache(maxsize=128)(self._search_for)\n+        self._search_for_cached = functools.lru_cache(maxsize=128)(self._search_for)\n \n-    def _search_for(self, dependency: Dependency) -> list[DependencyPackage]:\n+    def _search_for(\n+        self,\n+        dependency: Dependency,\n+        key: DependencyCacheKey,\n+    ) -> list[DependencyPackage]:\n+        cache_entries = self._cache[key]\n+        if cache_entries:\n+            packages = [\n+                p\n+                for p in cache_entries[-1]\n+                if dependency.constraint.allows(p.package.version)\n+            ]\n+        else:\n+            packages = None\n+\n+        # provider.search_for() normally does not include pre-release packages\n+        # (unless requested), but will include them if there are no other\n+        # eligible package versions for a version constraint.\n+        #\n+        # Therefore, if the eligible versions have been filtered down to\n+        # nothing, we need to call provider.search_for() again as it may return\n+        # additional results this time.\n+        if not packages:\n+            packages = self._provider.search_for(dependency)\n+\n+        return packages\n+\n+    def search_for(\n+        self,\n+        dependency: Dependency,\n+        decision_level: int,\n+    ) -> list[DependencyPackage]:\n         key = (\n             dependency.complete_name,\n             dependency.source_type,",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/mixology/version_solver.py::DependencyCache::__init__"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/mixology/version_solver.py::DependencyCache::_search_for"
+            },
+            {
+              "kind": "class",
+              "node": "src/poetry/mixology/version_solver.py::DependencyCache"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/mixology/version_solver.py::DependencyCache::search_for"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -55,20 +106,18 @@",
+          "snippet": " class DependencyCache:\n             dependency.source_subdirectory,\n         )\n \n-        packages = self.cache.get(key)\n-        if packages is None:\n-            packages = self.provider.search_for(dependency)\n-        else:\n-            packages = [\n-                p for p in packages if dependency.constraint.allows(p.package.version)\n-            ]\n-\n-        self.cache[key] = packages\n+        packages = self._search_for_cached(dependency, key)\n+        if not self._cache[key] or self._cache[key][-1] is not packages:\n+            self._cache[key].append(packages)\n+            self._cached_dependencies_by_level[decision_level].append(key)\n \n         return packages\n \n-    def clear(self) -> None:\n-        self.cache.clear()\n+    def clear_level(self, level: int) -> None:\n+        if level in self._cached_dependencies_by_level:\n+            self._search_for_cached.cache_clear()\n+            for key in self._cached_dependencies_by_level.pop(level):\n+                self._cache[key].pop()\n \n \n class VersionSolver:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/mixology/version_solver.py::DependencyCache::search_for"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/mixology/version_solver.py::DependencyCache::clear_level"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -86,6 +135,9 @@",
+          "snippet": " class VersionSolver:\n         self._dependency_cache = DependencyCache(provider)\n         self._incompatibilities: dict[str, list[Incompatibility]] = {}\n         self._contradicted_incompatibilities: set[Incompatibility] = set()\n+        self._contradicted_incompatibilities_by_level: dict[\n+            int, set[Incompatibility]\n+        ] = collections.defaultdict(set)\n         self._solution = PartialSolution()\n \n     @property",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/mixology/version_solver.py::VersionSolver::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -184,6 +236,9 @@",
+          "snippet": " class VersionSolver:\n                 # incompatibility is contradicted as well and there's nothing new we\n                 # can deduce from it.\n                 self._contradicted_incompatibilities.add(incompatibility)\n+                self._contradicted_incompatibilities_by_level[\n+                    self._solution.decision_level\n+                ].add(incompatibility)\n                 return None\n             elif relation == SetRelation.OVERLAPPING:\n                 # If more than one term is inconclusive, we can't deduce anything about",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/mixology/version_solver.py::VersionSolver::_propagate_incompatibility"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -202,6 +257,9 @@",
+          "snippet": " class VersionSolver:\n             return _conflict\n \n         self._contradicted_incompatibilities.add(incompatibility)\n+        self._contradicted_incompatibilities_by_level[\n+            self._solution.decision_level\n+        ].add(incompatibility)\n \n         adverb = \"not \" if unsatisfied.is_positive() else \"\"\n         self._log(f\"derived: {adverb}{unsatisfied.dependency}\")",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/mixology/version_solver.py::VersionSolver::_propagate_incompatibility"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -295,9 +353,16 @@",
+          "snippet": " class VersionSolver:\n                 previous_satisfier_level < most_recent_satisfier.decision_level\n                 or most_recent_satisfier.cause is None\n             ):\n+                for level in range(\n+                    self._solution.decision_level, previous_satisfier_level, -1\n+                ):\n+                    if level in self._contradicted_incompatibilities_by_level:\n+                        self._contradicted_incompatibilities.difference_update(\n+                            self._contradicted_incompatibilities_by_level.pop(level),\n+                        )\n+                    self._dependency_cache.clear_level(level)\n+\n                 self._solution.backtrack(previous_satisfier_level)\n-                self._contradicted_incompatibilities.clear()\n-                self._dependency_cache.clear()\n                 if new_incompatibility:\n                     self._add_incompatibility(incompatibility)\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/mixology/version_solver.py::VersionSolver::_resolve_conflict"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -395,7 +460,11 @@",
+          "snippet": " class VersionSolver:\n                 if locked:\n                     return is_specific_marker, Preference.LOCKED, 1\n \n-            num_packages = len(self._dependency_cache.search_for(dependency))\n+            num_packages = len(\n+                self._dependency_cache.search_for(\n+                    dependency, self._solution.decision_level\n+                )\n+            )\n \n             if num_packages < 2:\n                 preference = Preference.NO_CHOICE",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/mixology/version_solver.py::VersionSolver::_get_min"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -412,7 +481,9 @@",
+          "snippet": " class VersionSolver:\n \n         locked = self._provider.get_locked(dependency)\n         if locked is None:\n-            packages = self._dependency_cache.search_for(dependency)\n+            packages = self._dependency_cache.search_for(\n+                dependency, self._solution.decision_level\n+            )\n             package = next(iter(packages), None)\n \n             if package is None:\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/mixology/version_solver.py::VersionSolver::_choose_package_version"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/puzzle/provider.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -280,12 +280,8 @@",
+          "snippet": " class Provider:\n         #\n         # We rely on the VersionSolver resolving direct-origin dependencies first.\n         direct_origin_package = self._direct_origin_packages.get(dependency.name)\n-        if direct_origin_package is not None:\n-            packages = (\n-                [direct_origin_package]\n-                if dependency.constraint.allows(direct_origin_package.version)\n-                else []\n-            )\n+        if direct_origin_package and direct_origin_package.satisfies(dependency):\n+            packages = [direct_origin_package]\n             return PackageCollection(dependency, packages)\n \n         packages = self._pool.find_packages(dependency)\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/puzzle/provider.py::Provider::search_for"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/repositories/http_repository.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -76,15 +76,11 @@",
+          "snippet": " class HTTPRepository(CachedRepository):\n \n     @contextmanager\n     def _cached_or_downloaded_file(self, link: Link) -> Iterator[Path]:\n-        filepath = self._authenticator.get_cached_file_for_url(link.url)\n-        if filepath:\n+        self._log(f\"Downloading: {link.url}\", level=\"debug\")\n+        with temporary_directory() as temp_dir:\n+            filepath = Path(temp_dir) / link.filename\n+            self._download(link.url, filepath)\n             yield filepath\n-        else:\n-            self._log(f\"Downloading: {link.url}\", level=\"debug\")\n-            with temporary_directory() as temp_dir:\n-                filepath = Path(temp_dir) / link.filename\n-                self._download(link.url, filepath)\n-                yield filepath\n \n     def _get_info_from_wheel(self, url: str) -> PackageInfo:\n         from poetry.inspection.info import PackageInfo\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/repositories/http_repository.py::HTTPRepository::_cached_or_downloaded_file"
+            },
+            {
+              "kind": "class",
+              "node": "src/poetry/repositories/http_repository.py::HTTPRepository"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/utils/authenticator.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -19,7 +19,6 @@",
+          "snippet": " import requests.exceptions\n \n from cachecontrol import CacheControlAdapter\n from cachecontrol.caches import FileCache\n-from cachecontrol.caches.file_cache import url_to_file_path\n from filelock import FileLock\n \n from poetry.config.config import Config",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/utils/authenticator.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -464,13 +463,6 @@",
+          "snippet": " class Authenticator:\n             return selected.certs(config=self._config)\n         return RepositoryCertificateConfig()\n \n-    def get_cached_file_for_url(self, url: str) -> Path | None:\n-        if self._cache_control is None:\n-            return None\n-\n-        path = Path(url_to_file_path(url, self._cache_control))\n-        return path if path.exists() else None\n-\n \n _authenticator: Authenticator | None = None\n \n",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/utils/authenticator.py::<module>"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/utils/env.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -698,7 +698,7 @@",
+          "snippet": " class EnvManager:\n \n         if not in_venv or env is not None:\n             # Checking if a local virtualenv exists\n-            if self.use_in_project_venv():\n+            if self.in_project_venv_exists():\n                 venv = self.in_project_venv\n \n                 return VirtualEnv(venv)",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env.py::EnvManager::get"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -736,7 +736,7 @@",
+          "snippet": " class EnvManager:\n         venv_path = self._poetry.config.virtualenvs_path\n         env_list = [VirtualEnv(p) for p in sorted(venv_path.glob(f\"{venv_name}-py*\"))]\n \n-        if self.use_in_project_venv():\n+        if self.in_project_venv_exists():\n             venv = self.in_project_venv\n             env_list.insert(0, VirtualEnv(venv))\n         return env_list",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env.py::EnvManager::list"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -855,6 +855,14 @@",
+          "snippet": " class EnvManager:\n         in_project: bool | None = self._poetry.config.get(\"virtualenvs.in-project\")\n         if in_project is not None:\n             return in_project\n+\n+        return self.in_project_venv.is_dir()\n+\n+    def in_project_venv_exists(self) -> bool:\n+        in_project: bool | None = self._poetry.config.get(\"virtualenvs.in-project\")\n+        if in_project is False:\n+            return False\n+\n         return self.in_project_venv.is_dir()\n \n     def create_venv(",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env.py::EnvManager::use_in_project_venv"
+            },
+            {
+              "kind": "class",
+              "node": "src/poetry/utils/env.py::EnvManager"
+            },
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env.py::EnvManager::in_project_venv_exists"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1246,7 +1254,7 @@",
+          "snippet": " class Env:\n         \"\"\"\n         Path to current python executable\n         \"\"\"\n-        return self._bin(self._executable)\n+        return Path(self._bin(self._executable))\n \n     @property\n     def marker_env(self) -> dict[str, Any]:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env.py::Env::python"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1314,7 +1322,7 @@",
+          "snippet": " class Env:\n         \"\"\"\n         # we do not use as_posix() here due to issues with windows pathlib2\n         # implementation\n-        path = self._bin(self._pip_executable)\n+        path = Path(self._bin(self._pip_executable))\n         if not path.exists():\n             return self.pip_embedded\n         return path",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env.py::Env::pip"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1434,7 +1442,7 @@",
+          "snippet": " class Env:\n         raise NotImplementedError()\n \n     def get_pip_command(self, embedded: bool = False) -> list[str]:\n-        if embedded or not self._bin(self._pip_executable).exists():\n+        if embedded or not Path(self._bin(self._pip_executable)).exists():\n             return [str(self.python), str(self.pip_embedded)]\n         # run as module so that pip can update itself on Windows\n         return [str(self.python), \"-m\", \"pip\"]",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env.py::Env::get_pip_command"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1464,7 +1472,7 @@",
+          "snippet": " class Env:\n             # embedded pip when pip is not available in the environment\n             return self.get_pip_command()\n \n-        return [str(self._bin(bin))]\n+        return [self._bin(bin)]\n \n     def run(self, bin: str, *args: str, **kwargs: Any) -> str:\n         cmd = self.get_command_from_bin(bin) + list(args)",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env.py::Env::get_command_from_bin"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1544,7 +1552,7 @@",
+          "snippet": " class Env:\n                 self._script_dirs.append(self.userbase / self._script_dirs[0].name)\n         return self._script_dirs\n \n-    def _bin(self, bin: str) -> Path:\n+    def _bin(self, bin: str) -> str:\n         \"\"\"\n         Return path to the given executable.\n         \"\"\"",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env.py::Env::_bin"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1565,11 +1573,11 @@",
+          "snippet": " class Env:\n                     bin_path = self._path / bin\n \n                 if bin_path.exists():\n-                    return bin_path\n+                    return str(bin_path)\n \n-            return Path(bin)\n+            return bin\n \n-        return bin_path\n+        return str(bin_path)\n \n     def __eq__(self, other: object) -> bool:\n         if not isinstance(other, Env):",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env.py::Env::_bin"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1883,8 +1891,8 @@",
+          "snippet": " class NullEnv(SystemEnv):\n             return super().execute(bin, *args, **kwargs)\n         return 0\n \n-    def _bin(self, bin: str) -> Path:\n-        return Path(bin)\n+    def _bin(self, bin: str) -> str:\n+        return bin\n \n \n @contextmanager\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/utils/env.py::NullEnv::_bin"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/utils/helpers.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -121,7 +121,7 @@",
+          "snippet": " def download_file(\n             # but skip the updating\n             set_indicator = total_size > 1024 * 1024\n \n-        with dest.open(\"wb\") as f:\n+        with atomic_open(dest) as f:\n             for chunk in response.iter_content(chunk_size=chunk_size):\n                 if chunk:\n                     f.write(chunk)",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/poetry/utils/helpers.py::download_file"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

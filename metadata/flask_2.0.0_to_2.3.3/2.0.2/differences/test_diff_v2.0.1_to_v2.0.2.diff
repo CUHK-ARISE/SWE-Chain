@@ -1,0 +1,243 @@
+diff --git a/tests/test_async.py b/tests/test_async.py
+index 26a9111..8276c4a 100644
+--- a/tests/test_async.py
++++ b/tests/test_async.py
+@@ -6,6 +6,8 @@ import pytest
+ from flask import Blueprint
+ from flask import Flask
+ from flask import request
++from flask.views import MethodView
++from flask.views import View
+ 
+ pytest.importorskip("asgiref")
+ 
+@@ -18,6 +20,24 @@ class BlueprintError(Exception):
+     pass
+ 
+ 
++class AsyncView(View):
++    methods = ["GET", "POST"]
++
++    async def dispatch_request(self):
++        await asyncio.sleep(0)
++        return request.method
++
++
++class AsyncMethodView(MethodView):
++    async def get(self):
++        await asyncio.sleep(0)
++        return "GET"
++
++    async def post(self):
++        await asyncio.sleep(0)
++        return "POST"
++
++
+ @pytest.fixture(name="async_app")
+ def _async_app():
+     app = Flask(__name__)
+@@ -53,11 +73,14 @@ def _async_app():
+ 
+     app.register_blueprint(blueprint, url_prefix="/bp")
+ 
++    app.add_url_rule("/view", view_func=AsyncView.as_view("view"))
++    app.add_url_rule("/methodview", view_func=AsyncMethodView.as_view("methodview"))
++
+     return app
+ 
+ 
+ @pytest.mark.skipif(sys.version_info < (3, 7), reason="requires Python >= 3.7")
+-@pytest.mark.parametrize("path", ["/", "/home", "/bp/"])
++@pytest.mark.parametrize("path", ["/", "/home", "/bp/", "/view", "/methodview"])
+ def test_async_route(path, async_app):
+     test_client = async_app.test_client()
+     response = test_client.get(path)
+
+diff --git a/tests/test_blueprints.py b/tests/test_blueprints.py
+index 088ad77..e02cd4b 100644
+--- a/tests/test_blueprints.py
++++ b/tests/test_blueprints.py
+@@ -837,6 +837,86 @@ def test_nested_blueprint(app, client):
+     assert client.get("/parent/child/grandchild/no").data == b"Grandchild no"
+ 
+ 
++def test_nested_callback_order(app, client):
++    parent = flask.Blueprint("parent", __name__)
++    child = flask.Blueprint("child", __name__)
++
++    @app.before_request
++    def app_before1():
++        flask.g.setdefault("seen", []).append("app_1")
++
++    @app.teardown_request
++    def app_teardown1(e=None):
++        assert flask.g.seen.pop() == "app_1"
++
++    @app.before_request
++    def app_before2():
++        flask.g.setdefault("seen", []).append("app_2")
++
++    @app.teardown_request
++    def app_teardown2(e=None):
++        assert flask.g.seen.pop() == "app_2"
++
++    @app.context_processor
++    def app_ctx():
++        return dict(key="app")
++
++    @parent.before_request
++    def parent_before1():
++        flask.g.setdefault("seen", []).append("parent_1")
++
++    @parent.teardown_request
++    def parent_teardown1(e=None):
++        assert flask.g.seen.pop() == "parent_1"
++
++    @parent.before_request
++    def parent_before2():
++        flask.g.setdefault("seen", []).append("parent_2")
++
++    @parent.teardown_request
++    def parent_teardown2(e=None):
++        assert flask.g.seen.pop() == "parent_2"
++
++    @parent.context_processor
++    def parent_ctx():
++        return dict(key="parent")
++
++    @child.before_request
++    def child_before1():
++        flask.g.setdefault("seen", []).append("child_1")
++
++    @child.teardown_request
++    def child_teardown1(e=None):
++        assert flask.g.seen.pop() == "child_1"
++
++    @child.before_request
++    def child_before2():
++        flask.g.setdefault("seen", []).append("child_2")
++
++    @child.teardown_request
++    def child_teardown2(e=None):
++        assert flask.g.seen.pop() == "child_2"
++
++    @child.context_processor
++    def child_ctx():
++        return dict(key="child")
++
++    @child.route("/a")
++    def a():
++        return ", ".join(flask.g.seen)
++
++    @child.route("/b")
++    def b():
++        return flask.render_template_string("{{ key }}")
++
++    parent.register_blueprint(child)
++    app.register_blueprint(parent)
++    assert (
++        client.get("/a").data == b"app_1, app_2, parent_1, parent_2, child_1, child_2"
++    )
++    assert client.get("/b").data == b"child"
++
++
+ @pytest.mark.parametrize(
+     "parent_init, child_init, parent_registration, child_registration",
+     [
+@@ -899,6 +979,14 @@ def test_blueprint_renaming(app, client) -> None:
+     def index():
+         return flask.request.endpoint
+ 
++    @bp.get("/error")
++    def error():
++        flask.abort(403)
++
++    @bp.errorhandler(403)
++    def forbidden(_: Exception):
++        return "Error", 403
++
+     @bp2.get("/")
+     def index2():
+         return flask.request.endpoint
+@@ -911,3 +999,5 @@ def test_blueprint_renaming(app, client) -> None:
+     assert client.get("/b/").data == b"alt.index"
+     assert client.get("/a/a/").data == b"bp.sub.index2"
+     assert client.get("/b/a/").data == b"alt.sub.index2"
++    assert client.get("/a/error").data == b"Error"
++    assert client.get("/b/error").data == b"Error"
+
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index ebf8d1f..e7462bd 100644
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -17,6 +17,7 @@ from flask import Blueprint
+ from flask import current_app
+ from flask import Flask
+ from flask.cli import AppGroup
++from flask.cli import DispatchingApp
+ from flask.cli import dotenv
+ from flask.cli import find_best_app
+ from flask.cli import FlaskGroup
+@@ -73,6 +74,15 @@ def test_find_best_app(test_apps):
+     assert isinstance(app, Flask)
+     assert app.name == "appname"
+ 
++    class Module:
++        @staticmethod
++        def create_app(**kwargs):
++            return Flask("appname")
++
++    app = find_best_app(script_info, Module)
++    assert isinstance(app, Flask)
++    assert app.name == "appname"
++
+     class Module:
+         @staticmethod
+         def create_app(foo):
+@@ -310,6 +320,23 @@ def test_scriptinfo(test_apps, monkeypatch):
+     assert app.name == "testapp"
+ 
+ 
++def test_lazy_load_error(monkeypatch):
++    """When using lazy loading, the correct exception should be
++    re-raised.
++    """
++
++    class BadExc(Exception):
++        pass
++
++    def bad_load():
++        raise BadExc
++
++    lazy = DispatchingApp(bad_load, use_eager_loading=False)
++
++    with pytest.raises(BadExc):
++        lazy._flush_bg_loading_exception()
++
++
+ def test_with_appcontext(runner):
+     @click.command()
+     @with_appcontext
+
+diff --git a/tests/test_json.py b/tests/test_json.py
+index fb8bdcb..9210275 100644
+--- a/tests/test_json.py
++++ b/tests/test_json.py
+@@ -1,4 +1,5 @@
+ import datetime
++import decimal
+ import io
+ import uuid
+ 
+@@ -187,6 +188,11 @@ def test_jsonify_uuid_types(app, client):
+     assert rv_uuid == test_uuid
+ 
+ 
++def test_json_decimal():
++    rv = flask.json.dumps(decimal.Decimal("0.003"))
++    assert rv == '"0.003"'
++
++
+ def test_json_attr(app, client):
+     @app.route("/add", methods=["POST"])
+     def add():

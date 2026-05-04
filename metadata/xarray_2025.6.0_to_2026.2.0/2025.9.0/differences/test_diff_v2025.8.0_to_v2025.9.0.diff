@@ -1,0 +1,2169 @@
+diff --git a/xarray/tests/conftest.py b/xarray/tests/conftest.py
+index a5964e1..b8955b9 100644
+--- a/xarray/tests/conftest.py
++++ b/xarray/tests/conftest.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++import warnings
++
+ import numpy as np
+ import pandas as pd
+ import pytest
+@@ -9,6 +11,27 @@ from xarray import DataArray, Dataset, DataTree
+ from xarray.tests import create_test_data, has_cftime, requires_dask
+ 
+ 
++@pytest.fixture(autouse=True)
++def handle_numpy_1_warnings():
++    """Handle NumPy 1.x DeprecationWarnings for out-of-bound integer conversions.
++
++    NumPy 1.x raises DeprecationWarning when converting out-of-bounds values
++    (e.g., 255 to int8), while NumPy 2.x raises OverflowError. This fixture
++    suppresses the warning in NumPy 1.x environments to allow tests to pass.
++    """
++    # Only apply for NumPy < 2.0
++    if np.__version__.startswith("1."):
++        with warnings.catch_warnings():
++            warnings.filterwarnings(
++                "ignore",
++                "NumPy will stop allowing conversion of out-of-bound Python integers",
++                DeprecationWarning,
++            )
++            yield
++    else:
++        yield
++
++
+ @pytest.fixture(params=["numpy", pytest.param("dask", marks=requires_dask)])
+ def backend(request):
+     return request.param
+
+diff --git a/xarray/tests/test_backends.py b/xarray/tests/test_backends.py
+index c336fe7..a402648 100644
+--- a/xarray/tests/test_backends.py
++++ b/xarray/tests/test_backends.py
+@@ -34,9 +34,11 @@ import xarray.testing as xrt
+ from xarray import (
+     DataArray,
+     Dataset,
++    DataTree,
+     backends,
+     load_dataarray,
+     load_dataset,
++    load_datatree,
+     open_dataarray,
+     open_dataset,
+     open_mfdataset,
+@@ -166,6 +168,70 @@ def skip_if_zarr_format_2(reason: str):
+ 
+ ON_WINDOWS = sys.platform == "win32"
+ default_value = object()
++
++
++def _check_compression_codec_available(codec: str | None) -> bool:
++    """Check if a compression codec is available in the netCDF4 library.
++
++    Parameters
++    ----------
++    codec : str or None
++        The compression codec name (e.g., 'zstd', 'blosc_lz', etc.)
++
++    Returns
++    -------
++    bool
++        True if the codec is available, False otherwise.
++    """
++    if codec is None or codec in ("zlib", "szip"):
++        # These are standard and should be available
++        return True
++
++    if not has_netCDF4:
++        return False
++
++    try:
++        import os
++        import tempfile
++
++        import netCDF4
++
++        # Try to create a file with the compression to test availability
++        with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
++            tmp_path = tmp.name
++
++        try:
++            nc = netCDF4.Dataset(tmp_path, "w", format="NETCDF4")
++            nc.createDimension("x", 10)
++
++            # Attempt to create a variable with the compression
++            if codec and codec.startswith("blosc"):
++                nc.createVariable(  # type: ignore[call-overload]
++                    varname="test",
++                    datatype="f4",
++                    dimensions=("x",),
++                    compression=codec,
++                    blosc_shuffle=1,
++                )
++            else:
++                nc.createVariable(  # type: ignore[call-overload]
++                    varname="test", datatype="f4", dimensions=("x",), compression=codec
++                )
++
++            nc.close()
++            os.unlink(tmp_path)
++            return True
++        except (RuntimeError, netCDF4.NetCDF4MissingFeatureException):
++            # Codec not available
++            if os.path.exists(tmp_path):
++                with contextlib.suppress(OSError):
++                    os.unlink(tmp_path)
++            return False
++    except Exception:
++        # Any other error, assume codec is not available
++        return False
++
++
+ dask_array_type = array_type("dask")
+ 
+ if TYPE_CHECKING:
+@@ -1399,8 +1465,8 @@ class CFEncodedBase(DatasetIOBase):
+         # test unlimited_dims validation
+         # https://github.com/pydata/xarray/issues/10549
+         ds.encoding = {"unlimited_dims": "z"}
+-        with pytest.raises(
+-            ValueError,
++        with pytest.warns(
++            UserWarning,
+             match=r"Unlimited dimension\(s\) .* declared in 'dataset.encoding'",
+         ):
+             with self.roundtrip(ds) as _:
+@@ -2261,12 +2327,48 @@ class TestNetCDF4Data(NetCDF4Base):
+             None,
+             "zlib",
+             "szip",
+-            "zstd",
+-            "blosc_lz",
+-            "blosc_lz4",
+-            "blosc_lz4hc",
+-            "blosc_zlib",
+-            "blosc_zstd",
++            pytest.param(
++                "zstd",
++                marks=pytest.mark.xfail(
++                    not _check_compression_codec_available("zstd"),
++                    reason="zstd codec not available in netCDF4 installation",
++                ),
++            ),
++            pytest.param(
++                "blosc_lz",
++                marks=pytest.mark.xfail(
++                    not _check_compression_codec_available("blosc_lz"),
++                    reason="blosc_lz codec not available in netCDF4 installation",
++                ),
++            ),
++            pytest.param(
++                "blosc_lz4",
++                marks=pytest.mark.xfail(
++                    not _check_compression_codec_available("blosc_lz4"),
++                    reason="blosc_lz4 codec not available in netCDF4 installation",
++                ),
++            ),
++            pytest.param(
++                "blosc_lz4hc",
++                marks=pytest.mark.xfail(
++                    not _check_compression_codec_available("blosc_lz4hc"),
++                    reason="blosc_lz4hc codec not available in netCDF4 installation",
++                ),
++            ),
++            pytest.param(
++                "blosc_zlib",
++                marks=pytest.mark.xfail(
++                    not _check_compression_codec_available("blosc_zlib"),
++                    reason="blosc_zlib codec not available in netCDF4 installation",
++                ),
++            ),
++            pytest.param(
++                "blosc_zstd",
++                marks=pytest.mark.xfail(
++                    not _check_compression_codec_available("blosc_zstd"),
++                    reason="blosc_zstd codec not available in netCDF4 installation",
++                ),
++            ),
+         ],
+     )
+     @requires_netCDF4_1_6_2_or_above
+@@ -2553,7 +2655,7 @@ class ZarrBase(CFEncodedBase):
+     def test_non_existent_store(self) -> None:
+         with pytest.raises(
+             FileNotFoundError,
+-            match="(No such file or directory|Unable to find group|No group found in store)",
++            match="(No such file or directory|Unable to find group|No group found in store|does not exist)",
+         ):
+             xr.open_zarr(f"{uuid.uuid4()}")
+ 
+@@ -2634,6 +2736,12 @@ class ZarrBase(CFEncodedBase):
+                 assert_identical(actual, auto)
+                 assert_identical(actual.load(), auto.load())
+ 
++    def test_unlimited_dims_encoding_is_ignored(self) -> None:
++        ds = Dataset({"x": np.arange(10)})
++        ds.encoding = {"unlimited_dims": ["x"]}
++        with self.roundtrip(ds) as actual:
++            assert_identical(ds, actual)
++
+     @requires_dask
+     @pytest.mark.filterwarnings("ignore:.*does not have a Zarr V3 specification.*")
+     def test_warning_on_bad_chunks(self) -> None:
+@@ -4293,9 +4401,10 @@ class TestZarrWriteEmpty(TestZarrDirectoryStore):
+                 # that was performed by the roundtrip_dir
+                 if (write_empty is False) or (write_empty is None and has_zarr_v3):
+                     expected.append("1.1.0")
+-                elif not has_zarr_v3:
+-                    # TODO: remove zarr3 if once zarr issue is fixed
+-                    # https://github.com/zarr-developers/zarr-python/issues/2931
++                elif not has_zarr_v3 or has_zarr_v3_async_oindex:
++                    # this was broken from zarr 3.0.0 until 3.1.2
++                    # async oindex released in 3.1.2 along with a fix
++                    # for write_empty_chunks in append
+                     expected.extend(
+                         [
+                             "1.1.0",
+@@ -4398,29 +4507,25 @@ class TestScipyInMemoryData(NetCDF3Only, CFEncodedBase):
+         await super().test_load_async()
+ 
+     def test_to_netcdf_explicit_engine(self) -> None:
+-        with pytest.warns(
+-            FutureWarning,
+-            match=re.escape("return value of to_netcdf() without a target"),
+-        ):
+-            Dataset({"foo": 42}).to_netcdf(engine="scipy")
++        Dataset({"foo": 42}).to_netcdf(engine="scipy")
+ 
+     def test_roundtrip_via_bytes(self) -> None:
+         original = create_test_data()
+-        with pytest.warns(
+-            FutureWarning,
+-            match=re.escape("return value of to_netcdf() without a target"),
+-        ):
+-            netcdf_bytes = original.to_netcdf(engine="scipy")
++        netcdf_bytes = original.to_netcdf(engine="scipy")
+         roundtrip = open_dataset(netcdf_bytes, engine="scipy")
+         assert_identical(roundtrip, original)
+ 
++    def test_to_bytes_compute_false(self) -> None:
++        original = create_test_data()
++        with pytest.raises(
++            NotImplementedError,
++            match=re.escape("to_netcdf() with compute=False is not yet implemented"),
++        ):
++            original.to_netcdf(engine="scipy", compute=False)
++
+     def test_bytes_pickle(self) -> None:
+         data = Dataset({"foo": ("x", [1, 2, 3])})
+-        with pytest.warns(
+-            FutureWarning,
+-            match=re.escape("return value of to_netcdf() without a target"),
+-        ):
+-            fobj = data.to_netcdf()
++        fobj = data.to_netcdf(engine="scipy")
+         with self.open(fobj) as ds:
+             unpickled = pickle.loads(pickle.dumps(ds))
+             assert_identical(unpickled, data)
+@@ -4578,11 +4683,19 @@ class TestGenericNetCDFData(NetCDF3Only, CFEncodedBase):
+         pass
+ 
+     @requires_scipy
++    @requires_netCDF4
+     def test_engine(self) -> None:
+         data = create_test_data()
++
+         with pytest.raises(ValueError, match=r"unrecognized engine"):
+             data.to_netcdf("foo.nc", engine="foobar")  # type: ignore[call-overload]
+-        with pytest.raises(ValueError, match=r"invalid engine"):
++
++        with pytest.raises(
++            ValueError,
++            match=re.escape(
++                "can only read bytes or file-like objects with engine='scipy' or 'h5netcdf'"
++            ),
++        ):
+             data.to_netcdf(engine="netcdf4")
+ 
+         with create_tmp_file() as tmp_file:
+@@ -4643,12 +4756,8 @@ class TestGenericNetCDFData(NetCDF3Only, CFEncodedBase):
+     @requires_scipy
+     def test_roundtrip_via_bytes(self) -> None:
+         original = create_test_data()
+-        with pytest.warns(
+-            FutureWarning,
+-            match=re.escape("return value of to_netcdf() without a target"),
+-        ):
+-            netcdf_bytes = original.to_netcdf()
+-        roundtrip = open_dataset(netcdf_bytes)
++        netcdf_bytes = original.to_netcdf()
++        roundtrip = load_dataset(netcdf_bytes)
+         assert_identical(roundtrip, original)
+ 
+     @pytest.mark.xfail(
+@@ -6111,17 +6220,29 @@ class TestDask(DatasetIOBase):
+             original = Dataset({"foo": ("x", np.random.randn(10))})
+             original.to_netcdf(tmp)
+             ds = load_dataset(tmp)
++            assert_identical(original, ds)
+             # this would fail if we used open_dataset instead of load_dataset
+             ds.to_netcdf(tmp)
+ 
+     def test_load_dataarray(self) -> None:
+         with create_tmp_file() as tmp:
+-            original = Dataset({"foo": ("x", np.random.randn(10))})
++            original = DataArray(np.random.randn(10), dims=["x"])
+             original.to_netcdf(tmp)
+-            ds = load_dataarray(tmp)
++            da = load_dataarray(tmp)
++            assert_identical(original, da)
+             # this would fail if we used open_dataarray instead of
+             # load_dataarray
+-            ds.to_netcdf(tmp)
++            da.to_netcdf(tmp)
++
++    def test_load_datatree(self) -> None:
++        with create_tmp_file() as tmp:
++            original = DataTree(Dataset({"foo": ("x", np.random.randn(10))}))
++            original.to_netcdf(tmp)
++            dt = load_datatree(tmp)
++            xr.testing.assert_identical(original, dt)
++            # this would fail if we used open_datatree instead of
++            # load_datatree
++            dt.to_netcdf(tmp)
+ 
+     @pytest.mark.skipif(
+         ON_WINDOWS,
+@@ -6449,12 +6570,8 @@ class TestDataArrayToNetCDF:
+     def test_dataarray_to_netcdf_return_bytes(self) -> None:
+         # regression test for GH1410
+         data = xr.DataArray([1, 2, 3])
+-        with pytest.warns(
+-            FutureWarning,
+-            match=re.escape("return value of to_netcdf() without a target"),
+-        ):
+-            output = data.to_netcdf(engine="scipy")
+-        assert isinstance(output, bytes)
++        output = data.to_netcdf(engine="scipy")
++        assert isinstance(output, memoryview)
+ 
+     def test_dataarray_to_netcdf_no_name_pathlib(self) -> None:
+         original_da = DataArray(np.arange(12).reshape((3, 4)))
+@@ -6820,8 +6937,12 @@ def test_extract_zarr_variable_encoding() -> None:
+ def test_open_fsspec() -> None:
+     import fsspec
+ 
+-    if not hasattr(zarr.storage, "FSStore") or not hasattr(
+-        zarr.storage.FSStore, "getitems"
++    if not (
++        (
++            hasattr(zarr.storage, "FSStore")
++            and hasattr(zarr.storage.FSStore, "getitems")
++        )  # zarr v2
++        or hasattr(zarr.storage, "FsspecStore")  # zarr v3
+     ):
+         pytest.skip("zarr too old")
+ 
+@@ -6990,10 +7111,7 @@ def test_scipy_entrypoint(tmp_path: Path) -> None:
+     with open(path, "rb") as f:
+         _check_guess_can_open_and_open(entrypoint, f, engine="scipy", expected=ds)
+ 
+-    with pytest.warns(
+-        FutureWarning, match=re.escape("return value of to_netcdf() without a target")
+-    ):
+-        contents = ds.to_netcdf(engine="scipy")
++    contents = ds.to_netcdf(engine="scipy")
+     _check_guess_can_open_and_open(entrypoint, contents, engine="scipy", expected=ds)
+     _check_guess_can_open_and_open(
+         entrypoint, BytesIO(contents), engine="scipy", expected=ds
+@@ -7031,6 +7149,31 @@ def test_h5netcdf_entrypoint(tmp_path: Path) -> None:
+     assert not entrypoint.guess_can_open("not-found-and-no-extension")
+ 
+ 
++@requires_zarr
++def test_zarr_entrypoint(tmp_path: Path) -> None:
++    from xarray.backends.zarr import ZarrBackendEntrypoint
++
++    entrypoint = ZarrBackendEntrypoint()
++    ds = create_test_data()
++
++    path = tmp_path / "foo.zarr"
++    ds.to_zarr(path)
++    _check_guess_can_open_and_open(entrypoint, path, engine="zarr", expected=ds)
++    _check_guess_can_open_and_open(entrypoint, str(path), engine="zarr", expected=ds)
++
++    # add a trailing slash to the path and check again
++    _check_guess_can_open_and_open(
++        entrypoint, str(path) + "/", engine="zarr", expected=ds
++    )
++
++    # Test the new functionality: .zarr with trailing slash
++    assert entrypoint.guess_can_open("something-local.zarr")
++    assert entrypoint.guess_can_open("something-local.zarr/")  # With trailing slash
++    assert not entrypoint.guess_can_open("something-local.nc")
++    assert not entrypoint.guess_can_open("not-found-and-no-extension")
++    assert not entrypoint.guess_can_open("something.zarr.txt")
++
++
+ @requires_netCDF4
+ @pytest.mark.parametrize("str_type", (str, np.str_))
+ def test_write_file_from_np_str(str_type: type[str | np.str_], tmpdir: str) -> None:
+
+diff --git a/xarray/tests/test_backends_api.py b/xarray/tests/test_backends_api.py
+index ed487b0..2d659dc 100644
+--- a/xarray/tests/test_backends_api.py
++++ b/xarray/tests/test_backends_api.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import re
+ import sys
+ from numbers import Number
+ 
+@@ -7,7 +8,7 @@ import numpy as np
+ import pytest
+ 
+ import xarray as xr
+-from xarray.backends.api import _get_default_engine, _get_default_engine_netcdf
++from xarray.backends.api import get_default_netcdf_write_engine
+ from xarray.tests import (
+     assert_identical,
+     assert_no_warnings,
+@@ -20,15 +21,27 @@ from xarray.tests import (
+ 
+ @requires_netCDF4
+ @requires_scipy
+-def test__get_default_engine() -> None:
+-    engine_remote = _get_default_engine("http://example.org/test.nc", allow_remote=True)
+-    assert engine_remote == "netcdf4"
++@requires_h5netcdf
++def test_get_default_netcdf_write_engine() -> None:
++    engine = get_default_netcdf_write_engine(
++        format=None, to_fileobject_or_memoryview=False
++    )
++    assert engine == "netcdf4"
++
++    engine = get_default_netcdf_write_engine(
++        format="NETCDF4", to_fileobject_or_memoryview=False
++    )
++    assert engine == "netcdf4"
+ 
+-    engine_gz = _get_default_engine("/example.gz")
+-    assert engine_gz == "scipy"
++    engine = get_default_netcdf_write_engine(
++        format="NETCDF4", to_fileobject_or_memoryview=True
++    )
++    assert engine == "h5netcdf"
+ 
+-    engine_default = _get_default_engine("/example")
+-    assert engine_default == "netcdf4"
++    engine = get_default_netcdf_write_engine(
++        format="NETCDF3_CLASSIC", to_fileobject_or_memoryview=True
++    )
++    assert engine == "scipy"
+ 
+ 
+ @requires_h5netcdf
+@@ -39,7 +52,20 @@ def test_default_engine_h5netcdf(monkeypatch):
+     monkeypatch.delitem(sys.modules, "scipy", raising=False)
+     monkeypatch.setattr(sys, "meta_path", [])
+ 
+-    assert _get_default_engine_netcdf() == "h5netcdf"
++    engine = get_default_netcdf_write_engine(
++        format=None, to_fileobject_or_memoryview=False
++    )
++    assert engine == "h5netcdf"
++
++    with pytest.raises(
++        ValueError,
++        match=re.escape(
++            "cannot write NetCDF files with format='NETCDF3_CLASSIC' because none of the suitable backend libraries (netCDF4, scipy) are installed"
++        ),
++    ):
++        get_default_netcdf_write_engine(
++            format="NETCDF3_CLASSIC", to_fileobject_or_memoryview=False
++        )
+ 
+ 
+ def test_custom_engine() -> None:
+
+diff --git a/xarray/tests/test_backends_datatree.py b/xarray/tests/test_backends_datatree.py
+index 2bdae6d..de6c749 100644
+--- a/xarray/tests/test_backends_datatree.py
++++ b/xarray/tests/test_backends_datatree.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import contextlib
+ import re
++import sys
+ from collections.abc import Callable, Generator, Hashable
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Literal, cast
+@@ -23,6 +24,7 @@ from xarray.tests import (
+     requires_pydap,
+     requires_zarr,
+ )
++from xarray.tests.test_backends import TestNetCDF4Data as _TestNetCDF4Data
+ 
+ if TYPE_CHECKING:
+     from xarray.core.datatree_io import T_DataTreeNetcdfEngine
+@@ -31,6 +33,19 @@ with contextlib.suppress(ImportError):
+     import netCDF4 as nc4
+ 
+ 
++class TestNetCDF4DataTree(_TestNetCDF4Data):
++    @contextlib.contextmanager
++    def open(self, path, **kwargs):
++        with open_datatree(path, engine=self.engine, **kwargs) as ds:
++            yield ds.to_dataset()
++
++    def test_child_group_with_inconsistent_dimensions(self) -> None:
++        with pytest.raises(
++            ValueError, match=r"group '/child' is not aligned with its parents"
++        ):
++            super().test_child_group_with_inconsistent_dimensions()
++
++
+ def diff_chunks(
+     comparison: dict[tuple[str, Hashable], bool], tree1: DataTree, tree2: DataTree
+ ) -> str:
+@@ -215,7 +230,7 @@ class DatatreeIOBase:
+         ) as roundtrip_dt:
+             assert original_dt["test"].dtype == roundtrip_dt["test"].dtype
+ 
+-    def test_to_netcdf_inherited_coords(self, tmpdir):
++    def test_to_netcdf_inherited_coords(self, tmpdir) -> None:
+         filepath = tmpdir / "test.nc"
+         original_dt = DataTree.from_dict(
+             {
+@@ -230,7 +245,7 @@ class DatatreeIOBase:
+             subtree = cast(DataTree, roundtrip_dt["/sub"])
+             assert "x" not in subtree.to_dataset(inherit=False).coords
+ 
+-    def test_netcdf_encoding(self, tmpdir, simple_datatree):
++    def test_netcdf_encoding(self, tmpdir, simple_datatree) -> None:
+         filepath = tmpdir / "test.nc"
+         original_dt = simple_datatree
+ 
+@@ -247,7 +262,7 @@ class DatatreeIOBase:
+             with pytest.raises(ValueError, match="unexpected encoding group.*"):
+                 original_dt.to_netcdf(filepath, encoding=enc, engine=self.engine)
+ 
+-    def test_write_subgroup(self, tmpdir):
++    def test_write_subgroup(self, tmpdir) -> None:
+         original_dt = DataTree.from_dict(
+             {
+                 "/": xr.Dataset(coords={"x": [1, 2, 3]}),
+@@ -266,7 +281,7 @@ class DatatreeIOBase:
+             assert_identical(expected_dt, roundtrip_dt)
+ 
+     @requires_netCDF4
+-    def test_no_redundant_dimensions(self, tmpdir):
++    def test_no_redundant_dimensions(self, tmpdir) -> None:
+         # regression test for https://github.com/pydata/xarray/issues/10241
+         original_dt = DataTree.from_dict(
+             {
+@@ -282,6 +297,30 @@ class DatatreeIOBase:
+         assert list(root.dimensions) == ["x"]
+         assert list(child.dimensions) == []
+ 
++    @requires_dask
++    def test_compute_false(self, tmpdir, simple_datatree):
++        filepath = tmpdir / "test.nc"
++        original_dt = simple_datatree.chunk()
++        result = original_dt.to_netcdf(filepath, engine=self.engine, compute=False)
++
++        with open_datatree(filepath, engine=self.engine) as in_progress_dt:
++            assert in_progress_dt.isomorphic(original_dt)
++            assert not in_progress_dt.equals(original_dt)
++
++        result.compute()
++        with open_datatree(filepath, engine=self.engine) as written_dt:
++            assert_identical(written_dt, original_dt)
++
++    def test_default_write_engine(self, tmpdir, simple_datatree, monkeypatch):
++        # Ensure the other netCDF library are not installed
++        exclude = "netCDF4" if self.engine == "h5netcdf" else "h5netcdf"
++        monkeypatch.delitem(sys.modules, exclude, raising=False)
++        monkeypatch.setattr(sys, "meta_path", [])
++
++        filepath = tmpdir + "/phony_dims.nc"
++        original_dt = simple_datatree
++        original_dt.to_netcdf(filepath)  # should not raise
++
+ 
+ @requires_netCDF4
+ class TestNetCDF4DatatreeIO(DatatreeIOBase):
+@@ -556,17 +595,25 @@ class TestH5NetCDFDatatreeIO(DatatreeIOBase):
+                     "phony_dim_3": 25,
+                 }
+ 
+-    def test_roundtrip_via_bytes(self, simple_datatree):
++    def test_roundtrip_via_bytes(self, simple_datatree) -> None:
+         original_dt = simple_datatree
+         roundtrip_dt = open_datatree(original_dt.to_netcdf())
+         assert_equal(original_dt, roundtrip_dt)
+ 
+-    def test_roundtrip_via_bytes_engine_specified(self, simple_datatree):
++    def test_roundtrip_via_bytes_engine_specified(self, simple_datatree) -> None:
+         original_dt = simple_datatree
+         roundtrip_dt = open_datatree(original_dt.to_netcdf(engine=self.engine))
+         assert_equal(original_dt, roundtrip_dt)
+ 
+-    def test_roundtrip_using_filelike_object(self, tmpdir, simple_datatree):
++    def test_to_bytes_compute_false(self, simple_datatree) -> None:
++        original_dt = simple_datatree
++        with pytest.raises(
++            NotImplementedError,
++            match=re.escape("to_netcdf() with compute=False is not yet implemented"),
++        ):
++            original_dt.to_netcdf(compute=False)
++
++    def test_roundtrip_using_filelike_object(self, tmpdir, simple_datatree) -> None:
+         original_dt = simple_datatree
+         filepath = tmpdir + "/test.nc"
+         # h5py requires both read and write access when writing, it will
+@@ -584,7 +631,7 @@ class TestH5NetCDFDatatreeIO(DatatreeIOBase):
+ class TestZarrDatatreeIO:
+     engine = "zarr"
+ 
+-    def test_to_zarr(self, tmpdir, simple_datatree, zarr_format):
++    def test_to_zarr(self, tmpdir, simple_datatree, zarr_format) -> None:
+         filepath = str(tmpdir / "test.zarr")
+         original_dt = simple_datatree
+         original_dt.to_zarr(filepath, zarr_format=zarr_format)
+@@ -592,7 +639,10 @@ class TestZarrDatatreeIO:
+         with open_datatree(filepath, engine="zarr") as roundtrip_dt:
+             assert_equal(original_dt, roundtrip_dt)
+ 
+-    def test_zarr_encoding(self, tmpdir, simple_datatree, zarr_format):
++    @pytest.mark.filterwarnings(
++        "ignore:Numcodecs codecs are not in the Zarr version 3 specification"
++    )
++    def test_zarr_encoding(self, tmpdir, simple_datatree, zarr_format) -> None:
+         filepath = str(tmpdir / "test.zarr")
+         original_dt = simple_datatree
+ 
+@@ -618,12 +668,11 @@ class TestZarrDatatreeIO:
+ 
+             enc["/not/a/group"] = {"foo": "bar"}  # type: ignore[dict-item]
+             with pytest.raises(ValueError, match="unexpected encoding group.*"):
+-                original_dt.to_zarr(
+-                    filepath, encoding=enc, engine="zarr", zarr_format=zarr_format
+-                )
++                original_dt.to_zarr(filepath, encoding=enc, zarr_format=zarr_format)
+ 
+     @pytest.mark.xfail(reason="upstream zarr read-only changes have broken this test")
+-    def test_to_zarr_zip_store(self, tmpdir, simple_datatree, zarr_format):
++    @pytest.mark.filterwarnings("ignore:Duplicate name")
++    def test_to_zarr_zip_store(self, tmpdir, simple_datatree, zarr_format) -> None:
+         from zarr.storage import ZipStore
+ 
+         filepath = str(tmpdir / "test.zarr.zip")
+@@ -634,7 +683,9 @@ class TestZarrDatatreeIO:
+         with open_datatree(store, engine="zarr") as roundtrip_dt:  # type: ignore[arg-type, unused-ignore]
+             assert_equal(original_dt, roundtrip_dt)
+ 
+-    def test_to_zarr_not_consolidated(self, tmpdir, simple_datatree, zarr_format):
++    def test_to_zarr_not_consolidated(
++        self, tmpdir, simple_datatree, zarr_format
++    ) -> None:
+         filepath = tmpdir / "test.zarr"
+         zmetadata = filepath / ".zmetadata"
+         s1zmetadata = filepath / "set1" / ".zmetadata"
+@@ -648,7 +699,9 @@ class TestZarrDatatreeIO:
+             with open_datatree(filepath, engine="zarr") as roundtrip_dt:
+                 assert_equal(original_dt, roundtrip_dt)
+ 
+-    def test_to_zarr_default_write_mode(self, tmpdir, simple_datatree, zarr_format):
++    def test_to_zarr_default_write_mode(
++        self, tmpdir, simple_datatree, zarr_format
++    ) -> None:
+         simple_datatree.to_zarr(str(tmpdir), zarr_format=zarr_format)
+ 
+         import zarr
+@@ -665,12 +718,14 @@ class TestZarrDatatreeIO:
+     @requires_dask
+     def test_to_zarr_compute_false(
+         self, tmp_path: Path, simple_datatree: DataTree, zarr_format: Literal[2, 3]
+-    ):
++    ) -> None:
+         import dask.array as da
+ 
+         storepath = tmp_path / "test.zarr"
+         original_dt = simple_datatree.chunk()
+-        original_dt.to_zarr(str(storepath), compute=False, zarr_format=zarr_format)
++        result = original_dt.to_zarr(
++            str(storepath), compute=False, zarr_format=zarr_format
++        )
+ 
+         def assert_expected_zarr_files_exist(
+             arr_dir: Path,
+@@ -724,7 +779,7 @@ class TestZarrDatatreeIO:
+             # inherited variables aren't meant to be written to zarr
+             local_node_variables = node.to_dataset(inherit=False).variables
+             for name, var in local_node_variables.items():
+-                var_dir = storepath / node.path.removeprefix("/") / name
++                var_dir = storepath / node.path.removeprefix("/") / name  # type: ignore[operator]
+ 
+                 assert_expected_zarr_files_exist(
+                     arr_dir=var_dir,
+@@ -741,6 +796,50 @@ class TestZarrDatatreeIO:
+                     zarr_format=zarr_format,
+                 )
+ 
++        with open_datatree(str(storepath), engine="zarr") as in_progress_dt:
++            assert in_progress_dt.isomorphic(original_dt)
++            assert not in_progress_dt.equals(original_dt)
++
++        result.compute()
++        with open_datatree(str(storepath), engine="zarr") as written_dt:
++            assert_identical(written_dt, original_dt)
++
++    @requires_dask
++    def test_rplus_mode(
++        self, tmp_path: Path, simple_datatree: DataTree, zarr_format: Literal[2, 3]
++    ) -> None:
++        storepath = tmp_path / "test.zarr"
++        original_dt = simple_datatree.chunk()
++        original_dt.to_zarr(storepath, compute=False, zarr_format=zarr_format)
++        original_dt.to_zarr(storepath, mode="r+")
++        with open_datatree(str(storepath), engine="zarr") as written_dt:
++            assert_identical(written_dt, original_dt)
++
++    @requires_dask
++    def test_to_zarr_no_redundant_computation(self, tmpdir, zarr_format) -> None:
++        import dask.array as da
++
++        eval_count = 0
++
++        def expensive_func(x):
++            nonlocal eval_count
++            eval_count += 1
++            return x + 1
++
++        base = da.random.random((), chunks=())
++        derived1 = da.map_blocks(expensive_func, base, meta=np.array((), np.float64))
++        derived2 = derived1 + 1  # depends on derived1
++        tree = DataTree.from_dict(
++            {
++                "group1": xr.Dataset({"derived": derived1}),
++                "group2": xr.Dataset({"derived": derived2}),
++            }
++        )
++
++        filepath = str(tmpdir / "test.zarr")
++        tree.to_zarr(filepath, zarr_format=zarr_format)
++        assert eval_count == 1  # not 2
++
+     def test_to_zarr_inherited_coords(self, tmpdir, zarr_format):
+         original_dt = DataTree.from_dict(
+             {
+@@ -893,7 +992,7 @@ class TestZarrDatatreeIO:
+         for ds in dict_of_datasets.values():
+             ds.close()
+ 
+-    def test_write_subgroup(self, tmpdir, zarr_format):
++    def test_write_subgroup(self, tmpdir, zarr_format) -> None:
+         original_dt = DataTree.from_dict(
+             {
+                 "/": xr.Dataset(coords={"x": [1, 2, 3]}),
+@@ -914,7 +1013,7 @@ class TestZarrDatatreeIO:
+     @pytest.mark.filterwarnings(
+         "ignore:Failed to open Zarr store with consolidated metadata:RuntimeWarning"
+     )
+-    def test_write_inherited_coords_false(self, tmpdir, zarr_format):
++    def test_write_inherited_coords_false(self, tmpdir, zarr_format) -> None:
+         original_dt = DataTree.from_dict(
+             {
+                 "/": xr.Dataset(coords={"x": [1, 2, 3]}),
+@@ -938,7 +1037,7 @@ class TestZarrDatatreeIO:
+     @pytest.mark.filterwarnings(
+         "ignore:Failed to open Zarr store with consolidated metadata:RuntimeWarning"
+     )
+-    def test_write_inherited_coords_true(self, tmpdir, zarr_format):
++    def test_write_inherited_coords_true(self, tmpdir, zarr_format) -> None:
+         original_dt = DataTree.from_dict(
+             {
+                 "/": xr.Dataset(coords={"x": [1, 2, 3]}),
+
+diff --git a/xarray/tests/test_cftime_offsets.py b/xarray/tests/test_cftime_offsets.py
+index 715eb71..5c8de46 100644
+--- a/xarray/tests/test_cftime_offsets.py
++++ b/xarray/tests/test_cftime_offsets.py
+@@ -445,7 +445,6 @@ _MUL_TESTS = [
+     (Second(), 3, Second(n=3)),
+     (Millisecond(), 3, Millisecond(n=3)),
+     (Microsecond(), 3, Microsecond(n=3)),
+-    (Day(), 0.5, Hour(n=12)),
+     (Hour(), 0.5, Minute(n=30)),
+     (Hour(), -0.5, Minute(n=-30)),
+     (Minute(), 0.5, Second(n=30)),
+@@ -472,7 +471,15 @@ def test_mul_float_multiple_next_higher_resolution():
+ 
+ @pytest.mark.parametrize(
+     "offset",
+-    [YearBegin(), YearEnd(), QuarterBegin(), QuarterEnd(), MonthBegin(), MonthEnd()],
++    [
++        YearBegin(),
++        YearEnd(),
++        QuarterBegin(),
++        QuarterEnd(),
++        MonthBegin(),
++        MonthEnd(),
++        Day(),
++    ],
+     ids=_id_func,
+ )
+ def test_nonTick_offset_multiplied_float_error(offset):
+@@ -534,6 +541,20 @@ def test_add_sub_monthly(offset, expected_date_args, calendar):
+     assert result == expected
+ 
+ 
++def test_add_daily_offsets() -> None:
++    offset = Day(n=2)
++    expected = Day(n=4)
++    result = offset + offset
++    assert result == expected
++
++
++def test_subtract_daily_offsets() -> None:
++    offset = Day(n=2)
++    expected = Day(n=0)
++    result = offset - offset
++    assert result == expected
++
++
+ @pytest.mark.parametrize(("offset", "expected_date_args"), _ADD_TESTS, ids=_id_func)
+ def test_radd_sub_monthly(offset, expected_date_args, calendar):
+     date_type = get_date_type(calendar)
+
+diff --git a/xarray/tests/test_cftimeindex.py b/xarray/tests/test_cftimeindex.py
+index a6b41ff..5dd541c 100644
+--- a/xarray/tests/test_cftimeindex.py
++++ b/xarray/tests/test_cftimeindex.py
+@@ -830,7 +830,6 @@ def test_cftimeindex_add_timedeltaindex(calendar) -> None:
+ @pytest.mark.parametrize(
+     "freq,units",
+     [
+-        ("D", "D"),
+         ("h", "h"),
+         ("min", "min"),
+         ("s", "s"),
+@@ -856,7 +855,7 @@ def test_cftimeindex_shift_float_us() -> None:
+ 
+ 
+ @requires_cftime
+-@pytest.mark.parametrize("freq", ["YS", "YE", "QS", "QE", "MS", "ME"])
++@pytest.mark.parametrize("freq", ["YS", "YE", "QS", "QE", "MS", "ME", "D"])
+ def test_cftimeindex_shift_float_fails_for_non_tick_freqs(freq) -> None:
+     a = xr.date_range("2000", periods=3, freq="D", use_cftime=True)
+     with pytest.raises(TypeError, match="unsupported operand type"):
+
+diff --git a/xarray/tests/test_cftimeindex_resample.py b/xarray/tests/test_cftimeindex_resample.py
+index fa896da..d5dbe61 100644
+--- a/xarray/tests/test_cftimeindex_resample.py
++++ b/xarray/tests/test_cftimeindex_resample.py
+@@ -6,12 +6,17 @@ from typing import TypedDict
+ import numpy as np
+ import pandas as pd
+ import pytest
+-from packaging.version import Version
+ 
+ import xarray as xr
+-from xarray.coding.cftime_offsets import _new_to_legacy_freq
++from xarray.coding.cftime_offsets import (
++    CFTIME_TICKS,
++    Day,
++    _new_to_legacy_freq,
++    to_offset,
++)
+ from xarray.coding.cftimeindex import CFTimeIndex
+ from xarray.core.resample_cftime import CFTimeGrouper
++from xarray.tests import has_pandas_3
+ 
+ cftime = pytest.importorskip("cftime")
+ 
+@@ -54,6 +59,20 @@ FREQS = [
+ ]
+ 
+ 
++def has_tick_resample_freq(freqs):
++    resample_freq, _ = freqs
++    resample_freq_as_offset = to_offset(resample_freq)
++    return isinstance(resample_freq_as_offset, CFTIME_TICKS)
++
++
++def has_non_tick_resample_freq(freqs):
++    return not has_tick_resample_freq(freqs)
++
++
++FREQS_WITH_TICK_RESAMPLE_FREQ = list(filter(has_tick_resample_freq, FREQS))
++FREQS_WITH_NON_TICK_RESAMPLE_FREQ = list(filter(has_non_tick_resample_freq, FREQS))
++
++
+ def compare_against_pandas(
+     da_datetimeindex,
+     da_cftimeindex,
+@@ -110,22 +129,14 @@ def da(index) -> xr.DataArray:
+     )
+ 
+ 
+-@pytest.mark.parametrize("freqs", FREQS, ids=lambda x: "{}->{}".format(*x))
++@pytest.mark.parametrize(
++    "freqs", FREQS_WITH_TICK_RESAMPLE_FREQ, ids=lambda x: "{}->{}".format(*x)
++)
+ @pytest.mark.parametrize("closed", [None, "left", "right"])
+ @pytest.mark.parametrize("label", [None, "left", "right"])
+ @pytest.mark.parametrize("offset", [None, "5s"], ids=lambda x: f"{x}")
+-def test_resample(freqs, closed, label, offset) -> None:
++def test_resample_with_tick_resample_freq(freqs, closed, label, offset) -> None:
+     initial_freq, resample_freq = freqs
+-    if (
+-        resample_freq == "4001D"
+-        and closed == "right"
+-        and Version(pd.__version__) < Version("2.2")
+-    ):
+-        pytest.skip(
+-            "Pandas fixed a bug in this test case in version 2.2, which we "
+-            "ported to xarray, so this test no longer produces the same "
+-            "result as pandas for earlier pandas versions."
+-        )
+     start = "2000-01-01T12:07:01"
+     origin = "start"
+ 
+@@ -149,6 +160,43 @@ def test_resample(freqs, closed, label, offset) -> None:
+     )
+ 
+ 
++@pytest.mark.parametrize(
++    "freqs", FREQS_WITH_NON_TICK_RESAMPLE_FREQ, ids=lambda x: "{}->{}".format(*x)
++)
++@pytest.mark.parametrize("closed", [None, "left", "right"])
++@pytest.mark.parametrize("label", [None, "left", "right"])
++def test_resample_with_non_tick_resample_freq(freqs, closed, label) -> None:
++    initial_freq, resample_freq = freqs
++    resample_freq_as_offset = to_offset(resample_freq)
++    if isinstance(resample_freq_as_offset, Day) and not has_pandas_3:
++        pytest.skip("Only valid for pandas >= 3.0")
++    start = "2000-01-01T12:07:01"
++
++    # Set offset and origin to their default values since they have no effect
++    # on resampling data with a non-tick resample frequency.
++    offset = None
++    origin = "start_day"
++
++    datetime_index = pd.date_range(
++        start=start, periods=5, freq=_new_to_legacy_freq(initial_freq)
++    )
++    cftime_index = xr.date_range(
++        start=start, periods=5, freq=initial_freq, use_cftime=True
++    )
++    da_datetimeindex = da(datetime_index)
++    da_cftimeindex = da(cftime_index)
++
++    compare_against_pandas(
++        da_datetimeindex,
++        da_cftimeindex,
++        resample_freq,
++        closed=closed,
++        label=label,
++        offset=offset,
++        origin=origin,
++    )
++
++
+ @pytest.mark.parametrize(
+     ("freq", "expected"),
+     [
+@@ -228,7 +276,7 @@ def test_invalid_offset_error(offset: str | int) -> None:
+     cftime_index = xr.date_range("2000", periods=5, use_cftime=True)
+     da_cftime = da(cftime_index)
+     with pytest.raises(ValueError, match="offset must be"):
+-        da_cftime.resample(time="2D", offset=offset)  # type: ignore[arg-type]
++        da_cftime.resample(time="2h", offset=offset)  # type: ignore[arg-type]
+ 
+ 
+ def test_timedelta_offset() -> None:
+@@ -238,6 +286,15 @@ def test_timedelta_offset() -> None:
+     cftime_index = xr.date_range("2000", periods=5, use_cftime=True)
+     da_cftime = da(cftime_index)
+ 
+-    timedelta_result = da_cftime.resample(time="2D", offset=timedelta).mean()
+-    string_result = da_cftime.resample(time="2D", offset=string).mean()
++    timedelta_result = da_cftime.resample(time="2h", offset=timedelta).mean()
++    string_result = da_cftime.resample(time="2h", offset=string).mean()
+     xr.testing.assert_identical(timedelta_result, string_result)
++
++
++@pytest.mark.parametrize(("option", "value"), [("offset", "5s"), ("origin", "start")])
++def test_non_tick_option_warning(option, value) -> None:
++    cftime_index = xr.date_range("2000", periods=5, use_cftime=True)
++    da_cftime = da(cftime_index)
++    kwargs = {option: value}
++    with pytest.warns(RuntimeWarning, match=option):
++        da_cftime.resample(time="ME", **kwargs)
+
+diff --git a/xarray/tests/test_coding_times.py b/xarray/tests/test_coding_times.py
+index 322ff96..10295e4 100644
+--- a/xarray/tests/test_coding_times.py
++++ b/xarray/tests/test_coding_times.py
+@@ -1763,7 +1763,7 @@ def test_encode_cf_timedelta_via_dask(
+ ) -> None:
+     import dask.array
+ 
+-    times_pd = pd.timedelta_range(start="0D", freq="D", periods=3, unit=time_unit)  # type: ignore[call-arg]
++    times_pd = pd.timedelta_range(start="0D", freq="D", periods=3, unit=time_unit)  # type: ignore[call-arg,unused-ignore]
+     times = dask.array.from_array(times_pd, chunks=1)
+     encoded_times, encoding_units = encode_cf_timedelta(times, units, dtype)
+ 
+@@ -1934,7 +1934,7 @@ _DECODE_TIMEDELTA_VIA_DTYPE_TESTS = {
+ def test_decode_timedelta_via_dtype(
+     decode_times, decode_timedelta, original_unit, expected_dtype
+ ) -> None:
+-    timedeltas = pd.timedelta_range(0, freq="D", periods=3, unit=original_unit)  # type: ignore[call-arg]
++    timedeltas = pd.timedelta_range(0, freq="D", periods=3, unit=original_unit)  # type: ignore[call-arg,unused-ignore]
+     encoding = {"units": "days"}
+     var = Variable(["time"], timedeltas, encoding=encoding)
+     encoded = conventions.encode_cf_variable(var)
+
+diff --git a/xarray/tests/test_conventions.py b/xarray/tests/test_conventions.py
+index a958d5b..404af00 100644
+--- a/xarray/tests/test_conventions.py
++++ b/xarray/tests/test_conventions.py
+@@ -140,8 +140,17 @@ class TestEncodeCFVariable:
+     def test_missing_fillvalue(self) -> None:
+         v = Variable(["x"], np.array([np.nan, 1, 2, 3]))
+         v.encoding = {"dtype": "int16"}
+-        with pytest.warns(Warning, match="floating point data as an integer"):
++        # Expect both the SerializationWarning and the RuntimeWarning from numpy
++        with pytest.warns(Warning) as record:
+             conventions.encode_cf_variable(v)
++        # Check we got the expected warnings
++        warning_messages = [str(w.message) for w in record]
++        assert any(
++            "floating point data as an integer" in msg for msg in warning_messages
++        )
++        assert any(
++            "invalid value encountered in cast" in msg for msg in warning_messages
++        )
+ 
+     def test_multidimensional_coordinates(self) -> None:
+         # regression test for GH1763
+
+diff --git a/xarray/tests/test_coordinates.py b/xarray/tests/test_coordinates.py
+index b4ba922..40af670 100644
+--- a/xarray/tests/test_coordinates.py
++++ b/xarray/tests/test_coordinates.py
+@@ -208,3 +208,87 @@ class TestCoordinates:
+         coords = Coordinates(coords={"x": var}, indexes={})
+         ds = Dataset(coords=coords)
+         assert ds.coords["x"].dims == ("x", "y")
++
++    def test_drop_vars(self):
++        coords = Coordinates(
++            coords={
++                "x": Variable("x", range(3)),
++                "y": Variable("y", list("ab")),
++                "a": Variable(["x", "y"], np.arange(6).reshape(3, 2)),
++            },
++            indexes={},
++        )
++
++        actual = coords.drop_vars("x")
++        assert isinstance(actual, Coordinates)
++        assert set(actual.variables) == {"a", "y"}
++
++        actual = coords.drop_vars(["x", "y"])
++        assert isinstance(actual, Coordinates)
++        assert set(actual.variables) == {"a"}
++
++    def test_drop_dims(self) -> None:
++        coords = Coordinates(
++            coords={
++                "x": Variable("x", range(3)),
++                "y": Variable("y", list("ab")),
++                "a": Variable(["x", "y"], np.arange(6).reshape(3, 2)),
++            },
++            indexes={},
++        )
++
++        actual = coords.drop_dims("x")
++        assert isinstance(actual, Coordinates)
++        assert set(actual.variables) == {"y"}
++
++        actual = coords.drop_dims(["x", "y"])
++        assert isinstance(actual, Coordinates)
++        assert set(actual.variables) == set()
++
++    def test_rename_dims(self) -> None:
++        coords = Coordinates(
++            coords={
++                "x": Variable("x", range(3)),
++                "y": Variable("y", list("ab")),
++                "a": Variable(["x", "y"], np.arange(6).reshape(3, 2)),
++            },
++            indexes={},
++        )
++
++        actual = coords.rename_dims({"x": "X"})
++        assert isinstance(actual, Coordinates)
++        assert set(actual.dims) == {"X", "y"}
++        assert set(actual.variables) == {"a", "x", "y"}
++
++        actual = coords.rename_dims({"x": "u", "y": "v"})
++        assert isinstance(actual, Coordinates)
++        assert set(actual.dims) == {"u", "v"}
++        assert set(actual.variables) == {"a", "x", "y"}
++
++    def test_rename_vars(self) -> None:
++        coords = Coordinates(
++            coords={
++                "x": Variable("x", range(3)),
++                "y": Variable("y", list("ab")),
++                "a": Variable(["x", "y"], np.arange(6).reshape(3, 2)),
++            },
++            indexes={},
++        )
++
++        actual = coords.rename_vars({"x": "X"})
++        assert isinstance(actual, Coordinates)
++        assert set(actual.dims) == {"x", "y"}
++        assert set(actual.variables) == {"a", "X", "y"}
++
++        actual = coords.rename_vars({"x": "u", "y": "v"})
++        assert isinstance(actual, Coordinates)
++        assert set(actual.dims) == {"x", "y"}
++        assert set(actual.variables) == {"a", "u", "v"}
++
++    def test_operator_merge(self) -> None:
++        coords1 = Coordinates({"x": ("x", [0, 1, 2])})
++        coords2 = Coordinates({"y": ("y", [3, 4, 5])})
++        expected = Dataset(coords={"x": [0, 1, 2], "y": [3, 4, 5]})
++
++        actual = coords1 | coords2
++        assert_identical(Dataset(coords=actual), expected)
+
+diff --git a/xarray/tests/test_dataarray.py b/xarray/tests/test_dataarray.py
+index 71c1162..3bf16b3 100644
+--- a/xarray/tests/test_dataarray.py
++++ b/xarray/tests/test_dataarray.py
+@@ -34,11 +34,7 @@ from xarray.coders import CFDatetimeCoder
+ from xarray.core import dtypes
+ from xarray.core.common import full_like
+ from xarray.core.coordinates import Coordinates, CoordinateValidationError
+-from xarray.core.indexes import (
+-    Index,
+-    PandasIndex,
+-    filter_indexes_from_coords,
+-)
++from xarray.core.indexes import Index, PandasIndex, filter_indexes_from_coords
+ from xarray.core.types import QueryEngineOptions, QueryParserOptions
+ from xarray.core.utils import is_scalar
+ from xarray.testing import _assert_internal_invariants
+@@ -749,6 +745,16 @@ class TestDataArray:
+         )
+         assert_identical(da[[]], DataArray(np.zeros((0, 4)), dims=["x", "y"]))
+ 
++    def test_getitem_typeerror(self) -> None:
++        with pytest.raises(TypeError, match=r"unexpected indexer type"):
++            self.dv[True]
++        with pytest.raises(TypeError, match=r"unexpected indexer type"):
++            self.dv[np.array(True)]
++        with pytest.raises(TypeError, match=r"invalid indexer array"):
++            self.dv[3.0]
++        with pytest.raises(TypeError, match=r"invalid indexer array"):
++            self.dv[None]
++
+     def test_setitem(self) -> None:
+         # basic indexing should work as numpy's indexing
+         tuples: list[tuple[int | list[int] | slice, int | list[int] | slice]] = [
+@@ -2573,7 +2579,10 @@ class TestDataArray:
+         # test GH3000
+         a = orig[:0, :1].stack(new_dim=("x", "y")).indexes["new_dim"]
+         b = pd.MultiIndex(
+-            levels=[pd.Index([], dtype=np.int64), pd.Index([0], dtype=np.int64)],
++            levels=[
++                pd.Index([], dtype=np.int64),  # type: ignore[list-item,unused-ignore]
++                pd.Index([0], dtype=np.int64),  # type: ignore[list-item,unused-ignore]
++            ],
+             codes=[[], []],
+             names=["x", "y"],
+         )
+@@ -3022,6 +3031,9 @@ class TestDataArray:
+ 
+         np.testing.assert_allclose(actual.values, expected)
+ 
++    @pytest.mark.filterwarnings(
++        "default:The `interpolation` argument to quantile was renamed to `method`:FutureWarning"
++    )
+     @pytest.mark.parametrize("method", ["midpoint", "lower"])
+     def test_quantile_interpolation_deprecated(self, method) -> None:
+         da = DataArray(self.va)
+@@ -3607,7 +3619,9 @@ class TestDataArray:
+         # regression test for GH4019
+         import sparse
+ 
+-        idx = pd.MultiIndex.from_product([np.arange(3), np.arange(5)], names=["a", "b"])
++        idx = pd.MultiIndex.from_product(
++            [list(np.arange(3)), list(np.arange(5))], names=["a", "b"]
++        )
+         series: pd.Series = pd.Series(
+             np.random.default_rng(0).random(len(idx)), index=idx
+         ).sample(n=5, random_state=3)
+
+diff --git a/xarray/tests/test_dataset.py b/xarray/tests/test_dataset.py
+index 8e4b09f..2cafb1f 100644
+--- a/xarray/tests/test_dataset.py
++++ b/xarray/tests/test_dataset.py
+@@ -47,7 +47,7 @@ from xarray.core.coordinates import Coordinates, DatasetCoordinates
+ from xarray.core.indexes import Index, PandasIndex
+ from xarray.core.types import ArrayLike
+ from xarray.core.utils import is_scalar
+-from xarray.groupers import TimeResampler
++from xarray.groupers import SeasonResampler, TimeResampler
+ from xarray.namedarray.pycompat import array_type, integer_types
+ from xarray.testing import _assert_internal_invariants
+ from xarray.tests import (
+@@ -1136,6 +1136,111 @@ class TestDataset:
+         ds = open_dataset(store)
+         assert ds.chunks == {}
+ 
++    @requires_dask
++    @pytest.mark.parametrize(
++        "use_cftime,calendar",
++        [
++            (False, "standard"),
++            (pytest.param(True, marks=pytest.mark.skipif(not has_cftime)), "standard"),
++            (pytest.param(True, marks=pytest.mark.skipif(not has_cftime)), "noleap"),
++            (pytest.param(True, marks=pytest.mark.skipif(not has_cftime)), "360_day"),
++        ],
++    )
++    def test_chunk_by_season_resampler(self, use_cftime: bool, calendar: str) -> None:
++        import dask.array
++
++        N = 365 + 365  # 2 years - 1 day
++        time = xr.date_range(
++            "2000-01-01", periods=N, freq="D", use_cftime=use_cftime, calendar=calendar
++        )
++
++        ds = Dataset(
++            {
++                "pr": ("time", dask.array.random.random((N), chunks=(20))),
++                "pr2d": (("x", "time"), dask.array.random.random((10, N), chunks=(20))),
++                "ones": ("time", np.ones((N,))),
++            },
++            coords={"time": time},
++        )
++
++        # Standard seasons
++        rechunked = ds.chunk(
++            {"x": 2, "time": SeasonResampler(["DJF", "MAM", "JJA", "SON"])}
++        )
++        assert rechunked.chunksizes["x"] == (2,) * 5
++        assert len(rechunked.chunksizes["time"]) == 9
++        assert rechunked.chunksizes["x"] == (2,) * 5
++        assert sum(rechunked.chunksizes["time"]) == ds.sizes["time"]
++
++        if calendar == "standard":
++            assert rechunked.chunksizes["time"] == (60, 92, 92, 91, 90, 92, 92, 91, 30)
++        elif calendar == "noleap":
++            assert rechunked.chunksizes["time"] == (59, 92, 92, 91, 90, 92, 92, 91, 31)
++        elif calendar == "360_day":
++            assert rechunked.chunksizes["time"] == (60, 90, 90, 90, 90, 90, 90, 90, 40)
++        else:
++            raise AssertionError("unreachable")
++
++        # Custom seasons
++        rechunked = ds.chunk(
++            {"x": 2, "time": SeasonResampler(["DJFM", "AM", "JJA", "SON"])}
++        )
++        assert len(rechunked.chunksizes["time"]) == 9
++        assert sum(rechunked.chunksizes["time"]) == ds.sizes["time"]
++        assert rechunked.chunksizes["x"] == (2,) * 5
++
++        if calendar == "standard":
++            assert rechunked.chunksizes["time"] == (91, 61, 92, 91, 121, 61, 92, 91, 30)
++        elif calendar == "noleap":
++            assert rechunked.chunksizes["time"] == (90, 61, 92, 91, 121, 61, 92, 91, 31)
++        elif calendar == "360_day":
++            assert rechunked.chunksizes["time"] == (90, 60, 90, 90, 120, 60, 90, 90, 40)
++        else:
++            raise AssertionError("unreachable")
++
++        # Test that drop_incomplete doesn't affect chunking
++        rechunked_drop_true = ds.chunk(
++            time=SeasonResampler(["DJF", "MAM", "JJA", "SON"], drop_incomplete=True)
++        )
++        rechunked_drop_false = ds.chunk(
++            time=SeasonResampler(["DJF", "MAM", "JJA", "SON"], drop_incomplete=False)
++        )
++        assert (
++            rechunked_drop_true.chunksizes["time"]
++            == rechunked_drop_false.chunksizes["time"]
++        )
++
++    @requires_dask
++    def test_chunk_by_season_resampler_errors(self):
++        """Test error handling for SeasonResampler chunking."""
++        # Test error on missing season (should fail with incomplete seasons)
++        ds = Dataset(
++            {"x": ("time", np.arange(12))},
++            coords={"time": pd.date_range("2000-01-01", periods=12, freq="MS")},
++        )
++        with pytest.raises(ValueError, match="does not cover all 12 months"):
++            ds.chunk(time=SeasonResampler(["DJF", "MAM", "SON"]))
++
++        ds = Dataset({"foo": ("x", [1, 2, 3])})
++        # Test error on virtual variable
++        with pytest.raises(ValueError, match="virtual variable"):
++            ds.chunk(x=SeasonResampler(["DJF", "MAM", "JJA", "SON"]))
++
++        # Test error on non-datetime variable
++        ds["x"] = ("x", [1, 2, 3])
++        with pytest.raises(ValueError, match="datetime variables"):
++            ds.chunk(x=SeasonResampler(["DJF", "MAM", "JJA", "SON"]))
++
++        # Test successful case with 1D datetime variable
++        ds["x"] = ("x", xr.date_range("2001-01-01", periods=3, freq="D"))
++        # This should work
++        result = ds.chunk(x=SeasonResampler(["DJF", "MAM", "JJA", "SON"]))
++        assert result.chunks is not None
++
++        # Test error on missing season (should fail with incomplete seasons)
++        with pytest.raises(ValueError):
++            ds.chunk(x=SeasonResampler(["DJF", "MAM", "SON"]))
++
+     @requires_dask
+     def test_chunk(self) -> None:
+         data = create_test_data()
+@@ -3685,7 +3790,7 @@ class TestDataset:
+     def test_set_index(self) -> None:
+         expected = create_test_multiindex()
+         mindex = expected["x"].to_index()
+-        indexes = [mindex.get_level_values(n) for n in mindex.names]
++        indexes = [mindex.get_level_values(str(n)) for n in mindex.names]
+         coords = {idx.name: ("x", idx) for idx in indexes}
+         ds = Dataset({}, coords=coords)
+ 
+@@ -3746,7 +3851,7 @@ class TestDataset:
+     def test_reset_index(self) -> None:
+         ds = create_test_multiindex()
+         mindex = ds["x"].to_index()
+-        indexes = [mindex.get_level_values(n) for n in mindex.names]
++        indexes = [mindex.get_level_values(str(n)) for n in mindex.names]
+         coords = {idx.name: ("x", idx) for idx in indexes}
+         expected = Dataset({}, coords=coords)
+ 
+@@ -5198,7 +5303,7 @@ class TestDataset:
+     def test_from_dataframe_non_unique_columns(self) -> None:
+         # regression test for GH449
+         df = pd.DataFrame(np.zeros((2, 2)))
+-        df.columns = ["foo", "foo"]  # type: ignore[assignment]
++        df.columns = ["foo", "foo"]  # type: ignore[assignment,unused-ignore]
+         with pytest.raises(ValueError, match=r"non-unique columns"):
+             Dataset.from_dataframe(df)
+ 
+@@ -6056,17 +6161,20 @@ class TestDataset:
+         assert_identical(result.var2, ds.var2.quantile(q, method=method))
+         assert_identical(result.var3, ds.var3.quantile(q, method=method))
+ 
++    @pytest.mark.filterwarnings(
++        "default:The `interpolation` argument to quantile was renamed to `method`:FutureWarning"
++    )
+     @pytest.mark.parametrize("method", ["midpoint", "lower"])
+     def test_quantile_interpolation_deprecated(self, method) -> None:
+         ds = create_test_data(seed=123)
+         q = [0.25, 0.5, 0.75]
+ 
+-        with warnings.catch_warnings(record=True) as w:
++        with pytest.warns(
++            FutureWarning,
++            match="`interpolation` argument to quantile was renamed to `method`",
++        ):
+             ds.quantile(q, interpolation=method)
+ 
+-            # ensure the warning is only raised once
+-            assert len(w) == 1
+-
+         with warnings.catch_warnings(record=True):
+             with pytest.raises(TypeError, match="interpolation and method keywords"):
+                 ds.quantile(q, method=method, interpolation=method)
+@@ -6637,8 +6745,8 @@ class TestDataset:
+ 
+         expected = ds.copy(deep=True)
+         # https://github.com/python/mypy/issues/3004
+-        expected["d1"].values = [2, 2, 2]  # type: ignore[assignment]
+-        expected["d2"].values = [2.0, 2.0, 2.0]  # type: ignore[assignment]
++        expected["d1"].values = [2, 2, 2]  # type: ignore[assignment,unused-ignore]
++        expected["d2"].values = [2.0, 2.0, 2.0]  # type: ignore[assignment,unused-ignore]
+         assert expected["d1"].dtype == int
+         assert expected["d2"].dtype == float
+         assert_identical(expected, actual)
+@@ -6646,8 +6754,8 @@ class TestDataset:
+         # override dtype
+         actual = full_like(ds, fill_value=True, dtype=bool)
+         expected = ds.copy(deep=True)
+-        expected["d1"].values = [True, True, True]  # type: ignore[assignment]
+-        expected["d2"].values = [True, True, True]  # type: ignore[assignment]
++        expected["d1"].values = [True, True, True]  # type: ignore[assignment,unused-ignore]
++        expected["d2"].values = [True, True, True]  # type: ignore[assignment,unused-ignore]
+         assert expected["d1"].dtype == bool
+         assert expected["d2"].dtype == bool
+         assert_identical(expected, actual)
+@@ -7556,7 +7664,7 @@ def test_cumulative_integrate(dask) -> None:
+     from scipy.integrate import cumulative_trapezoid
+ 
+     expected_x = xr.DataArray(
+-        cumulative_trapezoid(da.compute(), da["x"], axis=0, initial=0.0),
++        cumulative_trapezoid(da.compute(), da["x"], axis=0, initial=0.0),  # type: ignore[call-overload,unused-ignore]
+         dims=["x", "y"],
+         coords=da.coords,
+     )
+@@ -7572,7 +7680,7 @@ def test_cumulative_integrate(dask) -> None:
+     # along y
+     actual = da.cumulative_integrate("y")
+     expected_y = xr.DataArray(
+-        cumulative_trapezoid(da, da["y"], axis=1, initial=0.0),
++        cumulative_trapezoid(da, da["y"], axis=1, initial=0.0),  # type: ignore[call-overload,unused-ignore]
+         dims=["x", "y"],
+         coords=da.coords,
+     )
+
+diff --git a/xarray/tests/test_datatree.py b/xarray/tests/test_datatree.py
+index efa2538..b54fd3c 100644
+--- a/xarray/tests/test_datatree.py
++++ b/xarray/tests/test_datatree.py
+@@ -165,7 +165,9 @@ class TestPaths:
+                 "/Kate": DataTree(),
+             }
+         )
+-        assert john["/Mary"].same_tree(john["/Kate"])
++        mary = john.children["Mary"]
++        kate = john.children["Kate"]
++        assert mary.same_tree(kate)
+ 
+     def test_relative_paths(self) -> None:
+         john = DataTree.from_dict(
+@@ -174,14 +176,8 @@ class TestPaths:
+                 "/Annie": DataTree(),
+             }
+         )
+-        sue_result = john["Mary/Sue"]
+-        if isinstance(sue_result, DataTree):
+-            sue: DataTree = sue_result
+-
+-        annie_result = john["Annie"]
+-        if isinstance(annie_result, DataTree):
+-            annie: DataTree = annie_result
+-
++        sue = john.children["Mary"].children["Sue"]
++        annie = john.children["Annie"]
+         assert sue.relative_to(john) == "Mary/Sue"
+         assert john.relative_to(sue) == "../.."
+         assert annie.relative_to(sue) == "../../Annie"
+@@ -208,7 +204,7 @@ class TestStoreDatasets:
+     def test_set_data(self) -> None:
+         john = DataTree(name="john")
+         dat = xr.Dataset({"a": 0})
+-        john.dataset = dat  # type: ignore[assignment]
++        john.dataset = dat  # type: ignore[assignment,unused-ignore]
+ 
+         assert_identical(john.to_dataset(), dat)
+ 
+@@ -229,7 +225,7 @@ class TestStoreDatasets:
+         eve = DataTree(children={"john": john})
+         assert eve.is_hollow
+ 
+-        eve.dataset = xr.Dataset({"a": 1})  # type: ignore[assignment]
++        eve.dataset = xr.Dataset({"a": 1})  # type: ignore[assignment,unused-ignore]
+         assert not eve.is_hollow
+ 
+ 
+@@ -266,13 +262,13 @@ class TestVariablesChildrenNameCollisions:
+         )
+ 
+         with pytest.raises(ValueError, match="node already contains a variable"):
+-            dt.dataset = xr.Dataset({"a": 0})  # type: ignore[assignment]
++            dt.dataset = xr.Dataset({"a": 0})  # type: ignore[assignment,unused-ignore]
+ 
+-        dt.dataset = xr.Dataset()  # type: ignore[assignment]
++        dt.dataset = xr.Dataset()  # type: ignore[assignment,unused-ignore]
+ 
+         new_ds = dt.to_dataset().assign(a=xr.DataArray(0))
+         with pytest.raises(ValueError, match="node already contains a variable"):
+-            dt.dataset = new_ds  # type: ignore[assignment]
++            dt.dataset = new_ds  # type: ignore[assignment,unused-ignore]
+ 
+ 
+ class TestGet: ...
+@@ -531,7 +527,7 @@ class TestSetItem:
+         john["mary"] = DataTree()
+         assert_identical(john["mary"].to_dataset(), xr.Dataset())
+ 
+-        john.dataset = xr.Dataset()  # type: ignore[assignment]
++        john.dataset = xr.Dataset()  # type: ignore[assignment,unused-ignore]
+         with pytest.raises(ValueError, match="has no name"):
+             john["."] = DataTree()
+ 
+@@ -1572,7 +1568,7 @@ class TestInheritance:
+             )
+ 
+         dt = DataTree()
+-        dt.dataset = xr.Dataset(coords={"x": [1.0]})  # type: ignore[assignment]
++        dt.dataset = xr.Dataset(coords={"x": [1.0]})  # type: ignore[assignment,unused-ignore]
+         dt["/b"] = DataTree()
+         with pytest.raises(ValueError, match=expected_msg):
+             dt["/b"].dataset = xr.Dataset(coords={"x": [2.0]})
+@@ -1607,7 +1603,7 @@ class TestInheritance:
+             )
+ 
+         dt = DataTree()
+-        dt.dataset = xr.Dataset(coords={"x": [1.0]})  # type: ignore[assignment]
++        dt.dataset = xr.Dataset(coords={"x": [1.0]})  # type: ignore[assignment,unused-ignore]
+         dt["/b/c"] = DataTree()
+         with pytest.raises(ValueError, match=expected_msg):
+             dt["/b/c"].dataset = xr.Dataset(coords={"x": [2.0]})
+@@ -1884,7 +1880,7 @@ class TestIsomorphicEqualsAndIdentical:
+         assert not child.identical(new_child)
+ 
+         deeper_root = DataTree(children={"root": root})
+-        grandchild = deeper_root["/root/child"]
++        grandchild = deeper_root.children["root"].children["child"]
+         assert child.equals(grandchild)
+         assert child.identical(grandchild)
+ 
+
+diff --git a/xarray/tests/test_duck_array_wrapping.py b/xarray/tests/test_duck_array_wrapping.py
+index 340669b..9bbc3d9 100644
+--- a/xarray/tests/test_duck_array_wrapping.py
++++ b/xarray/tests/test_duck_array_wrapping.py
+@@ -102,7 +102,7 @@ NAMESPACE_ARRAYS = {
+ }
+ 
+ try:
+-    import jax
++    import jax  # type: ignore[import-not-found,unused-ignore]
+ 
+     # enable double-precision
+     jax.config.update("jax_enable_x64", True)
+
+diff --git a/xarray/tests/test_groupby.py b/xarray/tests/test_groupby.py
+index 66dfd2c..94e88fa 100644
+--- a/xarray/tests/test_groupby.py
++++ b/xarray/tests/test_groupby.py
+@@ -565,6 +565,9 @@ def test_ds_groupby_quantile() -> None:
+     assert_identical(expected, actual)
+ 
+ 
++@pytest.mark.filterwarnings(
++    "default:The `interpolation` argument to quantile was renamed to `method`:FutureWarning"
++)
+ @pytest.mark.parametrize("as_dataset", [False, True])
+ def test_groupby_quantile_interpolation_deprecated(as_dataset: bool) -> None:
+     array = xr.DataArray(data=[1, 2, 3, 4], coords={"x": [1, 1, 2, 2]}, dims="x")
+@@ -2219,7 +2222,7 @@ class TestDataArrayResample:
+             f = interp1d(
+                 np.arange(len(times)),
+                 data,
+-                kind=kwargs["order"] if kind == "polynomial" else kind,
++                kind=kwargs["order"] if kind == "polynomial" else kind,  # type: ignore[arg-type,unused-ignore]
+                 axis=-1,
+                 bounds_error=True,
+                 assume_sorted=True,
+@@ -2297,7 +2300,7 @@ class TestDataArrayResample:
+             f = interp1d(
+                 np.arange(len(times)),
+                 data,
+-                kind=kwargs["order"] if kind == "polynomial" else kind,
++                kind=kwargs["order"] if kind == "polynomial" else kind,  # type: ignore[arg-type,unused-ignore]
+                 axis=-1,
+                 bounds_error=True,
+                 assume_sorted=True,
+
+diff --git a/xarray/tests/test_indexing.py b/xarray/tests/test_indexing.py
+index 67bb23c..71490b9 100644
+--- a/xarray/tests/test_indexing.py
++++ b/xarray/tests/test_indexing.py
+@@ -568,6 +568,10 @@ def test_invalid_for_all(indexer_cls) -> None:
+         indexer_cls((slice("foo"),))
+     with pytest.raises(TypeError):
+         indexer_cls((np.array(["foo"]),))
++    with pytest.raises(TypeError):
++        indexer_cls(True)
++    with pytest.raises(TypeError):
++        indexer_cls(np.array(True))
+ 
+ 
+ def check_integer(indexer_cls):
+
+diff --git a/xarray/tests/test_interp.py b/xarray/tests/test_interp.py
+index dd3906c..7e430bd 100644
+--- a/xarray/tests/test_interp.py
++++ b/xarray/tests/test_interp.py
+@@ -139,7 +139,7 @@ def test_interpolate_1d(method: InterpOptions, dim: str, case: int) -> None:
+             axis=obj.get_axis_num(dim),
+             bounds_error=False,
+             fill_value=np.nan,
+-            kind=method,
++            kind=method,  # type: ignore[arg-type,unused-ignore]
+         )(new_x)
+ 
+     if dim == "x":
+@@ -170,7 +170,7 @@ def test_interpolate_1d_methods(method: InterpOptions) -> None:
+             axis=obj.get_axis_num(dim),
+             bounds_error=False,
+             fill_value=np.nan,
+-            kind=method,
++            kind=method,  # type: ignore[arg-type,unused-ignore]
+         )(new_x)
+ 
+     coords = {"x": xdest, "y": da["y"], "x2": ("x", func(da["x2"], xdest))}
+@@ -229,7 +229,7 @@ def test_interpolate_vectorize(use_dask: bool, method: InterpOptions) -> None:
+                 da[dim],
+                 obj.data,
+                 axis=obj.get_axis_num(dim),
+-                kind=method,
++                kind=method,  # type: ignore[arg-type,unused-ignore]
+                 bounds_error=False,
+                 fill_value=np.nan,
+                 **scipy_kwargs,
+@@ -338,7 +338,7 @@ def test_interpolate_nd(case: int, method: InterpnOptions, nd_interp_coords) ->
+     zdest = nd_interp_coords["zdest"]
+     grid_oned_points = nd_interp_coords["grid_oned_points"]
+     actual = da.interp(x=xdest, y=ydest, z=zdest, method=method)
+-    expected_data = scipy.interpolate.interpn(
++    expected_data_1d: np.ndarray = scipy.interpolate.interpn(
+         points=(da.x, da.y, da.z),
+         values=da.data,
+         xi=grid_oned_points,
+@@ -346,7 +346,7 @@ def test_interpolate_nd(case: int, method: InterpnOptions, nd_interp_coords) ->
+         bounds_error=False,
+     ).reshape([len(xdest), len(zdest)])
+     expected = xr.DataArray(
+-        expected_data,
++        expected_data_1d,
+         dims=["y", "z"],
+         coords={
+             "y": ydest,
+@@ -449,7 +449,7 @@ def test_interpolate_scalar(method: InterpOptions, case: int) -> None:
+             axis=obj.get_axis_num("x"),
+             bounds_error=False,
+             fill_value=np.nan,
+-            kind=method,
++            kind=method,  # type: ignore[arg-type,unused-ignore]
+         )(new_x)
+ 
+     coords = {"x": xdest, "y": da["y"], "x2": func(da["x2"], xdest)}
+@@ -476,7 +476,7 @@ def test_interpolate_nd_scalar(method: InterpOptions, case: int) -> None:
+     expected_data = scipy.interpolate.RegularGridInterpolator(
+         (da["x"], da["y"], da["z"]),
+         da.transpose("x", "y", "z").values,
+-        method=method,
++        method=method,  # type: ignore[arg-type,unused-ignore]
+         bounds_error=False,
+         fill_value=np.nan,
+     )(np.asarray([(xdest, ydest, z_val) for z_val in zdest]))
+
+diff --git a/xarray/tests/test_missing.py b/xarray/tests/test_missing.py
+index 271813d..ba6616a 100644
+--- a/xarray/tests/test_missing.py
++++ b/xarray/tests/test_missing.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import itertools
++from typing import Any
+ from unittest import mock
+ 
+ import numpy as np
+@@ -204,7 +205,7 @@ def test_interpolate_unsorted_index_raises():
+     vals = np.array([1, 2, 3], dtype=np.float64)
+     expected = xr.DataArray(vals, dims="x", coords={"x": [2, 1, 3]})
+     with pytest.raises(ValueError, match=r"Index 'x' must be monotonically increasing"):
+-        expected.interpolate_na(dim="x", method="index")
++        expected.interpolate_na(dim="x", method="index")  # type: ignore[arg-type]
+ 
+ 
+ def test_interpolate_no_dim_raises():
+@@ -216,14 +217,14 @@ def test_interpolate_no_dim_raises():
+ def test_interpolate_invalid_interpolator_raises():
+     da = xr.DataArray(np.array([1, 2, np.nan, 5], dtype=np.float64), dims="x")
+     with pytest.raises(ValueError, match=r"not a valid"):
+-        da.interpolate_na(dim="x", method="foo")
++        da.interpolate_na(dim="x", method="foo")  # type: ignore[arg-type]
+ 
+ 
+ def test_interpolate_duplicate_values_raises():
+     data = np.random.randn(2, 3)
+     da = xr.DataArray(data, coords=[("x", ["a", "a"]), ("y", [0, 1, 2])])
+     with pytest.raises(ValueError, match=r"Index 'x' has duplicate values"):
+-        da.interpolate_na(dim="x", method="foo")
++        da.interpolate_na(dim="x", method="foo")  # type: ignore[arg-type]
+ 
+ 
+ def test_interpolate_multiindex_raises():
+@@ -331,15 +332,15 @@ def test_interpolate_limits():
+ @requires_scipy
+ def test_interpolate_methods():
+     for method in ["linear", "nearest", "zero", "slinear", "quadratic", "cubic"]:
+-        kwargs = {}
++        kwargs: dict[str, Any] = {}
+         da = xr.DataArray(
+             np.array([0, 1, 2, np.nan, np.nan, np.nan, 6, 7, 8], dtype=np.float64),
+             dims="x",
+         )
+-        actual = da.interpolate_na("x", method=method, **kwargs)
++        actual = da.interpolate_na("x", method=method, **kwargs)  # type: ignore[arg-type]
+         assert actual.isnull().sum() == 0
+ 
+-        actual = da.interpolate_na("x", method=method, limit=2, **kwargs)
++        actual = da.interpolate_na("x", method=method, limit=2, **kwargs)  # type: ignore[arg-type]
+         assert actual.isnull().sum() == 1
+ 
+ 
+
+diff --git a/xarray/tests/test_nputils.py b/xarray/tests/test_nputils.py
+index dbe8ee3..d8af419 100644
+--- a/xarray/tests/test_nputils.py
++++ b/xarray/tests/test_nputils.py
+@@ -18,7 +18,7 @@ def test_vindex() -> None:
+ 
+     # getitem
+     assert_array_equal(vindex[0], x[0])
+-    assert_array_equal(vindex[[1, 2], [1, 2]], x[[1, 2], [1, 2]])
++    assert_array_equal(vindex[[1, 2], [1, 2]], x[([1, 2], [1, 2])])
+     assert vindex[[0, 1], [0, 1], :].shape == (2, 5)
+     assert vindex[[0, 1], :, [0, 1]].shape == (2, 4)
+     assert vindex[:, [0, 1], [0, 1]].shape == (2, 3)
+
+diff --git a/xarray/tests/test_parallelcompat.py b/xarray/tests/test_parallelcompat.py
+index 67e3d00..558df62 100644
+--- a/xarray/tests/test_parallelcompat.py
++++ b/xarray/tests/test_parallelcompat.py
+@@ -48,7 +48,7 @@ class DummyChunkedArray(np.ndarray):
+     def __array_finalize__(self, obj):
+         if obj is None:
+             return
+-        self.chunks = getattr(obj, "chunks", None)
++        self.chunks = getattr(obj, "chunks", None)  # type: ignore[assignment]
+ 
+     def rechunk(self, chunks, **kwargs):
+         copied = self.copy()
+
+diff --git a/xarray/tests/test_plot.py b/xarray/tests/test_plot.py
+index 3dd8a4f..4c72c33 100644
+--- a/xarray/tests/test_plot.py
++++ b/xarray/tests/test_plot.py
+@@ -1776,6 +1776,18 @@ class TestContourf(Common2dMixin, PlotTestCase):
+         artist = self.plotmethod(levels=3)
+         assert artist.extend == "neither"
+ 
++    def test_colormap_norm(self) -> None:
++        # Using a norm should plot a nice colorbar and look consistent with pcolormesh.
++        norm = mpl.colors.LogNorm(0.1, 1e1)
++
++        with pytest.warns(UserWarning):
++            artist = self.plotmethod(norm=norm, add_colorbar=True)
++
++        actual = artist.colorbar.locator()
++        expected = np.array([0.01, 0.1, 1.0, 10.0])
++
++        np.testing.assert_allclose(actual, expected)
++
+ 
+ @pytest.mark.slow
+ class TestContour(Common2dMixin, PlotTestCase):
+@@ -1792,16 +1804,18 @@ class TestContour(Common2dMixin, PlotTestCase):
+         artist = self.plotmethod(colors="k")
+         assert artist.cmap.colors[0] == "k"
+ 
++        # 2 colors, will repeat every other tick:
+         artist = self.plotmethod(colors=["k", "b"])
+-        assert self._color_as_tuple(artist.cmap.colors[1]) == (0.0, 0.0, 1.0)
++        assert artist.cmap.colors[:2] == ["k", "b"]
+ 
++        # 4 colors, will repeat every 4th tick:
+         artist = self.darray.plot.contour(
+             levels=[-0.5, 0.0, 0.5, 1.0], colors=["k", "r", "w", "b"]
+         )
+-        assert self._color_as_tuple(artist.cmap.colors[1]) == (1.0, 0.0, 0.0)
+-        assert self._color_as_tuple(artist.cmap.colors[2]) == (1.0, 1.0, 1.0)
++        assert artist.cmap.colors[:5] == ["k", "r", "w", "b"]  # type: ignore[attr-defined,unused-ignore]
++
+         # the last color is now under "over"
+-        assert self._color_as_tuple(artist.cmap._rgba_over) == (0.0, 0.0, 1.0)
++        assert self._color_as_tuple(artist.cmap.get_over()) == (0.0, 0.0, 1.0)
+ 
+     def test_colors_np_levels(self) -> None:
+         # https://github.com/pydata/xarray/issues/3284
+@@ -1809,15 +1823,11 @@ class TestContour(Common2dMixin, PlotTestCase):
+         artist = self.darray.plot.contour(levels=levels, colors=["k", "r", "w", "b"])
+         cmap = artist.cmap
+         assert isinstance(cmap, mpl.colors.ListedColormap)
+-        # non-optimal typing in matplotlib (ArrayLike)
+-        # https://github.com/matplotlib/matplotlib/blob/84464dd085210fb57cc2419f0d4c0235391d97e6/lib/matplotlib/colors.pyi#L133
+-        colors = cast(np.ndarray, cmap.colors)
+ 
+-        assert self._color_as_tuple(colors[1]) == (1.0, 0.0, 0.0)
+-        assert self._color_as_tuple(colors[2]) == (1.0, 1.0, 1.0)
++        assert artist.cmap.colors[:5] == ["k", "r", "w", "b"]  # type: ignore[attr-defined,unused-ignore]
++
+         # the last color is now under "over"
+-        assert hasattr(cmap, "_rgba_over")
+-        assert self._color_as_tuple(cmap._rgba_over) == (0.0, 0.0, 1.0)
++        assert self._color_as_tuple(cmap.get_over()) == (0.0, 0.0, 1.0)
+ 
+     def test_cmap_and_color_both(self) -> None:
+         with pytest.raises(ValueError):
+@@ -1841,6 +1851,18 @@ class TestContour(Common2dMixin, PlotTestCase):
+         self.plotmethod(levels=[0.1])
+         self.plotmethod(levels=1)
+ 
++    def test_colormap_norm(self) -> None:
++        # Using a norm should plot a nice colorbar and look consistent with pcolormesh.
++        norm = mpl.colors.LogNorm(0.1, 1e1)
++
++        with pytest.warns(UserWarning):
++            artist = self.plotmethod(norm=norm, add_colorbar=True)
++
++        actual = artist.colorbar.locator()
++        expected = np.array([0.01, 0.1, 1.0, 10.0])
++
++        np.testing.assert_allclose(actual, expected)
++
+ 
+ class TestPcolormesh(Common2dMixin, PlotTestCase):
+     plotfunc = staticmethod(xplt.pcolormesh)
+@@ -3444,7 +3466,7 @@ def test_plot1d_default_rcparams() -> None:
+         fg = ds.plot.scatter(x="A", y="B", col="x", marker="o")
+         ax = fg.axs.ravel()[0]
+         actual = mpl.colors.to_rgba_array("w")
+-        expected = ax.collections[0].get_edgecolor()  # type: ignore[assignment]
++        expected = ax.collections[0].get_edgecolor()  # type: ignore[assignment,unused-ignore]
+         np.testing.assert_allclose(actual, expected)
+ 
+         # scatter should not emit any warnings when using unfilled markers:
+
+diff --git a/xarray/tests/test_plugins.py b/xarray/tests/test_plugins.py
+index e212922..f1342a1 100644
+--- a/xarray/tests/test_plugins.py
++++ b/xarray/tests/test_plugins.py
+@@ -171,7 +171,7 @@ def test_build_engines_sorted() -> None:
+     backend_entrypoints = list(plugins.build_engines(dummy_pkg_entrypoints))
+ 
+     indices = []
+-    for be in plugins.STANDARD_BACKENDS_ORDER:
++    for be in plugins.NETCDF_BACKENDS_ORDER:
+         try:
+             index = backend_entrypoints.index(be)
+             backend_entrypoints.pop(index)
+
+diff --git a/xarray/tests/test_treenode.py b/xarray/tests/test_treenode.py
+index 5f9c586..7eb7156 100644
+--- a/xarray/tests/test_treenode.py
++++ b/xarray/tests/test_treenode.py
+@@ -100,7 +100,7 @@ class TestFamilyTree:
+         john: TreeNode = TreeNode()
+ 
+         with pytest.raises(TypeError):
+-            john.children = {"Kate": 666}
++            john.children = {"Kate": 666}  # type: ignore[dict-item]
+ 
+         with pytest.raises(InvalidTreeError, match="Cannot add same node"):
+             john.children = {"Kate": kate, "Evil_Kate": kate}
+
+diff --git a/xarray/tests/test_tutorial.py b/xarray/tests/test_tutorial.py
+index e271da6..ed3ed68 100644
+--- a/xarray/tests/test_tutorial.py
++++ b/xarray/tests/test_tutorial.py
+@@ -9,19 +9,14 @@ from xarray.tests import network
+ class TestLoadDataset:
+     def test_download_from_github(self, tmp_path) -> None:
+         cache_dir = tmp_path / tutorial._default_cache_dir_name
+-        ds = tutorial.open_dataset("tiny", cache_dir=cache_dir).load()
++        ds = tutorial.load_dataset("tiny", cache_dir=cache_dir)
+         tiny = DataArray(range(5), name="tiny").to_dataset()
+         assert_identical(ds, tiny)
+ 
+-    def test_download_from_github_load_without_cache(
+-        self, tmp_path, monkeypatch
+-    ) -> None:
++    def test_download_from_github_load_without_cache(self, tmp_path) -> None:
+         cache_dir = tmp_path / tutorial._default_cache_dir_name
+-
+-        ds_nocache = tutorial.open_dataset(
+-            "tiny", cache=False, cache_dir=cache_dir
+-        ).load()
+-        ds_cache = tutorial.open_dataset("tiny", cache_dir=cache_dir).load()
++        ds_nocache = tutorial.load_dataset("tiny", cache=False, cache_dir=cache_dir)
++        ds_cache = tutorial.load_dataset("tiny", cache_dir=cache_dir)
+         assert_identical(ds_cache, ds_nocache)
+ 
+ 
+@@ -29,17 +24,12 @@ class TestLoadDataset:
+ class TestLoadDataTree:
+     def test_download_from_github(self, tmp_path) -> None:
+         cache_dir = tmp_path / tutorial._default_cache_dir_name
+-        ds = tutorial.open_datatree("tiny", cache_dir=cache_dir).load()
++        ds = tutorial.load_datatree("tiny", cache_dir=cache_dir)
+         tiny = DataTree.from_dict({"/": DataArray(range(5), name="tiny").to_dataset()})
+         assert_identical(ds, tiny)
+ 
+-    def test_download_from_github_load_without_cache(
+-        self, tmp_path, monkeypatch
+-    ) -> None:
++    def test_download_from_github_load_without_cache(self, tmp_path) -> None:
+         cache_dir = tmp_path / tutorial._default_cache_dir_name
+-
+-        ds_nocache = tutorial.open_datatree(
+-            "tiny", cache=False, cache_dir=cache_dir
+-        ).load()
+-        ds_cache = tutorial.open_datatree("tiny", cache_dir=cache_dir).load()
++        ds_nocache = tutorial.load_datatree("tiny", cache=False, cache_dir=cache_dir)
++        ds_cache = tutorial.load_datatree("tiny", cache_dir=cache_dir)
+         assert_identical(ds_cache, ds_nocache)
+
+diff --git a/xarray/tests/test_units.py b/xarray/tests/test_units.py
+index c955b3c..c52d581 100644
+--- a/xarray/tests/test_units.py
++++ b/xarray/tests/test_units.py
+@@ -29,6 +29,18 @@ pint = pytest.importorskip("pint")
+ DimensionalityError = pint.errors.DimensionalityError
+ 
+ 
++def create_nan_array(values, dtype):
++    """Create array with NaN values, handling cast warnings for int dtypes."""
++    import warnings
++
++    # When casting float arrays with NaN to integer, NumPy raises a warning
++    # This is expected behavior when dtype is int
++    with warnings.catch_warnings():
++        if np.issubdtype(dtype, np.integer):
++            warnings.filterwarnings("ignore", "invalid value encountered in cast")
++        return np.array(values).astype(dtype)
++
++
+ # make sure scalars are converted to 0d arrays so quantities can
+ # always be treated like ndarrays
+ unit_registry = pint.UnitRegistry(force_ndarray_like=True)
+@@ -2781,7 +2793,7 @@ class TestDataArray:
+     @pytest.mark.parametrize("func", (method("ffill"), method("bfill")), ids=repr)
+     def test_missing_value_filling(self, func, dtype):
+         array = (
+-            np.array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1]).astype(dtype)
++            create_nan_array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1], dtype)
+             * unit_registry.degK
+         )
+         x = np.arange(len(array))
+@@ -2818,7 +2830,7 @@ class TestDataArray:
+     def test_fillna(self, fill_value, unit, error, dtype):
+         original_unit = unit_registry.m
+         array = (
+-            np.array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1]).astype(dtype)
++            create_nan_array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1], dtype)
+             * original_unit
+         )
+         data_array = xr.DataArray(data=array)
+@@ -2846,7 +2858,7 @@ class TestDataArray:
+ 
+     def test_dropna(self, dtype):
+         array = (
+-            np.array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1]).astype(dtype)
++            create_nan_array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1], dtype)
+             * unit_registry.m
+         )
+         x = np.arange(len(array))
+@@ -2871,12 +2883,12 @@ class TestDataArray:
+     )
+     def test_isin(self, unit, dtype):
+         array = (
+-            np.array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1]).astype(dtype)
++            create_nan_array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1], dtype)
+             * unit_registry.m
+         )
+         data_array = xr.DataArray(data=array, dims="x")
+ 
+-        raw_values = np.array([1.4, np.nan, 2.3]).astype(dtype)
++        raw_values = create_nan_array([1.4, np.nan, 2.3], dtype)
+         values = raw_values * unit
+ 
+         units = {None: unit_registry.m if array.check(unit) else None}
+@@ -4267,11 +4279,11 @@ class TestDataset:
+     @pytest.mark.parametrize("func", (method("ffill"), method("bfill")), ids=repr)
+     def test_missing_value_filling(self, func, dtype):
+         array1 = (
+-            np.array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1]).astype(dtype)
++            create_nan_array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1], dtype)
+             * unit_registry.degK
+         )
+         array2 = (
+-            np.array([4.3, 9.8, 7.5, np.nan, 8.2, np.nan]).astype(dtype)
++            create_nan_array([4.3, 9.8, 7.5, np.nan, 8.2, np.nan], dtype)
+             * unit_registry.Pa
+         )
+ 
+@@ -4310,11 +4322,11 @@ class TestDataset:
+     )
+     def test_fillna(self, fill_value, unit, error, dtype):
+         array1 = (
+-            np.array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1]).astype(dtype)
++            create_nan_array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1], dtype)
+             * unit_registry.m
+         )
+         array2 = (
+-            np.array([4.3, 9.8, 7.5, np.nan, 8.2, np.nan]).astype(dtype)
++            create_nan_array([4.3, 9.8, 7.5, np.nan, 8.2, np.nan], dtype)
+             * unit_registry.m
+         )
+         ds = xr.Dataset({"a": ("x", array1), "b": ("x", array2)})
+@@ -4340,11 +4352,11 @@ class TestDataset:
+ 
+     def test_dropna(self, dtype):
+         array1 = (
+-            np.array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1]).astype(dtype)
++            create_nan_array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1], dtype)
+             * unit_registry.degK
+         )
+         array2 = (
+-            np.array([4.3, 9.8, 7.5, np.nan, 8.2, np.nan]).astype(dtype)
++            create_nan_array([4.3, 9.8, 7.5, np.nan, 8.2, np.nan], dtype)
+             * unit_registry.Pa
+         )
+         ds = xr.Dataset({"a": ("x", array1), "b": ("x", array2)})
+@@ -4368,16 +4380,16 @@ class TestDataset:
+     )
+     def test_isin(self, unit, dtype):
+         array1 = (
+-            np.array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1]).astype(dtype)
++            create_nan_array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1], dtype)
+             * unit_registry.m
+         )
+         array2 = (
+-            np.array([4.3, 9.8, 7.5, np.nan, 8.2, np.nan]).astype(dtype)
++            create_nan_array([4.3, 9.8, 7.5, np.nan, 8.2, np.nan], dtype)
+             * unit_registry.m
+         )
+         ds = xr.Dataset({"a": ("x", array1), "b": ("x", array2)})
+ 
+-        raw_values = np.array([1.4, np.nan, 2.3]).astype(dtype)
++        raw_values = create_nan_array([1.4, np.nan, 2.3], dtype)
+         values = raw_values * unit
+ 
+         converted_values = (
+@@ -4453,11 +4465,11 @@ class TestDataset:
+     @pytest.mark.xfail(reason="interpolate_na uses numpy.vectorize")
+     def test_interpolate_na(self, dtype):
+         array1 = (
+-            np.array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1]).astype(dtype)
++            create_nan_array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1], dtype)
+             * unit_registry.degK
+         )
+         array2 = (
+-            np.array([4.3, 9.8, 7.5, np.nan, 8.2, np.nan]).astype(dtype)
++            create_nan_array([4.3, 9.8, 7.5, np.nan, 8.2, np.nan], dtype)
+             * unit_registry.Pa
+         )
+         ds = xr.Dataset({"a": ("x", array1), "b": ("x", array2)})
+@@ -4502,10 +4514,10 @@ class TestDataset:
+         data_unit, other_data_unit, dims_unit, other_dims_unit = variants.get(variant)
+ 
+         array1 = (
+-            np.array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1]).astype(dtype) * data_unit
++            create_nan_array([1.4, np.nan, 2.3, np.nan, np.nan, 9.1], dtype) * data_unit
+         )
+         array2 = (
+-            np.array([4.3, 9.8, 7.5, np.nan, 8.2, np.nan]).astype(dtype) * data_unit
++            create_nan_array([4.3, 9.8, 7.5, np.nan, 8.2, np.nan], dtype) * data_unit
+         )
+         x = np.arange(len(array1)) * dims_unit
+         ds = xr.Dataset(
+
+diff --git a/xarray/tests/test_utils.py b/xarray/tests/test_utils.py
+index 0e6bbf2..f3333d1 100644
+--- a/xarray/tests/test_utils.py
++++ b/xarray/tests/test_utils.py
+@@ -23,7 +23,7 @@ class TestAlias:
+             pass
+ 
+         old_method = utils.alias(new_method, "old_method")
+-        assert "deprecated" in old_method.__doc__
++        assert "deprecated" in old_method.__doc__  # type: ignore[operator]
+         with pytest.warns(Warning, match="deprecated"):
+             old_method()
+ 
+@@ -102,10 +102,10 @@ class TestDictionaries:
+             utils.compat_dict_union(self.x, self.z)
+ 
+     def test_dict_equiv(self):
+-        x = {}
++        x: dict = {}
+         x["a"] = 3
+         x["b"] = np.array([1, 2, 3])
+-        y = {}
++        y: dict = {}
+         y["b"] = np.array([1.0, 2.0, 3.0])
+         y["a"] = 3
+         assert utils.dict_equiv(x, y)  # two nparrays are equal
+@@ -129,11 +129,11 @@ class TestDictionaries:
+     def test_frozen(self):
+         x = utils.Frozen(self.x)
+         with pytest.raises(TypeError):
+-            x["foo"] = "bar"
++            x["foo"] = "bar"  # type: ignore[index]
+         with pytest.raises(TypeError):
+-            del x["a"]
++            del x["a"]  # type: ignore[attr-defined]
+         with pytest.raises(AttributeError):
+-            x.update(self.y)
++            x.update(self.y)  # type: ignore[attr-defined]
+         assert x.mapping == self.x
+         assert repr(x) in (
+             "Frozen({'a': 'A', 'b': 'B'})",
+@@ -231,11 +231,11 @@ def test_hidden_key_dict():
+ 
+ 
+ def test_either_dict_or_kwargs():
+-    result = either_dict_or_kwargs(dict(a=1), None, "foo")
++    result = either_dict_or_kwargs(dict(a=1), {}, "foo")
+     expected = dict(a=1)
+     assert result == expected
+ 
+-    result = either_dict_or_kwargs(None, dict(a=1), "foo")
++    result = either_dict_or_kwargs({}, dict(a=1), "foo")
+     expected = dict(a=1)
+     assert result == expected
+ 
+
+diff --git a/xarray/tests/test_variable.py b/xarray/tests/test_variable.py
+index de77ec0..41475a0 100644
+--- a/xarray/tests/test_variable.py
++++ b/xarray/tests/test_variable.py
+@@ -1928,6 +1928,9 @@ class TestVariable(VariableSubclassobjects):
+ 
+         np.testing.assert_allclose(actual.values, expected)
+ 
++    @pytest.mark.filterwarnings(
++        "default:The `interpolation` argument to quantile was renamed to `method`:FutureWarning"
++    )
+     @pytest.mark.parametrize("method", ["midpoint", "lower"])
+     def test_quantile_interpolation_deprecation(self, method) -> None:
+         v = Variable(["x", "y"], self.d)
+@@ -2776,11 +2779,11 @@ class TestAsCompatibleData(Generic[T_DuckArray]):
+ 
+         expect = orig.copy(deep=True)
+         # see https://github.com/python/mypy/issues/3004 for why we need to ignore type
+-        expect.values = [[2.0, 2.0], [2.0, 2.0]]  # type: ignore[assignment]
++        expect.values = [[2.0, 2.0], [2.0, 2.0]]  # type: ignore[assignment,unused-ignore]
+         assert_identical(expect, full_like(orig, 2))
+ 
+         # override dtype
+-        expect.values = [[True, True], [True, True]]  # type: ignore[assignment]
++        expect.values = [[True, True], [True, True]]  # type: ignore[assignment,unused-ignore]
+         assert expect.dtype == bool
+         assert_identical(expect, full_like(orig, True, dtype=bool))
+ 

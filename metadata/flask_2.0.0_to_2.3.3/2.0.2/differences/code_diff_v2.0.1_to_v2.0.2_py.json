@@ -1,0 +1,731 @@
+{
+  "old_dir": ".packages/flask/2.0.1",
+  "new_dir": ".packages/flask/2.0.2",
+  "extracted_at": "2026-03-26T20:28:22.623911",
+  "diff_file": "metadata/flask_upgrade/v2.0.1_v2.0.2/code_diff_v2.0.1_to_v2.0.2_py.diff",
+  "diff_content": "diff --git a/examples/tutorial/flaskr/auth.py b/examples/tutorial/flaskr/auth.py\nindex bcd3c67..b423e6a 100644\n--- a/examples/tutorial/flaskr/auth.py\n+++ b/examples/tutorial/flaskr/auth.py\n@@ -60,21 +60,21 @@ def register():\n             error = \"Username is required.\"\n         elif not password:\n             error = \"Password is required.\"\n-        elif (\n-            db.execute(\"SELECT id FROM user WHERE username = ?\", (username,)).fetchone()\n-            is not None\n-        ):\n-            error = f\"User {username} is already registered.\"\n \n         if error is None:\n-            # the name is available, store it in the database and go to\n-            # the login page\n-            db.execute(\n-                \"INSERT INTO user (username, password) VALUES (?, ?)\",\n-                (username, generate_password_hash(password)),\n-            )\n-            db.commit()\n-            return redirect(url_for(\"auth.login\"))\n+            try:\n+                db.execute(\n+                    \"INSERT INTO user (username, password) VALUES (?, ?)\",\n+                    (username, generate_password_hash(password)),\n+                )\n+                db.commit()\n+            except db.IntegrityError:\n+                # The username was already taken, which caused the\n+                # commit to fail. Show a validation error.\n+                error = f\"User {username} is already registered.\"\n+            else:\n+                # Success, go to the login page.\n+                return redirect(url_for(\"auth.login\"))\n \n         flash(error)\n \n\ndiff --git a/examples/tutorial/tests/test_auth.py b/examples/tutorial/tests/test_auth.py\nindex 3ac9a12..0bc0a9d 100644\n--- a/examples/tutorial/tests/test_auth.py\n+++ b/examples/tutorial/tests/test_auth.py\n@@ -16,7 +16,7 @@ def test_register(client, app):\n     # test that the user was inserted into the database\n     with app.app_context():\n         assert (\n-            get_db().execute(\"select * from user where username = 'a'\").fetchone()\n+            get_db().execute(\"SELECT * FROM user WHERE username = 'a'\").fetchone()\n             is not None\n         )\n \n\ndiff --git a/src/flask/__init__.py b/src/flask/__init__.py\nindex c5da045..43b5468 100644\n--- a/src/flask/__init__.py\n+++ b/src/flask/__init__.py\n@@ -43,4 +43,4 @@ from .signals import template_rendered as template_rendered\n from .templating import render_template as render_template\n from .templating import render_template_string as render_template_string\n \n-__version__ = \"2.0.1\"\n+__version__ = \"2.0.2\"\n\ndiff --git a/src/flask/app.py b/src/flask/app.py\nindex 3abce3c..23b99e2 100644\n--- a/src/flask/app.py\n+++ b/src/flask/app.py\n@@ -58,17 +58,12 @@ from .signals import request_started\n from .signals import request_tearing_down\n from .templating import DispatchingJinjaLoader\n from .templating import Environment\n-from .typing import AfterRequestCallable\n-from .typing import BeforeRequestCallable\n-from .typing import ErrorHandlerCallable\n+from .typing import BeforeFirstRequestCallable\n from .typing import ResponseReturnValue\n from .typing import TeardownCallable\n-from .typing import TemplateContextProcessorCallable\n from .typing import TemplateFilterCallable\n from .typing import TemplateGlobalCallable\n from .typing import TemplateTestCallable\n-from .typing import URLDefaultCallable\n-from .typing import URLValuePreprocessorCallable\n from .wrappers import Request\n from .wrappers import Response\n \n@@ -77,6 +72,7 @@ if t.TYPE_CHECKING:\n     from .blueprints import Blueprint\n     from .testing import FlaskClient\n     from .testing import FlaskCliRunner\n+    from .typing import ErrorHandlerCallable\n \n if sys.version_info >= (3, 8):\n     iscoroutinefunction = inspect.iscoroutinefunction\n@@ -365,7 +361,8 @@ class Flask(Scaffold):\n     #: .. versionadded:: 1.1.0\n     url_map_class = Map\n \n-    #: the test client that is used with when `test_client` is used.\n+    #: The :meth:`test_client` method creates an instance of this test\n+    #: client class. Defaults to :class:`~flask.testing.FlaskClient`.\n     #:\n     #: .. versionadded:: 0.7\n     test_client_class: t.Optional[t.Type[\"FlaskClient\"]] = None\n@@ -388,7 +385,7 @@ class Flask(Scaffold):\n         self,\n         import_name: str,\n         static_url_path: t.Optional[str] = None,\n-        static_folder: t.Optional[str] = \"static\",\n+        static_folder: t.Optional[t.Union[str, os.PathLike]] = \"static\",\n         static_host: t.Optional[str] = None,\n         host_matching: bool = False,\n         subdomain_matching: bool = False,\n@@ -439,7 +436,7 @@ class Flask(Scaffold):\n         #: :meth:`before_first_request` decorator.\n         #:\n         #: .. versionadded:: 0.8\n-        self.before_first_request_funcs: t.List[BeforeRequestCallable] = []\n+        self.before_first_request_funcs: t.List[BeforeFirstRequestCallable] = []\n \n         #: A list of functions that are called when the application context\n         #: is destroyed.  Since the application context is also torn down\n@@ -743,20 +740,21 @@ class Flask(Scaffold):\n         :param context: the context as a dictionary that is updated in place\n                         to add extra variables.\n         \"\"\"\n-        funcs: t.Iterable[\n-            TemplateContextProcessorCallable\n-        ] = self.template_context_processors[None]\n-        reqctx = _request_ctx_stack.top\n-        if reqctx is not None:\n-            for bp in request.blueprints:\n-                if bp in self.template_context_processors:\n-                    funcs = chain(funcs, self.template_context_processors[bp])\n+        names: t.Iterable[t.Optional[str]] = (None,)\n+\n+        # A template may be rendered outside a request context.\n+        if request:\n+            names = chain(names, reversed(request.blueprints))\n+\n+        # The values passed to render_template take precedence. Keep a\n+        # copy to re-apply after all context functions.\n         orig_ctx = context.copy()\n-        for func in funcs:\n-            context.update(func())\n-        # make sure the original values win.  This makes it possible to\n-        # easier add new variables in context processors without breaking\n-        # existing views.\n+\n+        for name in names:\n+            if name in self.template_context_processors:\n+                for func in self.template_context_processors[name]:\n+                    context.update(func())\n+\n         context.update(orig_ctx)\n \n     def make_shell_context(self) -> dict:\n@@ -1211,7 +1209,9 @@ class Flask(Scaffold):\n         self.jinja_env.globals[name or f.__name__] = f\n \n     @setupmethod\n-    def before_first_request(self, f: BeforeRequestCallable) -> BeforeRequestCallable:\n+    def before_first_request(\n+        self, f: BeforeFirstRequestCallable\n+    ) -> BeforeFirstRequestCallable:\n         \"\"\"Registers a function to be run before the first request to this\n         instance of the application.\n \n@@ -1265,16 +1265,19 @@ class Flask(Scaffold):\n         self.shell_context_processors.append(f)\n         return f\n \n-    def _find_error_handler(self, e: Exception) -> t.Optional[ErrorHandlerCallable]:\n+    def _find_error_handler(\n+        self, e: Exception\n+    ) -> t.Optional[\"ErrorHandlerCallable[Exception]\"]:\n         \"\"\"Return a registered error handler for an exception in this order:\n         blueprint handler for a specific code, app handler for a specific code,\n         blueprint handler for an exception class, app handler for an exception\n         class, or ``None`` if a suitable handler is not found.\n         \"\"\"\n         exc_class, code = self._get_exc_class_and_code(type(e))\n+        names = (*request.blueprints, None)\n \n-        for c in [code, None]:\n-            for name in chain(request.blueprints, [None]):\n+        for c in (code, None) if code is not None else (None,):\n+            for name in names:\n                 handler_map = self.error_handler_spec[name][c]\n \n                 if not handler_map:\n@@ -1301,7 +1304,7 @@ class Flask(Scaffold):\n \n         .. versionchanged:: 1.0\n             Exceptions are looked up by code *and* by MRO, so\n-            ``HTTPExcpetion`` subclasses can be handled with a catch-all\n+            ``HTTPException`` subclasses can be handled with a catch-all\n             handler for the base ``HTTPException``.\n \n         .. versionadded:: 0.3\n@@ -1616,7 +1619,7 @@ class Flask(Scaffold):\n         except ImportError:\n             raise RuntimeError(\n                 \"Install Flask with the 'async' extra in order to use async views.\"\n-            )\n+            ) from None\n \n         # Check that Werkzeug isn't using its fallback ContextVar class.\n         if ContextVar.__module__ == \"werkzeug.local\":\n@@ -1722,7 +1725,7 @@ class Flask(Scaffold):\n                         \" response. The return type must be a string,\"\n                         \" dict, tuple, Response instance, or WSGI\"\n                         f\" callable, but it was a {type(rv).__name__}.\"\n-                    ).with_traceback(sys.exc_info()[2])\n+                    ).with_traceback(sys.exc_info()[2]) from None\n             else:\n                 raise TypeError(\n                     \"The view function did not return a valid\"\n@@ -1794,17 +1797,19 @@ class Flask(Scaffold):\n \n         .. versionadded:: 0.7\n         \"\"\"\n-        funcs: t.Iterable[URLDefaultCallable] = self.url_default_functions[None]\n+        names: t.Iterable[t.Optional[str]] = (None,)\n \n+        # url_for may be called outside a request context, parse the\n+        # passed endpoint instead of using request.blueprints.\n         if \".\" in endpoint:\n-            # This is called by url_for, which can be called outside a\n-            # request, can't use request.blueprints.\n-            bps = _split_blueprint_path(endpoint.rpartition(\".\")[0])\n-            bp_funcs = chain.from_iterable(self.url_default_functions[bp] for bp in bps)\n-            funcs = chain(funcs, bp_funcs)\n+            names = chain(\n+                names, reversed(_split_blueprint_path(endpoint.rpartition(\".\")[0]))\n+            )\n \n-        for func in funcs:\n-            func(endpoint, values)\n+        for name in names:\n+            if name in self.url_default_functions:\n+                for func in self.url_default_functions[name]:\n+                    func(endpoint, values)\n \n     def handle_url_build_error(\n         self, error: Exception, endpoint: str, values: dict\n@@ -1839,24 +1844,20 @@ class Flask(Scaffold):\n         value is handled as if it was the return value from the view, and\n         further request handling is stopped.\n         \"\"\"\n+        names = (None, *reversed(request.blueprints))\n+\n+        for name in names:\n+            if name in self.url_value_preprocessors:\n+                for url_func in self.url_value_preprocessors[name]:\n+                    url_func(request.endpoint, request.view_args)\n \n-        funcs: t.Iterable[URLValuePreprocessorCallable] = self.url_value_preprocessors[\n-            None\n-        ]\n-        for bp in request.blueprints:\n-            if bp in self.url_value_preprocessors:\n-                funcs = chain(funcs, self.url_value_preprocessors[bp])\n-        for func in funcs:\n-            func(request.endpoint, request.view_args)\n-\n-        funcs: t.Iterable[BeforeRequestCallable] = self.before_request_funcs[None]\n-        for bp in request.blueprints:\n-            if bp in self.before_request_funcs:\n-                funcs = chain(funcs, self.before_request_funcs[bp])\n-        for func in funcs:\n-            rv = self.ensure_sync(func)()\n-            if rv is not None:\n-                return rv\n+        for name in names:\n+            if name in self.before_request_funcs:\n+                for before_func in self.before_request_funcs[name]:\n+                    rv = self.ensure_sync(before_func)()\n+\n+                    if rv is not None:\n+                        return rv\n \n         return None\n \n@@ -1874,16 +1875,18 @@ class Flask(Scaffold):\n                  instance of :attr:`response_class`.\n         \"\"\"\n         ctx = _request_ctx_stack.top\n-        funcs: t.Iterable[AfterRequestCallable] = ctx._after_request_functions\n-        for bp in request.blueprints:\n-            if bp in self.after_request_funcs:\n-                funcs = chain(funcs, reversed(self.after_request_funcs[bp]))\n-        if None in self.after_request_funcs:\n-            funcs = chain(funcs, reversed(self.after_request_funcs[None]))\n-        for handler in funcs:\n-            response = self.ensure_sync(handler)(response)\n+\n+        for func in ctx._after_request_functions:\n+            response = self.ensure_sync(func)(response)\n+\n+        for name in chain(request.blueprints, (None,)):\n+            if name in self.after_request_funcs:\n+                for func in reversed(self.after_request_funcs[name]):\n+                    response = self.ensure_sync(func)(response)\n+\n         if not self.session_interface.is_null_session(ctx.session):\n             self.session_interface.save_session(self, ctx.session, response)\n+\n         return response\n \n     def do_teardown_request(\n@@ -1911,14 +1914,12 @@ class Flask(Scaffold):\n         \"\"\"\n         if exc is _sentinel:\n             exc = sys.exc_info()[1]\n-        funcs: t.Iterable[TeardownCallable] = reversed(\n-            self.teardown_request_funcs[None]\n-        )\n-        for bp in request.blueprints:\n-            if bp in self.teardown_request_funcs:\n-                funcs = chain(funcs, reversed(self.teardown_request_funcs[bp]))\n-        for func in funcs:\n-            self.ensure_sync(func)(exc)\n+\n+        for name in chain(request.blueprints, (None,)):\n+            if name in self.teardown_request_funcs:\n+                for func in reversed(self.teardown_request_funcs[name]):\n+                    self.ensure_sync(func)(exc)\n+\n         request_tearing_down.send(self, exc=exc)\n \n     def do_teardown_appcontext(\n@@ -1940,8 +1941,10 @@ class Flask(Scaffold):\n         \"\"\"\n         if exc is _sentinel:\n             exc = sys.exc_info()[1]\n+\n         for func in reversed(self.teardown_appcontext_funcs):\n             self.ensure_sync(func)(exc)\n+\n         appcontext_tearing_down.send(self, exc=exc)\n \n     def app_context(self) -> AppContext:\n\ndiff --git a/src/flask/blueprints.py b/src/flask/blueprints.py\nindex f3913b3..5c23a73 100644\n--- a/src/flask/blueprints.py\n+++ b/src/flask/blueprints.py\n@@ -1,3 +1,4 @@\n+import os\n import typing as t\n from collections import defaultdict\n from functools import update_wrapper\n@@ -6,8 +7,8 @@ from .scaffold import _endpoint_from_view_func\n from .scaffold import _sentinel\n from .scaffold import Scaffold\n from .typing import AfterRequestCallable\n+from .typing import BeforeFirstRequestCallable\n from .typing import BeforeRequestCallable\n-from .typing import ErrorHandlerCallable\n from .typing import TeardownCallable\n from .typing import TemplateContextProcessorCallable\n from .typing import TemplateFilterCallable\n@@ -18,6 +19,7 @@ from .typing import URLValuePreprocessorCallable\n \n if t.TYPE_CHECKING:\n     from .app import Flask\n+    from .typing import ErrorHandlerCallable\n \n DeferredSetupFunction = t.Callable[[\"BlueprintSetupState\"], t.Callable]\n \n@@ -174,7 +176,7 @@ class Blueprint(Scaffold):\n         self,\n         name: str,\n         import_name: str,\n-        static_folder: t.Optional[str] = None,\n+        static_folder: t.Optional[t.Union[str, os.PathLike]] = None,\n         static_url_path: t.Optional[str] = None,\n         template_folder: t.Optional[str] = None,\n         url_prefix: t.Optional[str] = None,\n@@ -292,7 +294,6 @@ class Blueprint(Scaffold):\n             Registering the same blueprint with the same name multiple\n             times is deprecated and will become an error in Flask 2.1.\n         \"\"\"\n-        first_registration = not any(bp is self for bp in app.blueprints.values())\n         name_prefix = options.get(\"name_prefix\", \"\")\n         self_name = options.get(\"name\", self.name)\n         name = f\"{name_prefix}.{self_name}\".lstrip(\".\")\n@@ -317,9 +318,12 @@ class Blueprint(Scaffold):\n                     stacklevel=4,\n                 )\n \n+        first_bp_registration = not any(bp is self for bp in app.blueprints.values())\n+        first_name_registration = name not in app.blueprints\n+\n         app.blueprints[name] = self\n         self._got_registered_once = True\n-        state = self.make_setup_state(app, options, first_registration)\n+        state = self.make_setup_state(app, options, first_bp_registration)\n \n         if self.has_static_folder:\n             state.add_url_rule(\n@@ -329,7 +333,7 @@ class Blueprint(Scaffold):\n             )\n \n         # Merge blueprint data into parent.\n-        if first_registration:\n+        if first_bp_registration or first_name_registration:\n \n             def extend(bp_dict, parent_dict):\n                 for key, values in bp_dict.items():\n@@ -537,8 +541,8 @@ class Blueprint(Scaffold):\n         return f\n \n     def before_app_first_request(\n-        self, f: BeforeRequestCallable\n-    ) -> BeforeRequestCallable:\n+        self, f: BeforeFirstRequestCallable\n+    ) -> BeforeFirstRequestCallable:\n         \"\"\"Like :meth:`Flask.before_first_request`.  Such a function is\n         executed before the first request to the application.\n         \"\"\"\n@@ -580,7 +584,9 @@ class Blueprint(Scaffold):\n         handler is used for all requests, even if outside of the blueprint.\n         \"\"\"\n \n-        def decorator(f: ErrorHandlerCallable) -> ErrorHandlerCallable:\n+        def decorator(\n+            f: \"ErrorHandlerCallable[Exception]\",\n+        ) -> \"ErrorHandlerCallable[Exception]\":\n             self.record_once(lambda s: s.app.errorhandler(code)(f))\n             return f\n \n\ndiff --git a/src/flask/cli.py b/src/flask/cli.py\nindex d9e810d..7ab4fa1 100644\n--- a/src/flask/cli.py\n+++ b/src/flask/cli.py\n@@ -69,15 +69,16 @@ def find_best_app(script_info, module):\n \n                 if isinstance(app, Flask):\n                     return app\n-            except TypeError:\n+            except TypeError as e:\n                 if not _called_with_wrong_args(app_factory):\n                     raise\n+\n                 raise NoAppException(\n                     f\"Detected factory {attr_name!r} in module {module.__name__!r},\"\n                     \" but could not call it without arguments. Use\"\n                     f\" \\\"FLASK_APP='{module.__name__}:{attr_name}(args)'\\\"\"\n                     \" to specify arguments.\"\n-                )\n+                ) from e\n \n     raise NoAppException(\n         \"Failed to find Flask application or factory in module\"\n@@ -103,18 +104,21 @@ def call_factory(script_info, app_factory, args=None, kwargs=None):\n         )\n         kwargs[\"script_info\"] = script_info\n \n-    if (\n-        not args\n-        and len(sig.parameters) == 1\n-        and next(iter(sig.parameters.values())).default is inspect.Parameter.empty\n-    ):\n-        warnings.warn(\n-            \"Script info is deprecated and will not be passed as the\"\n-            \" single argument to the app factory function in Flask\"\n-            \" 2.1.\",\n-            DeprecationWarning,\n-        )\n-        args.append(script_info)\n+    if not args and len(sig.parameters) == 1:\n+        first_parameter = next(iter(sig.parameters.values()))\n+\n+        if (\n+            first_parameter.default is inspect.Parameter.empty\n+            # **kwargs is reported as an empty default, ignore it\n+            and first_parameter.kind is not inspect.Parameter.VAR_KEYWORD\n+        ):\n+            warnings.warn(\n+                \"Script info is deprecated and will not be passed as the\"\n+                \" single argument to the app factory function in Flask\"\n+                \" 2.1.\",\n+                DeprecationWarning,\n+            )\n+            args.append(script_info)\n \n     return app_factory(*args, **kwargs)\n \n@@ -158,7 +162,7 @@ def find_app_by_string(script_info, module, app_name):\n     except SyntaxError:\n         raise NoAppException(\n             f\"Failed to parse {app_name!r} as an attribute name or function call.\"\n-        )\n+        ) from None\n \n     if isinstance(expr, ast.Name):\n         name = expr.id\n@@ -181,7 +185,7 @@ def find_app_by_string(script_info, module, app_name):\n             # message with the full expression instead.\n             raise NoAppException(\n                 f\"Failed to parse arguments as literal values: {app_name!r}.\"\n-            )\n+            ) from None\n     else:\n         raise NoAppException(\n             f\"Failed to parse {app_name!r} as an attribute name or function call.\"\n@@ -189,17 +193,17 @@ def find_app_by_string(script_info, module, app_name):\n \n     try:\n         attr = getattr(module, name)\n-    except AttributeError:\n+    except AttributeError as e:\n         raise NoAppException(\n             f\"Failed to find attribute {name!r} in {module.__name__!r}.\"\n-        )\n+        ) from e\n \n     # If the attribute is a function, call it with any args and kwargs\n     # to get the real application.\n     if inspect.isfunction(attr):\n         try:\n             app = call_factory(script_info, attr, args, kwargs)\n-        except TypeError:\n+        except TypeError as e:\n             if not _called_with_wrong_args(attr):\n                 raise\n \n@@ -207,7 +211,7 @@ def find_app_by_string(script_info, module, app_name):\n                 f\"The factory {app_name!r} in module\"\n                 f\" {module.__name__!r} could not be called with the\"\n                 \" specified arguments.\"\n-            )\n+            ) from e\n     else:\n         app = attr\n \n@@ -254,16 +258,15 @@ def locate_app(script_info, module_name, app_name, raise_if_not_found=True):\n \n     try:\n         __import__(module_name)\n-    except ImportError:\n+    except ImportError as e:\n         # Reraise the ImportError if it occurred within the imported module.\n         # Determine this by checking whether the trace has a depth > 1.\n         if sys.exc_info()[2].tb_next:\n             raise NoAppException(\n-                f\"While importing {module_name!r}, an ImportError was\"\n-                f\" raised:\\n\\n{traceback.format_exc()}\"\n-            )\n+                f\"While importing {module_name!r}, an ImportError was raised.\"\n+            ) from e\n         elif raise_if_not_found:\n-            raise NoAppException(f\"Could not import {module_name!r}.\")\n+            raise NoAppException(f\"Could not import {module_name!r}.\") from e\n         else:\n             return\n \n@@ -312,7 +315,7 @@ class DispatchingApp:\n         self.loader = loader\n         self._app = None\n         self._lock = Lock()\n-        self._bg_loading_exc_info = None\n+        self._bg_loading_exc = None\n \n         if use_eager_loading is None:\n             use_eager_loading = os.environ.get(\"WERKZEUG_RUN_MAIN\") != \"true\"\n@@ -328,23 +331,24 @@ class DispatchingApp:\n             with self._lock:\n                 try:\n                     self._load_unlocked()\n-                except Exception:\n-                    self._bg_loading_exc_info = sys.exc_info()\n+                except Exception as e:\n+                    self._bg_loading_exc = e\n \n         t = Thread(target=_load_app, args=())\n         t.start()\n \n     def _flush_bg_loading_exception(self):\n         __traceback_hide__ = True  # noqa: F841\n-        exc_info = self._bg_loading_exc_info\n-        if exc_info is not None:\n-            self._bg_loading_exc_info = None\n-            raise exc_info\n+        exc = self._bg_loading_exc\n+\n+        if exc is not None:\n+            self._bg_loading_exc = None\n+            raise exc\n \n     def _load_unlocked(self):\n         __traceback_hide__ = True  # noqa: F841\n         self._app = rv = self.loader()\n-        self._bg_loading_exc_info = None\n+        self._bg_loading_exc = None\n         return rv\n \n     def __call__(self, environ, start_response):\n@@ -721,7 +725,7 @@ class CertParamType(click.ParamType):\n                         \"Using ad-hoc certificates requires the cryptography library.\",\n                         ctx,\n                         param,\n-                    )\n+                    ) from None\n \n                 return value\n \n\ndiff --git a/src/flask/config.py b/src/flask/config.py\nindex c79a558..ca76902 100644\n--- a/src/flask/config.py\n+++ b/src/flask/config.py\n@@ -83,7 +83,7 @@ class Config(dict):\n         :param variable_name: name of the environment variable\n         :param silent: set to ``True`` if you want silent failure for missing\n                        files.\n-        :return: bool. ``True`` if able to load config, ``False`` otherwise.\n+        :return: ``True`` if the file was loaded successfully.\n         \"\"\"\n         rv = os.environ.get(variable_name)\n         if not rv:\n@@ -107,6 +107,7 @@ class Config(dict):\n                          root path.\n         :param silent: set to ``True`` if you want silent failure for missing\n                        files.\n+        :return: ``True`` if the file was loaded successfully.\n \n         .. versionadded:: 0.7\n            `silent` parameter.\n@@ -185,6 +186,7 @@ class Config(dict):\n         :type load: ``Callable[[Reader], Mapping]`` where ``Reader``\n             implements a ``read`` method.\n         :param silent: Ignore the file if it doesn't exist.\n+        :return: ``True`` if the file was loaded successfully.\n \n         .. versionadded:: 2.0\n         \"\"\"\n@@ -209,6 +211,7 @@ class Config(dict):\n         :param filename: The path to the JSON file. This can be an\n             absolute path or relative to the config root path.\n         :param silent: Ignore the file if it doesn't exist.\n+        :return: ``True`` if the file was loaded successfully.\n \n         .. deprecated:: 2.0.0\n             Will be removed in Flask 2.1. Use :meth:`from_file` instead.\n@@ -232,6 +235,7 @@ class Config(dict):\n     ) -> bool:\n         \"\"\"Updates the config like :meth:`update` ignoring items with non-upper\n         keys.\n+        :return: Always returns ``True``.\n \n         .. versionadded:: 0.11\n         \"\"\"\n\ndiff --git a/src/flask/debughelpers.py b/src/flask/debughelpers.py\nindex ce65c48..212f7d7 100644\n--- a/src/flask/debughelpers.py\n+++ b/src/flask/debughelpers.py\n@@ -83,10 +83,11 @@ def attach_enctype_error_multidict(request):\n         def __getitem__(self, key):\n             try:\n                 return oldcls.__getitem__(self, key)\n-            except KeyError:\n+            except KeyError as e:\n                 if key not in request.form:\n                     raise\n-                raise DebugFilesKeyError(request, key)\n+\n+                raise DebugFilesKeyError(request, key) from e\n \n     newcls.__name__ = oldcls.__name__\n     newcls.__module__ = oldcls.__module__\n\ndiff --git a/src/flask/json/__init__.py b/src/flask/json/__init__.py\nindex 5780e20..10d5123 100644\n--- a/src/flask/json/__init__.py\n+++ b/src/flask/json/__init__.py\n@@ -1,3 +1,4 @@\n+import decimal\n import io\n import json as _json\n import typing as t\n@@ -47,7 +48,7 @@ class JSONEncoder(_json.JSONEncoder):\n         \"\"\"\n         if isinstance(o, date):\n             return http_date(o)\n-        if isinstance(o, uuid.UUID):\n+        if isinstance(o, (decimal.Decimal, uuid.UUID)):\n             return str(o)\n         if dataclasses and dataclasses.is_dataclass(o):\n             return dataclasses.asdict(o)\n@@ -117,6 +118,9 @@ def dumps(obj: t.Any, app: t.Optional[\"Flask\"] = None, **kwargs: t.Any) -> str:\n         or defaults.\n     :param kwargs: Extra arguments passed to :func:`json.dumps`.\n \n+    .. versionchanged:: 2.0.2\n+        :class:`decimal.Decimal` is supported by converting to a string.\n+\n     .. versionchanged:: 2.0\n         ``encoding`` is deprecated and will be removed in Flask 2.1.\n \n@@ -324,6 +328,9 @@ def jsonify(*args: t.Any, **kwargs: t.Any) -> \"Response\":\n     debug mode or if :data:`JSONIFY_PRETTYPRINT_REGULAR` is ``True``,\n     the output will be formatted to be easier to read.\n \n+    .. versionchanged:: 2.0.2\n+        :class:`decimal.Decimal` is supported by converting to a string.\n+\n     .. versionchanged:: 0.11\n         Added support for serializing top-level arrays. This introduces\n         a security risk in ancient browsers. See :ref:`security-json`.\n\ndiff --git a/src/flask/scaffold.py b/src/flask/scaffold.py\nindex 239bc46..07ca5c6 100644\n--- a/src/flask/scaffold.py\n+++ b/src/flask/scaffold.py\n@@ -21,7 +21,7 @@ from .templating import _default_template_ctx_processor\n from .typing import AfterRequestCallable\n from .typing import AppOrBlueprintKey\n from .typing import BeforeRequestCallable\n-from .typing import ErrorHandlerCallable\n+from .typing import GenericException\n from .typing import TeardownCallable\n from .typing import TemplateContextProcessorCallable\n from .typing import URLDefaultCallable\n@@ -29,6 +29,7 @@ from .typing import URLValuePreprocessorCallable\n \n if t.TYPE_CHECKING:\n     from .wrappers import Response\n+    from .typing import ErrorHandlerCallable\n \n # a singleton sentinel value for parameter defaults\n _sentinel = object()\n@@ -91,7 +92,7 @@ class Scaffold:\n     def __init__(\n         self,\n         import_name: str,\n-        static_folder: t.Optional[str] = None,\n+        static_folder: t.Optional[t.Union[str, os.PathLike]] = None,\n         static_url_path: t.Optional[str] = None,\n         template_folder: t.Optional[str] = None,\n         root_path: t.Optional[str] = None,\n@@ -100,7 +101,7 @@ class Scaffold:\n         #: to. Do not change this once it is set by the constructor.\n         self.import_name = import_name\n \n-        self.static_folder = static_folder\n+        self.static_folder = static_folder  # type: ignore\n         self.static_url_path = static_url_path\n \n         #: The path to the templates folder, relative to\n@@ -144,7 +145,10 @@ class Scaffold:\n         #: directly and its format may change at any time.\n         self.error_handler_spec: t.Dict[\n             AppOrBlueprintKey,\n-            t.Dict[t.Optional[int], t.Dict[t.Type[Exception], ErrorHandlerCallable]],\n+            t.Dict[\n+                t.Optional[int],\n+                t.Dict[t.Type[Exception], \"ErrorHandlerCallable[Exception]\"],\n+            ],\n         ] = defaultdict(lambda: defaultdict(dict))\n \n         #: A data structure of functions to call at the beginning of\n@@ -253,7 +257,7 @@ class Scaffold:\n             return None\n \n     @static_folder.setter\n-    def static_folder(self, value: t.Optional[str]) -> None:\n+    def static_folder(self, value: t.Optional[t.Union[str, os.PathLike]]) -> None:\n         if value is not None:\n             value = os.fspath(value).rstrip(r\"\\/\")\n \n@@ -643,8 +647,11 @@ class Scaffold:\n \n     @setupmethod\n     def errorhandler(\n-        self, code_or_exception: t.Union[t.Type[Exception], int]\n-    ) -> t.Callable[[ErrorHandlerCallable], ErrorHandlerCallable]:\n+        self, code_or_exception: t.Union[t.Type[GenericException], int]\n+    ) -> t.Callable[\n+        [\"ErrorHandlerCallable[GenericException]\"],\n+        \"ErrorHandlerCallable[GenericException]\",\n+    ]:\n         \"\"\"Register a function to handle errors by code or exception class.\n \n         A decorator that is used to register a function given an\n@@ -674,7 +681,9 @@ class Scaffold:\n                                   an arbitrary exception\n         \"\"\"\n \n-        def decorator(f: ErrorHandlerCallable) -> ErrorHandlerCallable:\n+        def decorator(\n+            f: \"ErrorHandlerCallable[GenericException]\",\n+        ) -> \"ErrorHandlerCallable[GenericException]\":\n             self.register_error_handler(code_or_exception, f)\n             return f\n \n@@ -683,8 +692,8 @@ class Scaffold:\n     @setupmethod\n     def register_error_handler(\n         self,\n-        code_or_exception: t.Union[t.Type[Exception], int],\n-        f: ErrorHandlerCallable,\n+        code_or_exception: t.Union[t.Type[GenericException], int],\n+        f: \"ErrorHandlerCallable[GenericException]\",\n     ) -> None:\n         \"\"\"Alternative error attach function to the :meth:`errorhandler`\n         decorator that is more straightforward to use for non decorator\n@@ -706,9 +715,11 @@ class Scaffold:\n                 f\"'{code_or_exception}' is not a recognized HTTP error\"\n                 \" code. Use a subclass of HTTPException with that code\"\n                 \" instead.\"\n-            )\n+            ) from None\n \n-        self.error_handler_spec[None][code][exc_class] = f\n+        self.error_handler_spec[None][code][exc_class] = t.cast(\n+            \"ErrorHandlerCallable[Exception]\", f\n+        )\n \n     @staticmethod\n     def _get_exc_class_and_code(\n\ndiff --git a/src/flask/signals.py b/src/flask/signals.py\nindex 63667bd..2c6d646 100644\n--- a/src/flask/signals.py\n+++ b/src/flask/signals.py\n@@ -29,7 +29,7 @@ except ImportError:\n             raise RuntimeError(\n                 \"Signalling support is unavailable because the blinker\"\n                 \" library is not installed.\"\n-            )\n+            ) from None\n \n         connect = connect_via = connected_to = temporarily_connected_to = _fail\n         disconnect = _fail\n\ndiff --git a/src/flask/typing.py b/src/flask/typing.py\nindex 5f27308..f1c8467 100644\n--- a/src/flask/typing.py\n+++ b/src/flask/typing.py\n@@ -33,14 +33,24 @@ ResponseReturnValue = t.Union[\n     \"WSGIApplication\",\n ]\n \n+GenericException = t.TypeVar(\"GenericException\", bound=Exception, contravariant=True)\n+\n AppOrBlueprintKey = t.Optional[str]  # The App key is None, whereas blueprints are named\n AfterRequestCallable = t.Callable[[\"Response\"], \"Response\"]\n-BeforeRequestCallable = t.Callable[[], None]\n-ErrorHandlerCallable = t.Callable[[Exception], ResponseReturnValue]\n-TeardownCallable = t.Callable[[t.Optional[BaseException]], \"Response\"]\n+BeforeFirstRequestCallable = t.Callable[[], None]\n+BeforeRequestCallable = t.Callable[[], t.Optional[ResponseReturnValue]]\n+TeardownCallable = t.Callable[[t.Optional[BaseException]], None]\n TemplateContextProcessorCallable = t.Callable[[], t.Dict[str, t.Any]]\n-TemplateFilterCallable = t.Callable[[t.Any], str]\n-TemplateGlobalCallable = t.Callable[[], t.Any]\n-TemplateTestCallable = t.Callable[[t.Any], bool]\n+TemplateFilterCallable = t.Callable[..., t.Any]\n+TemplateGlobalCallable = t.Callable[..., t.Any]\n+TemplateTestCallable = t.Callable[..., bool]\n URLDefaultCallable = t.Callable[[str, dict], None]\n URLValuePreprocessorCallable = t.Callable[[t.Optional[str], t.Optional[dict]], None]\n+\n+\n+if t.TYPE_CHECKING:\n+    import typing_extensions as te\n+\n+    class ErrorHandlerCallable(te.Protocol[GenericException]):\n+        def __call__(self, error: GenericException) -> ResponseReturnValue:\n+            ...\n\ndiff --git a/src/flask/views.py b/src/flask/views.py\nindex 339ffa1..1bd5c68 100644\n--- a/src/flask/views.py\n+++ b/src/flask/views.py\n@@ -1,5 +1,6 @@\n import typing as t\n \n+from .globals import current_app\n from .globals import request\n from .typing import ResponseReturnValue\n \n@@ -80,7 +81,7 @@ class View:\n \n         def view(*args: t.Any, **kwargs: t.Any) -> ResponseReturnValue:\n             self = view.view_class(*class_args, **class_kwargs)  # type: ignore\n-            return self.dispatch_request(*args, **kwargs)\n+            return current_app.ensure_sync(self.dispatch_request)(*args, **kwargs)\n \n         if cls.decorators:\n             view.__name__ = name\n@@ -154,4 +155,4 @@ class MethodView(View, metaclass=MethodViewType):\n             meth = getattr(self, \"get\", None)\n \n         assert meth is not None, f\"Unimplemented method {request.method!r}\"\n-        return meth(*args, **kwargs)\n+        return current_app.ensure_sync(meth)(*args, **kwargs)\n",
+  "structured_diff": {
+    "examples/tutorial/flaskr/auth.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -60,21 +60,21 @@",
+          "snippet": " def register():\n             error = \"Username is required.\"\n         elif not password:\n             error = \"Password is required.\"\n-        elif (\n-            db.execute(\"SELECT id FROM user WHERE username = ?\", (username,)).fetchone()\n-            is not None\n-        ):\n-            error = f\"User {username} is already registered.\"\n \n         if error is None:\n-            # the name is available, store it in the database and go to\n-            # the login page\n-            db.execute(\n-                \"INSERT INTO user (username, password) VALUES (?, ?)\",\n-                (username, generate_password_hash(password)),\n-            )\n-            db.commit()\n-            return redirect(url_for(\"auth.login\"))\n+            try:\n+                db.execute(\n+                    \"INSERT INTO user (username, password) VALUES (?, ?)\",\n+                    (username, generate_password_hash(password)),\n+                )\n+                db.commit()\n+            except db.IntegrityError:\n+                # The username was already taken, which caused the\n+                # commit to fail. Show a validation error.\n+                error = f\"User {username} is already registered.\"\n+            else:\n+                # Success, go to the login page.\n+                return redirect(url_for(\"auth.login\"))\n \n         flash(error)\n \n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "examples/tutorial/flaskr/auth.py::register"
+            }
+          ]
+        }
+      ]
+    },
+    "examples/tutorial/tests/test_auth.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -16,7 +16,7 @@",
+          "snippet": " def test_register(client, app):\n     # test that the user was inserted into the database\n     with app.app_context():\n         assert (\n-            get_db().execute(\"select * from user where username = 'a'\").fetchone()\n+            get_db().execute(\"SELECT * FROM user WHERE username = 'a'\").fetchone()\n             is not None\n         )\n \n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "examples/tutorial/tests/test_auth.py::test_register"
+            }
+          ]
+        }
+      ]
+    },
+    "src/flask/__init__.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -43,4 +43,4 @@",
+          "snippet": " from .signals import template_rendered as template_rendered\n from .templating import render_template as render_template\n from .templating import render_template_string as render_template_string\n \n-__version__ = \"2.0.1\"\n+__version__ = \"2.0.2\"\n",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "src/flask/__init__.py::__version__"
+            }
+          ]
+        }
+      ]
+    },
+    "src/flask/app.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -58,17 +58,12 @@",
+          "snippet": " from .signals import request_started\n from .signals import request_tearing_down\n from .templating import DispatchingJinjaLoader\n from .templating import Environment\n-from .typing import AfterRequestCallable\n-from .typing import BeforeRequestCallable\n-from .typing import ErrorHandlerCallable\n+from .typing import BeforeFirstRequestCallable\n from .typing import ResponseReturnValue\n from .typing import TeardownCallable\n-from .typing import TemplateContextProcessorCallable\n from .typing import TemplateFilterCallable\n from .typing import TemplateGlobalCallable\n from .typing import TemplateTestCallable\n-from .typing import URLDefaultCallable\n-from .typing import URLValuePreprocessorCallable\n from .wrappers import Request\n from .wrappers import Response\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/flask/app.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -77,6 +72,7 @@",
+          "snippet": " if t.TYPE_CHECKING:\n     from .blueprints import Blueprint\n     from .testing import FlaskClient\n     from .testing import FlaskCliRunner\n+    from .typing import ErrorHandlerCallable\n \n if sys.version_info >= (3, 8):\n     iscoroutinefunction = inspect.iscoroutinefunction",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/flask/app.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -365,7 +361,8 @@",
+          "snippet": " class Flask(Scaffold):\n     #: .. versionadded:: 1.1.0\n     url_map_class = Map\n \n-    #: the test client that is used with when `test_client` is used.\n+    #: The :meth:`test_client` method creates an instance of this test\n+    #: client class. Defaults to :class:`~flask.testing.FlaskClient`.\n     #:\n     #: .. versionadded:: 0.7\n     test_client_class: t.Optional[t.Type[\"FlaskClient\"]] = None",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "src/flask/app.py::Flask"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -388,7 +385,7 @@",
+          "snippet": " class Flask(Scaffold):\n         self,\n         import_name: str,\n         static_url_path: t.Optional[str] = None,\n-        static_folder: t.Optional[str] = \"static\",\n+        static_folder: t.Optional[t.Union[str, os.PathLike]] = \"static\",\n         static_host: t.Optional[str] = None,\n         host_matching: bool = False,\n         subdomain_matching: bool = False,",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/app.py::Flask::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -439,7 +436,7 @@",
+          "snippet": " class Flask(Scaffold):\n         #: :meth:`before_first_request` decorator.\n         #:\n         #: .. versionadded:: 0.8\n-        self.before_first_request_funcs: t.List[BeforeRequestCallable] = []\n+        self.before_first_request_funcs: t.List[BeforeFirstRequestCallable] = []\n \n         #: A list of functions that are called when the application context\n         #: is destroyed.  Since the application context is also torn down",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/app.py::Flask::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -743,20 +740,21 @@",
+          "snippet": " class Flask(Scaffold):\n         :param context: the context as a dictionary that is updated in place\n                         to add extra variables.\n         \"\"\"\n-        funcs: t.Iterable[\n-            TemplateContextProcessorCallable\n-        ] = self.template_context_processors[None]\n-        reqctx = _request_ctx_stack.top\n-        if reqctx is not None:\n-            for bp in request.blueprints:\n-                if bp in self.template_context_processors:\n-                    funcs = chain(funcs, self.template_context_processors[bp])\n+        names: t.Iterable[t.Optional[str]] = (None,)\n+\n+        # A template may be rendered outside a request context.\n+        if request:\n+            names = chain(names, reversed(request.blueprints))\n+\n+        # The values passed to render_template take precedence. Keep a\n+        # copy to re-apply after all context functions.\n         orig_ctx = context.copy()\n-        for func in funcs:\n-            context.update(func())\n-        # make sure the original values win.  This makes it possible to\n-        # easier add new variables in context processors without breaking\n-        # existing views.\n+\n+        for name in names:\n+            if name in self.template_context_processors:\n+                for func in self.template_context_processors[name]:\n+                    context.update(func())\n+\n         context.update(orig_ctx)\n \n     def make_shell_context(self) -> dict:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/app.py::Flask::update_template_context"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1211,7 +1209,9 @@",
+          "snippet": " class Flask(Scaffold):\n         self.jinja_env.globals[name or f.__name__] = f\n \n     @setupmethod\n-    def before_first_request(self, f: BeforeRequestCallable) -> BeforeRequestCallable:\n+    def before_first_request(\n+        self, f: BeforeFirstRequestCallable\n+    ) -> BeforeFirstRequestCallable:\n         \"\"\"Registers a function to be run before the first request to this\n         instance of the application.\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/app.py::Flask::before_first_request"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1265,16 +1265,19 @@",
+          "snippet": " class Flask(Scaffold):\n         self.shell_context_processors.append(f)\n         return f\n \n-    def _find_error_handler(self, e: Exception) -> t.Optional[ErrorHandlerCallable]:\n+    def _find_error_handler(\n+        self, e: Exception\n+    ) -> t.Optional[\"ErrorHandlerCallable[Exception]\"]:\n         \"\"\"Return a registered error handler for an exception in this order:\n         blueprint handler for a specific code, app handler for a specific code,\n         blueprint handler for an exception class, app handler for an exception\n         class, or ``None`` if a suitable handler is not found.\n         \"\"\"\n         exc_class, code = self._get_exc_class_and_code(type(e))\n+        names = (*request.blueprints, None)\n \n-        for c in [code, None]:\n-            for name in chain(request.blueprints, [None]):\n+        for c in (code, None) if code is not None else (None,):\n+            for name in names:\n                 handler_map = self.error_handler_spec[name][c]\n \n                 if not handler_map:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/app.py::Flask::_find_error_handler"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1301,7 +1304,7 @@",
+          "snippet": " class Flask(Scaffold):\n \n         .. versionchanged:: 1.0\n             Exceptions are looked up by code *and* by MRO, so\n-            ``HTTPExcpetion`` subclasses can be handled with a catch-all\n+            ``HTTPException`` subclasses can be handled with a catch-all\n             handler for the base ``HTTPException``.\n \n         .. versionadded:: 0.3",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/app.py::Flask::handle_http_exception"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1616,7 +1619,7 @@",
+          "snippet": " class Flask(Scaffold):\n         except ImportError:\n             raise RuntimeError(\n                 \"Install Flask with the 'async' extra in order to use async views.\"\n-            )\n+            ) from None\n \n         # Check that Werkzeug isn't using its fallback ContextVar class.\n         if ContextVar.__module__ == \"werkzeug.local\":",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/app.py::Flask::async_to_sync"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1722,7 +1725,7 @@",
+          "snippet": " class Flask(Scaffold):\n                         \" response. The return type must be a string,\"\n                         \" dict, tuple, Response instance, or WSGI\"\n                         f\" callable, but it was a {type(rv).__name__}.\"\n-                    ).with_traceback(sys.exc_info()[2])\n+                    ).with_traceback(sys.exc_info()[2]) from None\n             else:\n                 raise TypeError(\n                     \"The view function did not return a valid\"",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/app.py::Flask::make_response"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1794,17 +1797,19 @@",
+          "snippet": " class Flask(Scaffold):\n \n         .. versionadded:: 0.7\n         \"\"\"\n-        funcs: t.Iterable[URLDefaultCallable] = self.url_default_functions[None]\n+        names: t.Iterable[t.Optional[str]] = (None,)\n \n+        # url_for may be called outside a request context, parse the\n+        # passed endpoint instead of using request.blueprints.\n         if \".\" in endpoint:\n-            # This is called by url_for, which can be called outside a\n-            # request, can't use request.blueprints.\n-            bps = _split_blueprint_path(endpoint.rpartition(\".\")[0])\n-            bp_funcs = chain.from_iterable(self.url_default_functions[bp] for bp in bps)\n-            funcs = chain(funcs, bp_funcs)\n+            names = chain(\n+                names, reversed(_split_blueprint_path(endpoint.rpartition(\".\")[0]))\n+            )\n \n-        for func in funcs:\n-            func(endpoint, values)\n+        for name in names:\n+            if name in self.url_default_functions:\n+                for func in self.url_default_functions[name]:\n+                    func(endpoint, values)\n \n     def handle_url_build_error(\n         self, error: Exception, endpoint: str, values: dict",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/app.py::Flask::inject_url_defaults"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1839,24 +1844,20 @@",
+          "snippet": " class Flask(Scaffold):\n         value is handled as if it was the return value from the view, and\n         further request handling is stopped.\n         \"\"\"\n+        names = (None, *reversed(request.blueprints))\n+\n+        for name in names:\n+            if name in self.url_value_preprocessors:\n+                for url_func in self.url_value_preprocessors[name]:\n+                    url_func(request.endpoint, request.view_args)\n \n-        funcs: t.Iterable[URLValuePreprocessorCallable] = self.url_value_preprocessors[\n-            None\n-        ]\n-        for bp in request.blueprints:\n-            if bp in self.url_value_preprocessors:\n-                funcs = chain(funcs, self.url_value_preprocessors[bp])\n-        for func in funcs:\n-            func(request.endpoint, request.view_args)\n-\n-        funcs: t.Iterable[BeforeRequestCallable] = self.before_request_funcs[None]\n-        for bp in request.blueprints:\n-            if bp in self.before_request_funcs:\n-                funcs = chain(funcs, self.before_request_funcs[bp])\n-        for func in funcs:\n-            rv = self.ensure_sync(func)()\n-            if rv is not None:\n-                return rv\n+        for name in names:\n+            if name in self.before_request_funcs:\n+                for before_func in self.before_request_funcs[name]:\n+                    rv = self.ensure_sync(before_func)()\n+\n+                    if rv is not None:\n+                        return rv\n \n         return None\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/app.py::Flask::preprocess_request"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1874,16 +1875,18 @@",
+          "snippet": " class Flask(Scaffold):\n                  instance of :attr:`response_class`.\n         \"\"\"\n         ctx = _request_ctx_stack.top\n-        funcs: t.Iterable[AfterRequestCallable] = ctx._after_request_functions\n-        for bp in request.blueprints:\n-            if bp in self.after_request_funcs:\n-                funcs = chain(funcs, reversed(self.after_request_funcs[bp]))\n-        if None in self.after_request_funcs:\n-            funcs = chain(funcs, reversed(self.after_request_funcs[None]))\n-        for handler in funcs:\n-            response = self.ensure_sync(handler)(response)\n+\n+        for func in ctx._after_request_functions:\n+            response = self.ensure_sync(func)(response)\n+\n+        for name in chain(request.blueprints, (None,)):\n+            if name in self.after_request_funcs:\n+                for func in reversed(self.after_request_funcs[name]):\n+                    response = self.ensure_sync(func)(response)\n+\n         if not self.session_interface.is_null_session(ctx.session):\n             self.session_interface.save_session(self, ctx.session, response)\n+\n         return response\n \n     def do_teardown_request(",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/app.py::Flask::process_response"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1911,14 +1914,12 @@",
+          "snippet": " class Flask(Scaffold):\n         \"\"\"\n         if exc is _sentinel:\n             exc = sys.exc_info()[1]\n-        funcs: t.Iterable[TeardownCallable] = reversed(\n-            self.teardown_request_funcs[None]\n-        )\n-        for bp in request.blueprints:\n-            if bp in self.teardown_request_funcs:\n-                funcs = chain(funcs, reversed(self.teardown_request_funcs[bp]))\n-        for func in funcs:\n-            self.ensure_sync(func)(exc)\n+\n+        for name in chain(request.blueprints, (None,)):\n+            if name in self.teardown_request_funcs:\n+                for func in reversed(self.teardown_request_funcs[name]):\n+                    self.ensure_sync(func)(exc)\n+\n         request_tearing_down.send(self, exc=exc)\n \n     def do_teardown_appcontext(",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/app.py::Flask::do_teardown_request"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1940,8 +1941,10 @@",
+          "snippet": " class Flask(Scaffold):\n         \"\"\"\n         if exc is _sentinel:\n             exc = sys.exc_info()[1]\n+\n         for func in reversed(self.teardown_appcontext_funcs):\n             self.ensure_sync(func)(exc)\n+\n         appcontext_tearing_down.send(self, exc=exc)\n \n     def app_context(self) -> AppContext:\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/app.py::Flask::do_teardown_appcontext"
+            }
+          ]
+        }
+      ]
+    },
+    "src/flask/blueprints.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,3 +1,4 @@",
+          "snippet": "+import os\n import typing as t\n from collections import defaultdict\n from functools import update_wrapper",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/flask/blueprints.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -6,8 +7,8 @@",
+          "snippet": " from .scaffold import _endpoint_from_view_func\n from .scaffold import _sentinel\n from .scaffold import Scaffold\n from .typing import AfterRequestCallable\n+from .typing import BeforeFirstRequestCallable\n from .typing import BeforeRequestCallable\n-from .typing import ErrorHandlerCallable\n from .typing import TeardownCallable\n from .typing import TemplateContextProcessorCallable\n from .typing import TemplateFilterCallable",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/flask/blueprints.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -18,6 +19,7 @@",
+          "snippet": " from .typing import URLValuePreprocessorCallable\n \n if t.TYPE_CHECKING:\n     from .app import Flask\n+    from .typing import ErrorHandlerCallable\n \n DeferredSetupFunction = t.Callable[[\"BlueprintSetupState\"], t.Callable]\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/flask/blueprints.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -174,7 +176,7 @@",
+          "snippet": " class Blueprint(Scaffold):\n         self,\n         name: str,\n         import_name: str,\n-        static_folder: t.Optional[str] = None,\n+        static_folder: t.Optional[t.Union[str, os.PathLike]] = None,\n         static_url_path: t.Optional[str] = None,\n         template_folder: t.Optional[str] = None,\n         url_prefix: t.Optional[str] = None,",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/blueprints.py::Blueprint::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -292,7 +294,6 @@",
+          "snippet": " class Blueprint(Scaffold):\n             Registering the same blueprint with the same name multiple\n             times is deprecated and will become an error in Flask 2.1.\n         \"\"\"\n-        first_registration = not any(bp is self for bp in app.blueprints.values())\n         name_prefix = options.get(\"name_prefix\", \"\")\n         self_name = options.get(\"name\", self.name)\n         name = f\"{name_prefix}.{self_name}\".lstrip(\".\")",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/blueprints.py::Blueprint::register"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -317,9 +318,12 @@",
+          "snippet": " class Blueprint(Scaffold):\n                     stacklevel=4,\n                 )\n \n+        first_bp_registration = not any(bp is self for bp in app.blueprints.values())\n+        first_name_registration = name not in app.blueprints\n+\n         app.blueprints[name] = self\n         self._got_registered_once = True\n-        state = self.make_setup_state(app, options, first_registration)\n+        state = self.make_setup_state(app, options, first_bp_registration)\n \n         if self.has_static_folder:\n             state.add_url_rule(",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/blueprints.py::Blueprint::register"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -329,7 +333,7 @@",
+          "snippet": " class Blueprint(Scaffold):\n             )\n \n         # Merge blueprint data into parent.\n-        if first_registration:\n+        if first_bp_registration or first_name_registration:\n \n             def extend(bp_dict, parent_dict):\n                 for key, values in bp_dict.items():",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/blueprints.py::Blueprint::register"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -537,8 +541,8 @@",
+          "snippet": " class Blueprint(Scaffold):\n         return f\n \n     def before_app_first_request(\n-        self, f: BeforeRequestCallable\n-    ) -> BeforeRequestCallable:\n+        self, f: BeforeFirstRequestCallable\n+    ) -> BeforeFirstRequestCallable:\n         \"\"\"Like :meth:`Flask.before_first_request`.  Such a function is\n         executed before the first request to the application.\n         \"\"\"",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/blueprints.py::Blueprint::before_app_first_request"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -580,7 +584,9 @@",
+          "snippet": " class Blueprint(Scaffold):\n         handler is used for all requests, even if outside of the blueprint.\n         \"\"\"\n \n-        def decorator(f: ErrorHandlerCallable) -> ErrorHandlerCallable:\n+        def decorator(\n+            f: \"ErrorHandlerCallable[Exception]\",\n+        ) -> \"ErrorHandlerCallable[Exception]\":\n             self.record_once(lambda s: s.app.errorhandler(code)(f))\n             return f\n \n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/blueprints.py::Blueprint::decorator"
+            }
+          ]
+        }
+      ]
+    },
+    "src/flask/cli.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -69,15 +69,16 @@",
+          "snippet": " def find_best_app(script_info, module):\n \n                 if isinstance(app, Flask):\n                     return app\n-            except TypeError:\n+            except TypeError as e:\n                 if not _called_with_wrong_args(app_factory):\n                     raise\n+\n                 raise NoAppException(\n                     f\"Detected factory {attr_name!r} in module {module.__name__!r},\"\n                     \" but could not call it without arguments. Use\"\n                     f\" \\\"FLASK_APP='{module.__name__}:{attr_name}(args)'\\\"\"\n                     \" to specify arguments.\"\n-                )\n+                ) from e\n \n     raise NoAppException(\n         \"Failed to find Flask application or factory in module\"",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/flask/cli.py::find_best_app"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -103,18 +104,21 @@",
+          "snippet": " def call_factory(script_info, app_factory, args=None, kwargs=None):\n         )\n         kwargs[\"script_info\"] = script_info\n \n-    if (\n-        not args\n-        and len(sig.parameters) == 1\n-        and next(iter(sig.parameters.values())).default is inspect.Parameter.empty\n-    ):\n-        warnings.warn(\n-            \"Script info is deprecated and will not be passed as the\"\n-            \" single argument to the app factory function in Flask\"\n-            \" 2.1.\",\n-            DeprecationWarning,\n-        )\n-        args.append(script_info)\n+    if not args and len(sig.parameters) == 1:\n+        first_parameter = next(iter(sig.parameters.values()))\n+\n+        if (\n+            first_parameter.default is inspect.Parameter.empty\n+            # **kwargs is reported as an empty default, ignore it\n+            and first_parameter.kind is not inspect.Parameter.VAR_KEYWORD\n+        ):\n+            warnings.warn(\n+                \"Script info is deprecated and will not be passed as the\"\n+                \" single argument to the app factory function in Flask\"\n+                \" 2.1.\",\n+                DeprecationWarning,\n+            )\n+            args.append(script_info)\n \n     return app_factory(*args, **kwargs)\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/flask/cli.py::call_factory"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -158,7 +162,7 @@",
+          "snippet": " def find_app_by_string(script_info, module, app_name):\n     except SyntaxError:\n         raise NoAppException(\n             f\"Failed to parse {app_name!r} as an attribute name or function call.\"\n-        )\n+        ) from None\n \n     if isinstance(expr, ast.Name):\n         name = expr.id",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/flask/cli.py::find_app_by_string"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -181,7 +185,7 @@",
+          "snippet": " def find_app_by_string(script_info, module, app_name):\n             # message with the full expression instead.\n             raise NoAppException(\n                 f\"Failed to parse arguments as literal values: {app_name!r}.\"\n-            )\n+            ) from None\n     else:\n         raise NoAppException(\n             f\"Failed to parse {app_name!r} as an attribute name or function call.\"",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/flask/cli.py::find_app_by_string"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -189,17 +193,17 @@",
+          "snippet": " def find_app_by_string(script_info, module, app_name):\n \n     try:\n         attr = getattr(module, name)\n-    except AttributeError:\n+    except AttributeError as e:\n         raise NoAppException(\n             f\"Failed to find attribute {name!r} in {module.__name__!r}.\"\n-        )\n+        ) from e\n \n     # If the attribute is a function, call it with any args and kwargs\n     # to get the real application.\n     if inspect.isfunction(attr):\n         try:\n             app = call_factory(script_info, attr, args, kwargs)\n-        except TypeError:\n+        except TypeError as e:\n             if not _called_with_wrong_args(attr):\n                 raise\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/flask/cli.py::find_app_by_string"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -207,7 +211,7 @@",
+          "snippet": " def find_app_by_string(script_info, module, app_name):\n                 f\"The factory {app_name!r} in module\"\n                 f\" {module.__name__!r} could not be called with the\"\n                 \" specified arguments.\"\n-            )\n+            ) from e\n     else:\n         app = attr\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/flask/cli.py::find_app_by_string"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -254,16 +258,15 @@",
+          "snippet": " def locate_app(script_info, module_name, app_name, raise_if_not_found=True):\n \n     try:\n         __import__(module_name)\n-    except ImportError:\n+    except ImportError as e:\n         # Reraise the ImportError if it occurred within the imported module.\n         # Determine this by checking whether the trace has a depth > 1.\n         if sys.exc_info()[2].tb_next:\n             raise NoAppException(\n-                f\"While importing {module_name!r}, an ImportError was\"\n-                f\" raised:\\n\\n{traceback.format_exc()}\"\n-            )\n+                f\"While importing {module_name!r}, an ImportError was raised.\"\n+            ) from e\n         elif raise_if_not_found:\n-            raise NoAppException(f\"Could not import {module_name!r}.\")\n+            raise NoAppException(f\"Could not import {module_name!r}.\") from e\n         else:\n             return\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/flask/cli.py::locate_app"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -312,7 +315,7 @@",
+          "snippet": " class DispatchingApp:\n         self.loader = loader\n         self._app = None\n         self._lock = Lock()\n-        self._bg_loading_exc_info = None\n+        self._bg_loading_exc = None\n \n         if use_eager_loading is None:\n             use_eager_loading = os.environ.get(\"WERKZEUG_RUN_MAIN\") != \"true\"",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/cli.py::DispatchingApp::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -328,23 +331,24 @@",
+          "snippet": " class DispatchingApp:\n             with self._lock:\n                 try:\n                     self._load_unlocked()\n-                except Exception:\n-                    self._bg_loading_exc_info = sys.exc_info()\n+                except Exception as e:\n+                    self._bg_loading_exc = e\n \n         t = Thread(target=_load_app, args=())\n         t.start()\n \n     def _flush_bg_loading_exception(self):\n         __traceback_hide__ = True  # noqa: F841\n-        exc_info = self._bg_loading_exc_info\n-        if exc_info is not None:\n-            self._bg_loading_exc_info = None\n-            raise exc_info\n+        exc = self._bg_loading_exc\n+\n+        if exc is not None:\n+            self._bg_loading_exc = None\n+            raise exc\n \n     def _load_unlocked(self):\n         __traceback_hide__ = True  # noqa: F841\n         self._app = rv = self.loader()\n-        self._bg_loading_exc_info = None\n+        self._bg_loading_exc = None\n         return rv\n \n     def __call__(self, environ, start_response):",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/cli.py::DispatchingApp::_load_app"
+            },
+            {
+              "kind": "method",
+              "node": "src/flask/cli.py::DispatchingApp::_flush_bg_loading_exception"
+            },
+            {
+              "kind": "method",
+              "node": "src/flask/cli.py::DispatchingApp::_load_unlocked"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -721,7 +725,7 @@",
+          "snippet": " class CertParamType(click.ParamType):\n                         \"Using ad-hoc certificates requires the cryptography library.\",\n                         ctx,\n                         param,\n-                    )\n+                    ) from None\n \n                 return value\n \n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/cli.py::CertParamType::convert"
+            }
+          ]
+        }
+      ]
+    },
+    "src/flask/config.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -83,7 +83,7 @@",
+          "snippet": " class Config(dict):\n         :param variable_name: name of the environment variable\n         :param silent: set to ``True`` if you want silent failure for missing\n                        files.\n-        :return: bool. ``True`` if able to load config, ``False`` otherwise.\n+        :return: ``True`` if the file was loaded successfully.\n         \"\"\"\n         rv = os.environ.get(variable_name)\n         if not rv:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/config.py::Config::from_envvar"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -107,6 +107,7 @@",
+          "snippet": " class Config(dict):\n                          root path.\n         :param silent: set to ``True`` if you want silent failure for missing\n                        files.\n+        :return: ``True`` if the file was loaded successfully.\n \n         .. versionadded:: 0.7\n            `silent` parameter.",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/config.py::Config::from_pyfile"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -185,6 +186,7 @@",
+          "snippet": " class Config(dict):\n         :type load: ``Callable[[Reader], Mapping]`` where ``Reader``\n             implements a ``read`` method.\n         :param silent: Ignore the file if it doesn't exist.\n+        :return: ``True`` if the file was loaded successfully.\n \n         .. versionadded:: 2.0\n         \"\"\"",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/config.py::Config::from_file"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -209,6 +211,7 @@",
+          "snippet": " class Config(dict):\n         :param filename: The path to the JSON file. This can be an\n             absolute path or relative to the config root path.\n         :param silent: Ignore the file if it doesn't exist.\n+        :return: ``True`` if the file was loaded successfully.\n \n         .. deprecated:: 2.0.0\n             Will be removed in Flask 2.1. Use :meth:`from_file` instead.",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/config.py::Config::from_json"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -232,6 +235,7 @@",
+          "snippet": " class Config(dict):\n     ) -> bool:\n         \"\"\"Updates the config like :meth:`update` ignoring items with non-upper\n         keys.\n+        :return: Always returns ``True``.\n \n         .. versionadded:: 0.11\n         \"\"\"\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/config.py::Config::from_mapping"
+            }
+          ]
+        }
+      ]
+    },
+    "src/flask/debughelpers.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -83,10 +83,11 @@",
+          "snippet": " def attach_enctype_error_multidict(request):\n         def __getitem__(self, key):\n             try:\n                 return oldcls.__getitem__(self, key)\n-            except KeyError:\n+            except KeyError as e:\n                 if key not in request.form:\n                     raise\n-                raise DebugFilesKeyError(request, key)\n+\n+                raise DebugFilesKeyError(request, key) from e\n \n     newcls.__name__ = oldcls.__name__\n     newcls.__module__ = oldcls.__module__\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/debughelpers.py::newcls::__getitem__"
+            }
+          ]
+        }
+      ]
+    },
+    "src/flask/json/__init__.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,3 +1,4 @@",
+          "snippet": "+import decimal\n import io\n import json as _json\n import typing as t",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/flask/json/__init__.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -47,7 +48,7 @@",
+          "snippet": " class JSONEncoder(_json.JSONEncoder):\n         \"\"\"\n         if isinstance(o, date):\n             return http_date(o)\n-        if isinstance(o, uuid.UUID):\n+        if isinstance(o, (decimal.Decimal, uuid.UUID)):\n             return str(o)\n         if dataclasses and dataclasses.is_dataclass(o):\n             return dataclasses.asdict(o)",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/json/__init__.py::JSONEncoder::default"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -117,6 +118,9 @@",
+          "snippet": " def dumps(obj: t.Any, app: t.Optional[\"Flask\"] = None, **kwargs: t.Any) -> str:\n         or defaults.\n     :param kwargs: Extra arguments passed to :func:`json.dumps`.\n \n+    .. versionchanged:: 2.0.2\n+        :class:`decimal.Decimal` is supported by converting to a string.\n+\n     .. versionchanged:: 2.0\n         ``encoding`` is deprecated and will be removed in Flask 2.1.\n ",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/flask/json/__init__.py::dumps"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -324,6 +328,9 @@",
+          "snippet": " def jsonify(*args: t.Any, **kwargs: t.Any) -> \"Response\":\n     debug mode or if :data:`JSONIFY_PRETTYPRINT_REGULAR` is ``True``,\n     the output will be formatted to be easier to read.\n \n+    .. versionchanged:: 2.0.2\n+        :class:`decimal.Decimal` is supported by converting to a string.\n+\n     .. versionchanged:: 0.11\n         Added support for serializing top-level arrays. This introduces\n         a security risk in ancient browsers. See :ref:`security-json`.\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/flask/json/__init__.py::jsonify"
+            }
+          ]
+        }
+      ]
+    },
+    "src/flask/scaffold.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -21,7 +21,7 @@",
+          "snippet": " from .templating import _default_template_ctx_processor\n from .typing import AfterRequestCallable\n from .typing import AppOrBlueprintKey\n from .typing import BeforeRequestCallable\n-from .typing import ErrorHandlerCallable\n+from .typing import GenericException\n from .typing import TeardownCallable\n from .typing import TemplateContextProcessorCallable\n from .typing import URLDefaultCallable",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/flask/scaffold.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -29,6 +29,7 @@",
+          "snippet": " from .typing import URLValuePreprocessorCallable\n \n if t.TYPE_CHECKING:\n     from .wrappers import Response\n+    from .typing import ErrorHandlerCallable\n \n # a singleton sentinel value for parameter defaults\n _sentinel = object()",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/flask/scaffold.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -91,7 +92,7 @@",
+          "snippet": " class Scaffold:\n     def __init__(\n         self,\n         import_name: str,\n-        static_folder: t.Optional[str] = None,\n+        static_folder: t.Optional[t.Union[str, os.PathLike]] = None,\n         static_url_path: t.Optional[str] = None,\n         template_folder: t.Optional[str] = None,\n         root_path: t.Optional[str] = None,",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/scaffold.py::Scaffold::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -100,7 +101,7 @@",
+          "snippet": " class Scaffold:\n         #: to. Do not change this once it is set by the constructor.\n         self.import_name = import_name\n \n-        self.static_folder = static_folder\n+        self.static_folder = static_folder  # type: ignore\n         self.static_url_path = static_url_path\n \n         #: The path to the templates folder, relative to",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/scaffold.py::Scaffold::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -144,7 +145,10 @@",
+          "snippet": " class Scaffold:\n         #: directly and its format may change at any time.\n         self.error_handler_spec: t.Dict[\n             AppOrBlueprintKey,\n-            t.Dict[t.Optional[int], t.Dict[t.Type[Exception], ErrorHandlerCallable]],\n+            t.Dict[\n+                t.Optional[int],\n+                t.Dict[t.Type[Exception], \"ErrorHandlerCallable[Exception]\"],\n+            ],\n         ] = defaultdict(lambda: defaultdict(dict))\n \n         #: A data structure of functions to call at the beginning of",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/scaffold.py::Scaffold::__init__"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -253,7 +257,7 @@",
+          "snippet": " class Scaffold:\n             return None\n \n     @static_folder.setter\n-    def static_folder(self, value: t.Optional[str]) -> None:\n+    def static_folder(self, value: t.Optional[t.Union[str, os.PathLike]]) -> None:\n         if value is not None:\n             value = os.fspath(value).rstrip(r\"\\/\")\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/scaffold.py::Scaffold::static_folder"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -643,8 +647,11 @@",
+          "snippet": " class Scaffold:\n \n     @setupmethod\n     def errorhandler(\n-        self, code_or_exception: t.Union[t.Type[Exception], int]\n-    ) -> t.Callable[[ErrorHandlerCallable], ErrorHandlerCallable]:\n+        self, code_or_exception: t.Union[t.Type[GenericException], int]\n+    ) -> t.Callable[\n+        [\"ErrorHandlerCallable[GenericException]\"],\n+        \"ErrorHandlerCallable[GenericException]\",\n+    ]:\n         \"\"\"Register a function to handle errors by code or exception class.\n \n         A decorator that is used to register a function given an",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/scaffold.py::Scaffold::errorhandler"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -674,7 +681,9 @@",
+          "snippet": " class Scaffold:\n                                   an arbitrary exception\n         \"\"\"\n \n-        def decorator(f: ErrorHandlerCallable) -> ErrorHandlerCallable:\n+        def decorator(\n+            f: \"ErrorHandlerCallable[GenericException]\",\n+        ) -> \"ErrorHandlerCallable[GenericException]\":\n             self.register_error_handler(code_or_exception, f)\n             return f\n ",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/scaffold.py::Scaffold::decorator"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -683,8 +692,8 @@",
+          "snippet": " class Scaffold:\n     @setupmethod\n     def register_error_handler(\n         self,\n-        code_or_exception: t.Union[t.Type[Exception], int],\n-        f: ErrorHandlerCallable,\n+        code_or_exception: t.Union[t.Type[GenericException], int],\n+        f: \"ErrorHandlerCallable[GenericException]\",\n     ) -> None:\n         \"\"\"Alternative error attach function to the :meth:`errorhandler`\n         decorator that is more straightforward to use for non decorator",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/scaffold.py::Scaffold::register_error_handler"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -706,9 +715,11 @@",
+          "snippet": " class Scaffold:\n                 f\"'{code_or_exception}' is not a recognized HTTP error\"\n                 \" code. Use a subclass of HTTPException with that code\"\n                 \" instead.\"\n-            )\n+            ) from None\n \n-        self.error_handler_spec[None][code][exc_class] = f\n+        self.error_handler_spec[None][code][exc_class] = t.cast(\n+            \"ErrorHandlerCallable[Exception]\", f\n+        )\n \n     @staticmethod\n     def _get_exc_class_and_code(\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/scaffold.py::Scaffold::register_error_handler"
+            }
+          ]
+        }
+      ]
+    },
+    "src/flask/signals.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -29,7 +29,7 @@",
+          "snippet": " except ImportError:\n             raise RuntimeError(\n                 \"Signalling support is unavailable because the blinker\"\n                 \" library is not installed.\"\n-            )\n+            ) from None\n \n         connect = connect_via = connected_to = temporarily_connected_to = _fail\n         disconnect = _fail\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/signals.py::_FakeSignal::_fail"
+            }
+          ]
+        }
+      ]
+    },
+    "src/flask/typing.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -33,14 +33,24 @@",
+          "snippet": " ResponseReturnValue = t.Union[\n     \"WSGIApplication\",\n ]\n \n+GenericException = t.TypeVar(\"GenericException\", bound=Exception, contravariant=True)\n+\n AppOrBlueprintKey = t.Optional[str]  # The App key is None, whereas blueprints are named\n AfterRequestCallable = t.Callable[[\"Response\"], \"Response\"]\n-BeforeRequestCallable = t.Callable[[], None]\n-ErrorHandlerCallable = t.Callable[[Exception], ResponseReturnValue]\n-TeardownCallable = t.Callable[[t.Optional[BaseException]], \"Response\"]\n+BeforeFirstRequestCallable = t.Callable[[], None]\n+BeforeRequestCallable = t.Callable[[], t.Optional[ResponseReturnValue]]\n+TeardownCallable = t.Callable[[t.Optional[BaseException]], None]\n TemplateContextProcessorCallable = t.Callable[[], t.Dict[str, t.Any]]\n-TemplateFilterCallable = t.Callable[[t.Any], str]\n-TemplateGlobalCallable = t.Callable[[], t.Any]\n-TemplateTestCallable = t.Callable[[t.Any], bool]\n+TemplateFilterCallable = t.Callable[..., t.Any]\n+TemplateGlobalCallable = t.Callable[..., t.Any]\n+TemplateTestCallable = t.Callable[..., bool]\n URLDefaultCallable = t.Callable[[str, dict], None]\n URLValuePreprocessorCallable = t.Callable[[t.Optional[str], t.Optional[dict]], None]\n+\n+\n+if t.TYPE_CHECKING:\n+    import typing_extensions as te\n+\n+    class ErrorHandlerCallable(te.Protocol[GenericException]):\n+        def __call__(self, error: GenericException) -> ResponseReturnValue:\n+            ...\n",
+          "affect": [
+            {
+              "kind": "variable",
+              "node": "src/flask/typing.py::GenericException"
+            },
+            {
+              "kind": "variable",
+              "node": "src/flask/typing.py::BeforeFirstRequestCallable"
+            },
+            {
+              "kind": "variable",
+              "node": "src/flask/typing.py::BeforeRequestCallable"
+            },
+            {
+              "kind": "variable",
+              "node": "src/flask/typing.py::TeardownCallable"
+            },
+            {
+              "kind": "variable",
+              "node": "src/flask/typing.py::TemplateFilterCallable"
+            },
+            {
+              "kind": "variable",
+              "node": "src/flask/typing.py::TemplateGlobalCallable"
+            },
+            {
+              "kind": "variable",
+              "node": "src/flask/typing.py::TemplateTestCallable"
+            },
+            {
+              "kind": "class",
+              "node": "src/flask/typing.py::ErrorHandlerCallable"
+            },
+            {
+              "kind": "method",
+              "node": "src/flask/typing.py::ErrorHandlerCallable::__call__"
+            }
+          ]
+        }
+      ]
+    },
+    "src/flask/views.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1,5 +1,6 @@",
+          "snippet": " import typing as t\n \n+from .globals import current_app\n from .globals import request\n from .typing import ResponseReturnValue\n ",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/flask/views.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -80,7 +81,7 @@",
+          "snippet": " class View:\n \n         def view(*args: t.Any, **kwargs: t.Any) -> ResponseReturnValue:\n             self = view.view_class(*class_args, **class_kwargs)  # type: ignore\n-            return self.dispatch_request(*args, **kwargs)\n+            return current_app.ensure_sync(self.dispatch_request)(*args, **kwargs)\n \n         if cls.decorators:\n             view.__name__ = name",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/views.py::View::view"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -154,4 +155,4 @@",
+          "snippet": " class MethodView(View, metaclass=MethodViewType):\n             meth = getattr(self, \"get\", None)\n \n         assert meth is not None, f\"Unimplemented method {request.method!r}\"\n-        return meth(*args, **kwargs)\n+        return current_app.ensure_sync(meth)(*args, **kwargs)",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/flask/views.py::MethodView::dispatch_request"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

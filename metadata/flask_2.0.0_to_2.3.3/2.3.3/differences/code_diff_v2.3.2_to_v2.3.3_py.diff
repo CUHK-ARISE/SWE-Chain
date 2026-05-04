@@ -1,0 +1,301 @@
+diff --git a/src/flask/__init__.py b/src/flask/__init__.py
+index 0bef221..bdca1b0 100644
+--- a/src/flask/__init__.py
++++ b/src/flask/__init__.py
+@@ -38,7 +38,7 @@ from .templating import render_template_string as render_template_string
+ from .templating import stream_template as stream_template
+ from .templating import stream_template_string as stream_template_string
+ 
+-__version__ = "2.3.2"
++__version__ = "2.3.3"
+ 
+ 
+ def __getattr__(name):
+
+diff --git a/src/flask/cli.py b/src/flask/cli.py
+index f7e1f29..dda266b 100644
+--- a/src/flask/cli.py
++++ b/src/flask/cli.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import ast
++import importlib.metadata
+ import inspect
+ import os
+ import platform
+@@ -241,13 +242,13 @@ def get_version(ctx, param, value):
+     if not value or ctx.resilient_parsing:
+         return
+ 
+-    import werkzeug
+-    from . import __version__
++    flask_version = importlib.metadata.version("flask")
++    werkzeug_version = importlib.metadata.version("werkzeug")
+ 
+     click.echo(
+         f"Python {platform.python_version()}\n"
+-        f"Flask {__version__}\n"
+-        f"Werkzeug {werkzeug.__version__}",
++        f"Flask {flask_version}\n"
++        f"Werkzeug {werkzeug_version}",
+         color=ctx.color,
+     )
+     ctx.exit()
+@@ -302,7 +303,7 @@ class ScriptInfo:
+         else:
+             if self.app_import_path:
+                 path, name = (
+-                    re.split(r":(?![\\/])", self.app_import_path, 1) + [None]
++                    re.split(r":(?![\\/])", self.app_import_path, maxsplit=1) + [None]
+                 )[:2]
+                 import_name = prepare_import(path)
+                 app = locate_app(import_name, name)
+
+diff --git a/src/flask/config.py b/src/flask/config.py
+index a73dd78..5f921b4 100644
+--- a/src/flask/config.py
++++ b/src/flask/config.py
+@@ -72,7 +72,9 @@ class Config(dict):
+     :param defaults: an optional dictionary of default values
+     """
+ 
+-    def __init__(self, root_path: str, defaults: dict | None = None) -> None:
++    def __init__(
++        self, root_path: str | os.PathLike, defaults: dict | None = None
++    ) -> None:
+         super().__init__(defaults or {})
+         self.root_path = root_path
+ 
+@@ -164,7 +166,7 @@ class Config(dict):
+ 
+         return True
+ 
+-    def from_pyfile(self, filename: str, silent: bool = False) -> bool:
++    def from_pyfile(self, filename: str | os.PathLike, silent: bool = False) -> bool:
+         """Updates the values in the config from a Python file.  This function
+         behaves as if the file was imported as module with the
+         :meth:`from_object` function.
+@@ -233,7 +235,7 @@ class Config(dict):
+ 
+     def from_file(
+         self,
+-        filename: str,
++        filename: str | os.PathLike,
+         load: t.Callable[[t.IO[t.Any]], t.Mapping],
+         silent: bool = False,
+         text: bool = True,
+
+diff --git a/src/flask/helpers.py b/src/flask/helpers.py
+index 61a0f81..284c369 100644
+--- a/src/flask/helpers.py
++++ b/src/flask/helpers.py
+@@ -1,7 +1,7 @@
+ from __future__ import annotations
+ 
++import importlib.util
+ import os
+-import pkgutil
+ import socket
+ import sys
+ import typing as t
+@@ -575,12 +575,20 @@ def get_root_path(import_name: str) -> str:
+         return os.path.dirname(os.path.abspath(mod.__file__))
+ 
+     # Next attempt: check the loader.
+-    loader = pkgutil.get_loader(import_name)
++    try:
++        spec = importlib.util.find_spec(import_name)
++
++        if spec is None:
++            raise ValueError
++    except (ImportError, ValueError):
++        loader = None
++    else:
++        loader = spec.loader
+ 
+     # Loader does not exist or we're referring to an unloaded main
+     # module or a main module without path (interactive sessions), go
+     # with the current working directory.
+-    if loader is None or import_name == "__main__":
++    if loader is None:
+         return os.getcwd()
+ 
+     if hasattr(loader, "get_filename"):
+
+diff --git a/src/flask/scaffold.py b/src/flask/scaffold.py
+index 6af6906..d15b873 100644
+--- a/src/flask/scaffold.py
++++ b/src/flask/scaffold.py
+@@ -3,7 +3,6 @@ from __future__ import annotations
+ import importlib.util
+ import os
+ import pathlib
+-import pkgutil
+ import sys
+ import typing as t
+ from collections import defaultdict
+@@ -780,31 +779,6 @@ def _endpoint_from_view_func(view_func: t.Callable) -> str:
+     return view_func.__name__
+ 
+ 
+-def _matching_loader_thinks_module_is_package(loader, mod_name):
+-    """Attempt to figure out if the given name is a package or a module.
+-
+-    :param: loader: The loader that handled the name.
+-    :param mod_name: The name of the package or module.
+-    """
+-    # Use loader.is_package if it's available.
+-    if hasattr(loader, "is_package"):
+-        return loader.is_package(mod_name)
+-
+-    cls = type(loader)
+-
+-    # NamespaceLoader doesn't implement is_package, but all names it
+-    # loads must be packages.
+-    if cls.__module__ == "_frozen_importlib" and cls.__name__ == "NamespaceLoader":
+-        return True
+-
+-    # Otherwise we need to fail with an error that explains what went
+-    # wrong.
+-    raise AttributeError(
+-        f"'{cls.__name__}.is_package()' must be implemented for PEP 302"
+-        f" import hooks."
+-    )
+-
+-
+ def _path_is_relative_to(path: pathlib.PurePath, base: str) -> bool:
+     # Path.is_relative_to doesn't exist until Python 3.9
+     try:
+@@ -823,63 +797,39 @@ def _find_package_path(import_name):
+ 
+         if root_spec is None:
+             raise ValueError("not found")
+-    # ImportError: the machinery told us it does not exist
+-    # ValueError:
+-    #    - the module name was invalid
+-    #    - the module name is __main__
+-    #    - *we* raised `ValueError` due to `root_spec` being `None`
+     except (ImportError, ValueError):
+-        pass  # handled below
+-    else:
+-        # namespace package
+-        if root_spec.origin in {"namespace", None}:
+-            package_spec = importlib.util.find_spec(import_name)
+-            if package_spec is not None and package_spec.submodule_search_locations:
+-                # Pick the path in the namespace that contains the submodule.
+-                package_path = pathlib.Path(
+-                    os.path.commonpath(package_spec.submodule_search_locations)
+-                )
+-                search_locations = (
+-                    location
+-                    for location in root_spec.submodule_search_locations
+-                    if _path_is_relative_to(package_path, location)
+-                )
+-            else:
+-                # Pick the first path.
+-                search_locations = iter(root_spec.submodule_search_locations)
+-            return os.path.dirname(next(search_locations))
+-        # a package (with __init__.py)
+-        elif root_spec.submodule_search_locations:
+-            return os.path.dirname(os.path.dirname(root_spec.origin))
+-        # just a normal module
+-        else:
+-            return os.path.dirname(root_spec.origin)
+-
+-    # we were unable to find the `package_path` using PEP 451 loaders
+-    loader = pkgutil.get_loader(root_mod_name)
+-
+-    if loader is None or root_mod_name == "__main__":
+-        # import name is not found, or interactive/main module
++        # ImportError: the machinery told us it does not exist
++        # ValueError:
++        #    - the module name was invalid
++        #    - the module name is __main__
++        #    - we raised `ValueError` due to `root_spec` being `None`
+         return os.getcwd()
+ 
+-    if hasattr(loader, "get_filename"):
+-        filename = loader.get_filename(root_mod_name)
+-    elif hasattr(loader, "archive"):
+-        # zipimporter's loader.archive points to the .egg or .zip file.
+-        filename = loader.archive
+-    else:
+-        # At least one loader is missing both get_filename and archive:
+-        # Google App Engine's HardenedModulesHook, use __file__.
+-        filename = importlib.import_module(root_mod_name).__file__
+-
+-    package_path = os.path.abspath(os.path.dirname(filename))
++    if root_spec.origin in {"namespace", None}:
++        # namespace package
++        package_spec = importlib.util.find_spec(import_name)
+ 
+-    # If the imported name is a package, filename is currently pointing
+-    # to the root of the package, need to get the current directory.
+-    if _matching_loader_thinks_module_is_package(loader, root_mod_name):
+-        package_path = os.path.dirname(package_path)
++        if package_spec is not None and package_spec.submodule_search_locations:
++            # Pick the path in the namespace that contains the submodule.
++            package_path = pathlib.Path(
++                os.path.commonpath(package_spec.submodule_search_locations)
++            )
++            search_location = next(
++                location
++                for location in root_spec.submodule_search_locations
++                if _path_is_relative_to(package_path, location)
++            )
++        else:
++            # Pick the first path.
++            search_location = root_spec.submodule_search_locations[0]
+ 
+-    return package_path
++        return os.path.dirname(search_location)
++    elif root_spec.submodule_search_locations:
++        # package with __init__.py
++        return os.path.dirname(os.path.dirname(root_spec.origin))
++    else:
++        # module
++        return os.path.dirname(root_spec.origin)
+ 
+ 
+ def find_package(import_name: str):
+
+diff --git a/src/flask/testing.py b/src/flask/testing.py
+index 773f152..69aa785 100644
+--- a/src/flask/testing.py
++++ b/src/flask/testing.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import importlib.metadata
+ import typing as t
+ from contextlib import contextmanager
+ from contextlib import ExitStack
+@@ -92,6 +93,18 @@ class EnvironBuilder(werkzeug.test.EnvironBuilder):
+         return self.app.json.dumps(obj, **kwargs)
+ 
+ 
++_werkzeug_version = ""
++
++
++def _get_werkzeug_version() -> str:
++    global _werkzeug_version
++
++    if not _werkzeug_version:
++        _werkzeug_version = importlib.metadata.version("werkzeug")
++
++    return _werkzeug_version
++
++
+ class FlaskClient(Client):
+     """Works like a regular Werkzeug test client but has knowledge about
+     Flask's contexts to defer the cleanup of the request context until
+@@ -115,7 +128,7 @@ class FlaskClient(Client):
+         self._context_stack = ExitStack()
+         self.environ_base = {
+             "REMOTE_ADDR": "127.0.0.1",
+-            "HTTP_USER_AGENT": f"werkzeug/{werkzeug.__version__}",
++            "HTTP_USER_AGENT": f"Werkzeug/{_get_werkzeug_version()}",
+         }
+ 
+     @contextmanager

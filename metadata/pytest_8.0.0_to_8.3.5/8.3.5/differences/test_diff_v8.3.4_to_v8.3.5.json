@@ -1,0 +1,177 @@
+{
+  "old_dir": ".packages/pytest/8.3.4",
+  "new_dir": ".packages/pytest/8.3.5",
+  "extracted_at": "2026-04-12T11:24:23.514417",
+  "diff_file": "confirmed/pytest/8.3.5/differences/test_diff_v8.3.4_to_v8.3.5.diff",
+  "diff_content": "diff --git a/testing/conftest.py b/testing/conftest.py\nindex 69af033..194da0f 100644\n--- a/testing/conftest.py\n+++ b/testing/conftest.py\n@@ -2,10 +2,13 @@\n from __future__ import annotations\n \n import dataclasses\n+import importlib.metadata\n import re\n import sys\n from typing import Generator\n \n+from packaging.version import Version\n+\n from _pytest.monkeypatch import MonkeyPatch\n from _pytest.pytester import Pytester\n import pytest\n@@ -168,6 +171,9 @@ def color_mapping():\n \n     Used by tests which check the actual colors output by pytest.\n     \"\"\"\n+    # https://github.com/pygments/pygments/commit/d24e272894a56a98b1b718d9ac5fabc20124882a\n+    pygments_version = Version(importlib.metadata.version(\"pygments\"))\n+    pygments_has_kwspace_hl = pygments_version >= Version(\"2.19\")\n \n     class ColorMapping:\n         COLORS = {\n@@ -180,6 +186,7 @@ def color_mapping():\n             \"bold\": \"\\x1b[1m\",\n             \"reset\": \"\\x1b[0m\",\n             \"kw\": \"\\x1b[94m\",\n+            \"kwspace\": \"\\x1b[90m \\x1b[39;49;00m\" if pygments_has_kwspace_hl else \" \",\n             \"hl-reset\": \"\\x1b[39;49;00m\",\n             \"function\": \"\\x1b[92m\",\n             \"number\": \"\\x1b[94m\",\n\ndiff --git a/testing/test_capture.py b/testing/test_capture.py\nindex 328de74..adf1c3b 100644\n--- a/testing/test_capture.py\n+++ b/testing/test_capture.py\n@@ -5,6 +5,7 @@ import contextlib\n import io\n from io import UnsupportedOperation\n import os\n+import re\n import subprocess\n import sys\n import textwrap\n@@ -1666,3 +1667,32 @@ def test_logging_while_collecting(pytester: Pytester) -> None:\n     )\n     result.stdout.no_fnmatch_line(\"*Captured stderr call*\")\n     result.stdout.no_fnmatch_line(\"*during collection*\")\n+\n+\n+def test_libedit_workaround(pytester: Pytester) -> None:\n+    pytester.makeconftest(\"\"\"\n+    import pytest\n+\n+\n+    def pytest_terminal_summary(config):\n+        capture = config.pluginmanager.getplugin(\"capturemanager\")\n+        capture.suspend_global_capture(in_=True)\n+\n+        print(\"Enter 'hi'\")\n+        value = input()\n+        print(f\"value: {value!r}\")\n+\n+        capture.resume_global_capture()\n+    \"\"\")\n+    readline = pytest.importorskip(\"readline\")\n+    backend = getattr(readline, \"backend\", readline.__doc__)  # added in Python 3.13\n+    print(f\"Readline backend: {backend}\")\n+\n+    child = pytester.spawn_pytest(\"\")\n+    child.expect(r\"Enter 'hi'\")\n+    child.sendline(\"hi\")\n+    rest = child.read().decode(\"utf8\")\n+    print(rest)\n+    match = re.search(r\"^value: '(.*)'\\r?$\", rest, re.MULTILINE)\n+    assert match is not None\n+    assert match.group(1) == \"hi\"\n\ndiff --git a/testing/test_pathlib.py b/testing/test_pathlib.py\nindex 6235930..dbf7688 100644\n--- a/testing/test_pathlib.py\n+++ b/testing/test_pathlib.py\n@@ -38,6 +38,7 @@ from _pytest.pathlib import module_name_from_path\n from _pytest.pathlib import resolve_package_path\n from _pytest.pathlib import resolve_pkg_root_and_module_name\n from _pytest.pathlib import safe_exists\n+from _pytest.pathlib import scandir\n from _pytest.pathlib import spec_matches_module_path\n from _pytest.pathlib import symlink_or_skip\n from _pytest.pathlib import visit\n@@ -569,6 +570,29 @@ def test_samefile_false_negatives(tmp_path: Path, monkeypatch: MonkeyPatch) -> N\n     assert getattr(module, \"foo\")() == 42\n \n \n+def test_scandir_with_non_existent_directory() -> None:\n+    # Test with a directory that does not exist\n+    non_existent_dir = \"path_to_non_existent_dir\"\n+    result = scandir(non_existent_dir)\n+    # Assert that the result is an empty list\n+    assert result == []\n+\n+\n+def test_scandir_handles_os_error() -> None:\n+    # Create a mock entry that will raise an OSError when is_file is called\n+    mock_entry = unittest.mock.MagicMock()\n+    mock_entry.is_file.side_effect = OSError(\"some permission error\")\n+    # Mock os.scandir to return an iterator with our mock entry\n+    with unittest.mock.patch(\"os.scandir\") as mock_scandir:\n+        mock_scandir.return_value.__enter__.return_value = [mock_entry]\n+        # Call the scandir function with a path\n+        # We expect an OSError to be raised here\n+        with pytest.raises(OSError, match=\"some permission error\"):\n+            scandir(\"/fake/path\")\n+        # Verify that the is_file method was called on the mock entry\n+        mock_entry.is_file.assert_called_once()\n+\n+\n class TestImportLibMode:\n     def test_importmode_importlib_with_dataclass(\n         self, tmp_path: Path, ns_param: bool\n@@ -922,6 +946,37 @@ class TestImportLibMode:\n         result = pytester.runpytest(\"--import-mode=importlib\")\n         result.stdout.fnmatch_lines(\"* 1 passed *\")\n \n+    @pytest.mark.parametrize(\"name\", [\"code\", \"time\", \"math\"])\n+    def test_importlib_same_name_as_stl(\n+        self, pytester, ns_param: bool, tmp_path: Path, name: str\n+    ):\n+        \"\"\"Import a namespace package with the same name as the standard library (#13026).\"\"\"\n+        file_path = pytester.path / f\"{name}/foo/test_demo.py\"\n+        file_path.parent.mkdir(parents=True)\n+        file_path.write_text(\n+            dedent(\n+                \"\"\"\n+            def test_demo():\n+                pass\n+            \"\"\"\n+            ),\n+            encoding=\"utf-8\",\n+        )\n+\n+        # unit test\n+        __import__(name)  # import standard library\n+\n+        import_path(  # import user files\n+            file_path,\n+            mode=ImportMode.importlib,\n+            root=pytester.path,\n+            consider_namespace_packages=ns_param,\n+        )\n+\n+        # E2E test\n+        result = pytester.runpytest(\"--import-mode=importlib\")\n+        result.stdout.fnmatch_lines(\"* 1 passed *\")\n+\n     def create_installed_doctests_and_tests_dir(\n         self, path: Path, monkeypatch: MonkeyPatch\n     ) -> tuple[Path, Path, Path]:\n@@ -1467,6 +1522,34 @@ class TestNamespacePackages:\n             ]\n         )\n \n+    def test_ns_multiple_levels_import_error(\n+        self,\n+        tmp_path: Path,\n+        pytester: Pytester,\n+    ) -> None:\n+        # Trigger condition 1: ns and file with the same name\n+        file = pytester.path / \"cow/moo/moo.py\"\n+        file.parent.mkdir(parents=True)\n+        file.write_text(\"data=123\", encoding=\"utf-8\")\n+\n+        # Trigger condition 2: tests are located in ns\n+        tests = pytester.path / \"cow/moo/test_moo.py\"\n+\n+        tests.write_text(\n+            dedent(\n+                \"\"\"\n+            from cow.moo.moo import data\n+\n+            def test_moo():\n+                print(data)\n+            \"\"\"\n+            ),\n+            encoding=\"utf-8\",\n+        )\n+\n+        result = pytester.runpytest(\"--import-mode=importlib\")\n+        assert result.ret == ExitCode.OK\n+\n     @pytest.mark.parametrize(\"import_mode\", [\"prepend\", \"append\", \"importlib\"])\n     def test_incorrect_namespace_package(\n         self,\n\ndiff --git a/testing/test_terminal.py b/testing/test_terminal.py\nindex 14c152d..1412556 100644\n--- a/testing/test_terminal.py\n+++ b/testing/test_terminal.py\n@@ -1299,13 +1299,13 @@ def test_color_yes(pytester: Pytester, color_mapping) -> None:\n                 \"=*= FAILURES =*=\",\n                 \"{red}{bold}_*_ test_this _*_{reset}\",\n                 \"\",\n-                \"    {reset}{kw}def{hl-reset} {function}test_this{hl-reset}():{endline}\",\n+                \"    {reset}{kw}def{hl-reset}{kwspace}{function}test_this{hl-reset}():{endline}\",\n                 \">       fail(){endline}\",\n                 \"\",\n                 \"{bold}{red}test_color_yes.py{reset}:5: \",\n                 \"_ _ * _ _*\",\n                 \"\",\n-                \"    {reset}{kw}def{hl-reset} {function}fail{hl-reset}():{endline}\",\n+                \"    {reset}{kw}def{hl-reset}{kwspace}{function}fail{hl-reset}():{endline}\",\n                 \">       {kw}assert{hl-reset} {number}0{hl-reset}{endline}\",\n                 \"{bold}{red}E       assert 0{reset}\",\n                 \"\",\n@@ -2525,6 +2525,35 @@ def test_short_summary_with_verbose(\n     )\n \n \n+def test_full_sequence_print_with_vv(\n+    monkeypatch: MonkeyPatch, pytester: Pytester\n+) -> None:\n+    \"\"\"Do not truncate sequences in summaries with -vv (#11777).\"\"\"\n+    monkeypatch.setattr(_pytest.terminal, \"running_on_ci\", lambda: False)\n+\n+    pytester.makepyfile(\n+        \"\"\"\n+        def test_len_list():\n+            l = list(range(10))\n+            assert len(l) == 9\n+\n+        def test_len_dict():\n+            d = dict(zip(range(10), range(10)))\n+            assert len(d) == 9\n+        \"\"\"\n+    )\n+\n+    result = pytester.runpytest(\"-vv\")\n+    assert result.ret == 1\n+    result.stdout.fnmatch_lines(\n+        [\n+            \"*short test summary info*\",\n+            f\"*{list(range(10))}*\",\n+            f\"*{dict(zip(range(10), range(10)))}*\",\n+        ]\n+    )\n+\n+\n @pytest.mark.parametrize(\n     \"seconds, expected\",\n     [\n@@ -2585,7 +2614,7 @@ class TestCodeHighlight:\n         result.stdout.fnmatch_lines(\n             color_mapping.format_for_fnmatch(\n                 [\n-                    \"    {reset}{kw}def{hl-reset} {function}test_foo{hl-reset}():{endline}\",\n+                    \"    {reset}{kw}def{hl-reset}{kwspace}{function}test_foo{hl-reset}():{endline}\",\n                     \">       {kw}assert{hl-reset} {number}1{hl-reset} == {number}10{hl-reset}{endline}\",\n                     \"{bold}{red}E       assert 1 == 10{reset}\",\n                 ]\n@@ -2607,7 +2636,7 @@ class TestCodeHighlight:\n         result.stdout.fnmatch_lines(\n             color_mapping.format_for_fnmatch(\n                 [\n-                    \"    {reset}{kw}def{hl-reset} {function}test_foo{hl-reset}():{endline}\",\n+                    \"    {reset}{kw}def{hl-reset}{kwspace}{function}test_foo{hl-reset}():{endline}\",\n                     \"        {print}print{hl-reset}({str}'''{hl-reset}{str}{hl-reset}\",\n                     \">   {str}    {hl-reset}{str}'''{hl-reset}); {kw}assert{hl-reset} {number}0{hl-reset}{endline}\",\n                     \"{bold}{red}E       assert 0{reset}\",\n@@ -2630,7 +2659,7 @@ class TestCodeHighlight:\n         result.stdout.fnmatch_lines(\n             color_mapping.format_for_fnmatch(\n                 [\n-                    \"    {reset}{kw}def{hl-reset} {function}test_foo{hl-reset}():{endline}\",\n+                    \"    {reset}{kw}def{hl-reset}{kwspace}{function}test_foo{hl-reset}():{endline}\",\n                     \">       {kw}assert{hl-reset} {number}1{hl-reset} == {number}10{hl-reset}{endline}\",\n                     \"{bold}{red}E       assert 1 == 10{reset}\",\n                 ]\n",
+  "structured_diff": {
+    "testing/conftest.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -2,10 +2,13 @@",
+          "snippet": " from __future__ import annotations\n \n import dataclasses\n+import importlib.metadata\n import re\n import sys\n from typing import Generator\n \n+from packaging.version import Version\n+\n from _pytest.monkeypatch import MonkeyPatch\n from _pytest.pytester import Pytester\n import pytest",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "testing/conftest.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -168,6 +171,9 @@",
+          "snippet": " def color_mapping():\n \n     Used by tests which check the actual colors output by pytest.\n     \"\"\"\n+    # https://github.com/pygments/pygments/commit/d24e272894a56a98b1b718d9ac5fabc20124882a\n+    pygments_version = Version(importlib.metadata.version(\"pygments\"))\n+    pygments_has_kwspace_hl = pygments_version >= Version(\"2.19\")\n \n     class ColorMapping:\n         COLORS = {",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "testing/conftest.py::color_mapping"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -180,6 +186,7 @@",
+          "snippet": " def color_mapping():\n             \"bold\": \"\\x1b[1m\",\n             \"reset\": \"\\x1b[0m\",\n             \"kw\": \"\\x1b[94m\",\n+            \"kwspace\": \"\\x1b[90m \\x1b[39;49;00m\" if pygments_has_kwspace_hl else \" \",\n             \"hl-reset\": \"\\x1b[39;49;00m\",\n             \"function\": \"\\x1b[92m\",\n             \"number\": \"\\x1b[94m\",\n",
+          "affect": [
+            {
+              "kind": "attribute",
+              "node": "testing/conftest.py::ColorMapping::COLORS"
+            }
+          ]
+        }
+      ]
+    },
+    "testing/test_capture.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -5,6 +5,7 @@",
+          "snippet": " import contextlib\n import io\n from io import UnsupportedOperation\n import os\n+import re\n import subprocess\n import sys\n import textwrap",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "testing/test_capture.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1666,3 +1667,32 @@",
+          "snippet": " def test_logging_while_collecting(pytester: Pytester) -> None:\n     )\n     result.stdout.no_fnmatch_line(\"*Captured stderr call*\")\n     result.stdout.no_fnmatch_line(\"*during collection*\")\n+\n+\n+def test_libedit_workaround(pytester: Pytester) -> None:\n+    pytester.makeconftest(\"\"\"\n+    import pytest\n+\n+\n+    def pytest_terminal_summary(config):\n+        capture = config.pluginmanager.getplugin(\"capturemanager\")\n+        capture.suspend_global_capture(in_=True)\n+\n+        print(\"Enter 'hi'\")\n+        value = input()\n+        print(f\"value: {value!r}\")\n+\n+        capture.resume_global_capture()\n+    \"\"\")\n+    readline = pytest.importorskip(\"readline\")\n+    backend = getattr(readline, \"backend\", readline.__doc__)  # added in Python 3.13\n+    print(f\"Readline backend: {backend}\")\n+\n+    child = pytester.spawn_pytest(\"\")\n+    child.expect(r\"Enter 'hi'\")\n+    child.sendline(\"hi\")\n+    rest = child.read().decode(\"utf8\")\n+    print(rest)\n+    match = re.search(r\"^value: '(.*)'\\r?$\", rest, re.MULTILINE)\n+    assert match is not None\n+    assert match.group(1) == \"hi\"\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "testing/test_capture.py::test_libedit_workaround"
+            }
+          ]
+        }
+      ]
+    },
+    "testing/test_pathlib.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -38,6 +38,7 @@",
+          "snippet": " from _pytest.pathlib import module_name_from_path\n from _pytest.pathlib import resolve_package_path\n from _pytest.pathlib import resolve_pkg_root_and_module_name\n from _pytest.pathlib import safe_exists\n+from _pytest.pathlib import scandir\n from _pytest.pathlib import spec_matches_module_path\n from _pytest.pathlib import symlink_or_skip\n from _pytest.pathlib import visit",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "testing/test_pathlib.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -569,6 +570,29 @@",
+          "snippet": " def test_samefile_false_negatives(tmp_path: Path, monkeypatch: MonkeyPatch) -> N\n     assert getattr(module, \"foo\")() == 42\n \n \n+def test_scandir_with_non_existent_directory() -> None:\n+    # Test with a directory that does not exist\n+    non_existent_dir = \"path_to_non_existent_dir\"\n+    result = scandir(non_existent_dir)\n+    # Assert that the result is an empty list\n+    assert result == []\n+\n+\n+def test_scandir_handles_os_error() -> None:\n+    # Create a mock entry that will raise an OSError when is_file is called\n+    mock_entry = unittest.mock.MagicMock()\n+    mock_entry.is_file.side_effect = OSError(\"some permission error\")\n+    # Mock os.scandir to return an iterator with our mock entry\n+    with unittest.mock.patch(\"os.scandir\") as mock_scandir:\n+        mock_scandir.return_value.__enter__.return_value = [mock_entry]\n+        # Call the scandir function with a path\n+        # We expect an OSError to be raised here\n+        with pytest.raises(OSError, match=\"some permission error\"):\n+            scandir(\"/fake/path\")\n+        # Verify that the is_file method was called on the mock entry\n+        mock_entry.is_file.assert_called_once()\n+\n+\n class TestImportLibMode:\n     def test_importmode_importlib_with_dataclass(\n         self, tmp_path: Path, ns_param: bool",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "testing/test_pathlib.py::test_scandir_with_non_existent_directory"
+            },
+            {
+              "kind": "function",
+              "node": "testing/test_pathlib.py::test_scandir_handles_os_error"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -922,6 +946,37 @@",
+          "snippet": " class TestImportLibMode:\n         result = pytester.runpytest(\"--import-mode=importlib\")\n         result.stdout.fnmatch_lines(\"* 1 passed *\")\n \n+    @pytest.mark.parametrize(\"name\", [\"code\", \"time\", \"math\"])\n+    def test_importlib_same_name_as_stl(\n+        self, pytester, ns_param: bool, tmp_path: Path, name: str\n+    ):\n+        \"\"\"Import a namespace package with the same name as the standard library (#13026).\"\"\"\n+        file_path = pytester.path / f\"{name}/foo/test_demo.py\"\n+        file_path.parent.mkdir(parents=True)\n+        file_path.write_text(\n+            dedent(\n+                \"\"\"\n+            def test_demo():\n+                pass\n+            \"\"\"\n+            ),\n+            encoding=\"utf-8\",\n+        )\n+\n+        # unit test\n+        __import__(name)  # import standard library\n+\n+        import_path(  # import user files\n+            file_path,\n+            mode=ImportMode.importlib,\n+            root=pytester.path,\n+            consider_namespace_packages=ns_param,\n+        )\n+\n+        # E2E test\n+        result = pytester.runpytest(\"--import-mode=importlib\")\n+        result.stdout.fnmatch_lines(\"* 1 passed *\")\n+\n     def create_installed_doctests_and_tests_dir(\n         self, path: Path, monkeypatch: MonkeyPatch\n     ) -> tuple[Path, Path, Path]:",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "testing/test_pathlib.py::TestImportLibMode"
+            },
+            {
+              "kind": "method",
+              "node": "testing/test_pathlib.py::TestImportLibMode::test_importlib_same_name_as_stl"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -1467,6 +1522,34 @@",
+          "snippet": " class TestNamespacePackages:\n             ]\n         )\n \n+    def test_ns_multiple_levels_import_error(\n+        self,\n+        tmp_path: Path,\n+        pytester: Pytester,\n+    ) -> None:\n+        # Trigger condition 1: ns and file with the same name\n+        file = pytester.path / \"cow/moo/moo.py\"\n+        file.parent.mkdir(parents=True)\n+        file.write_text(\"data=123\", encoding=\"utf-8\")\n+\n+        # Trigger condition 2: tests are located in ns\n+        tests = pytester.path / \"cow/moo/test_moo.py\"\n+\n+        tests.write_text(\n+            dedent(\n+                \"\"\"\n+            from cow.moo.moo import data\n+\n+            def test_moo():\n+                print(data)\n+            \"\"\"\n+            ),\n+            encoding=\"utf-8\",\n+        )\n+\n+        result = pytester.runpytest(\"--import-mode=importlib\")\n+        assert result.ret == ExitCode.OK\n+\n     @pytest.mark.parametrize(\"import_mode\", [\"prepend\", \"append\", \"importlib\"])\n     def test_incorrect_namespace_package(\n         self,\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "testing/test_pathlib.py::TestNamespacePackages::test_ns_multiple_levels_import_error"
+            },
+            {
+              "kind": "class",
+              "node": "testing/test_pathlib.py::TestNamespacePackages"
+            }
+          ]
+        }
+      ]
+    },
+    "testing/test_terminal.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1299,13 +1299,13 @@",
+          "snippet": " def test_color_yes(pytester: Pytester, color_mapping) -> None:\n                 \"=*= FAILURES =*=\",\n                 \"{red}{bold}_*_ test_this _*_{reset}\",\n                 \"\",\n-                \"    {reset}{kw}def{hl-reset} {function}test_this{hl-reset}():{endline}\",\n+                \"    {reset}{kw}def{hl-reset}{kwspace}{function}test_this{hl-reset}():{endline}\",\n                 \">       fail(){endline}\",\n                 \"\",\n                 \"{bold}{red}test_color_yes.py{reset}:5: \",\n                 \"_ _ * _ _*\",\n                 \"\",\n-                \"    {reset}{kw}def{hl-reset} {function}fail{hl-reset}():{endline}\",\n+                \"    {reset}{kw}def{hl-reset}{kwspace}{function}fail{hl-reset}():{endline}\",\n                 \">       {kw}assert{hl-reset} {number}0{hl-reset}{endline}\",\n                 \"{bold}{red}E       assert 0{reset}\",\n                 \"\",",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "testing/test_terminal.py::test_color_yes"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2525,6 +2525,35 @@",
+          "snippet": " def test_short_summary_with_verbose(\n     )\n \n \n+def test_full_sequence_print_with_vv(\n+    monkeypatch: MonkeyPatch, pytester: Pytester\n+) -> None:\n+    \"\"\"Do not truncate sequences in summaries with -vv (#11777).\"\"\"\n+    monkeypatch.setattr(_pytest.terminal, \"running_on_ci\", lambda: False)\n+\n+    pytester.makepyfile(\n+        \"\"\"\n+        def test_len_list():\n+            l = list(range(10))\n+            assert len(l) == 9\n+\n+        def test_len_dict():\n+            d = dict(zip(range(10), range(10)))\n+            assert len(d) == 9\n+        \"\"\"\n+    )\n+\n+    result = pytester.runpytest(\"-vv\")\n+    assert result.ret == 1\n+    result.stdout.fnmatch_lines(\n+        [\n+            \"*short test summary info*\",\n+            f\"*{list(range(10))}*\",\n+            f\"*{dict(zip(range(10), range(10)))}*\",\n+        ]\n+    )\n+\n+\n @pytest.mark.parametrize(\n     \"seconds, expected\",\n     [",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "testing/test_terminal.py::test_full_sequence_print_with_vv"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2585,7 +2614,7 @@",
+          "snippet": " class TestCodeHighlight:\n         result.stdout.fnmatch_lines(\n             color_mapping.format_for_fnmatch(\n                 [\n-                    \"    {reset}{kw}def{hl-reset} {function}test_foo{hl-reset}():{endline}\",\n+                    \"    {reset}{kw}def{hl-reset}{kwspace}{function}test_foo{hl-reset}():{endline}\",\n                     \">       {kw}assert{hl-reset} {number}1{hl-reset} == {number}10{hl-reset}{endline}\",\n                     \"{bold}{red}E       assert 1 == 10{reset}\",\n                 ]",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "testing/test_terminal.py::TestCodeHighlight::test_code_highlight_simple"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2607,7 +2636,7 @@",
+          "snippet": " class TestCodeHighlight:\n         result.stdout.fnmatch_lines(\n             color_mapping.format_for_fnmatch(\n                 [\n-                    \"    {reset}{kw}def{hl-reset} {function}test_foo{hl-reset}():{endline}\",\n+                    \"    {reset}{kw}def{hl-reset}{kwspace}{function}test_foo{hl-reset}():{endline}\",\n                     \"        {print}print{hl-reset}({str}'''{hl-reset}{str}{hl-reset}\",\n                     \">   {str}    {hl-reset}{str}'''{hl-reset}); {kw}assert{hl-reset} {number}0{hl-reset}{endline}\",\n                     \"{bold}{red}E       assert 0{reset}\",",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "testing/test_terminal.py::TestCodeHighlight::test_code_highlight_continuation"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -2630,7 +2659,7 @@",
+          "snippet": " class TestCodeHighlight:\n         result.stdout.fnmatch_lines(\n             color_mapping.format_for_fnmatch(\n                 [\n-                    \"    {reset}{kw}def{hl-reset} {function}test_foo{hl-reset}():{endline}\",\n+                    \"    {reset}{kw}def{hl-reset}{kwspace}{function}test_foo{hl-reset}():{endline}\",\n                     \">       {kw}assert{hl-reset} {number}1{hl-reset} == {number}10{hl-reset}{endline}\",\n                     \"{bold}{red}E       assert 1 == 10{reset}\",\n                 ]",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "testing/test_terminal.py::TestCodeHighlight::test_code_highlight_custom_theme"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

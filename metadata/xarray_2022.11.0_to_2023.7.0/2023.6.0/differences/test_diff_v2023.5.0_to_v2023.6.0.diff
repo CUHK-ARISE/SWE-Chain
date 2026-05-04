@@ -1,0 +1,551 @@
+diff --git a/xarray/tests/test_backends.py b/xarray/tests/test_backends.py
+index 190adab..0450e76 100644
+--- a/xarray/tests/test_backends.py
++++ b/xarray/tests/test_backends.py
+@@ -46,6 +46,7 @@ from xarray.backends.netCDF4_ import (
+ )
+ from xarray.backends.pydap_ import PydapDataStore
+ from xarray.backends.scipy_ import ScipyBackendEntrypoint
++from xarray.coding.strings import check_vlen_dtype, create_vlen_dtype
+ from xarray.coding.variables import SerializationWarning
+ from xarray.conventions import encode_dataset_coordinates
+ from xarray.core import indexing
+@@ -859,6 +860,20 @@ class CFEncodedBase(DatasetIOBase):
+             with self.roundtrip(original) as actual:
+                 assert_identical(expected, actual)
+ 
++    def test_roundtrip_empty_vlen_string_array(self) -> None:
++        # checks preserving vlen dtype for empty arrays GH7862
++        dtype = create_vlen_dtype(str)
++        original = Dataset({"a": np.array([], dtype=dtype)})
++        assert check_vlen_dtype(original["a"].dtype) == str
++        with self.roundtrip(original) as actual:
++            assert_identical(original, actual)
++            assert object == actual["a"].dtype
++            assert actual["a"].dtype == original["a"].dtype
++            # only check metadata for capable backends
++            # eg. NETCDF3 based backends do not roundtrip metadata
++            if actual["a"].dtype.metadata is not None:
++                assert check_vlen_dtype(actual["a"].dtype) == str
++
+     @pytest.mark.parametrize(
+         "decoded_fn, encoded_fn",
+         [
+@@ -1834,6 +1849,8 @@ class ZarrBase(CFEncodedBase):
+         with self.create_zarr_target() as store_target, self.create_zarr_target() as chunk_store:
+             save_kwargs = {"chunk_store": chunk_store}
+             self.save(expected, store_target, **save_kwargs)
++            # the chunk store must have been populated with some entries
++            assert len(chunk_store) > 0
+             open_kwargs = {"backend_kwargs": {"chunk_store": chunk_store}}
+             with self.open(store_target, **open_kwargs) as ds:
+                 assert_equal(ds, expected)
+
+diff --git a/xarray/tests/test_coding_strings.py b/xarray/tests/test_coding_strings.py
+index cb9595f..0c9f67e 100644
+--- a/xarray/tests/test_coding_strings.py
++++ b/xarray/tests/test_coding_strings.py
+@@ -32,6 +32,10 @@ def test_vlen_dtype() -> None:
+     assert strings.is_bytes_dtype(dtype)
+     assert strings.check_vlen_dtype(dtype) is bytes
+ 
++    # check h5py variant ("vlen")
++    dtype = np.dtype("O", metadata={"vlen": str})  # type: ignore[call-overload]
++    assert strings.check_vlen_dtype(dtype) is str
++
+     assert strings.check_vlen_dtype(np.dtype(object)) is None
+ 
+ 
+
+diff --git a/xarray/tests/test_conventions.py b/xarray/tests/test_conventions.py
+index acdf9c8..424b7db 100644
+--- a/xarray/tests/test_conventions.py
++++ b/xarray/tests/test_conventions.py
+@@ -487,3 +487,18 @@ def test_decode_cf_error_includes_variable_name():
+     ds = Dataset({"invalid": ([], 1e36, {"units": "days since 2000-01-01"})})
+     with pytest.raises(ValueError, match="Failed to decode variable 'invalid'"):
+         decode_cf(ds)
++
++
++def test_encode_cf_variable_with_vlen_dtype() -> None:
++    v = Variable(
++        ["x"], np.array(["a", "b"], dtype=coding.strings.create_vlen_dtype(str))
++    )
++    encoded_v = conventions.encode_cf_variable(v)
++    assert encoded_v.data.dtype.kind == "O"
++    assert coding.strings.check_vlen_dtype(encoded_v.data.dtype) == str
++
++    # empty array
++    v = Variable(["x"], np.array([], dtype=coding.strings.create_vlen_dtype(str)))
++    encoded_v = conventions.encode_cf_variable(v)
++    assert encoded_v.data.dtype.kind == "O"
++    assert coding.strings.check_vlen_dtype(encoded_v.data.dtype) == str
+
+diff --git a/xarray/tests/test_dataarray.py b/xarray/tests/test_dataarray.py
+index 263653e..cee5afa 100644
+--- a/xarray/tests/test_dataarray.py
++++ b/xarray/tests/test_dataarray.py
+@@ -1698,6 +1698,19 @@ class TestDataArray:
+         assert_identical(expected, actual)
+         assert actual.dtype == expected.dtype
+ 
++    def test_reindex_empty_array_dtype(self) -> None:
++        # Dtype of reindex result should match dtype of the original DataArray.
++        # See GH issue #7299
++        x = xr.DataArray([], dims=("x",), coords={"x": []}).astype("float32")
++        y = x.reindex(x=[1.0, 2.0])
++
++        assert (
++            x.dtype == y.dtype
++        ), "Dtype of reindexed DataArray should match dtype of the original DataArray"
++        assert (
++            y.dtype == np.float32
++        ), "Dtype of reindexed DataArray should remain float32"
++
+     def test_rename(self) -> None:
+         da = xr.DataArray(
+             [1, 2, 3], dims="dim", name="name", coords={"coord": ("dim", [5, 6, 7])}
+@@ -3548,6 +3561,10 @@ class TestDataArray:
+         ma = da.to_masked_array()
+         assert len(ma.mask) == N
+ 
++    @pytest.mark.skipif(
++        Version(np.__version__) > Version("1.24") or sys.version_info[:2] > (3, 10),
++        reason="cdms2 is unmaintained and does not support newer `numpy` or python versions",
++    )
+     def test_to_and_from_cdms2_classic(self) -> None:
+         """Classic with 1D axes"""
+         pytest.importorskip("cdms2")
+@@ -3565,7 +3582,8 @@ class TestDataArray:
+             IndexVariable("distance", [-2, 2]),
+             IndexVariable("time", [0, 1, 2]),
+         ]
+-        actual = original.to_cdms2()
++        with pytest.deprecated_call(match=".*cdms2"):
++            actual = original.to_cdms2()
+         assert_array_equal(actual.asma(), original)
+         assert actual.id == original.name
+         assert tuple(actual.getAxisIds()) == original.dims
+@@ -3578,7 +3596,8 @@ class TestDataArray:
+         assert len(component_times) == 3
+         assert str(component_times[0]) == "2000-1-1 0:0:0.0"
+ 
+-        roundtripped = DataArray.from_cdms2(actual)
++        with pytest.deprecated_call(match=".*cdms2"):
++            roundtripped = DataArray.from_cdms2(actual)
+         assert_identical(original, roundtripped)
+ 
+         back = from_cdms2(actual)
+@@ -3587,6 +3606,10 @@ class TestDataArray:
+         for coord_name in original.coords.keys():
+             assert_array_equal(original.coords[coord_name], back.coords[coord_name])
+ 
++    @pytest.mark.skipif(
++        Version(np.__version__) > Version("1.24") or sys.version_info[:2] > (3, 10),
++        reason="cdms2 is unmaintained and does not support newer `numpy` or python versions",
++    )
+     def test_to_and_from_cdms2_sgrid(self) -> None:
+         """Curvilinear (structured) grid
+ 
+@@ -3605,7 +3628,8 @@ class TestDataArray:
+             coords=dict(x=x, y=y, lon=lon, lat=lat),
+             name="sst",
+         )
+-        actual = original.to_cdms2()
++        with pytest.deprecated_call():
++            actual = original.to_cdms2()
+         assert tuple(actual.getAxisIds()) == original.dims
+         assert_array_equal(original.coords["lon"], actual.getLongitude().asma())
+         assert_array_equal(original.coords["lat"], actual.getLatitude().asma())
+@@ -3616,6 +3640,10 @@ class TestDataArray:
+         assert_array_equal(original.coords["lat"], back.coords["lat"])
+         assert_array_equal(original.coords["lon"], back.coords["lon"])
+ 
++    @pytest.mark.skipif(
++        Version(np.__version__) > Version("1.24") or sys.version_info[:2] > (3, 10),
++        reason="cdms2 is unmaintained and does not support newer `numpy` or python versions",
++    )
+     def test_to_and_from_cdms2_ugrid(self) -> None:
+         """Unstructured grid"""
+         pytest.importorskip("cdms2")
+@@ -3626,7 +3654,8 @@ class TestDataArray:
+         original = DataArray(
+             np.arange(5), dims=["cell"], coords={"lon": lon, "lat": lat, "cell": cell}
+         )
+-        actual = original.to_cdms2()
++        with pytest.deprecated_call(match=".*cdms2"):
++            actual = original.to_cdms2()
+         assert tuple(actual.getAxisIds()) == original.dims
+         assert_array_equal(original.coords["lon"], actual.getLongitude().getValue())
+         assert_array_equal(original.coords["lat"], actual.getLatitude().getValue())
+@@ -4399,7 +4428,7 @@ class TestDataArray:
+             da = da.chunk({"x": 1})
+ 
+         fit = da.curvefit(
+-            coords=[da.t], func=exp_decay, p0={"n0": 4}, bounds={"tau": [2, 6]}
++            coords=[da.t], func=exp_decay, p0={"n0": 4}, bounds={"tau": (2, 6)}
+         )
+         assert_allclose(fit.curvefit_coefficients, expected, rtol=1e-3)
+ 
+@@ -4420,12 +4449,183 @@ class TestDataArray:
+         assert param_defaults == {"n0": 4, "tau": 6}
+         assert bounds_defaults == {"n0": (-np.inf, np.inf), "tau": (5, np.inf)}
+ 
++        # DataArray as bound
++        param_defaults, bounds_defaults = xr.core.dataset._initialize_curvefit_params(
++            params=params,
++            p0={"n0": 4},
++            bounds={"tau": [DataArray([3, 4], coords=[("x", [1, 2])]), np.inf]},
++            func_args=func_args,
++        )
++        assert param_defaults["n0"] == 4
++        assert (
++            param_defaults["tau"] == xr.DataArray([4, 5], coords=[("x", [1, 2])])
++        ).all()
++        assert bounds_defaults["n0"] == (-np.inf, np.inf)
++        assert (
++            bounds_defaults["tau"][0] == DataArray([3, 4], coords=[("x", [1, 2])])
++        ).all()
++        assert bounds_defaults["tau"][1] == np.inf
++
+         param_names = ["a"]
+         params, func_args = xr.core.dataset._get_func_args(np.power, param_names)
+         assert params == param_names
+         with pytest.raises(ValueError):
+             xr.core.dataset._get_func_args(np.power, [])
+ 
++    @requires_scipy
++    @pytest.mark.parametrize("use_dask", [True, False])
++    def test_curvefit_multidimensional_guess(self, use_dask: bool) -> None:
++        if use_dask and not has_dask:
++            pytest.skip("requires dask")
++
++        def sine(t, a, f, p):
++            return a * np.sin(2 * np.pi * (f * t + p))
++
++        t = np.arange(0, 2, 0.02)
++        da = DataArray(
++            np.stack([sine(t, 1.0, 2, 0), sine(t, 1.0, 2, 0)]),
++            coords={"x": [0, 1], "t": t},
++        )
++
++        # Fitting to a sine curve produces a different result depending on the
++        # initial guess: either the phase is zero and the amplitude is positive
++        # or the phase is 0.5 * 2pi and the amplitude is negative.
++
++        expected = DataArray(
++            [[1, 2, 0], [-1, 2, 0.5]],
++            coords={"x": [0, 1], "param": ["a", "f", "p"]},
++        )
++
++        # Different initial guesses for different values of x
++        a_guess = DataArray([1, -1], coords=[da.x])
++        p_guess = DataArray([0, 0.5], coords=[da.x])
++
++        if use_dask:
++            da = da.chunk({"x": 1})
++
++        fit = da.curvefit(
++            coords=[da.t],
++            func=sine,
++            p0={"a": a_guess, "p": p_guess, "f": 2},
++        )
++        assert_allclose(fit.curvefit_coefficients, expected)
++
++        with pytest.raises(
++            ValueError,
++            match=r"Initial guess for 'a' has unexpected dimensions .* should only have "
++            "dimensions that are in data dimensions",
++        ):
++            # initial guess with additional dimensions should be an error
++            da.curvefit(
++                coords=[da.t],
++                func=sine,
++                p0={"a": DataArray([1, 2], coords={"foo": [1, 2]})},
++            )
++
++    @requires_scipy
++    @pytest.mark.parametrize("use_dask", [True, False])
++    def test_curvefit_multidimensional_bounds(self, use_dask: bool) -> None:
++        if use_dask and not has_dask:
++            pytest.skip("requires dask")
++
++        def sine(t, a, f, p):
++            return a * np.sin(2 * np.pi * (f * t + p))
++
++        t = np.arange(0, 2, 0.02)
++        da = xr.DataArray(
++            np.stack([sine(t, 1.0, 2, 0), sine(t, 1.0, 2, 0)]),
++            coords={"x": [0, 1], "t": t},
++        )
++
++        # Fit a sine with different bounds: positive amplitude should result in a fit with
++        # phase 0 and negative amplitude should result in phase 0.5 * 2pi.
++
++        expected = DataArray(
++            [[1, 2, 0], [-1, 2, 0.5]],
++            coords={"x": [0, 1], "param": ["a", "f", "p"]},
++        )
++
++        if use_dask:
++            da = da.chunk({"x": 1})
++
++        fit = da.curvefit(
++            coords=[da.t],
++            func=sine,
++            p0={"f": 2, "p": 0.25},  # this guess is needed to get the expected result
++            bounds={
++                "a": (
++                    DataArray([0, -2], coords=[da.x]),
++                    DataArray([2, 0], coords=[da.x]),
++                ),
++            },
++        )
++        assert_allclose(fit.curvefit_coefficients, expected)
++
++        # Scalar lower bound with array upper bound
++        fit2 = da.curvefit(
++            coords=[da.t],
++            func=sine,
++            p0={"f": 2, "p": 0.25},  # this guess is needed to get the expected result
++            bounds={
++                "a": (-2, DataArray([2, 0], coords=[da.x])),
++            },
++        )
++        assert_allclose(fit2.curvefit_coefficients, expected)
++
++        with pytest.raises(
++            ValueError,
++            match=r"Upper bound for 'a' has unexpected dimensions .* should only have "
++            "dimensions that are in data dimensions",
++        ):
++            # bounds with additional dimensions should be an error
++            da.curvefit(
++                coords=[da.t],
++                func=sine,
++                bounds={"a": (0, DataArray([1], coords={"foo": [1]}))},
++            )
++
++    @requires_scipy
++    @pytest.mark.parametrize("use_dask", [True, False])
++    def test_curvefit_ignore_errors(self, use_dask: bool) -> None:
++        if use_dask and not has_dask:
++            pytest.skip("requires dask")
++
++        # nonsense function to make the optimization fail
++        def line(x, a, b):
++            if a > 10:
++                return 0
++            return a * x + b
++
++        da = DataArray(
++            [[1, 3, 5], [0, 20, 40]],
++            coords={"i": [1, 2], "x": [0.0, 1.0, 2.0]},
++        )
++
++        if use_dask:
++            da = da.chunk({"i": 1})
++
++        expected = DataArray(
++            [[2, 1], [np.nan, np.nan]], coords={"i": [1, 2], "param": ["a", "b"]}
++        )
++
++        with pytest.raises(RuntimeError, match="calls to function has reached maxfev"):
++            da.curvefit(
++                coords="x",
++                func=line,
++                # limit maximum number of calls so the optimization fails
++                kwargs=dict(maxfev=5),
++            ).compute()  # have to compute to raise the error
++
++        fit = da.curvefit(
++            coords="x",
++            func=line,
++            errors="ignore",
++            # limit maximum number of calls so the optimization fails
++            kwargs=dict(maxfev=5),
++        ).compute()
++
++        assert_allclose(fit.curvefit_coefficients, expected)
++
+ 
+ class TestReduce:
+     @pytest.fixture(autouse=True)
+
+diff --git a/xarray/tests/test_dataset.py b/xarray/tests/test_dataset.py
+index cc9220d..01c26ad 100644
+--- a/xarray/tests/test_dataset.py
++++ b/xarray/tests/test_dataset.py
+@@ -6217,6 +6217,14 @@ class TestDataset:
+         out = ds.polyfit("time", 2)
+         assert len(out.data_vars) == 0
+ 
++    def test_polyfit_weighted(self) -> None:
++        # Make sure weighted polyfit does not change the original object (issue #5644)
++        ds = create_test_data(seed=1)
++        ds_copy = ds.copy(deep=True)
++
++        ds.polyfit("dim2", 2, w=np.arange(ds.sizes["dim2"]))
++        xr.testing.assert_identical(ds, ds_copy)
++
+     def test_polyfit_warnings(self) -> None:
+         ds = create_test_data(seed=1)
+ 
+
+diff --git a/xarray/tests/test_dtypes.py b/xarray/tests/test_dtypes.py
+index 1c942a1..490520c 100644
+--- a/xarray/tests/test_dtypes.py
++++ b/xarray/tests/test_dtypes.py
+@@ -18,17 +18,17 @@ from xarray.core import dtypes
+         ([np.bytes_, np.unicode_], np.object_),
+     ],
+ )
+-def test_result_type(args, expected):
++def test_result_type(args, expected) -> None:
+     actual = dtypes.result_type(*args)
+     assert actual == expected
+ 
+ 
+-def test_result_type_scalar():
++def test_result_type_scalar() -> None:
+     actual = dtypes.result_type(np.arange(3, dtype=np.float32), np.nan)
+     assert actual == np.float32
+ 
+ 
+-def test_result_type_dask_array():
++def test_result_type_dask_array() -> None:
+     # verify it works without evaluating dask arrays
+     da = pytest.importorskip("dask.array")
+     dask = pytest.importorskip("dask")
+@@ -50,7 +50,7 @@ def test_result_type_dask_array():
+ 
+ 
+ @pytest.mark.parametrize("obj", [1.0, np.inf, "ab", 1.0 + 1.0j, True])
+-def test_inf(obj):
++def test_inf(obj) -> None:
+     assert dtypes.INF > obj
+     assert dtypes.NINF < obj
+ 
+@@ -85,7 +85,7 @@ def test_inf(obj):
+         ("V", (np.dtype("O"), "nan")),  # dtype('V')
+     ],
+ )
+-def test_maybe_promote(kind, expected):
++def test_maybe_promote(kind, expected) -> None:
+     # 'g': np.float128 is not tested : not available on all platforms
+     # 'G': np.complex256 is not tested : not available on all platforms
+ 
+@@ -94,7 +94,7 @@ def test_maybe_promote(kind, expected):
+     assert str(actual[1]) == expected[1]
+ 
+ 
+-def test_nat_types_membership():
++def test_nat_types_membership() -> None:
+     assert np.datetime64("NaT").dtype in dtypes.NAT_TYPES
+     assert np.timedelta64("NaT").dtype in dtypes.NAT_TYPES
+     assert np.float64 not in dtypes.NAT_TYPES
+
+diff --git a/xarray/tests/test_groupby.py b/xarray/tests/test_groupby.py
+index 97ba0b5..79b18cf 100644
+--- a/xarray/tests/test_groupby.py
++++ b/xarray/tests/test_groupby.py
+@@ -137,6 +137,18 @@ def test_groupby_input_mutation() -> None:
+     assert_identical(array, array_copy)  # should not modify inputs
+ 
+ 
++@pytest.mark.parametrize("use_flox", [True, False])
++def test_groupby_indexvariable(use_flox: bool) -> None:
++    # regression test for GH7919
++    array = xr.DataArray([1, 2, 3], [("x", [2, 2, 1])])
++    iv = xr.IndexVariable(dims="x", data=pd.Index(array.x.values))
++    with xr.set_options(use_flox=use_flox):
++        actual = array.groupby(iv).sum()
++    actual = array.groupby(iv).sum()
++    expected = xr.DataArray([3, 3], [("x", [1, 2])])
++    assert_identical(expected, actual)
++
++
+ @pytest.mark.parametrize(
+     "obj",
+     [
+@@ -2340,6 +2352,14 @@ def test_groupby_binary_op_regression() -> None:
+     assert_identical(xr.zeros_like(anom_gb), anom_gb)
+ 
+ 
++def test_groupby_multiindex_level() -> None:
++    # GH6836
++    midx = pd.MultiIndex.from_product([list("abc"), [0, 1]], names=("one", "two"))
++    mda = xr.DataArray(np.random.rand(6, 3), [("x", midx), ("y", range(3))])
++    groups = mda.groupby("one").groups
++    assert groups == {"a": [0, 1], "b": [2, 3], "c": [4, 5]}
++
++
+ @requires_flox
+ @pytest.mark.parametrize("func", ["sum", "prod"])
+ @pytest.mark.parametrize("skipna", [True, False])
+
+diff --git a/xarray/tests/test_ufuncs.py b/xarray/tests/test_ufuncs.py
+index 6cd73e9..6b4c3f3 100644
+--- a/xarray/tests/test_ufuncs.py
++++ b/xarray/tests/test_ufuncs.py
+@@ -4,7 +4,7 @@ import numpy as np
+ import pytest
+ 
+ import xarray as xr
+-from xarray.tests import assert_array_equal, mock
++from xarray.tests import assert_allclose, assert_array_equal, mock
+ from xarray.tests import assert_identical as assert_identical_
+ 
+ 
+@@ -16,16 +16,16 @@ def assert_identical(a, b):
+         assert_array_equal(a, b)
+ 
+ 
+-def test_unary():
+-    args = [
+-        0,
+-        np.zeros(2),
++@pytest.mark.parametrize(
++    "a",
++    [
+         xr.Variable(["x"], [0, 0]),
+         xr.DataArray([0, 0], dims="x"),
+         xr.Dataset({"y": ("x", [0, 0])}),
+-    ]
+-    for a in args:
+-        assert_identical(a + 1, np.cos(a))
++    ],
++)
++def test_unary(a):
++    assert_allclose(a + 1, np.cos(a))
+ 
+ 
+ def test_binary():
+
+diff --git a/xarray/tests/test_units.py b/xarray/tests/test_units.py
+index 9e872c9..ad9da0f 100644
+--- a/xarray/tests/test_units.py
++++ b/xarray/tests/test_units.py
+@@ -5627,16 +5627,20 @@ class TestDataset:
+ 
+ @requires_dask
+ class TestPintWrappingDask:
++    @pytest.mark.skipif(
++        version.parse(pint.__version__) <= version.parse("0.21"),
++        reason="pint didn't support dask properly before 0.21",
++    )
+     def test_duck_array_ops(self):
+         import dask.array
+ 
+         d = dask.array.array([1, 2, 3])
+-        q = pint.Quantity(d, units="m")
++        q = unit_registry.Quantity(d, units="m")
+         da = xr.DataArray(q, dims="x")
+ 
+         actual = da.mean().compute()
+         actual.name = None
+-        expected = xr.DataArray(pint.Quantity(np.array(2.0), units="m"))
++        expected = xr.DataArray(unit_registry.Quantity(np.array(2.0), units="m"))
+ 
+         assert_units_equal(expected, actual)
+         # Don't use isinstance b/c we don't want to allow subclasses through

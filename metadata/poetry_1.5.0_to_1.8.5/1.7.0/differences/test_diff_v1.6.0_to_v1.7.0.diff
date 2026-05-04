@@ -1,0 +1,2871 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 8733082..05418d7 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -12,9 +12,13 @@ from typing import TYPE_CHECKING
+ from typing import Any
+ 
+ import httpretty
++import keyring
+ import pytest
+ 
++from keyring import backends
+ from keyring.backend import KeyringBackend
++from keyring.errors import KeyringError
++from keyring.errors import KeyringLocked
+ 
+ from poetry.config.config import Config as BaseConfig
+ from poetry.config.dict_config_source import DictConfigSource
+@@ -65,7 +69,10 @@ def pytest_configure(config: PyTestConfig) -> None:
+     config.addinivalue_line("markers", "integration: mark integration tests")
+ 
+     if not config.option.integration:
+-        config.option.markexpr = "not integration"
++        if config.option.markexpr:
++            config.option.markexpr += " and not integration"
++        else:
++            config.option.markexpr = "not integration"
+ 
+ 
+ class Config(BaseConfig):
+@@ -113,6 +120,33 @@ class DummyBackend(KeyringBackend):
+             del self._passwords[service][username]
+ 
+ 
++class LockedBackend(KeyringBackend):
++    @classmethod
++    def priority(cls) -> int:
++        return 42
++
++    def set_password(self, service: str, username: str | None, password: Any) -> None:
++        raise KeyringLocked()
++
++    def get_password(self, service: str, username: str | None) -> Any:
++        raise KeyringLocked()
++
++    def get_credential(self, service: str, username: str | None) -> Any:
++        raise KeyringLocked()
++
++    def delete_password(self, service: str, username: str | None) -> None:
++        raise KeyringLocked()
++
++
++class ErroneousBackend(backends.fail.Keyring):
++    @classmethod
++    def priority(cls) -> int:
++        return 42
++
++    def get_credential(self, service: str, username: str | None) -> Any:
++        raise KeyringError()
++
++
+ @pytest.fixture()
+ def dummy_keyring() -> DummyBackend:
+     return DummyBackend()
+@@ -120,24 +154,28 @@ def dummy_keyring() -> DummyBackend:
+ 
+ @pytest.fixture()
+ def with_simple_keyring(dummy_keyring: DummyBackend) -> None:
+-    import keyring
+-
+     keyring.set_keyring(dummy_keyring)
+ 
+ 
+ @pytest.fixture()
+ def with_fail_keyring() -> None:
+-    import keyring
+-
+     from keyring.backends.fail import Keyring
+ 
+     keyring.set_keyring(Keyring())  # type: ignore[no-untyped-call]
+ 
+ 
+ @pytest.fixture()
+-def with_null_keyring() -> None:
+-    import keyring
++def with_locked_keyring() -> None:
++    keyring.set_keyring(LockedBackend())  # type: ignore[no-untyped-call]
++
+ 
++@pytest.fixture()
++def with_erroneous_keyring() -> None:
++    keyring.set_keyring(ErroneousBackend())  # type: ignore[no-untyped-call]
++
++
++@pytest.fixture()
++def with_null_keyring() -> None:
+     from keyring.backends.null import Keyring
+ 
+     keyring.set_keyring(Keyring())  # type: ignore[no-untyped-call]
+@@ -151,8 +189,6 @@ def with_chained_fail_keyring(mocker: MockerFixture) -> None:
+         "keyring.backend.get_all_keyring",
+         lambda: [Keyring()],  # type: ignore[no-untyped-call]
+     )
+-    import keyring
+-
+     from keyring.backends.chainer import ChainerBackend
+ 
+     keyring.set_keyring(ChainerBackend())  # type: ignore[no-untyped-call]
+@@ -166,8 +202,6 @@ def with_chained_null_keyring(mocker: MockerFixture) -> None:
+         "keyring.backend.get_all_keyring",
+         lambda: [Keyring()],  # type: ignore[no-untyped-call]
+     )
+-    import keyring
+-
+     from keyring.backends.chainer import ChainerBackend
+ 
+     keyring.set_keyring(ChainerBackend())  # type: ignore[no-untyped-call]
+@@ -206,8 +240,6 @@ def config(
+     auth_config_source: DictConfigSource,
+     mocker: MockerFixture,
+ ) -> Config:
+-    import keyring
+-
+     from keyring.backends.fail import Keyring
+ 
+     keyring.set_keyring(Keyring())  # type: ignore[no-untyped-call]
+
+diff --git a/tests/console/commands/env/helpers.py b/tests/console/commands/env/helpers.py
+index 942c272..4337281 100644
+--- a/tests/console/commands/env/helpers.py
++++ b/tests/console/commands/env/helpers.py
+@@ -24,17 +24,28 @@ def check_output_wrapper(
+ ) -> Callable[[list[str], Any, Any], str]:
+     def check_output(cmd: list[str], *args: Any, **kwargs: Any) -> str:
+         # cmd is a list, like ["python", "-c", "do stuff"]
+-        python_cmd = cmd[2]
++        python_cmd = cmd[-1]
++        if "print(json.dumps(env))" in python_cmd:
++            return (
++                f'{{"version_info": [{version.major}, {version.minor},'
++                f" {version.patch}]}}"
++            )
++
+         if "sys.version_info[:3]" in python_cmd:
+             return version.text
+-        elif "sys.version_info[:2]" in python_cmd:
++
++        if "sys.version_info[:2]" in python_cmd:
+             return f"{version.major}.{version.minor}"
+-        elif "import sys; print(sys.executable)" in python_cmd:
++
++        if "import sys; print(sys.executable)" in python_cmd:
+             executable = cmd[0]
+             basename = os.path.basename(executable)
+             return f"/usr/bin/{basename}"
+-        else:
+-            assert "import sys; print(sys.prefix)" in python_cmd
+-            return "/prefix"
++
++        if "print(sys.base_prefix)" in python_cmd:
++            return "/usr"
++
++        assert "import sys; print(sys.prefix)" in python_cmd
++        return "/prefix"
+ 
+     return check_output
+
+diff --git a/tests/console/commands/test_check.py b/tests/console/commands/test_check.py
+index aeed833..d5e8a44 100644
+--- a/tests/console/commands/test_check.py
++++ b/tests/console/commands/test_check.py
+@@ -77,8 +77,10 @@ def test_check_invalid(
+ 
+     tester.execute("--lock")
+ 
+-    expected = """\
+-Error: 'description' is a required property
++    jsonschema_error = "'description' is a required property"
++    fastjsonschema_error = "data must contain ['description'] properties"
++    expected_template = """\
++Error: {schema_error}
+ Error: Project name (invalid) is same as one of its dependencies
+ Error: Unrecognized classifiers: ['Intended Audience :: Clowns'].
+ Error: Declared README file does not exist: never/exists.md
+@@ -93,8 +95,12 @@ Warning: Deprecated classifier\
+  'Topic :: Communications :: Chat :: AOL Instant Messenger'.\
+  Must be removed.
+ """
++    expected = {
++        expected_template.format(schema_error=schema_error)
++        for schema_error in (jsonschema_error, fastjsonschema_error)
++    }
+ 
+-    assert tester.io.fetch_error() == expected
++    assert tester.io.fetch_error() in expected
+ 
+ 
+ def test_check_private(
+
+diff --git a/tests/console/commands/test_config.py b/tests/console/commands/test_config.py
+index ecfade5..24b89a6 100644
+--- a/tests/console/commands/test_config.py
++++ b/tests/console/commands/test_config.py
+@@ -67,6 +67,7 @@ virtualenvs.options.system-site-packages = false
+ virtualenvs.path = {venv_path}  # {config_cache_dir / 'virtualenvs'}
+ virtualenvs.prefer-active-python = false
+ virtualenvs.prompt = "{{project_name}}-py{{python_version}}"
++warnings.export = true
+ """
+ 
+     assert tester.io.fetch_output() == expected
+@@ -96,6 +97,7 @@ virtualenvs.options.system-site-packages = false
+ virtualenvs.path = {venv_path}  # {config_cache_dir / 'virtualenvs'}
+ virtualenvs.prefer-active-python = false
+ virtualenvs.prompt = "{{project_name}}-py{{python_version}}"
++warnings.export = true
+ """
+ 
+     assert config.set_config_source.call_count == 0  # type: ignore[attr-defined]
+@@ -146,6 +148,7 @@ virtualenvs.options.system-site-packages = false
+ virtualenvs.path = {venv_path}  # {config_cache_dir / 'virtualenvs'}
+ virtualenvs.prefer-active-python = false
+ virtualenvs.prompt = "{{project_name}}-py{{python_version}}"
++warnings.export = true
+ """
+     assert config.set_config_source.call_count == 0  # type: ignore[attr-defined]
+     assert tester.io.fetch_output() == expected
+@@ -174,6 +177,7 @@ virtualenvs.options.system-site-packages = false
+ virtualenvs.path = {venv_path}  # {config_cache_dir / 'virtualenvs'}
+ virtualenvs.prefer-active-python = false
+ virtualenvs.prompt = "{{project_name}}-py{{python_version}}"
++warnings.export = true
+ """
+     assert config.set_config_source.call_count == 0  # type: ignore[attr-defined]
+     assert tester.io.fetch_output() == expected
+@@ -301,6 +305,7 @@ virtualenvs.options.system-site-packages = false
+ virtualenvs.path = {venv_path}  # {config_cache_dir / 'virtualenvs'}
+ virtualenvs.prefer-active-python = false
+ virtualenvs.prompt = "{{project_name}}-py{{python_version}}"
++warnings.export = true
+ """
+ 
+     assert config.set_config_source.call_count == 1  # type: ignore[attr-defined]
+@@ -338,6 +343,7 @@ virtualenvs.options.system-site-packages = false
+ virtualenvs.path = {venv_path}  # {config_cache_dir / 'virtualenvs'}
+ virtualenvs.prefer-active-python = false
+ virtualenvs.prompt = "{{project_name}}-py{{python_version}}"
++warnings.export = true
+ """
+ 
+     assert tester.io.fetch_output() == expected
+@@ -402,6 +408,15 @@ def test_set_pypi_token_unsuccessful_multiple_values(
+     assert str(e.value) == "Expected only one argument (token), got 2"
+ 
+ 
++def test_set_pypi_token_no_values(
++    tester: CommandTester,
++) -> None:
++    with pytest.raises(ValueError) as e:
++        tester.execute("pypi-token.pypi")
++
++    assert str(e.value) == "Expected a value for pypi-token.pypi setting."
++
++
+ def test_set_client_cert(
+     tester: CommandTester,
+     auth_config_source: DictConfigSource,
+
+diff --git a/tests/console/commands/test_export.py b/tests/console/commands/test_export.py
+new file mode 100644
+index 0000000..962c2c8
+--- /dev/null
++++ b/tests/console/commands/test_export.py
+@@ -0,0 +1,31 @@
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++
++import pytest
++
++
++if TYPE_CHECKING:
++    from cleo.testers.command_tester import CommandTester
++
++    from tests.conftest import Config
++    from tests.types import CommandTesterFactory
++
++
++@pytest.fixture
++def tester(command_tester_factory: CommandTesterFactory) -> CommandTester:
++    return command_tester_factory("export")
++
++
++def test_export_prints_warning(tester: CommandTester) -> None:
++    tester.execute("")
++    assert (
++        "Warning: poetry-plugin-export will not be installed by default"
++        in tester.io.fetch_error()
++    )
++
++
++def test_disable_export_warning(tester: CommandTester, config: Config) -> None:
++    config.config["warnings"]["export"] = False
++    tester.execute("")
++    assert "poetry-plugin-export" not in tester.io.fetch_error()
+
+diff --git a/tests/console/commands/test_install.py b/tests/console/commands/test_install.py
+index bf3c819..bf0789c 100644
+--- a/tests/console/commands/test_install.py
++++ b/tests/console/commands/test_install.py
+@@ -33,7 +33,6 @@ authors = [
+     "Python Poetry <tests@python-poetry.org>"
+ ]
+ license = "MIT"
+-readme = "README.rst"
+ 
+ [tool.poetry.dependencies]
+ python = "~2.7 || ^3.4"
+@@ -348,9 +347,9 @@ def test_remove_untracked_outputs_deprecation_warning(
+ 
+     assert tester.status_code == 0
+     assert (
+-        tester.io.fetch_error()
+-        == "The `--remove-untracked` option is deprecated, use the `--sync` option"
++        "The `--remove-untracked` option is deprecated, use the `--sync` option"
+         " instead.\n"
++        in tester.io.fetch_error()
+     )
+ 
+ 
+@@ -417,6 +416,38 @@ def test_install_logs_output_decorated(
+     assert tester.io.fetch_output() == expected
+ 
+ 
++@pytest.mark.parametrize("with_root", [True])
++@pytest.mark.parametrize("error", ["module", "readme", ""])
++def test_install_warning_corrupt_root(
++    command_tester_factory: CommandTesterFactory,
++    project_factory: ProjectFactory,
++    with_root: bool,
++    error: str,
++) -> None:
++    name = "corrupt"
++    content = f"""\
++[tool.poetry]
++name = "{name}"
++version = "1.2.3"
++description = ""
++authors = []
++"""
++    if error == "readme":
++        content += 'readme = "missing_readme.md"\n'
++    poetry = project_factory(name=name, pyproject_content=content)
++    if error != "module":
++        (poetry.pyproject_path.parent / f"{name}.py").touch()
++
++    tester = command_tester_factory("install", poetry=poetry)
++    tester.execute("" if with_root else "--no-root")
++
++    assert tester.status_code == 0
++    if with_root and error:
++        assert "The current project could not be installed: " in tester.io.fetch_error()
++    else:
++        assert tester.io.fetch_error() == ""
++
++
+ @pytest.mark.parametrize("options", ["", "--without dev"])
+ @pytest.mark.parametrize(
+     "project", ["missing_directory_dependency", "missing_file_dependency"]
+
+diff --git a/tests/console/commands/test_version.py b/tests/console/commands/test_version.py
+index a1d59a3..8d67127 100644
+--- a/tests/console/commands/test_version.py
++++ b/tests/console/commands/test_version.py
+@@ -55,6 +55,25 @@ def test_increment_version(
+     assert command.increment_version(version, rule).text == expected
+ 
+ 
++@pytest.mark.parametrize(
++    "version, rule, expected",
++    [
++        ("1.2.3", "prerelease", "1.2.4a0"),
++        ("1.2.3a0", "prerelease", "1.2.3b0"),
++        ("1.2.3a1", "prerelease", "1.2.3b0"),
++        ("1.2.3b1", "prerelease", "1.2.3rc0"),
++        ("1.2.3rc0", "prerelease", "1.2.3"),
++        ("1.2.3-beta.1", "prerelease", "1.2.3rc0"),
++        ("1.2.3-beta1", "prerelease", "1.2.3rc0"),
++        ("1.2.3beta1", "prerelease", "1.2.3rc0"),
++    ],
++)
++def test_next_phase_version(
++    version: str, rule: str, expected: str, command: VersionCommand
++) -> None:
++    assert command.increment_version(version, rule, True).text == expected
++
++
+ def test_version_show(tester: CommandTester) -> None:
+     tester.execute()
+     assert tester.io.fetch_output() == "simple-project 1.2.3\n"
+@@ -75,6 +94,13 @@ def test_short_version_update(tester: CommandTester) -> None:
+     assert tester.io.fetch_output() == "2.0.0\n"
+ 
+ 
++def test_phase_version_update(tester: CommandTester) -> None:
++    assert isinstance(tester.command, VersionCommand)
++    tester.command.poetry.package._set_version("1.2.4a0")
++    tester.execute("prerelease --next-phase")
++    assert tester.io.fetch_output() == "Bumping version from 1.2.4a0 to 1.2.4b0\n"
++
++
+ def test_dry_run(tester: CommandTester) -> None:
+     assert isinstance(tester.command, VersionCommand)
+     old_pyproject = tester.command.poetry.file.path.read_text()
+
+diff --git a/tests/inspection/test_info.py b/tests/inspection/test_info.py
+index 4b1e033..297af70 100644
+--- a/tests/inspection/test_info.py
++++ b/tests/inspection/test_info.py
+@@ -195,6 +195,7 @@ def test_info_setup_cfg(mocker: MockerFixture, demo_setup_cfg: Path) -> None:
+     demo_check_info(info, requires_dist={"package"})
+ 
+ 
++@pytest.mark.network
+ def test_info_setup_complex(demo_setup_complex: Path) -> None:
+     info = PackageInfo.from_directory(demo_setup_complex)
+     demo_check_info(info, requires_dist={"package"})
+@@ -213,6 +214,7 @@ def test_info_setup_complex_pep517_error(
+         PackageInfo.from_directory(demo_setup_complex)
+ 
+ 
++@pytest.mark.network
+ def test_info_setup_complex_pep517_legacy(
+     demo_setup_complex_pep517_legacy: Path,
+ ) -> None:
+@@ -231,6 +233,7 @@ def test_info_setup_complex_disable_build(
+     assert info.requires_dist is None
+ 
+ 
++@pytest.mark.network
+ @pytest.mark.parametrize("missing", ["version", "name", "install_requires"])
+ def test_info_setup_missing_mandatory_should_trigger_pep517(
+     mocker: MockerFixture, source_dir: Path, missing: str
+
+diff --git a/tests/installation/test_chef.py b/tests/installation/test_chef.py
+index d134b90..bcd4f42 100644
+--- a/tests/installation/test_chef.py
++++ b/tests/installation/test_chef.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import os
++import sys
+ import tempfile
+ 
+ from pathlib import Path
+@@ -13,12 +14,19 @@ from poetry.core.packages.utils.link import Link
+ 
+ from poetry.factory import Factory
+ from poetry.installation.chef import Chef
++from poetry.installation.chef import ChefInstallError
++from poetry.installation.chef import IsolatedEnv
++from poetry.puzzle.exceptions import SolverProblemError
++from poetry.puzzle.provider import IncompatibleConstraintsError
+ from poetry.repositories import RepositoryPool
+ from poetry.utils.env import EnvManager
++from poetry.utils.env import ephemeral_environment
+ from tests.repositories.test_pypi_repository import MockRepository
+ 
+ 
+ if TYPE_CHECKING:
++    from collections.abc import Collection
++
+     from pytest_mock import MockerFixture
+ 
+     from poetry.utils.cache import ArtifactCache
+@@ -40,6 +48,42 @@ def setup(mocker: MockerFixture, pool: RepositoryPool) -> None:
+     mocker.patch.object(Factory, "create_pool", return_value=pool)
+ 
+ 
++def test_isolated_env_install_success(pool: RepositoryPool) -> None:
++    with ephemeral_environment(Path(sys.executable)) as venv:
++        env = IsolatedEnv(venv, pool)
++        assert "poetry-core" not in venv.run("pip", "freeze")
++        env.install({"poetry-core"})
++        assert "poetry-core" in venv.run("pip", "freeze")
++
++
++@pytest.mark.parametrize(
++    ("requirements", "exception"),
++    [
++        ({"poetry-core==1.5.0", "poetry-core==1.6.0"}, IncompatibleConstraintsError),
++        ({"black==19.10b0", "attrs==17.4.0"}, SolverProblemError),
++    ],
++)
++def test_isolated_env_install_error(
++    requirements: Collection[str], exception: type[Exception], pool: RepositoryPool
++) -> None:
++    with ephemeral_environment(Path(sys.executable)) as venv:
++        env = IsolatedEnv(venv, pool)
++        with pytest.raises(exception):
++            env.install(requirements)
++
++
++def test_isolated_env_install_failure(
++    pool: RepositoryPool, mocker: MockerFixture
++) -> None:
++    mocker.patch("poetry.installation.installer.Installer.run", return_value=1)
++    with ephemeral_environment(Path(sys.executable)) as venv:
++        env = IsolatedEnv(venv, pool)
++        with pytest.raises(ChefInstallError) as e:
++            env.install({"a", "b>1"})
++        assert e.value.requirements == {"a", "b>1"}
++
++
++@pytest.mark.network
+ def test_prepare_sdist(
+     config: Config,
+     config_cache_dir: Path,
+@@ -58,6 +102,7 @@ def test_prepare_sdist(
+     assert wheel.name == "demo-0.1.0-py3-none-any.whl"
+ 
+ 
++@pytest.mark.network
+ def test_prepare_directory(
+     config: Config,
+     config_cache_dir: Path,
+@@ -78,6 +123,7 @@ def test_prepare_directory(
+     os.unlink(wheel)
+ 
+ 
++@pytest.mark.network
+ def test_prepare_directory_with_extensions(
+     config: Config,
+     config_cache_dir: Path,
+@@ -97,6 +143,7 @@ def test_prepare_directory_with_extensions(
+     os.unlink(wheel)
+ 
+ 
++@pytest.mark.network
+ def test_prepare_directory_editable(
+     config: Config,
+     config_cache_dir: Path,
+
+diff --git a/tests/installation/test_chooser.py b/tests/installation/test_chooser.py
+index 6c9930f..c2027dc 100644
+--- a/tests/installation/test_chooser.py
++++ b/tests/installation/test_chooser.py
+@@ -277,7 +277,7 @@ def test_chooser_chooses_distributions_that_match_the_package_hashes(
+     package = Package("isort", "4.3.4")
+     files = [
+         {
+-            "hash": "sha256:b9c40e9750f3d77e6e4d441d8b0266cf555e7cdabdcff33c4fd06366ca761ef8",  # noqa: E501
++            "hash": "sha256:b9c40e9750f3d77e6e4d441d8b0266cf555e7cdabdcff33c4fd06366ca761ef8",
+             "filename": "isort-4.3.4.tar.gz",
+         }
+     ]
+@@ -311,7 +311,7 @@ def test_chooser_chooses_yanked_if_no_others(
+     files = [
+         {
+             "filename": "black-21.11b0-py3-none-any.whl",
+-            "hash": "sha256:0b1f66cbfadcd332ceeaeecf6373d9991d451868d2e2219ad0ac1213fb701117",  # noqa: E501
++            "hash": "sha256:0b1f66cbfadcd332ceeaeecf6373d9991d451868d2e2219ad0ac1213fb701117",
+         }
+     ]
+     if source_type == "legacy":
+@@ -342,11 +342,11 @@ def test_chooser_does_not_choose_yanked_if_others(
+     files = [
+         {
+             "filename": "futures-3.2.0-py2-none-any.whl",
+-            "hash": "sha256:ec0a6cb848cc212002b9828c3e34c675e0c9ff6741dc445cab6fdd4e1085d1f1",  # noqa: E501
++            "hash": "sha256:ec0a6cb848cc212002b9828c3e34c675e0c9ff6741dc445cab6fdd4e1085d1f1",
+         },
+         {
+             "filename": "futures-3.2.0.tar.gz",
+-            "hash": "sha256:9ec02aa7d674acb8618afb127e27fde7fc68994c0437ad759fa094a574adb265",  # noqa: E501
++            "hash": "sha256:9ec02aa7d674acb8618afb127e27fde7fc68994c0437ad759fa094a574adb265",
+         },
+     ]
+     package = Package(
+@@ -387,7 +387,7 @@ def test_chooser_throws_an_error_if_package_hashes_do_not_match(
+     package = Package("isort", "4.3.4")
+     files = [
+         {
+-            "hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",  # noqa: E501
++            "hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+             "filename": "isort-4.3.4.tar.gz",
+         }
+     ]
+@@ -421,7 +421,7 @@ def test_chooser_md5_remote_fallback_to_sha256_inline_calculation(
+     )
+     package.files = [
+         {
+-            "hash": "sha256:9fa123ad707a5c6c944743bf3e11a0e80d86cb518d3cf25320866ca3ef43e2ad",  # noqa: E501
++            "hash": "sha256:9fa123ad707a5c6c944743bf3e11a0e80d86cb518d3cf25320866ca3ef43e2ad",
+             "filename": "demo-0.1.0.tar.gz",
+         }
+     ]
+
+diff --git a/tests/installation/test_executor.py b/tests/installation/test_executor.py
+index 3a3fc35..3b2aec4 100644
+--- a/tests/installation/test_executor.py
++++ b/tests/installation/test_executor.py
+@@ -21,7 +21,6 @@ from cleo.formatters.style import Style
+ from cleo.io.buffered_io import BufferedIO
+ from cleo.io.outputs.output import Verbosity
+ from poetry.core.packages.package import Package
+-from poetry.core.packages.utils.link import Link
+ from poetry.core.packages.utils.utils import path_to_url
+ 
+ from poetry.factory import Factory
+@@ -473,11 +472,11 @@ def test_execute_works_with_ansi_output(
+ 
+     # fmt: off
+     expected = [
+-        "\x1b[39;1mPackage operations\x1b[39;22m: \x1b[34m1\x1b[39m install, \x1b[34m0\x1b[39m updates, \x1b[34m0\x1b[39m removals",  # noqa: E501
+-        "\x1b[34;1m•\x1b[39;22m \x1b[39mInstalling \x1b[39m\x1b[36mcleo\x1b[39m\x1b[39m (\x1b[39m\x1b[39;1m1.0.0a5\x1b[39;22m\x1b[39m)\x1b[39m: \x1b[34mPending...\x1b[39m",  # noqa: E501
+-        "\x1b[34;1m•\x1b[39;22m \x1b[39mInstalling \x1b[39m\x1b[36mcleo\x1b[39m\x1b[39m (\x1b[39m\x1b[39;1m1.0.0a5\x1b[39;22m\x1b[39m)\x1b[39m: \x1b[34mDownloading...\x1b[39m",  # noqa: E501
+-        "\x1b[34;1m•\x1b[39;22m \x1b[39mInstalling \x1b[39m\x1b[36mcleo\x1b[39m\x1b[39m (\x1b[39m\x1b[39;1m1.0.0a5\x1b[39;22m\x1b[39m)\x1b[39m: \x1b[34mInstalling...\x1b[39m",  # noqa: E501
+-        "\x1b[32;1m•\x1b[39;22m \x1b[39mInstalling \x1b[39m\x1b[36mcleo\x1b[39m\x1b[39m (\x1b[39m\x1b[32m1.0.0a5\x1b[39m\x1b[39m)\x1b[39m",  # finished  # noqa: E501
++        "\x1b[39;1mPackage operations\x1b[39;22m: \x1b[34m1\x1b[39m install, \x1b[34m0\x1b[39m updates, \x1b[34m0\x1b[39m removals",
++        "\x1b[34;1m•\x1b[39;22m \x1b[39mInstalling \x1b[39m\x1b[36mcleo\x1b[39m\x1b[39m (\x1b[39m\x1b[39;1m1.0.0a5\x1b[39;22m\x1b[39m)\x1b[39m: \x1b[34mPending...\x1b[39m",
++        "\x1b[34;1m•\x1b[39;22m \x1b[39mInstalling \x1b[39m\x1b[36mcleo\x1b[39m\x1b[39m (\x1b[39m\x1b[39;1m1.0.0a5\x1b[39;22m\x1b[39m)\x1b[39m: \x1b[34mDownloading...\x1b[39m",
++        "\x1b[34;1m•\x1b[39;22m \x1b[39mInstalling \x1b[39m\x1b[36mcleo\x1b[39m\x1b[39m (\x1b[39m\x1b[39;1m1.0.0a5\x1b[39;22m\x1b[39m)\x1b[39m: \x1b[34mInstalling...\x1b[39m",
++        "\x1b[32;1m•\x1b[39;22m \x1b[39mInstalling \x1b[39m\x1b[36mcleo\x1b[39m\x1b[39m (\x1b[39m\x1b[32m1.0.0a5\x1b[39m\x1b[39m)\x1b[39m",  # finished
+     ]
+     # fmt: on
+ 
+@@ -583,21 +582,23 @@ def test_executor_should_delete_incomplete_downloads(
+     pool: RepositoryPool,
+     mock_file_downloads: None,
+     env: MockEnv,
+-    fixture_dir: FixtureDirGetter,
+ ) -> None:
+-    fixture = fixture_dir("distributions") / "demo-0.1.0-py2.py3-none-any.whl"
+-    destination_fixture = tmp_path / "tomlkit-0.5.3-py2.py3-none-any.whl"
+-    shutil.copyfile(str(fixture), str(destination_fixture))
++    cached_archive = tmp_path / "tomlkit-0.5.3-py2.py3-none-any.whl"
++
++    def download_fail(*_: Any) -> None:
++        cached_archive.touch()  # broken archive
++        raise Exception("Download error")
++
+     mocker.patch(
+         "poetry.installation.executor.Executor._download_archive",
+-        side_effect=Exception("Download error"),
++        side_effect=download_fail,
+     )
+     mocker.patch(
+-        "poetry.installation.executor.ArtifactCache.get_cached_archive_for_link",
++        "poetry.utils.cache.ArtifactCache._get_cached_archive",
+         return_value=None,
+     )
+     mocker.patch(
+-        "poetry.installation.executor.ArtifactCache.get_cache_directory_for_link",
++        "poetry.utils.cache.ArtifactCache.get_cache_directory_for_link",
+         return_value=tmp_path,
+     )
+ 
+@@ -608,7 +609,7 @@ def test_executor_should_delete_incomplete_downloads(
+     with pytest.raises(Exception, match="Download error"):
+         executor._download(Install(Package("tomlkit", "0.5.3")))
+ 
+-    assert not destination_fixture.exists()
++    assert not cached_archive.exists()
+ 
+ 
+ def verify_installed_distribution(
+@@ -669,7 +670,7 @@ def test_executor_should_not_write_pep610_url_references_for_cached_package(
+     package.files = [
+         {
+             "file": "demo-0.1.0-py2.py3-none-any.whl",
+-            "hash": "sha256:70e704135718fffbcbf61ed1fc45933cfd86951a744b681000eaaa75da31f17a",  # noqa: E501
++            "hash": "sha256:70e704135718fffbcbf61ed1fc45933cfd86951a744b681000eaaa75da31f17a",
+         }
+     ]
+ 
+@@ -696,7 +697,7 @@ def test_executor_should_write_pep610_url_references_for_wheel_files(
+     package.files = [
+         {
+             "file": "demo-0.1.0-py2.py3-none-any.whl",
+-            "hash": "sha256:70e704135718fffbcbf61ed1fc45933cfd86951a744b681000eaaa75da31f17a",  # noqa: E501
++            "hash": "sha256:70e704135718fffbcbf61ed1fc45933cfd86951a744b681000eaaa75da31f17a",
+         }
+     ]
+ 
+@@ -729,7 +730,7 @@ def test_executor_should_write_pep610_url_references_for_non_wheel_files(
+     package.files = [
+         {
+             "file": "demo-0.1.0.tar.gz",
+-            "hash": "sha256:9fa123ad707a5c6c944743bf3e11a0e80d86cb518d3cf25320866ca3ef43e2ad",  # noqa: E501
++            "hash": "sha256:9fa123ad707a5c6c944743bf3e11a0e80d86cb518d3cf25320866ca3ef43e2ad",
+         }
+     ]
+ 
+@@ -823,7 +824,7 @@ def test_executor_should_write_pep610_url_references_for_wheel_urls(
+     if is_artifact_cached:
+         link_cached = fixture_dir("distributions") / "demo-0.1.0-py2.py3-none-any.whl"
+         mocker.patch(
+-            "poetry.installation.executor.ArtifactCache.get_cached_archive_for_link",
++            "poetry.utils.cache.ArtifactCache.get_cached_archive_for_link",
+             return_value=link_cached,
+         )
+     download_spy = mocker.spy(Executor, "_download_archive")
+@@ -838,7 +839,7 @@ def test_executor_should_write_pep610_url_references_for_wheel_urls(
+     package.files = [
+         {
+             "file": "demo-0.1.0-py2.py3-none-any.whl",
+-            "hash": "sha256:70e704135718fffbcbf61ed1fc45933cfd86951a744b681000eaaa75da31f17a",  # noqa: E501
++            "hash": "sha256:70e704135718fffbcbf61ed1fc45933cfd86951a744b681000eaaa75da31f17a",
+         }
+     ]
+ 
+@@ -861,9 +862,13 @@ def test_executor_should_write_pep610_url_references_for_wheel_urls(
+     else:
+         assert package.source_url is not None
+         download_spy.assert_called_once_with(
+-            mocker.ANY, operation, Link(package.source_url)
++            mocker.ANY,
++            operation,
++            package.source_url,
++            dest=mocker.ANY,
+         )
+-        assert download_spy.spy_return.exists(), "cached file should not be deleted"
++        dest = download_spy.call_args.args[3]
++        assert dest.exists(), "cached file should not be deleted"
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -900,12 +905,12 @@ def test_executor_should_write_pep610_url_references_for_non_wheel_urls(
+     )
+     download_spy = mocker.spy(Executor, "_download_archive")
+ 
+-    if is_sdist_cached | is_wheel_cached:
++    if is_sdist_cached or is_wheel_cached:
+         cached_sdist = fixture_dir("distributions") / "demo-0.1.0.tar.gz"
+         cached_wheel = fixture_dir("distributions") / "demo-0.1.0-py2.py3-none-any.whl"
+ 
+-        def mock_get_cached_archive_for_link_func(
+-            _: Link, *, strict: bool, **__: Any
++        def mock_get_cached_archive_func(
++            _cache_dir: Path, *, strict: bool, **__: Any
+         ) -> Path | None:
+             if is_wheel_cached and not strict:
+                 return cached_wheel
+@@ -914,8 +919,8 @@ def test_executor_should_write_pep610_url_references_for_non_wheel_urls(
+             return None
+ 
+         mocker.patch(
+-            "poetry.installation.executor.ArtifactCache.get_cached_archive_for_link",
+-            side_effect=mock_get_cached_archive_for_link_func,
++            "poetry.utils.cache.ArtifactCache._get_cached_archive",
++            side_effect=mock_get_cached_archive_func,
+         )
+ 
+     package = Package(
+@@ -928,7 +933,7 @@ def test_executor_should_write_pep610_url_references_for_non_wheel_urls(
+     package.files = [
+         {
+             "file": "demo-0.1.0.tar.gz",
+-            "hash": "sha256:9fa123ad707a5c6c944743bf3e11a0e80d86cb518d3cf25320866ca3ef43e2ad",  # noqa: E501
++            "hash": "sha256:9fa123ad707a5c6c944743bf3e11a0e80d86cb518d3cf25320866ca3ef43e2ad",
+         }
+     ]
+ 
+@@ -955,9 +960,10 @@ def test_executor_should_write_pep610_url_references_for_non_wheel_urls(
+     if expect_artifact_download:
+         assert package.source_url is not None
+         download_spy.assert_called_once_with(
+-            mocker.ANY, operation, Link(package.source_url)
++            mocker.ANY, operation, package.source_url, dest=mocker.ANY
+         )
+-        assert download_spy.spy_return.exists(), "cached file should not be deleted"
++        dest = download_spy.call_args.args[3]
++        assert dest.exists(), "cached file should not be deleted"
+     else:
+         download_spy.assert_not_called()
+ 
+@@ -978,7 +984,7 @@ def test_executor_should_write_pep610_url_references_for_git(
+     if is_artifact_cached:
+         link_cached = fixture_dir("distributions") / "demo-0.1.2-py2.py3-none-any.whl"
+         mocker.patch(
+-            "poetry.installation.executor.ArtifactCache.get_cached_archive_for_git",
++            "poetry.utils.cache.ArtifactCache.get_cached_archive_for_git",
+             return_value=link_cached,
+         )
+     clone_spy = mocker.spy(Git, "clone")
+@@ -1238,9 +1244,17 @@ Package operations: 1 install, 0 updates, 0 removals
+ 
+ 
+ @pytest.mark.parametrize("failing_method", ["build", "get_requires_for_build"])
++@pytest.mark.parametrize(
++    "exception",
++    [
++        CalledProcessError(1, ["pip"], output=b"original error"),
++        Exception("original error"),
++    ],
++)
+ @pytest.mark.parametrize("editable", [False, True])
+ def test_build_backend_errors_are_reported_correctly_if_caused_by_subprocess(
+     failing_method: str,
++    exception: Exception,
+     editable: bool,
+     mocker: MockerFixture,
+     config: Config,
+@@ -1250,9 +1264,7 @@ def test_build_backend_errors_are_reported_correctly_if_caused_by_subprocess(
+     env: MockEnv,
+     fixture_dir: FixtureDirGetter,
+ ) -> None:
+-    error = BuildBackendException(
+-        CalledProcessError(1, ["pip"], output=b"Error on stdout")
+-    )
++    error = BuildBackendException(exception, description="hide the original error")
+     mocker.patch.object(ProjectBuilder, failing_method, side_effect=error)
+     io.set_verbosity(Verbosity.NORMAL)
+ 
+@@ -1282,19 +1294,19 @@ Package operations: 1 install, 0 updates, 0 removals
+ 
+   ChefBuildError
+ 
+-  Backend operation failed: CalledProcessError(1, ['pip'])
++  hide the original error
+   \
+ 
+-  Error on stdout
++  original error
+ """
+ 
+     assert directory_package.source_url is not None
+     if editable:
+-        pip_command = "pip wheel --use-pep517 --editable"
++        pip_command = "pip wheel --no-cache-dir --use-pep517 --editable"
+         requirement = directory_package.source_url
+         assert Path(requirement).exists()
+     else:
+-        pip_command = "pip wheel --use-pep517"
++        pip_command = "pip wheel --no-cache-dir --use-pep517"
+         requirement = f"{package_name} @ {path_to_url(directory_package.source_url)}"
+     expected_end = f"""
+ Note: This error originates from the build backend, and is likely not a problem with \
+@@ -1372,11 +1384,7 @@ def test_build_system_requires_not_available(
+         .as_posix(),
+     )
+ 
+-    return_code = executor.execute(
+-        [
+-            Install(directory_package),
+-        ]
+-    )
++    return_code = executor.execute([Install(directory_package)])
+ 
+     assert return_code == 1
+ 
+@@ -1396,3 +1404,99 @@ Package operations: 1 install, 0 updates, 0 removals
+     output = io.fetch_output().strip()
+     assert output.startswith(expected_start)
+     assert output.endswith(expected_end)
++
++
++def test_build_system_requires_install_failure(
++    mocker: MockerFixture,
++    config: Config,
++    pool: RepositoryPool,
++    io: BufferedIO,
++    mock_file_downloads: None,
++    env: MockEnv,
++    fixture_dir: FixtureDirGetter,
++) -> None:
++    mocker.patch("poetry.installation.installer.Installer.run", return_value=1)
++    mocker.patch("cleo.io.buffered_io.BufferedIO.fetch_output", return_value="output")
++    mocker.patch("cleo.io.buffered_io.BufferedIO.fetch_error", return_value="error")
++    io.set_verbosity(Verbosity.NORMAL)
++
++    executor = Executor(env, pool, config, io)
++
++    package_name = "simple-project"
++    package_version = "1.2.3"
++    directory_package = Package(
++        package_name,
++        package_version,
++        source_type="directory",
++        source_url=fixture_dir("simple_project").resolve().as_posix(),
++    )
++
++    return_code = executor.execute([Install(directory_package)])
++
++    assert return_code == 1
++
++    package_url = directory_package.source_url
++    expected_start = f"""\
++Package operations: 1 install, 0 updates, 0 removals
++
++  • Installing {package_name} ({package_version} {package_url})
++
++  ChefInstallError
++
++  Failed to install poetry-core>=1.1.0a7.
++  \
++
++  Output:
++  output
++  \
++
++  Error:
++  error
++
++"""
++    expected_end = "Cannot install build-system.requires for simple-project."
++
++    mocker.stopall()  # to get real output
++    output = io.fetch_output().strip()
++    assert output.startswith(expected_start)
++    assert output.endswith(expected_end)
++
++
++def test_other_error(
++    config: Config,
++    pool: RepositoryPool,
++    io: BufferedIO,
++    mock_file_downloads: None,
++    env: MockEnv,
++    fixture_dir: FixtureDirGetter,
++) -> None:
++    io.set_verbosity(Verbosity.NORMAL)
++
++    executor = Executor(env, pool, config, io)
++
++    package_name = "simple-project"
++    package_version = "1.2.3"
++    directory_package = Package(
++        package_name,
++        package_version,
++        source_type="directory",
++        source_url=fixture_dir("non-existing").resolve().as_posix(),
++    )
++
++    return_code = executor.execute([Install(directory_package)])
++
++    assert return_code == 1
++
++    package_url = directory_package.source_url
++    expected_start = f"""\
++Package operations: 1 install, 0 updates, 0 removals
++
++  • Installing {package_name} ({package_version} {package_url})
++
++  FileNotFoundError
++"""
++    expected_end = "Cannot install simple-project."
++
++    output = io.fetch_output().strip()
++    assert output.startswith(expected_start)
++    assert output.endswith(expected_end)
+
+diff --git a/tests/installation/test_installer.py b/tests/installation/test_installer.py
+index 0d4ec36..fca6307 100644
+--- a/tests/installation/test_installer.py
++++ b/tests/installation/test_installer.py
+@@ -1,6 +1,5 @@
+ from __future__ import annotations
+ 
+-import itertools
+ import json
+ 
+ from pathlib import Path
+@@ -46,8 +45,6 @@ if TYPE_CHECKING:
+     from tests.conftest import Config
+     from tests.types import FixtureDirGetter
+ 
+-RESERVED_PACKAGES = ("pip", "setuptools", "wheel")
+-
+ 
+ class Executor(BaseExecutor):
+     def __init__(self, *args: Any, **kwargs: Any) -> None:
+@@ -485,7 +482,7 @@ def test_run_install_does_not_remove_locked_packages_if_installed_but_not_requir
+     assert installer.executor.removals_count == 0
+ 
+ 
+-def test_run_install_removes_locked_packages_if_installed_and_synchronization_is_required(  # noqa: E501
++def test_run_install_removes_locked_packages_if_installed_and_synchronization_is_required(
+     installer: Installer,
+     locker: Locker,
+     repo: Repository,
+@@ -628,12 +625,7 @@ def test_run_install_removes_no_longer_locked_packages_if_installed(
+ 
+ @pytest.mark.parametrize(
+     "managed_reserved_package_names",
+-    itertools.chain(
+-        [()],
+-        itertools.permutations(RESERVED_PACKAGES, 1),
+-        itertools.permutations(RESERVED_PACKAGES, 2),
+-        [RESERVED_PACKAGES],
+-    ),
++    [(), ("pip",)],
+ )
+ def test_run_install_with_synchronization(
+     managed_reserved_package_names: tuple[str, ...],
+@@ -647,16 +639,12 @@ def test_run_install_with_synchronization(
+     package_b = get_package("b", "1.1")
+     package_c = get_package("c", "1.2")
+     package_pip = get_package("pip", "20.0.0")
+-    package_setuptools = get_package("setuptools", "20.0.0")
+-    package_wheel = get_package("wheel", "20.0.0")
+ 
+     all_packages = [
+         package_a,
+         package_b,
+         package_c,
+         package_pip,
+-        package_setuptools,
+-        package_wheel,
+     ]
+ 
+     managed_reserved_packages = [
+@@ -1152,6 +1140,7 @@ def test_run_installs_extras_with_deps_if_requested_locked(
+     assert installer.executor.installations_count == 4  # A, B, C, D
+ 
+ 
++@pytest.mark.network
+ def test_installer_with_pypi_repository(
+     package: ProjectPackage,
+     locker: Locker,
+@@ -1851,7 +1840,7 @@ def test_run_install_duplicate_dependencies_different_constraints_with_lock_upda
+ @pytest.mark.skip(
+     "This is not working at the moment due to limitations in the resolver"
+ )
+-def test_installer_test_solver_finds_compatible_package_for_dependency_python_not_fully_compatible_with_package_python(  # noqa: E501
++def test_installer_test_solver_finds_compatible_package_for_dependency_python_not_fully_compatible_with_package_python(
+     installer: Installer,
+     locker: Locker,
+     repo: Repository,
+@@ -1880,7 +1869,7 @@ def test_installer_test_solver_finds_compatible_package_for_dependency_python_no
+     assert installer.executor.installations_count == 1
+ 
+ 
+-def test_installer_required_extras_should_not_be_removed_when_updating_single_dependency(  # noqa: E501
++def test_installer_required_extras_should_not_be_removed_when_updating_single_dependency(
+     installer: Installer,
+     locker: Locker,
+     repo: Repository,
+@@ -1947,7 +1936,7 @@ def test_installer_required_extras_should_not_be_removed_when_updating_single_de
+     assert installer.executor.removals_count == 0
+ 
+ 
+-def test_installer_required_extras_should_not_be_removed_when_updating_single_dependency_pypi_repository(  # noqa: E501
++def test_installer_required_extras_should_not_be_removed_when_updating_single_dependency_pypi_repository(
+     locker: Locker,
+     repo: Repository,
+     package: ProjectPackage,
+
+diff --git a/tests/integration/test_utils_vcs_git.py b/tests/integration/test_utils_vcs_git.py
+index dfc59bf..b08ba24 100644
+--- a/tests/integration/test_utils_vcs_git.py
++++ b/tests/integration/test_utils_vcs_git.py
+@@ -8,6 +8,8 @@ from hashlib import sha1
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+ from typing import Iterator
++from urllib.parse import urlparse
++from urllib.parse import urlunparse
+ 
+ import pytest
+ 
+@@ -276,7 +278,7 @@ def test_system_git_fallback_on_http_401(
+     mocker.patch.object(
+         Git,
+         "_clone",
+-        side_effect=HTTPUnauthorized(None, None),  # type: ignore[no-untyped-call]
++        side_effect=HTTPUnauthorized(None, None),
+     )
+ 
+     with Git.clone(url=source_url, branch="0.1") as repo:
+@@ -389,3 +391,32 @@ def test_system_git_called_when_configured(
+         target=path,
+         refspec=GitRefSpec(branch="0.1", revision=None, tag=None, ref=b"HEAD"),
+     )
++
++
++def test_relative_submodules_with_ssh(
++    source_url: str, tmpdir: Path, mocker: MockerFixture
++) -> None:
++    target = tmpdir / "temp"
++    ssh_source_url = urlunparse(urlparse(source_url)._replace(scheme="ssh"))
++
++    repo_with_unresolved_submodules = Git._clone(
++        url=source_url,
++        refspec=GitRefSpec(branch="relative_submodule"),
++        target=target,
++    )
++
++    # construct fake git config
++    fake_config = ConfigFile(
++        {(b"remote", b"origin"): {b"url": ssh_source_url.encode("utf-8")}}
++    )
++    # trick Git into thinking remote.origin is an ssh url
++    mock_get_config = mocker.patch.object(repo_with_unresolved_submodules, "get_config")
++    mock_get_config.return_value = fake_config
++
++    submodules = Git._get_submodules(repo_with_unresolved_submodules)
++
++    assert [s.url for s in submodules] == [
++        "https://github.com/pypa/sample-namespace-packages.git",
++        "ssh://github.com/python-poetry/test-fixture-vcs-repository.git",
++        "ssh://github.com/python-poetry/test-fixture-vcs-repository.git",
++    ]
+
+diff --git a/tests/json/test_schema_sources.py b/tests/json/test_schema_sources.py
+index b1f023b..f0a9982 100644
+--- a/tests/json/test_schema_sources.py
++++ b/tests/json/test_schema_sources.py
+@@ -29,8 +29,8 @@ def test_pyproject_toml_invalid_priority() -> None:
+     content = toml["tool"]["poetry"]
+     assert Factory.validate(content) == {
+         "errors": [
+-            "[source.0.priority] 'arbitrary' is not one of ['primary', 'default',"
+-            " 'secondary', 'supplemental', 'explicit']"
++            "data.source[0].priority must be one of ['primary', 'default', "
++            "'secondary', 'supplemental', 'explicit']"
+         ],
+         "warnings": [],
+     }
+@@ -42,12 +42,6 @@ def test_pyproject_toml_invalid_priority_legacy_and_new() -> None:
+     ).read()
+     content = toml["tool"]["poetry"]
+     assert Factory.validate(content) == {
+-        "errors": [
+-            "[source.0] {'name': 'pypi-simple', 'url': "
+-            "'https://pypi.org/simple/', 'default': False, 'priority': "
+-            "'primary'} should not be valid under {'anyOf': [{'required': "
+-            "['priority', 'default']}, {'required': ['priority', "
+-            "'secondary']}]}"
+-        ],
++        "errors": ["data.source[0] must NOT match a disallowed definition"],
+         "warnings": [],
+     }
+
+diff --git a/tests/masonry/builders/test_editable_builder.py b/tests/masonry/builders/test_editable_builder.py
+index 6ae2b6b..aa7e9e0 100644
+--- a/tests/masonry/builders/test_editable_builder.py
++++ b/tests/masonry/builders/test_editable_builder.py
+@@ -15,6 +15,7 @@ import pytest
+ from cleo.io.null_io import NullIO
+ from deepdiff import DeepDiff
+ from poetry.core.constraints.version import Version
++from poetry.core.packages.package import Package
+ 
+ from poetry.factory import Factory
+ from poetry.masonry.builders.editable import EditableBuilder
+@@ -28,9 +29,9 @@ from poetry.utils.env import ephemeral_environment
+ 
+ if TYPE_CHECKING:
+     from pytest_mock import MockerFixture
++    from tests.types import FixtureDirGetter
+ 
+     from poetry.poetry import Poetry
+-    from tests.types import FixtureDirGetter
+ 
+ 
+ @pytest.fixture()
+@@ -125,8 +126,14 @@ def test_builder_installs_proper_files_for_standard_packages(
+         == "[console_scripts]\nbaz=bar:baz.boom.bim\nfoo=foo:bar\n"
+         "fox=fuz.foo:bar.baz\n\n"
+     )
+-
+-    metadata = """\
++    python_classifiers = "\n".join(
++        f"Classifier: Programming Language :: Python :: {version}"
++        for version in sorted(
++            Package.AVAILABLE_PYTHONS,
++            key=lambda x: tuple(map(int, x.split("."))),
++        )
++    )
++    metadata = f"""\
+ Metadata-Version: 2.1
+ Name: simple-project
+ Version: 1.2.3
+@@ -138,17 +145,7 @@ Author: Sébastien Eustace
+ Author-email: sebastien@eustace.io
+ Requires-Python: >=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*
+ Classifier: License :: OSI Approved :: MIT License
+-Classifier: Programming Language :: Python :: 2
+-Classifier: Programming Language :: Python :: 2.7
+-Classifier: Programming Language :: Python :: 3
+-Classifier: Programming Language :: Python :: 3.4
+-Classifier: Programming Language :: Python :: 3.5
+-Classifier: Programming Language :: Python :: 3.6
+-Classifier: Programming Language :: Python :: 3.7
+-Classifier: Programming Language :: Python :: 3.8
+-Classifier: Programming Language :: Python :: 3.9
+-Classifier: Programming Language :: Python :: 3.10
+-Classifier: Programming Language :: Python :: 3.11
++{python_classifiers}
+ Classifier: Topic :: Software Development :: Build Tools
+ Classifier: Topic :: Software Development :: Libraries :: Python Modules
+ Project-URL: Documentation, https://python-poetry.org/docs
+@@ -226,6 +223,7 @@ def test_builder_falls_back_on_setup_and_pip_for_packages_with_build_scripts(
+     assert [] == env.executed
+ 
+ 
++@pytest.mark.network
+ def test_builder_setup_generation_runs_with_pip_editable(
+     fixture_dir: FixtureDirGetter, tmp_path: Path
+ ) -> None:
+
+diff --git a/tests/mixology/solutions/solutions/test_python_requirement_solution.py b/tests/mixology/solutions/solutions/test_python_requirement_solution.py
+index 7e62713..6eafb44 100644
+--- a/tests/mixology/solutions/solutions/test_python_requirement_solution.py
++++ b/tests/mixology/solutions/solutions/test_python_requirement_solution.py
+@@ -26,8 +26,8 @@ The Python requirement can be specified via the `python` or `markers` properties
+ For foo, a possible solution would be to set the `python` property to ">=3.6,<4.0"\
+ """
+     links = [
+-        "https://python-poetry.org/docs/dependency-specification/#python-restricted-dependencies",  # noqa: E501
+-        "https://python-poetry.org/docs/dependency-specification/#using-environment-markers",  # noqa: E501
++        "https://python-poetry.org/docs/dependency-specification/#python-restricted-dependencies",
++        "https://python-poetry.org/docs/dependency-specification/#using-environment-markers",
+     ]
+ 
+     assert title == solution.solution_title
+
+diff --git a/tests/mixology/version_solver/test_python_constraint.py b/tests/mixology/version_solver/test_python_constraint.py
+index d54a918..ed7d0f1 100644
+--- a/tests/mixology/version_solver/test_python_constraint.py
++++ b/tests/mixology/version_solver/test_python_constraint.py
+@@ -23,8 +23,8 @@ def test_dependency_does_not_match_root_python_constraint(
+     add_to_repo(repo, "foo", "1.0.0", python="<3.5")
+ 
+     error = """\
+-The current project's Python requirement (>=3.6,<4.0) is not compatible with some of\
+- the required packages Python requirement:
++The current project's supported Python range (>=3.6,<4.0) is not compatible with some\
++ of the required packages Python requirement:
+   - foo requires Python <3.5, so it will not be satisfied for Python >=3.6,<4.0
+ 
+ Because no versions of foo match !=1.0.0
+
+diff --git a/tests/packages/test_direct_origin.py b/tests/packages/test_direct_origin.py
+index ff9548c..55a6394 100644
+--- a/tests/packages/test_direct_origin.py
++++ b/tests/packages/test_direct_origin.py
+@@ -43,7 +43,7 @@ def test_direct_origin_does_not_download_url_dependency_when_cached(
+     )
+     direct_origin = DirectOrigin(artifact_cache)
+     url = "https://python-poetry.org/distributions/demo-0.1.0-py2.py3-none-any.whl"
+-    mocker.patch(
++    download_file = mocker.patch(
+         "poetry.packages.direct_origin.download_file",
+         side_effect=Exception("download_file should not be called"),
+     )
+@@ -52,5 +52,5 @@ def test_direct_origin_does_not_download_url_dependency_when_cached(
+ 
+     assert package.name == "demo"
+     artifact_cache.get_cached_archive_for_link.assert_called_once_with(
+-        Link(url), strict=True
++        Link(url), strict=True, download_func=download_file
+     )
+
+diff --git a/tests/packages/test_locker.py b/tests/packages/test_locker.py
+index 715ba5e..adf143d 100644
+--- a/tests/packages/test_locker.py
++++ b/tests/packages/test_locker.py
+@@ -622,6 +622,38 @@ content-hash = "115cf985d932e9bf5f540555bbdd75decbb62cac81e399375fc19f6277f8c1d8
+     assert "Unable to read the lock file" in str(e.value)
+ 
+ 
++def test_reading_lock_file_should_raise_an_error_on_missing_metadata(
++    locker: Locker,
++) -> None:
++    content = f"""\
++# {GENERATED_COMMENT}
++
++[[package]]
++name = "A"
++version = "1.0.0"
++description = ""
++optional = false
++python-versions = "*"
++files = []
++
++[package.source]
++type = "legacy"
++url = "https://foo.bar"
++reference = "legacy"
++"""
++    with locker.lock.open("w", encoding="utf-8") as f:
++        f.write(content)
++
++    with pytest.raises(RuntimeError) as e:
++        _ = locker.lock_data
++
++    assert (
++        "The lock file does not have a metadata entry.\nRegenerate the lock file with"
++        " the `poetry lock` command."
++        in str(e.value)
++    )
++
++
+ def test_locking_legacy_repository_package_should_include_source_section(
+     root: ProjectPackage, locker: Locker
+ ) -> None:
+@@ -787,7 +819,7 @@ content-hash = "115cf985d932e9bf5f540555bbdd75decbb62cac81e399375fc19f6277f8c1d8
+     assert content == expected
+ 
+ 
+-def test_locker_should_neither_emit_warnings_nor_raise_error_for_lower_compatible_versions(  # noqa: E501
++def test_locker_should_neither_emit_warnings_nor_raise_error_for_lower_compatible_versions(
+     locker: Locker, caplog: LogCaptureFixture
+ ) -> None:
+     older_version = "1.1"
+
+diff --git a/tests/plugins/test_plugin_manager.py b/tests/plugins/test_plugin_manager.py
+index b6baa35..44e0d68 100644
+--- a/tests/plugins/test_plugin_manager.py
++++ b/tests/plugins/test_plugin_manager.py
+@@ -29,8 +29,7 @@ if TYPE_CHECKING:
+ 
+ 
+ class ManagerFactory(Protocol):
+-    def __call__(self, group: str = Plugin.group) -> PluginManager:
+-        ...
++    def __call__(self, group: str = Plugin.group) -> PluginManager: ...
+ 
+ 
+ class MyPlugin(Plugin):
+
+diff --git a/tests/puzzle/test_provider.py b/tests/puzzle/test_provider.py
+index 38504c4..ebb7800 100644
+--- a/tests/puzzle/test_provider.py
++++ b/tests/puzzle/test_provider.py
+@@ -426,10 +426,11 @@ def test_search_for_directory_poetry(
+         get_dependency("cachy", ">=0.2.0"),
+         get_dependency("pendulum", ">=1.4.4"),
+     ]
+-    assert package.extras == {
+-        "extras-a": [get_dependency("pendulum", ">=1.4.4")],
+-        "extras-b": [get_dependency("cachy", ">=0.2.0")],
+-    }
++    extras_a = canonicalize_name("extras-a")
++    extras_b = canonicalize_name("extras-b")
++    assert set(package.extras) == {extras_a, extras_b}
++    assert set(package.extras[extras_a]) == {get_dependency("pendulum", ">=1.4.4")}
++    assert set(package.extras[extras_b]) == {get_dependency("cachy", ">=0.2.0")}
+ 
+ 
+ def test_search_for_directory_poetry_with_extras(
+@@ -457,10 +458,11 @@ def test_search_for_directory_poetry_with_extras(
+         get_dependency("cachy", ">=0.2.0"),
+         get_dependency("pendulum", ">=1.4.4"),
+     ]
+-    assert package.extras == {
+-        "extras-a": [get_dependency("pendulum", ">=1.4.4")],
+-        "extras-b": [get_dependency("cachy", ">=0.2.0")],
+-    }
++    extras_a = canonicalize_name("extras-a")
++    extras_b = canonicalize_name("extras-b")
++    assert set(package.extras) == {extras_a, extras_b}
++    assert set(package.extras[extras_a]) == {get_dependency("pendulum", ">=1.4.4")}
++    assert set(package.extras[extras_b]) == {get_dependency("cachy", ">=0.2.0")}
+ 
+ 
+ def test_search_for_file_sdist(
+
+diff --git a/tests/puzzle/test_solver.py b/tests/puzzle/test_solver.py
+index 5b5b880..0b85d82 100644
+--- a/tests/puzzle/test_solver.py
++++ b/tests/puzzle/test_solver.py
+@@ -1108,7 +1108,7 @@ def test_solver_with_dependency_in_both_main_and_dev_dependencies(
+     )
+ 
+ 
+-def test_solver_with_dependency_in_both_main_and_dev_dependencies_with_one_more_dependent(  # noqa: E501
++def test_solver_with_dependency_in_both_main_and_dev_dependencies_with_one_more_dependent(
+     solver: Solver, repo: Repository, package: ProjectPackage
+ ) -> None:
+     package.add_dependency(Factory.create_dependency("A", "*"))
+@@ -2258,7 +2258,7 @@ def test_solver_can_resolve_git_dependencies_with_ref(
+     assert op.package.source_resolved_reference.startswith("9cf87a2")
+ 
+ 
+-def test_solver_does_not_trigger_conflict_for_python_constraint_if_python_requirement_is_compatible(  # noqa: E501
++def test_solver_does_not_trigger_conflict_for_python_constraint_if_python_requirement_is_compatible(
+     solver: Solver, repo: Repository, package: ProjectPackage
+ ) -> None:
+     set_package_python_versions(solver.provider, "~2.7 || ^3.4")
+@@ -2276,7 +2276,7 @@ def test_solver_does_not_trigger_conflict_for_python_constraint_if_python_requir
+     check_solver_result(transaction, [{"job": "install", "package": package_a}])
+ 
+ 
+-def test_solver_does_not_trigger_conflict_for_python_constraint_if_python_requirement_is_compatible_multiple(  # noqa: E501
++def test_solver_does_not_trigger_conflict_for_python_constraint_if_python_requirement_is_compatible_multiple(
+     solver: Solver, repo: Repository, package: ProjectPackage
+ ) -> None:
+     set_package_python_versions(solver.provider, "~2.7 || ^3.4")
+@@ -2308,7 +2308,7 @@ def test_solver_does_not_trigger_conflict_for_python_constraint_if_python_requir
+     )
+ 
+ 
+-def test_solver_triggers_conflict_for_dependency_python_not_fully_compatible_with_package_python(  # noqa: E501
++def test_solver_triggers_conflict_for_dependency_python_not_fully_compatible_with_package_python(
+     solver: Solver, repo: Repository, package: ProjectPackage
+ ) -> None:
+     set_package_python_versions(solver.provider, "~2.7 || ^3.4")
+@@ -2325,7 +2325,7 @@ def test_solver_triggers_conflict_for_dependency_python_not_fully_compatible_wit
+         solver.solve()
+ 
+ 
+-def test_solver_finds_compatible_package_for_dependency_python_not_fully_compatible_with_package_python(  # noqa: E501
++def test_solver_finds_compatible_package_for_dependency_python_not_fully_compatible_with_package_python(
+     solver: Solver, repo: Repository, package: ProjectPackage
+ ) -> None:
+     set_package_python_versions(solver.provider, "~2.7 || ^3.4")
+@@ -2347,7 +2347,7 @@ def test_solver_finds_compatible_package_for_dependency_python_not_fully_compati
+     check_solver_result(transaction, [{"job": "install", "package": package_a100}])
+ 
+ 
+-def test_solver_does_not_trigger_new_resolution_on_duplicate_dependencies_if_only_extras(  # noqa: E501
++def test_solver_does_not_trigger_new_resolution_on_duplicate_dependencies_if_only_extras(
+     solver: Solver, repo: Repository, package: ProjectPackage
+ ) -> None:
+     dep1 = Dependency.create_from_pep_508('B (>=1.0); extra == "foo"')
+@@ -4322,3 +4322,91 @@ def test_update_with_use_latest_vs_lock(
+             {"job": "install", "package": package_a1},
+         ],
+     )
++
++
++@pytest.mark.parametrize("with_extra", [False, True])
++def test_solver_resolves_duplicate_dependency_in_extra(
++    package: ProjectPackage,
++    pool: RepositoryPool,
++    repo: Repository,
++    io: NullIO,
++    with_extra: bool,
++) -> None:
++    """
++    Without extras, a newer version of B can be chosen than with extras.
++    See https://github.com/python-poetry/poetry/issues/8380.
++    """
++    constraint: dict[str, Any] = {"version": "*"}
++    if with_extra:
++        constraint["extras"] = ["foo"]
++    package.add_dependency(Factory.create_dependency("A", constraint))
++
++    package_a = get_package("A", "1.0")
++    package_b1 = get_package("B", "1.0")
++    package_b2 = get_package("B", "2.0")
++
++    dep = get_dependency("B", ">=1.0")
++    package_a.add_dependency(dep)
++
++    dep_extra = get_dependency("B", "^1.0", optional=True)
++    dep_extra.marker = parse_marker("extra == 'foo'")
++    package_a.extras = {canonicalize_name("foo"): [dep_extra]}
++    package_a.add_dependency(dep_extra)
++
++    repo.add_package(package_a)
++    repo.add_package(package_b1)
++    repo.add_package(package_b2)
++
++    solver = Solver(package, pool, [], [], io)
++    transaction = solver.solve()
++
++    check_solver_result(
++        transaction,
++        (
++            [
++                {"job": "install", "package": package_b1 if with_extra else package_b2},
++                {"job": "install", "package": package_a},
++            ]
++        ),
++    )
++
++
++def test_solver_resolves_duplicate_dependencies_with_restricted_extras(
++    package: ProjectPackage,
++    pool: RepositoryPool,
++    repo: Repository,
++    io: NullIO,
++) -> None:
++    package.add_dependency(
++        Factory.create_dependency("A", {"version": "*", "extras": ["foo"]})
++    )
++
++    package_a = get_package("A", "1.0")
++    package_b1 = get_package("B", "1.0")
++    package_b2 = get_package("B", "2.0")
++
++    dep1 = get_dependency("B", "^1.0", optional=True)
++    dep1.marker = parse_marker("sys_platform == 'win32' and extra == 'foo'")
++    dep2 = get_dependency("B", "^2.0", optional=True)
++    dep2.marker = parse_marker("sys_platform == 'linux' and extra == 'foo'")
++    package_a.extras = {canonicalize_name("foo"): [dep1, dep2]}
++    package_a.add_dependency(dep1)
++    package_a.add_dependency(dep2)
++
++    repo.add_package(package_a)
++    repo.add_package(package_b1)
++    repo.add_package(package_b2)
++
++    solver = Solver(package, pool, [], [], io)
++    transaction = solver.solve()
++
++    check_solver_result(
++        transaction,
++        (
++            [
++                {"job": "install", "package": package_b1},
++                {"job": "install", "package": package_b2},
++                {"job": "install", "package": package_a},
++            ]
++        ),
++    )
+
+diff --git a/tests/repositories/test_installed_repository.py b/tests/repositories/test_installed_repository.py
+index b69df38..2dbf014 100644
+--- a/tests/repositories/test_installed_repository.py
++++ b/tests/repositories/test_installed_repository.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import shutil
+ import zipfile
+ 
+ from pathlib import Path
+@@ -10,7 +11,9 @@ import pytest
+ 
+ from poetry.repositories.installed_repository import InstalledRepository
+ from poetry.utils._compat import metadata
++from poetry.utils.env import EnvManager
+ from poetry.utils.env import MockEnv as BaseMockEnv
++from poetry.utils.env import VirtualEnv
+ 
+ 
+ if TYPE_CHECKING:
+@@ -18,6 +21,10 @@ if TYPE_CHECKING:
+     from poetry.core.packages.package import Package
+     from pytest_mock.plugin import MockerFixture
+ 
++    from poetry.poetry import Poetry
++    from tests.types import FixtureDirGetter
++    from tests.types import ProjectFactory
++
+ FIXTURES_DIR = Path(__file__).parent / "fixtures"
+ ENV_DIR = (FIXTURES_DIR / "installed").resolve()
+ SITE_PURELIB = ENV_DIR / "lib" / "python3.7" / "site-packages"
+@@ -104,6 +111,11 @@ def get_package_from_repository(
+     return None
+ 
+ 
++@pytest.fixture
++def poetry(project_factory: ProjectFactory, fixture_dir: FixtureDirGetter) -> Poetry:
++    return project_factory("simple", source=fixture_dir("simple_project"))
++
++
+ def test_load_successful(repository: InstalledRepository) -> None:
+     assert len(repository.packages) == len(INSTALLED_RESULTS)
+ 
+@@ -301,3 +313,27 @@ def test_load_pep_610_compliant_editable_directory_packages(
+     assert package.source_type == "directory"
+     assert package.source_url == "/path/to/distributions/directory-pep-610"
+     assert package.develop
++
++
++def test_system_site_packages_source_type(
++    tmp_path: Path, mocker: MockerFixture, poetry: Poetry
++) -> None:
++    """
++    The source type of system site packages
++    must not be falsely identified as "directory".
++    """
++    venv_path = tmp_path / "venv"
++    site_path = tmp_path / "site"
++    for dist_info in {"cleo-0.7.6.dist-info", "directory_pep_610-1.2.3.dist-info"}:
++        shutil.copytree(SITE_PURELIB / dist_info, site_path / dist_info)
++    mocker.patch("poetry.utils.env.virtual_env.VirtualEnv.sys_path", [str(site_path)])
++    mocker.patch("site.getsitepackages", return_value=[str(site_path)])
++
++    EnvManager(poetry).build_venv(path=venv_path, flags={"system-site-packages": True})
++    env = VirtualEnv(venv_path)
++    installed_repository = InstalledRepository.load(env)
++
++    source_types = {
++        package.name: package.source_type for package in installed_repository.packages
++    }
++    assert source_types == {"cleo": None, "directory-pep-610": "directory"}
+
+diff --git a/tests/repositories/test_legacy_repository.py b/tests/repositories/test_legacy_repository.py
+index f291e54..180b7b3 100644
+--- a/tests/repositories/test_legacy_repository.py
++++ b/tests/repositories/test_legacy_repository.py
+@@ -130,11 +130,11 @@ def test_page_filters_out_invalid_package_names() -> None:
+     assert package.files == [
+         {
+             "file": "pytest-3.5.0-py2.py3-none-any.whl",
+-            "hash": "sha256:6266f87ab64692112e5477eba395cfedda53b1933ccd29478e671e73b420c19c",  # noqa: E501
++            "hash": "sha256:6266f87ab64692112e5477eba395cfedda53b1933ccd29478e671e73b420c19c",
+         },
+         {
+             "file": "pytest-3.5.0.tar.gz",
+-            "hash": "sha256:fae491d1874f199537fd5872b5e1f0e74a009b979df9d53d1553fd03da1703e1",  # noqa: E501
++            "hash": "sha256:fae491d1874f199537fd5872b5e1f0e74a009b979df9d53d1553fd03da1703e1",
+         },
+     ]
+ 
+@@ -383,11 +383,11 @@ def test_get_package_retrieves_non_sha256_hashes() -> None:
+     expected = [
+         {
+             "file": "ipython-7.5.0-py3-none-any.whl",
+-            "hash": "sha256:78aea20b7991823f6a32d55f4e963a61590820e43f666ad95ad07c7f0c704efa",  # noqa: E501
++            "hash": "sha256:78aea20b7991823f6a32d55f4e963a61590820e43f666ad95ad07c7f0c704efa",
+         },
+         {
+             "file": "ipython-7.5.0.tar.gz",
+-            "hash": "sha256:e840810029224b56cd0d9e7719dc3b39cf84d577f8ac686547c8ba7a06eeab26",  # noqa: E501
++            "hash": "sha256:e840810029224b56cd0d9e7719dc3b39cf84d577f8ac686547c8ba7a06eeab26",
+         },
+     ]
+ 
+@@ -406,11 +406,11 @@ def test_get_package_retrieves_non_sha256_hashes_mismatching_known_hash() -> Non
+         },
+         {
+             "file": "ipython-5.7.0-py3-none-any.whl",
+-            "hash": "sha256:fc0464e68f9c65cd8c453474b4175432cc29ecb6c83775baedf6dbfcee9275ab",  # noqa: E501
++            "hash": "sha256:fc0464e68f9c65cd8c453474b4175432cc29ecb6c83775baedf6dbfcee9275ab",
+         },
+         {
+             "file": "ipython-5.7.0.tar.gz",
+-            "hash": "sha256:8db43a7fb7619037c98626613ff08d03dda9d5d12c84814a4504c78c0da8323c",  # noqa: E501
++            "hash": "sha256:8db43a7fb7619037c98626613ff08d03dda9d5d12c84814a4504c78c0da8323c",
+         },
+     ]
+ 
+@@ -425,7 +425,7 @@ def test_get_package_retrieves_packages_with_no_hashes() -> None:
+     assert [
+         {
+             "file": "jupyter-1.0.0.tar.gz",
+-            "hash": "sha256:d9dc4b3318f310e34c82951ea5d6683f67bed7def4b259fafbfe4f1beb1d8e5f",  # noqa: E501
++            "hash": "sha256:d9dc4b3318f310e34c82951ea5d6683f67bed7def4b259fafbfe4f1beb1d8e5f",
+         }
+     ] == package.files
+ 
+
+diff --git a/tests/repositories/test_pypi_repository.py b/tests/repositories/test_pypi_repository.py
+index c2f5694..9169430 100644
+--- a/tests/repositories/test_pypi_repository.py
++++ b/tests/repositories/test_pypi_repository.py
+@@ -137,11 +137,11 @@ def test_package() -> None:
+     assert package.files == [
+         {
+             "file": "requests-2.18.4-py2.py3-none-any.whl",
+-            "hash": "sha256:6a1b267aa90cac58ac3a765d067950e7dbbf75b1da07e895d1f594193a40a38b",  # noqa: E501
++            "hash": "sha256:6a1b267aa90cac58ac3a765d067950e7dbbf75b1da07e895d1f594193a40a38b",
+         },
+         {
+             "file": "requests-2.18.4.tar.gz",
+-            "hash": "sha256:9c443e7324ba5b85070c4a818ade28bfabedf16ea10206da1132edaa6dda237e",  # noqa: E501
++            "hash": "sha256:9c443e7324ba5b85070c4a818ade28bfabedf16ea10206da1132edaa6dda237e",
+         },
+     ]
+ 
+
+diff --git a/tests/test_factory.py b/tests/test_factory.py
+index fcb0bbb..b1895d2 100644
+--- a/tests/test_factory.py
++++ b/tests/test_factory.py
+@@ -9,7 +9,9 @@ import pytest
+ from cleo.io.buffered_io import BufferedIO
+ from deepdiff import DeepDiff
+ from packaging.utils import canonicalize_name
++from poetry.core.constraints.version import Version
+ from poetry.core.constraints.version import parse_constraint
++from poetry.core.packages.package import Package
+ from poetry.core.packages.vcs_dependency import VCSDependency
+ 
+ from poetry.exceptions import PoetryException
+@@ -131,15 +133,18 @@ def test_create_poetry(fixture_dir: FixtureDirGetter) -> None:
+ 
+     assert package.all_classifiers == [
+         "License :: OSI Approved :: MIT License",
+-        "Programming Language :: Python :: 2",
+-        "Programming Language :: Python :: 2.7",
+-        "Programming Language :: Python :: 3",
+-        "Programming Language :: Python :: 3.6",
+-        "Programming Language :: Python :: 3.7",
+-        "Programming Language :: Python :: 3.8",
+-        "Programming Language :: Python :: 3.9",
+-        "Programming Language :: Python :: 3.10",
+-        "Programming Language :: Python :: 3.11",
++        *(
++            f"Programming Language :: Python :: {version}"
++            for version in sorted(
++                Package.AVAILABLE_PYTHONS,
++                key=lambda x: tuple(map(int, x.split("."))),
++            )
++            if package.python_constraint.allows_any(
++                parse_constraint(version + ".*")
++                if len(version) == 1
++                else Version.parse(version)
++            )
++        ),
+         "Topic :: Software Development :: Build Tools",
+         "Topic :: Software Development :: Libraries :: Python Modules",
+     ]
+@@ -519,12 +524,20 @@ def test_create_poetry_fails_on_invalid_configuration(
+     with pytest.raises(RuntimeError) as e:
+         Factory().create_poetry(fixture_dir("invalid_pyproject") / "pyproject.toml")
+ 
+-    expected = """\
++    jsonschema_error = "'description' is a required property"
++    fastjsonschema_error = "data must contain ['description'] properties"
++
++    expected_template = """\
+ The Poetry configuration is invalid:
+-  - 'description' is a required property
++  - {schema_error}
+   - Project name (invalid) is same as one of its dependencies
+ """
+-    assert str(e.value) == expected
++    expected = {
++        expected_template.format(schema_error=schema_error)
++        for schema_error in (jsonschema_error, fastjsonschema_error)
++    }
++
++    assert str(e.value) in expected
+ 
+ 
+ def test_create_poetry_with_local_config(fixture_dir: FixtureDirGetter) -> None:
+
+diff --git a/tests/types.py b/tests/types.py
+index d2bd5a6..63392cc 100644
+--- a/tests/types.py
++++ b/tests/types.py
+@@ -27,13 +27,13 @@ class CommandTesterFactory(Protocol):
+         installer: Installer | None = None,
+         executor: Executor | None = None,
+         environment: Env | None = None,
+-    ) -> CommandTester:
+-        ...
++    ) -> CommandTester: ...
+ 
+ 
+ class SourcesFactory(Protocol):
+-    def __call__(self, poetry: Poetry, sources: Source, config: Config, io: IO) -> None:
+-        ...
++    def __call__(
++        self, poetry: Poetry, sources: Source, config: Config, io: IO
++    ) -> None: ...
+ 
+ 
+ class ProjectFactory(Protocol):
+@@ -48,20 +48,16 @@ class ProjectFactory(Protocol):
+         source: Path | None = None,
+         locker_config: dict[str, Any] | None = None,
+         use_test_locker: bool = True,
+-    ) -> Poetry:
+-        ...
++    ) -> Poetry: ...
+ 
+ 
+ class FixtureDirGetter(Protocol):
+-    def __call__(self, name: str) -> Path:
+-        ...
++    def __call__(self, name: str) -> Path: ...
+ 
+ 
+ class FixtureCopier(Protocol):
+-    def __call__(self, relative_path: str, target: Path | None = None) -> Path:
+-        ...
++    def __call__(self, relative_path: str, target: Path | None = None) -> Path: ...
+ 
+ 
+ class HTMLPageGetter(Protocol):
+-    def __call__(self, content: str, base_url: str | None = None) -> str:
+-        ...
++    def __call__(self, content: str, base_url: str | None = None) -> str: ...
+
+diff --git a/tests/utils/fixtures/setups/minimal/setup.py b/tests/utils/fixtures/setups/minimal/setup.py
+new file mode 100644
+index 0000000..536cf17
+--- /dev/null
++++ b/tests/utils/fixtures/setups/minimal/setup.py
+@@ -0,0 +1,6 @@
++from __future__ import annotations
++
++from setuptools import setup
++
++
++setup()
+
+diff --git a/tests/utils/fixtures/setups/with-setup-cfg-minimal/setup.py b/tests/utils/fixtures/setups/with-setup-cfg-minimal/setup.py
+new file mode 100644
+index 0000000..536cf17
+--- /dev/null
++++ b/tests/utils/fixtures/setups/with-setup-cfg-minimal/setup.py
+@@ -0,0 +1,6 @@
++from __future__ import annotations
++
++from setuptools import setup
++
++
++setup()
+
+diff --git a/tests/utils/test_authenticator.py b/tests/utils/test_authenticator.py
+index 2a0d1be..844f761 100644
+--- a/tests/utils/test_authenticator.py
++++ b/tests/utils/test_authenticator.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import base64
++import logging
+ import re
+ import uuid
+ 
+@@ -20,6 +21,7 @@ from poetry.utils.authenticator import RepositoryCertificateConfig
+ 
+ 
+ if TYPE_CHECKING:
++    from _pytest.logging import LogCaptureFixture
+     from _pytest.monkeypatch import MonkeyPatch
+     from pytest_mock import MockerFixture
+ 
+@@ -65,8 +67,8 @@ def test_authenticator_uses_url_provided_credentials(
+     authenticator.request("get", "https://foo001:bar002@foo.bar/files/foo-0.1.0.tar.gz")
+ 
+     request = http.last_request()
+-
+-    assert request.headers["Authorization"] == "Basic Zm9vMDAxOmJhcjAwMg=="
++    basic_auth = base64.b64encode(b"foo001:bar002").decode()
++    assert request.headers["Authorization"] == f"Basic {basic_auth}"
+ 
+ 
+ def test_authenticator_uses_credentials_from_config_if_not_provided(
+@@ -76,8 +78,8 @@ def test_authenticator_uses_credentials_from_config_if_not_provided(
+     authenticator.request("get", "https://foo.bar/files/foo-0.1.0.tar.gz")
+ 
+     request = http.last_request()
+-
+-    assert request.headers["Authorization"] == "Basic YmFyOmJheg=="
++    basic_auth = base64.b64encode(b"bar:baz").decode()
++    assert request.headers["Authorization"] == f"Basic {basic_auth}"
+ 
+ 
+ def test_authenticator_uses_username_only_credentials(
+@@ -90,8 +92,38 @@ def test_authenticator_uses_username_only_credentials(
+     authenticator.request("get", "https://foo001@foo.bar/files/foo-0.1.0.tar.gz")
+ 
+     request = http.last_request()
++    basic_auth = base64.b64encode(b"foo001:").decode()
++    assert request.headers["Authorization"] == f"Basic {basic_auth}"
++
++
++def test_authenticator_ignores_locked_keyring(
++    mock_remote: None,
++    http: type[httpretty.httpretty],
++    with_locked_keyring: None,
++    caplog: LogCaptureFixture,
++) -> None:
++    caplog.set_level(logging.DEBUG, logger="poetry.utils.password_manager")
++    authenticator = Authenticator()
++    authenticator.request("get", "https://foo.bar/files/foo-0.1.0.tar.gz")
++
++    request = http.last_request()
++    assert request.headers["Authorization"] is None
++    assert "Keyring foo.bar is locked" in caplog.messages
+ 
+-    assert request.headers["Authorization"] == "Basic Zm9vMDAxOg=="
++
++def test_authenticator_ignores_failing_keyring(
++    mock_remote: None,
++    http: type[httpretty.httpretty],
++    with_erroneous_keyring: None,
++    caplog: LogCaptureFixture,
++) -> None:
++    caplog.set_level(logging.DEBUG, logger="poetry.utils.password_manager")
++    authenticator = Authenticator()
++    authenticator.request("get", "https://foo.bar/files/foo-0.1.0.tar.gz")
++
++    request = http.last_request()
++    assert request.headers["Authorization"] is None
++    assert "Accessing keyring foo.bar failed" in caplog.messages
+ 
+ 
+ def test_authenticator_uses_password_only_credentials(
+@@ -101,8 +133,8 @@ def test_authenticator_uses_password_only_credentials(
+     authenticator.request("get", "https://:bar002@foo.bar/files/foo-0.1.0.tar.gz")
+ 
+     request = http.last_request()
+-
+-    assert request.headers["Authorization"] == "Basic OmJhcjAwMg=="
++    basic_auth = base64.b64encode(b":bar002").decode()
++    assert request.headers["Authorization"] == f"Basic {basic_auth}"
+ 
+ 
+ def test_authenticator_uses_empty_strings_as_default_password(
+@@ -123,8 +155,8 @@ def test_authenticator_uses_empty_strings_as_default_password(
+     authenticator.request("get", "https://foo.bar/files/foo-0.1.0.tar.gz")
+ 
+     request = http.last_request()
+-
+-    assert request.headers["Authorization"] == "Basic YmFyOg=="
++    basic_auth = base64.b64encode(b"bar:").decode()
++    assert request.headers["Authorization"] == f"Basic {basic_auth}"
+ 
+ 
+ def test_authenticator_uses_empty_strings_as_default_username(
+@@ -144,8 +176,8 @@ def test_authenticator_uses_empty_strings_as_default_username(
+     authenticator.request("get", "https://foo.bar/files/foo-0.1.0.tar.gz")
+ 
+     request = http.last_request()
+-
+-    assert request.headers["Authorization"] == "Basic OmJhcg=="
++    basic_auth = base64.b64encode(b":bar").decode()
++    assert request.headers["Authorization"] == f"Basic {basic_auth}"
+ 
+ 
+ def test_authenticator_falls_back_to_keyring_url(
+@@ -170,8 +202,8 @@ def test_authenticator_falls_back_to_keyring_url(
+     authenticator.request("get", "https://foo.bar/files/foo-0.1.0.tar.gz")
+ 
+     request = http.last_request()
+-
+-    assert request.headers["Authorization"] == "Basic Zm9vOmJhcg=="
++    basic_auth = base64.b64encode(b"foo:bar").decode()
++    assert request.headers["Authorization"] == f"Basic {basic_auth}"
+ 
+ 
+ def test_authenticator_falls_back_to_keyring_netloc(
+@@ -194,8 +226,8 @@ def test_authenticator_falls_back_to_keyring_netloc(
+     authenticator.request("get", "https://foo.bar/files/foo-0.1.0.tar.gz")
+ 
+     request = http.last_request()
+-
+-    assert request.headers["Authorization"] == "Basic Zm9vOmJhcg=="
++    basic_auth = base64.b64encode(b"foo:bar").decode()
++    assert request.headers["Authorization"] == f"Basic {basic_auth}"
+ 
+ 
+ @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+@@ -306,6 +338,7 @@ def test_authenticator_request_retries_on_status_code(
+     with pytest.raises(requests.exceptions.HTTPError) as excinfo:
+         authenticator.request("get", sdist_uri)
+ 
++    assert excinfo.value.response is not None
+     assert excinfo.value.response.status_code == status
+     assert excinfo.value.response.text == content
+ 
+@@ -330,7 +363,8 @@ def test_authenticator_uses_env_provided_credentials(
+ 
+     request = http.last_request()
+ 
+-    assert request.headers["Authorization"] == "Basic YmFyOmJheg=="
++    basic_auth = base64.b64encode(b"bar:baz").decode()
++    assert request.headers["Authorization"] == f"Basic {basic_auth}"
+ 
+ 
+ @pytest.mark.parametrize(
+
+diff --git a/tests/utils/test_cache.py b/tests/utils/test_cache.py
+index fb8e6f3..1f4abfd 100644
+--- a/tests/utils/test_cache.py
++++ b/tests/utils/test_cache.py
+@@ -1,6 +1,8 @@
+ from __future__ import annotations
+ 
++import concurrent.futures
+ import shutil
++import traceback
+ 
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+@@ -121,7 +123,7 @@ def test_missing_cache_file(poetry_file_cache: FileCache[Any]) -> None:
+ 
+     key1_path = (
+         poetry_file_cache.path
+-        / "81/74/09/96/87/a2/66/21/8174099687a26621f4e2cdd7cc03b3dacedb3fb962255b1aafd033cabe831530"  # noqa: E501
++        / "81/74/09/96/87/a2/66/21/8174099687a26621f4e2cdd7cc03b3dacedb3fb962255b1aafd033cabe831530"
+     )
+     assert key1_path.exists()
+     key1_path.unlink()  # corrupt cache by removing a key file
+@@ -159,7 +161,7 @@ def test_detect_corrupted_cache_key_file(
+ 
+     key1_path = (
+         poetry_file_cache.path
+-        / "81/74/09/96/87/a2/66/21/8174099687a26621f4e2cdd7cc03b3dacedb3fb962255b1aafd033cabe831530"  # noqa: E501
++        / "81/74/09/96/87/a2/66/21/8174099687a26621f4e2cdd7cc03b3dacedb3fb962255b1aafd033cabe831530"
+     )
+     assert key1_path.exists()
+ 
+@@ -322,6 +324,41 @@ def test_get_found_cached_archive_for_link(
+     assert Path(cached) == archive
+ 
+ 
++def test_get_cached_archive_for_link_no_race_condition(
++    tmp_path: Path, mocker: MockerFixture
++) -> None:
++    cache = ArtifactCache(cache_dir=tmp_path)
++    link = Link("https://files.python-poetry.org/demo-0.1.0.tar.gz")
++
++    def replace_file(_: str, dest: Path) -> None:
++        dest.unlink(missing_ok=True)
++        # write some data (so it takes a while) to provoke possible race conditions
++        dest.write_text("a" * 2**20)
++
++    download_mock = mocker.Mock(side_effect=replace_file)
++
++    with concurrent.futures.ThreadPoolExecutor() as executor:
++        tasks = []
++        for _ in range(4):
++            tasks.append(
++                executor.submit(
++                    cache.get_cached_archive_for_link,  # type: ignore[arg-type]
++                    link,
++                    strict=True,
++                    download_func=download_mock,
++                )
++            )
++        concurrent.futures.wait(tasks)
++        results = set()
++        for task in tasks:
++            try:
++                results.add(task.result())
++            except Exception:
++                pytest.fail(traceback.format_exc())
++        assert results == {cache.get_cache_directory_for_link(link) / link.filename}
++        download_mock.assert_called_once()
++
++
+ def test_get_cached_archive_for_git() -> None:
+     """Smoke test that checks that no assertion is raised."""
+     cache = ArtifactCache(cache_dir=Path())
+
+diff --git a/tests/utils/test_env.py b/tests/utils/test_env.py
+index 269287d..de2f90d 100644
+--- a/tests/utils/test_env.py
++++ b/tests/utils/test_env.py
+@@ -1,6 +1,8 @@
+ from __future__ import annotations
+ 
++import contextlib
+ import os
++import site
+ import subprocess
+ import sys
+ 
+@@ -18,7 +20,7 @@ from poetry.factory import Factory
+ from poetry.repositories.installed_repository import InstalledRepository
+ from poetry.toml.file import TOMLFile
+ from poetry.utils._compat import WINDOWS
+-from poetry.utils.env import GET_BASE_PREFIX
++from poetry.utils._compat import metadata
+ from poetry.utils.env import GET_PYTHON_VERSION_ONELINER
+ from poetry.utils.env import EnvCommandError
+ from poetry.utils.env import EnvManager
+@@ -131,17 +133,6 @@ def test_env_commands_with_spaces_in_their_arg_work_as_expected(
+     )
+ 
+ 
+-def test_env_shell_commands_with_stdinput_in_their_arg_work_as_expected(
+-    tmp_path: Path, manager: EnvManager
+-) -> None:
+-    venv_path = tmp_path / "Virtual Env"
+-    manager.build_venv(venv_path)
+-    venv = VirtualEnv(venv_path)
+-    run_output_path = Path(venv.run("python", "-", input_=GET_BASE_PREFIX).strip())
+-    venv_base_prefix_path = Path(str(venv.get_base_prefix()))
+-    assert run_output_path.resolve() == venv_base_prefix_path.resolve()
+-
+-
+ def test_env_get_supported_tags_matches_inside_virtualenv(
+     tmp_path: Path, manager: EnvManager
+ ) -> None:
+@@ -192,18 +183,29 @@ def check_output_wrapper(
+ ) -> Callable[[list[str], Any, Any], str]:
+     def check_output(cmd: list[str], *args: Any, **kwargs: Any) -> str:
+         # cmd is a list, like ["python", "-c", "do stuff"]
+-        python_cmd = cmd[2]
++        python_cmd = cmd[-1]
++        if "print(json.dumps(env))" in python_cmd:
++            return (
++                f'{{"version_info": [{version.major}, {version.minor},'
++                f" {version.patch}]}}"
++            )
++
+         if "sys.version_info[:3]" in python_cmd:
+             return version.text
+-        elif "sys.version_info[:2]" in python_cmd:
++
++        if "sys.version_info[:2]" in python_cmd:
+             return f"{version.major}.{version.minor}"
+-        elif "import sys; print(sys.executable)" in python_cmd:
++
++        if "import sys; print(sys.executable)" in python_cmd:
+             executable = cmd[0]
+             basename = os.path.basename(executable)
+             return f"/usr/bin/{basename}"
+-        else:
+-            assert "import sys; print(sys.prefix)" in python_cmd
+-            return "/prefix"
++
++        if "print(sys.base_prefix)" in python_cmd:
++            return "/usr"
++
++        assert "import sys; print(sys.prefix)" in python_cmd
++        return "/prefix"
+ 
+     return check_output
+ 
+@@ -221,22 +223,12 @@ def test_activate_in_project_venv_no_explicit_config(
+         "subprocess.check_output",
+         side_effect=check_output_wrapper(),
+     )
+-    mocker.patch(
+-        "subprocess.Popen.communicate",
+-        side_effect=[
+-            ("/prefix", None),
+-            ('{"version_info": [3, 7, 0]}', None),
+-            ("/prefix", None),
+-            ("/prefix", None),
+-            ("/prefix", None),
+-        ],
+-    )
+     m = mocker.patch("poetry.utils.env.EnvManager.build_venv", side_effect=build_venv)
+ 
+     env = manager.activate("python3.7")
+ 
+     assert env.path == tmp_path / "poetry-fixture-simple" / ".venv"
+-    assert env.base == Path("/prefix")
++    assert env.base == Path("/usr")
+ 
+     m.assert_called_with(
+         tmp_path / "poetry-fixture-simple" / ".venv",
+@@ -273,10 +265,6 @@ def test_activate_activates_non_existing_virtualenv_no_envs_file(
+         "subprocess.check_output",
+         side_effect=check_output_wrapper(),
+     )
+-    mocker.patch(
+-        "subprocess.Popen.communicate",
+-        side_effect=[("/prefix", None), ("/prefix", None)],
+-    )
+     m = mocker.patch("poetry.utils.env.EnvManager.build_venv", side_effect=build_venv)
+ 
+     env = manager.activate("python3.7")
+@@ -296,7 +284,7 @@ def test_activate_activates_non_existing_virtualenv_no_envs_file(
+     assert envs[venv_name]["patch"] == "3.7.1"
+ 
+     assert env.path == tmp_path / f"{venv_name}-py3.7"
+-    assert env.base == Path("/prefix")
++    assert env.base == Path("/usr")
+ 
+ 
+ def test_activate_fails_when_python_cannot_be_found(
+@@ -343,10 +331,6 @@ def test_activate_activates_existing_virtualenv_no_envs_file(
+         "subprocess.check_output",
+         side_effect=check_output_wrapper(),
+     )
+-    mocker.patch(
+-        "subprocess.Popen.communicate",
+-        side_effect=[("/prefix", None)],
+-    )
+     m = mocker.patch("poetry.utils.env.EnvManager.build_venv", side_effect=build_venv)
+ 
+     env = manager.activate("python3.7")
+@@ -360,7 +344,7 @@ def test_activate_activates_existing_virtualenv_no_envs_file(
+     assert envs[venv_name]["patch"] == "3.7.1"
+ 
+     assert env.path == tmp_path / f"{venv_name}-py3.7"
+-    assert env.base == Path("/prefix")
++    assert env.base == Path("/usr")
+ 
+ 
+ def test_activate_activates_same_virtualenv_with_envs_file(
+@@ -388,10 +372,6 @@ def test_activate_activates_same_virtualenv_with_envs_file(
+         "subprocess.check_output",
+         side_effect=check_output_wrapper(),
+     )
+-    mocker.patch(
+-        "subprocess.Popen.communicate",
+-        side_effect=[("/prefix", None)],
+-    )
+     m = mocker.patch("poetry.utils.env.EnvManager.create_venv")
+ 
+     env = manager.activate("python3.7")
+@@ -404,7 +384,7 @@ def test_activate_activates_same_virtualenv_with_envs_file(
+     assert envs[venv_name]["patch"] == "3.7.1"
+ 
+     assert env.path == tmp_path / f"{venv_name}-py3.7"
+-    assert env.base == Path("/prefix")
++    assert env.base == Path("/usr")
+ 
+ 
+ def test_activate_activates_different_virtualenv_with_envs_file(
+@@ -433,10 +413,6 @@ def test_activate_activates_different_virtualenv_with_envs_file(
+         "subprocess.check_output",
+         side_effect=check_output_wrapper(Version.parse("3.6.6")),
+     )
+-    mocker.patch(
+-        "subprocess.Popen.communicate",
+-        side_effect=[("/prefix", None), ("/prefix", None), ("/prefix", None)],
+-    )
+     m = mocker.patch("poetry.utils.env.EnvManager.build_venv", side_effect=build_venv)
+ 
+     env = manager.activate("python3.6")
+@@ -454,7 +430,7 @@ def test_activate_activates_different_virtualenv_with_envs_file(
+     assert envs[venv_name]["patch"] == "3.6.6"
+ 
+     assert env.path == tmp_path / f"{venv_name}-py3.6"
+-    assert env.base == Path("/prefix")
++    assert env.base == Path("/usr")
+ 
+ 
+ def test_activate_activates_recreates_for_different_patch(
+@@ -483,16 +459,6 @@ def test_activate_activates_recreates_for_different_patch(
+         "subprocess.check_output",
+         side_effect=check_output_wrapper(),
+     )
+-    mocker.patch(
+-        "subprocess.Popen.communicate",
+-        side_effect=[
+-            ("/prefix", None),
+-            ('{"version_info": [3, 7, 0]}', None),
+-            ("/prefix", None),
+-            ("/prefix", None),
+-            ("/prefix", None),
+-        ],
+-    )
+     build_venv_m = mocker.patch(
+         "poetry.utils.env.EnvManager.build_venv", side_effect=build_venv
+     )
+@@ -516,7 +482,7 @@ def test_activate_activates_recreates_for_different_patch(
+     assert envs[venv_name]["patch"] == "3.7.1"
+ 
+     assert env.path == tmp_path / f"{venv_name}-py3.7"
+-    assert env.base == Path("/prefix")
++    assert env.base == Path("/usr")
+     assert (tmp_path / f"{venv_name}-py3.7").exists()
+ 
+ 
+@@ -546,10 +512,6 @@ def test_activate_does_not_recreate_when_switching_minor(
+         "subprocess.check_output",
+         side_effect=check_output_wrapper(Version.parse("3.6.6")),
+     )
+-    mocker.patch(
+-        "subprocess.Popen.communicate",
+-        side_effect=[("/prefix", None), ("/prefix", None), ("/prefix", None)],
+-    )
+     build_venv_m = mocker.patch(
+         "poetry.utils.env.EnvManager.build_venv", side_effect=build_venv
+     )
+@@ -568,7 +530,7 @@ def test_activate_does_not_recreate_when_switching_minor(
+     assert envs[venv_name]["patch"] == "3.6.6"
+ 
+     assert env.path == tmp_path / f"{venv_name}-py3.6"
+-    assert env.base == Path("/prefix")
++    assert env.base == Path("/usr")
+     assert (tmp_path / f"{venv_name}-py3.6").exists()
+ 
+ 
+@@ -661,15 +623,11 @@ def test_get_prefers_explicitly_activated_virtualenvs_over_env_var(
+         "subprocess.check_output",
+         side_effect=check_output_wrapper(),
+     )
+-    mocker.patch(
+-        "subprocess.Popen.communicate",
+-        side_effect=[("/prefix", None)],
+-    )
+ 
+     env = manager.get()
+ 
+     assert env.path == tmp_path / f"{venv_name}-py3.7"
+-    assert env.base == Path("/prefix")
++    assert env.base == Path("/usr")
+ 
+ 
+ def test_list(
+@@ -965,40 +923,16 @@ def test_env_has_symlinks_on_nix(tmp_path: Path, tmp_venv: VirtualEnv) -> None:
+     assert os.path.islink(tmp_venv.python)
+ 
+ 
+-def test_run_with_input(tmp_path: Path, tmp_venv: VirtualEnv) -> None:
+-    result = tmp_venv.run("python", "-", input_=MINIMAL_SCRIPT)
+-
+-    assert result == "Minimal Output\n"
+-
+-
+-def test_run_with_input_non_zero_return(tmp_path: Path, tmp_venv: VirtualEnv) -> None:
+-    with pytest.raises(EnvCommandError) as process_error:
+-        # Test command that will return non-zero returncode.
+-        tmp_venv.run("python", "-", input_=ERRORING_SCRIPT)
+-
+-    assert process_error.value.e.returncode == 1
+-
+-
+ def test_run_with_keyboard_interrupt(
+     tmp_path: Path, tmp_venv: VirtualEnv, mocker: MockerFixture
+ ) -> None:
+-    mocker.patch("subprocess.run", side_effect=KeyboardInterrupt())
++    mocker.patch("subprocess.check_output", side_effect=KeyboardInterrupt())
+     with pytest.raises(KeyboardInterrupt):
+-        tmp_venv.run("python", "-", input_=MINIMAL_SCRIPT)
+-    subprocess.run.assert_called_once()  # type: ignore[attr-defined]
+-
+-
+-def test_call_with_input_and_keyboard_interrupt(
+-    tmp_path: Path, tmp_venv: VirtualEnv, mocker: MockerFixture
+-) -> None:
+-    mocker.patch("subprocess.run", side_effect=KeyboardInterrupt())
+-    kwargs = {"call": True}
+-    with pytest.raises(KeyboardInterrupt):
+-        tmp_venv.run("python", "-", input_=MINIMAL_SCRIPT, **kwargs)
+-    subprocess.run.assert_called_once()  # type: ignore[attr-defined]
++        tmp_venv.run("python", "-c", MINIMAL_SCRIPT)
++    subprocess.check_output.assert_called_once()  # type: ignore[attr-defined]
+ 
+ 
+-def test_call_no_input_with_keyboard_interrupt(
++def test_call_with_keyboard_interrupt(
+     tmp_path: Path, tmp_venv: VirtualEnv, mocker: MockerFixture
+ ) -> None:
+     mocker.patch("subprocess.check_call", side_effect=KeyboardInterrupt())
+@@ -1012,31 +946,14 @@ def test_run_with_called_process_error(
+     tmp_path: Path, tmp_venv: VirtualEnv, mocker: MockerFixture
+ ) -> None:
+     mocker.patch(
+-        "subprocess.run",
+-        side_effect=subprocess.CalledProcessError(
+-            42, "some_command", "some output", "some error"
+-        ),
+-    )
+-    with pytest.raises(EnvCommandError) as error:
+-        tmp_venv.run("python", "-", input_=MINIMAL_SCRIPT)
+-    subprocess.run.assert_called_once()  # type: ignore[attr-defined]
+-    assert "some output" in str(error.value)
+-    assert "some error" in str(error.value)
+-
+-
+-def test_call_with_input_and_called_process_error(
+-    tmp_path: Path, tmp_venv: VirtualEnv, mocker: MockerFixture
+-) -> None:
+-    mocker.patch(
+-        "subprocess.run",
++        "subprocess.check_output",
+         side_effect=subprocess.CalledProcessError(
+             42, "some_command", "some output", "some error"
+         ),
+     )
+-    kwargs = {"call": True}
+     with pytest.raises(EnvCommandError) as error:
+-        tmp_venv.run("python", "-", input_=MINIMAL_SCRIPT, **kwargs)
+-    subprocess.run.assert_called_once()  # type: ignore[attr-defined]
++        tmp_venv.run("python", "-c", MINIMAL_SCRIPT)
++    subprocess.check_output.assert_called_once()  # type: ignore[attr-defined]
+     assert "some output" in str(error.value)
+     assert "some error" in str(error.value)
+ 
+@@ -1121,7 +1038,7 @@ def test_run_python_script_only_stdout(tmp_path: Path, tmp_venv: VirtualEnv) ->
+     assert "some warning" not in output
+ 
+ 
+-def test_create_venv_tries_to_find_a_compatible_python_executable_using_generic_ones_first(  # noqa: E501
++def test_create_venv_tries_to_find_a_compatible_python_executable_using_generic_ones_first(
+     manager: EnvManager,
+     poetry: Poetry,
+     config: Config,
+@@ -1201,7 +1118,13 @@ def test_create_venv_tries_to_find_a_compatible_python_executable_using_specific
+     mocker.patch("shutil.which", side_effect=lambda py: f"/usr/bin/{py}")
+     mocker.patch(
+         "subprocess.check_output",
+-        side_effect=["/usr/bin/python3", "3.5.3", "/usr/bin/python3.9", "3.9.0"],
++        side_effect=[
++            "/usr/bin/python3",
++            "3.5.3",
++            "/usr/bin/python3.9",
++            "3.9.0",
++            "/usr",
++        ],
+     )
+     m = mocker.patch(
+         "poetry.utils.env.EnvManager.build_venv", side_effect=lambda *args, **kwargs: ""
+@@ -1288,7 +1211,7 @@ def test_create_venv_uses_patch_version_to_detect_compatibility(
+ 
+     assert version.patch is not None
+     mocker.patch("sys.version_info", (version.major, version.minor, version.patch + 1))
+-    check_output = mocker.patch(
++    mocker.patch(
+         "subprocess.check_output",
+         side_effect=check_output_wrapper(Version.parse("3.6.9")),
+     )
+@@ -1298,7 +1221,6 @@ def test_create_venv_uses_patch_version_to_detect_compatibility(
+ 
+     manager.create_venv()
+ 
+-    assert not check_output.called
+     m.assert_called_with(
+         config_virtualenvs_path / f"{venv_name}-py{version.major}.{version.minor}",
+         executable=None,
+@@ -1400,10 +1322,6 @@ def test_activate_with_in_project_setting_does_not_fail_if_no_venvs_dir(
+         "subprocess.check_output",
+         side_effect=check_output_wrapper(),
+     )
+-    mocker.patch(
+-        "subprocess.Popen.communicate",
+-        side_effect=[("/prefix", None), ("/prefix", None), ("/prefix", None)],
+-    )
+     m = mocker.patch("poetry.utils.env.EnvManager.build_venv")
+ 
+     manager.activate("python3.7")
+@@ -1462,25 +1380,45 @@ def test_env_system_packages(tmp_path: Path, poetry: Poetry) -> None:
+     pyvenv_cfg = venv_path / "pyvenv.cfg"
+ 
+     EnvManager(poetry).build_venv(path=venv_path, flags={"system-site-packages": True})
++    env = VirtualEnv(venv_path)
+ 
+     assert "include-system-site-packages = true" in pyvenv_cfg.read_text()
++    assert env.includes_system_site_packages
++
++
++def test_env_system_packages_are_relative_to_lib(
++    tmp_path: Path, poetry: Poetry
++) -> None:
++    venv_path = tmp_path / "venv"
++    EnvManager(poetry).build_venv(path=venv_path, flags={"system-site-packages": True})
++    env = VirtualEnv(venv_path)
++    site_dir = Path(site.getsitepackages()[-1])
++    for dist in metadata.distributions():
++        # Emulate is_relative_to, only available in 3.9+
++        with contextlib.suppress(ValueError):
++            dist._path.relative_to(site_dir)  # type: ignore[attr-defined]
++            break
++    assert env.is_path_relative_to_lib(dist._path)  # type: ignore[attr-defined]
+ 
+ 
+ @pytest.mark.parametrize(
+     ("flags", "packages"),
+     [
+-        ({"no-pip": False}, {"pip", "wheel"}),
++        ({"no-pip": False}, {"pip"}),
+         ({"no-pip": False, "no-wheel": True}, {"pip"}),
++        ({"no-pip": False, "no-wheel": False}, {"pip", "wheel"}),
+         ({"no-pip": True}, set()),
+         ({"no-setuptools": False}, {"setuptools"}),
+         ({"no-setuptools": True}, set()),
++        ({"setuptools": "bundle"}, {"setuptools"}),
+         ({"no-pip": True, "no-setuptools": False}, {"setuptools"}),
+         ({"no-wheel": False}, {"wheel"}),
++        ({"wheel": "bundle"}, {"wheel"}),
+         ({}, set()),
+     ],
+ )
+ def test_env_no_pip(
+-    tmp_path: Path, poetry: Poetry, flags: dict[str, bool], packages: set[str]
++    tmp_path: Path, poetry: Poetry, flags: dict[str, str | bool], packages: set[str]
+ ) -> None:
+     venv_path = tmp_path / "venv"
+     EnvManager(poetry).build_venv(path=venv_path, flags=flags)
+@@ -1493,6 +1431,14 @@ def test_env_no_pip(
+         if package.name != "sqlite3"
+     }
+ 
++    # For python >= 3.12, virtualenv defaults to "--no-setuptools" and "--no-wheel"
++    # behaviour, so setting these values to False becomes meaningless.
++    if sys.version_info >= (3, 12):
++        if not flags.get("no-setuptools", True):
++            packages.discard("setuptools")
++        if not flags.get("no-wheel", True):
++            packages.discard("wheel")
++
+     assert installed_packages == packages
+ 
+ 
+
+diff --git a/tests/utils/test_helpers.py b/tests/utils/test_helpers.py
+index 1150536..bf69bea 100644
+--- a/tests/utils/test_helpers.py
++++ b/tests/utils/test_helpers.py
+@@ -59,11 +59,11 @@ isort@ git+git://github.com/timothycrosley/isort.git@e63ae06ec7d70b06df9e5283576
+         "msgpack-python>=0.5.0.0,<0.6.0.0",
+         "pyparsing>=2.2.0.0,<3.0.0.0",
+         "requests-toolbelt>=0.8.0.0,<0.9.0.0",
+-        'typing>=3.6.0.0,<4.0.0.0 ; (python_version >= "2.7.0.0" and python_version < "2.8.0.0") or (python_version >= "3.4.0.0" and python_version < "3.5.0.0")',  # noqa: E501
+-        'virtualenv>=15.2.0.0,<16.0.0.0 ; python_version >= "2.7.0.0" and python_version < "2.8.0.0"',  # noqa: E501
+-        'pathlib2>=2.3.0.0,<3.0.0.0 ; python_version >= "2.7.0.0" and python_version < "2.8.0.0"',  # noqa: E501
+-        'zipfile36>=0.1.0.0,<0.2.0.0 ; python_version >= "3.4.0.0" and python_version < "3.6.0.0"',  # noqa: E501
+-        'isort@ git+git://github.com/timothycrosley/isort.git@e63ae06ec7d70b06df9e528357650281a3d3ec22#egg=isort ; extra == "dev"',  # noqa: E501
++        'typing>=3.6.0.0,<4.0.0.0 ; (python_version >= "2.7.0.0" and python_version < "2.8.0.0") or (python_version >= "3.4.0.0" and python_version < "3.5.0.0")',
++        'virtualenv>=15.2.0.0,<16.0.0.0 ; python_version >= "2.7.0.0" and python_version < "2.8.0.0"',
++        'pathlib2>=2.3.0.0,<3.0.0.0 ; python_version >= "2.7.0.0" and python_version < "2.8.0.0"',
++        'zipfile36>=0.1.0.0,<0.2.0.0 ; python_version >= "3.4.0.0" and python_version < "3.6.0.0"',
++        'isort@ git+git://github.com/timothycrosley/isort.git@e63ae06ec7d70b06df9e528357650281a3d3ec22#egg=isort ; extra == "dev"',
+     ]
+     # fmt: on
+     assert result == expected
+@@ -80,7 +80,7 @@ def test_default_hash(fixture_dir: FixtureDirGetter) -> None:
+         ("sha224", "d26bd24163fe91c16b4b0162e773514beab77b76114d9faf6a31e350"),
+         (
+             "sha3_512",
+-            "196f4af9099185054ed72ca1d4c57707da5d724df0af7c3dfcc0fd018b0e0533908e790a291600c7d196fe4411b4f5f6db45213fe6e5cd5512bf18b2e9eff728",  # noqa: E501
++            "196f4af9099185054ed72ca1d4c57707da5d724df0af7c3dfcc0fd018b0e0533908e790a291600c7d196fe4411b4f5f6db45213fe6e5cd5512bf18b2e9eff728",
+         ),
+         (
+             "blake2s",
+@@ -88,11 +88,11 @@ def test_default_hash(fixture_dir: FixtureDirGetter) -> None:
+         ),
+         (
+             "sha3_384",
+-            "787264d7885a0c305d2ee4daecfff435d11818399ef96cacef7e7c6bb638ce475f630d39fdd2800ca187dcd0071dc410",  # noqa: E501
++            "787264d7885a0c305d2ee4daecfff435d11818399ef96cacef7e7c6bb638ce475f630d39fdd2800ca187dcd0071dc410",
+         ),
+         (
+             "blake2b",
+-            "077a34e8252c8f6776bddd0d34f321cc52762cb4c11a1c7aa9b6168023f1722caf53c9f029074a6eb990a8de341d415dd986293bc2a2fccddad428be5605696e",  # noqa: E501
++            "077a34e8252c8f6776bddd0d34f321cc52762cb4c11a1c7aa9b6168023f1722caf53c9f029074a6eb990a8de341d415dd986293bc2a2fccddad428be5605696e",
+         ),
+         (
+             "sha256",
+@@ -100,11 +100,11 @@ def test_default_hash(fixture_dir: FixtureDirGetter) -> None:
+         ),
+         (
+             "sha512",
+-            "766ecf369b6bdf801f6f7bbfe23923cc9793d633a55619472cd3d5763f9154711fbf57c8b6ca74e4a82fa9bd8380af831e7b8668e68e362669fc60b1d81d79ad",  # noqa: E501
++            "766ecf369b6bdf801f6f7bbfe23923cc9793d633a55619472cd3d5763f9154711fbf57c8b6ca74e4a82fa9bd8380af831e7b8668e68e362669fc60b1d81d79ad",
+         ),
+         (
+             "sha384",
+-            "c638f32460f318035e4600284ba64fb531630740aebd33885946e527002d742787ff09eb65fd81bc34ce5ff5ef11cfe8",  # noqa: E501
++            "c638f32460f318035e4600284ba64fb531630740aebd33885946e527002d742787ff09eb65fd81bc34ce5ff5ef11cfe8",
+         ),
+         ("sha3_224", "72980fc7bdf8c4d34268dc469442b09e1ccd2a8ff390954fc4d55a5a"),
+         ("sha1", "91b585bd38f72d7ceedb07d03f94911b772fdc4c"),
+
+diff --git a/tests/utils/test_password_manager.py b/tests/utils/test_password_manager.py
+index f2cbb7b..5efcf7f 100644
+--- a/tests/utils/test_password_manager.py
++++ b/tests/utils/test_password_manager.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import logging
+ import os
+ 
+ from typing import TYPE_CHECKING
+@@ -13,6 +14,7 @@ from poetry.utils.password_manager import PoetryKeyringError
+ 
+ 
+ if TYPE_CHECKING:
++    from _pytest.logging import LogCaptureFixture
+     from pytest_mock import MockerFixture
+ 
+     from tests.conftest import Config
+@@ -190,6 +192,32 @@ def test_keyring_raises_errors_on_keyring_errors(
+         key_ring.delete_password("foo", "bar")
+ 
+ 
++def test_keyring_returns_none_on_locked_keyring(
++    with_locked_keyring: None,
++    caplog: LogCaptureFixture,
++) -> None:
++    caplog.set_level(logging.DEBUG, logger="poetry.utils.password_manager")
++    key_ring = PoetryKeyring("poetry")
++
++    cred = key_ring.get_credential("foo")
++
++    assert cred.password is None
++    assert "Keyring foo is locked" in caplog.messages
++
++
++def test_keyring_returns_none_on_erroneous_keyring(
++    with_erroneous_keyring: None,
++    caplog: LogCaptureFixture,
++) -> None:
++    caplog.set_level(logging.DEBUG, logger="poetry.utils.password_manager")
++    key_ring = PoetryKeyring("poetry")
++
++    cred = key_ring.get_credential("foo")
++
++    assert cred.password is None
++    assert "Accessing keyring foo failed" in caplog.messages
++
++
+ def test_keyring_with_chainer_backend_and_fail_keyring_should_be_unavailable(
+     with_chained_fail_keyring: None,
+ ) -> None:
+@@ -222,6 +250,18 @@ def test_fail_keyring_should_be_unavailable(
+     assert not key_ring.is_available()
+ 
+ 
++def test_locked_keyring_should_be_available(with_locked_keyring: None) -> None:
++    key_ring = PoetryKeyring("poetry")
++
++    assert key_ring.is_available()
++
++
++def test_erroneous_keyring_should_be_available(with_erroneous_keyring: None) -> None:
++    key_ring = PoetryKeyring("poetry")
++
++    assert key_ring.is_available()
++
++
+ def test_get_http_auth_from_environment_variables(
+     environ: None, config: Config
+ ) -> None:
+
+diff --git a/tests/utils/test_setup_reader.py b/tests/utils/test_setup_reader.py
+index f675285..cd75aa3 100644
+--- a/tests/utils/test_setup_reader.py
++++ b/tests/utils/test_setup_reader.py
+@@ -22,6 +22,24 @@ def setup() -> Callable[[str], Path]:
+     return _setup
+ 
+ 
++def test_setup_reader_read_minimal_setup_py(setup: Callable[[str], Path]) -> None:
++    result = SetupReader.read_from_directory(setup("minimal"))
++
++    expected_name = None
++    expected_version = None
++    expected_description = None
++    expected_install_requires: list[str] = []
++    expected_extras_require: dict[str, list[str]] = {}
++    expected_python_requires = None
++
++    assert result["name"] == expected_name
++    assert result["version"] == expected_version
++    assert result["description"] == expected_description
++    assert result["install_requires"] == expected_install_requires
++    assert result["extras_require"] == expected_extras_require
++    assert result["python_requires"] == expected_python_requires
++
++
+ def test_setup_reader_read_first_level_setup_call_with_direct_types(
+     setup: Callable[[str], Path]
+ ) -> None:
+@@ -29,6 +47,7 @@ def test_setup_reader_read_first_level_setup_call_with_direct_types(
+ 
+     expected_name = "Flask"
+     expected_version = None
++    expected_description = "A simple framework for building complex web applications."
+     expected_install_requires = [
+         "Werkzeug>=0.14",
+         "Jinja2>=2.10",
+@@ -51,6 +70,7 @@ def test_setup_reader_read_first_level_setup_call_with_direct_types(
+ 
+     assert result["name"] == expected_name
+     assert result["version"] == expected_version
++    assert result["description"] == expected_description
+     assert result["install_requires"] == expected_install_requires
+     assert result["extras_require"] == expected_extras_require
+     assert result["python_requires"] == expected_python_requires
+@@ -63,6 +83,7 @@ def test_setup_reader_read_first_level_setup_call_with_variables(
+ 
+     expected_name = None
+     expected_version = None
++    expected_description = None
+     expected_install_requires = [
+         "chardet>=3.0.2,<3.1.0",
+         "idna>=2.5,<2.8",
+@@ -78,6 +99,7 @@ def test_setup_reader_read_first_level_setup_call_with_variables(
+ 
+     assert result["name"] == expected_name
+     assert result["version"] == expected_version
++    assert result["description"] == expected_description
+     assert result["install_requires"] == expected_install_requires
+     assert result["extras_require"] == expected_extras_require
+     assert result["python_requires"] == expected_python_requires
+@@ -90,6 +112,7 @@ def test_setup_reader_read_sub_level_setup_call_with_direct_types(
+ 
+     expected_name = "SQLAlchemy"
+     expected_version = None
++    expected_description = "Database Abstraction Library"
+     expected_install_requires: list[str] = []
+     expected_extras_require = {
+         "mysql": ["mysqlclient"],
+@@ -104,6 +127,7 @@ def test_setup_reader_read_sub_level_setup_call_with_direct_types(
+ 
+     assert result["name"] == expected_name
+     assert result["version"] == expected_version
++    assert result["description"] == expected_description
+     assert result["install_requires"] == expected_install_requires
+     assert result["extras_require"] == expected_extras_require
+     assert result["python_requires"] is None
+@@ -114,6 +138,7 @@ def test_setup_reader_read_setup_cfg(setup: Callable[[str], Path]) -> None:
+ 
+     expected_name = "with-setup-cfg"
+     expected_version = "1.2.3"
++    expected_description = "Package with setup.cfg"
+     expected_install_requires = ["six", "tomlkit"]
+     expected_extras_require = {
+         "validation": ["cerberus"],
+@@ -123,6 +148,25 @@ def test_setup_reader_read_setup_cfg(setup: Callable[[str], Path]) -> None:
+ 
+     assert result["name"] == expected_name
+     assert result["version"] == expected_version
++    assert result["description"] == expected_description
++    assert result["install_requires"] == expected_install_requires
++    assert result["extras_require"] == expected_extras_require
++    assert result["python_requires"] == expected_python_requires
++
++
++def test_setup_reader_read_minimal_setup_cfg(setup: Callable[[str], Path]) -> None:
++    result = SetupReader.read_from_directory(setup("with-setup-cfg-minimal"))
++
++    expected_name = None
++    expected_version = None
++    expected_description = None
++    expected_install_requires: list[str] = []
++    expected_extras_require: dict[str, list[str]] = {}
++    expected_python_requires = None
++
++    assert result["name"] == expected_name
++    assert result["version"] == expected_version
++    assert result["description"] == expected_description
+     assert result["install_requires"] == expected_install_requires
+     assert result["extras_require"] == expected_extras_require
+     assert result["python_requires"] == expected_python_requires
+@@ -138,12 +182,14 @@ def test_setup_reader_read_setup_kwargs(setup: Callable[[str], Path]) -> None:
+ 
+     expected_name = "pendulum"
+     expected_version = "2.0.4"
++    expected_description = "Python datetimes made easy"
+     expected_install_requires = ["python-dateutil>=2.6,<3.0", "pytzdata>=2018.3"]
+     expected_extras_require = {':python_version < "3.5"': ["typing>=3.6,<4.0"]}
+     expected_python_requires = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*"
+ 
+     assert result["name"] == expected_name
+     assert result["version"] == expected_version
++    assert result["description"] == expected_description
+     assert result["install_requires"] == expected_install_requires
+     assert result["extras_require"] == expected_extras_require
+     assert result["python_requires"] == expected_python_requires
+@@ -154,12 +200,14 @@ def test_setup_reader_read_setup_call_in_main(setup: Callable[[str], Path]) -> N
+ 
+     expected_name = "PyYAML"
+     expected_version = "3.13"
++    expected_description = "YAML parser and emitter for Python"
+     expected_install_requires: list[str] = []
+     expected_extras_require: dict[str, list[str]] = {}
+     expected_python_requires = None
+ 
+     assert result["name"] == expected_name
+     assert result["version"] == expected_version
++    assert result["description"] == expected_description
+     assert result["install_requires"] == expected_install_requires
+     assert result["extras_require"] == expected_extras_require
+     assert result["python_requires"] == expected_python_requires
+@@ -172,12 +220,14 @@ def test_setup_reader_read_extras_require_with_variables(
+ 
+     expected_name = "extras_require_with_vars"
+     expected_version = "0.0.1"
++    expected_description = "test setup_reader.py"
+     expected_install_requires: list[str] = []
+     expected_extras_require = {"test": ["pytest"]}
+     expected_python_requires = None
+ 
+     assert result["name"] == expected_name
+     assert result["version"] == expected_version
++    assert result["description"] == expected_description
+     assert result["install_requires"] == expected_install_requires
+     assert result["extras_require"] == expected_extras_require
+     assert result["python_requires"] == expected_python_requires
+@@ -188,6 +238,8 @@ def test_setup_reader_setuptools(setup: Callable[[str], Path]) -> None:
+ 
+     expected_name = "my_package"
+     expected_version = "0.1.2"
++    expected_description = "Just a description"
+ 
+     assert result["name"] == expected_name
+     assert result["version"] == expected_version
++    assert result["description"] == expected_description
+
+diff --git a/tests/vcs/git/test_system.py b/tests/vcs/git/test_system.py
+new file mode 100644
+index 0000000..ce0d80d
+--- /dev/null
++++ b/tests/vcs/git/test_system.py
+@@ -0,0 +1,97 @@
++from __future__ import annotations
++
++import re
++import shutil
++import subprocess
++import typing
++
++import dulwich.repo
++import pytest
++
++from poetry.vcs.git.system import SystemGit
++
++
++if typing.TYPE_CHECKING:
++    from pathlib import Path
++
++
++GIT_NOT_INSTALLLED = shutil.which("git") is None
++
++
++def get_head_sha(cwd: Path) -> str:
++    return subprocess.check_output(
++        ["git", "rev-parse", "HEAD"],
++        cwd=cwd,
++        text=True,
++    ).strip()
++
++
++class TempRepoFixture(typing.NamedTuple):
++    path: Path
++    repo: dulwich.repo.Repo
++    init_commit: str
++    head_commit: str
++
++
++@pytest.fixture()
++def temp_repo(tmp_path: Path) -> TempRepoFixture:
++    """Temporary repository with 2 commits"""
++    repo = dulwich.repo.Repo.init(str(tmp_path))
++
++    # init commit
++    (tmp_path / "foo").write_text("foo")
++    repo.stage(["foo"])
++
++    init_commit = repo.do_commit(
++        committer=b"User <user@example.com>",
++        author=b"User <user@example.com>",
++        message=b"init",
++        no_verify=True,
++    )
++
++    # extra commit
++    (tmp_path / "foo").write_text("bar")
++    repo.stage(["foo"])
++
++    head_commit = repo.do_commit(
++        committer=b"User <user@example.com>",
++        author=b"User <user@example.com>",
++        message=b"extra",
++        no_verify=True,
++    )
++
++    return TempRepoFixture(
++        path=tmp_path,
++        repo=repo,
++        init_commit=init_commit.decode(),
++        head_commit=head_commit.decode(),
++    )
++
++
++@pytest.mark.skipif(GIT_NOT_INSTALLLED, reason="These tests requires git cli")
++class TestSystemGit:
++    def test_clone_success(self, tmp_path: Path, temp_repo: TempRepoFixture) -> None:
++        target_dir = tmp_path / "test-repo"
++        stdout = SystemGit.clone(temp_repo.path.as_uri(), target_dir)
++        assert re.search(r"Cloning into '.+[\\/]test-repo'...", stdout)
++        assert (target_dir / ".git").is_dir()
++
++    def test_clone_invalid_parameter(self, tmp_path: Path) -> None:
++        with pytest.raises(
++            RuntimeError, match=re.escape("Invalid Git parameter: --upload-pack")
++        ):
++            SystemGit.clone("--upload-pack=touch ./HELL", tmp_path)
++
++    def test_checkout_1(self, temp_repo: TempRepoFixture) -> None:
++        # case 1 - with 'target' arg
++        SystemGit.checkout(temp_repo.init_commit[:12], temp_repo.path)
++        assert get_head_sha(temp_repo.path) == temp_repo.init_commit
++
++    def test_checkout_2(
++        self, monkeypatch: pytest.MonkeyPatch, temp_repo: TempRepoFixture
++    ) -> None:
++        # case 2 - without 'target' arg
++        monkeypatch.chdir(temp_repo.path)
++
++        SystemGit.checkout(temp_repo.init_commit[:12])
++        assert get_head_sha(temp_repo.path) == temp_repo.init_commit

@@ -1,0 +1,1596 @@
+diff --git a/jwt/__init__.py b/jwt/__init__.py
+index 457a4e3..93ff726 100644
+--- a/jwt/__init__.py
++++ b/jwt/__init__.py
+@@ -26,8 +26,9 @@ from .exceptions import (
+     PyJWTError,
+ )
+ from .jwks_client import PyJWKClient
++from .warnings import InsecureKeyLengthWarning
+ 
+-__version__ = "2.10.1"
++__version__ = "2.11.0"
+ 
+ __title__ = "PyJWT"
+ __description__ = "JSON Web Token implementation in Python"
+@@ -39,7 +40,7 @@ __author__ = "José Padilla"
+ __email__ = "hello@jpadilla.com"
+ 
+ __license__ = "MIT"
+-__copyright__ = "Copyright 2015-2022 José Padilla"
++__copyright__ = "Copyright 2015-2026 José Padilla"
+ 
+ 
+ __all__ = [
+@@ -55,6 +56,8 @@ __all__ = [
+     "register_algorithm",
+     "unregister_algorithm",
+     "get_algorithm_by_name",
++    # Warnings
++    "InsecureKeyLengthWarning",
+     # Exceptions
+     "DecodeError",
+     "ExpiredSignatureError",
+
+diff --git a/jwt/algorithms.py b/jwt/algorithms.py
+index ccb1500..3bf7f97 100644
+--- a/jwt/algorithms.py
++++ b/jwt/algorithms.py
+@@ -3,8 +3,18 @@ from __future__ import annotations
+ import hashlib
+ import hmac
+ import json
++import os
+ from abc import ABC, abstractmethod
+-from typing import TYPE_CHECKING, Any, ClassVar, Literal, NoReturn, cast, overload
++from typing import (
++    TYPE_CHECKING,
++    Any,
++    ClassVar,
++    Literal,
++    NoReturn,
++    Union,
++    cast,
++    overload,
++)
+ 
+ from .exceptions import InvalidKeyError
+ from .types import HashlibHash, JWKDict
+@@ -65,25 +75,67 @@ try:
+         load_ssh_public_key,
+     )
+ 
+-    has_crypto = True
+-except ModuleNotFoundError:
+-    has_crypto = False
+-
+-
+-if TYPE_CHECKING:
+-    # Type aliases for convenience in algorithms method signatures
+-    AllowedRSAKeys = RSAPrivateKey | RSAPublicKey
+-    AllowedECKeys = EllipticCurvePrivateKey | EllipticCurvePublicKey
+-    AllowedOKPKeys = (
+-        Ed25519PrivateKey | Ed25519PublicKey | Ed448PrivateKey | Ed448PublicKey
++    # pyjwt-964: we use these both for type checking below, as well as for validating the key passed in.
++    # in Py >= 3.10, we can replace this with the Union types below
++    ALLOWED_RSA_KEY_TYPES = (RSAPrivateKey, RSAPublicKey)
++    ALLOWED_EC_KEY_TYPES = (EllipticCurvePrivateKey, EllipticCurvePublicKey)
++    ALLOWED_OKP_KEY_TYPES = (
++        Ed25519PrivateKey,
++        Ed25519PublicKey,
++        Ed448PrivateKey,
++        Ed448PublicKey,
+     )
+-    AllowedKeys = AllowedRSAKeys | AllowedECKeys | AllowedOKPKeys
+-    AllowedPrivateKeys = (
+-        RSAPrivateKey | EllipticCurvePrivateKey | Ed25519PrivateKey | Ed448PrivateKey
++    ALLOWED_KEY_TYPES = (
++        ALLOWED_RSA_KEY_TYPES + ALLOWED_EC_KEY_TYPES + ALLOWED_OKP_KEY_TYPES
+     )
+-    AllowedPublicKeys = (
+-        RSAPublicKey | EllipticCurvePublicKey | Ed25519PublicKey | Ed448PublicKey
++    ALLOWED_PRIVATE_KEY_TYPES = (
++        RSAPrivateKey,
++        EllipticCurvePrivateKey,
++        Ed25519PrivateKey,
++        Ed448PrivateKey,
+     )
++    ALLOWED_PUBLIC_KEY_TYPES = (
++        RSAPublicKey,
++        EllipticCurvePublicKey,
++        Ed25519PublicKey,
++        Ed448PublicKey,
++    )
++
++    if TYPE_CHECKING or bool(os.getenv("SPHINX_BUILD", "")):
++        import sys
++
++        if sys.version_info >= (3, 10):
++            from typing import TypeAlias
++        else:
++            # Python 3.9 and lower
++            from typing_extensions import TypeAlias
++
++        from cryptography.hazmat.primitives.asymmetric.types import (
++            PrivateKeyTypes,
++            PublicKeyTypes,
++        )
++
++        # Type aliases for convenience in algorithms method signatures
++        AllowedRSAKeys: TypeAlias = Union[RSAPrivateKey, RSAPublicKey]
++        AllowedECKeys: TypeAlias = Union[
++            EllipticCurvePrivateKey, EllipticCurvePublicKey
++        ]
++        AllowedOKPKeys: TypeAlias = Union[
++            Ed25519PrivateKey, Ed25519PublicKey, Ed448PrivateKey, Ed448PublicKey
++        ]
++        AllowedKeys: TypeAlias = Union[AllowedRSAKeys, AllowedECKeys, AllowedOKPKeys]
++        #: Type alias for allowed ``cryptography`` private keys (requires ``cryptography`` to be installed)
++        AllowedPrivateKeys: TypeAlias = Union[
++            RSAPrivateKey, EllipticCurvePrivateKey, Ed25519PrivateKey, Ed448PrivateKey
++        ]
++        #: Type alias for allowed ``cryptography`` public keys (requires ``cryptography`` to be installed)
++        AllowedPublicKeys: TypeAlias = Union[
++            RSAPublicKey, EllipticCurvePublicKey, Ed25519PublicKey, Ed448PublicKey
++        ]
++
++    has_crypto = True
++except ModuleNotFoundError:
++    has_crypto = False
+ 
+ 
+ requires_cryptography = {
+@@ -106,7 +158,7 @@ def get_default_algorithms() -> dict[str, Algorithm]:
+     """
+     Returns the algorithms that are implemented by the library.
+     """
+-    default_algorithms = {
++    default_algorithms: dict[str, Algorithm] = {
+         "none": NoneAlgorithm(),
+         "HS256": HMACAlgorithm(HMACAlgorithm.SHA256),
+         "HS384": HMACAlgorithm(HMACAlgorithm.SHA384),
+@@ -119,12 +171,12 @@ def get_default_algorithms() -> dict[str, Algorithm]:
+                 "RS256": RSAAlgorithm(RSAAlgorithm.SHA256),
+                 "RS384": RSAAlgorithm(RSAAlgorithm.SHA384),
+                 "RS512": RSAAlgorithm(RSAAlgorithm.SHA512),
+-                "ES256": ECAlgorithm(ECAlgorithm.SHA256),
+-                "ES256K": ECAlgorithm(ECAlgorithm.SHA256),
+-                "ES384": ECAlgorithm(ECAlgorithm.SHA384),
+-                "ES521": ECAlgorithm(ECAlgorithm.SHA512),
++                "ES256": ECAlgorithm(ECAlgorithm.SHA256, SECP256R1),
++                "ES256K": ECAlgorithm(ECAlgorithm.SHA256, SECP256K1),
++                "ES384": ECAlgorithm(ECAlgorithm.SHA384, SECP384R1),
++                "ES521": ECAlgorithm(ECAlgorithm.SHA512, SECP521R1),
+                 "ES512": ECAlgorithm(
+-                    ECAlgorithm.SHA512
++                    ECAlgorithm.SHA512, SECP521R1
+                 ),  # Backward compat for #219 fix
+                 "PS256": RSAPSSAlgorithm(RSAPSSAlgorithm.SHA256),
+                 "PS384": RSAPSSAlgorithm(RSAPSSAlgorithm.SHA384),
+@@ -141,6 +193,9 @@ class Algorithm(ABC):
+     The interface for an algorithm used to sign and verify tokens.
+     """
+ 
++    # pyjwt-964: Validate to ensure the key passed in was decoded to the correct cryptography key family
++    _crypto_key_types: tuple[type[AllowedKeys], ...] | None = None
++
+     def compute_hash_digest(self, bytestr: bytes) -> bytes:
+         """
+         Compute a hash digest using the specified algorithm's hash algorithm.
+@@ -163,6 +218,29 @@ class Algorithm(ABC):
+         else:
+             return bytes(hash_alg(bytestr).digest())
+ 
++    def check_crypto_key_type(self, key: PublicKeyTypes | PrivateKeyTypes) -> None:
++        """Check that the key belongs to the right cryptographic family.
++
++        Note that this method only works when ``cryptography`` is installed.
++
++        :param key: Potentially a cryptography key
++        :type key: :py:data:`PublicKeyTypes <cryptography.hazmat.primitives.asymmetric.types.PublicKeyTypes>` | :py:data:`PrivateKeyTypes <cryptography.hazmat.primitives.asymmetric.types.PrivateKeyTypes>`
++        :raises ValueError: if ``cryptography`` is not installed, or this method is called by a non-cryptography algorithm
++        :raises InvalidKeyError: if the key doesn't match the expected key classes
++        """
++        if not has_crypto or self._crypto_key_types is None:
++            raise ValueError(
++                "This method requires the cryptography library, and should only be used by cryptography-based algorithms."
++            )
++
++        if not isinstance(key, self._crypto_key_types):
++            valid_classes = (cls.__name__ for cls in self._crypto_key_types)
++            actual_class = key.__class__.__name__
++            self_class = self.__class__.__name__
++            raise InvalidKeyError(
++                f"Expected one of {valid_classes}, got: {actual_class}. Invalid Key type for {self_class}"
++            )
++
+     @abstractmethod
+     def prepare_key(self, key: Any) -> Any:
+         """
+@@ -187,16 +265,18 @@ class Algorithm(ABC):
+     @overload
+     @staticmethod
+     @abstractmethod
+-    def to_jwk(key_obj, as_dict: Literal[True]) -> JWKDict: ...  # pragma: no cover
++    def to_jwk(key_obj: Any, as_dict: Literal[True]) -> JWKDict: ...  # pragma: no cover
+ 
+     @overload
+     @staticmethod
+     @abstractmethod
+-    def to_jwk(key_obj, as_dict: Literal[False] = False) -> str: ...  # pragma: no cover
++    def to_jwk(
++        key_obj: Any, as_dict: Literal[False] = False
++    ) -> str: ...  # pragma: no cover
+ 
+     @staticmethod
+     @abstractmethod
+-    def to_jwk(key_obj, as_dict: bool = False) -> JWKDict | str:
++    def to_jwk(key_obj: Any, as_dict: bool = False) -> JWKDict | str:
+         """
+         Serializes a given key into a JWK
+         """
+@@ -208,6 +288,13 @@ class Algorithm(ABC):
+         Deserializes a given key from JWK back into a key object
+         """
+ 
++    def check_key_length(self, key: Any) -> str | None:
++        """
++        Return a warning message if the key is below the minimum
++        recommended length for this algorithm, or None if adequate.
++        """
++        return None
++
+ 
+ class NoneAlgorithm(Algorithm):
+     """
+@@ -265,15 +352,11 @@ class HMACAlgorithm(Algorithm):
+ 
+     @overload
+     @staticmethod
+-    def to_jwk(
+-        key_obj: str | bytes, as_dict: Literal[True]
+-    ) -> JWKDict: ...  # pragma: no cover
++    def to_jwk(key_obj: str | bytes, as_dict: Literal[True]) -> JWKDict: ...
+ 
+     @overload
+     @staticmethod
+-    def to_jwk(
+-        key_obj: str | bytes, as_dict: Literal[False] = False
+-    ) -> str: ...  # pragma: no cover
++    def to_jwk(key_obj: str | bytes, as_dict: Literal[False] = False) -> str: ...
+ 
+     @staticmethod
+     def to_jwk(key_obj: str | bytes, as_dict: bool = False) -> JWKDict | str:
+@@ -304,6 +387,17 @@ class HMACAlgorithm(Algorithm):
+ 
+         return base64url_decode(obj["k"])
+ 
++    def check_key_length(self, key: bytes) -> str | None:
++        min_length = self.hash_alg().digest_size
++        if len(key) < min_length:
++            return (
++                f"The HMAC key is {len(key)} bytes long, which is below "
++                f"the minimum recommended length of {min_length} bytes for "
++                f"{self.hash_alg().name.upper()}. "
++                f"See RFC 7518 Section 3.2."
++            )
++        return None
++
+     def sign(self, msg: bytes, key: bytes) -> bytes:
+         return hmac.new(key, msg, self.hash_alg).digest()
+ 
+@@ -323,11 +417,23 @@ if has_crypto:
+         SHA384: ClassVar[type[hashes.HashAlgorithm]] = hashes.SHA384
+         SHA512: ClassVar[type[hashes.HashAlgorithm]] = hashes.SHA512
+ 
++        _crypto_key_types = ALLOWED_RSA_KEY_TYPES
++        _MIN_KEY_SIZE: ClassVar[int] = 2048
++
+         def __init__(self, hash_alg: type[hashes.HashAlgorithm]) -> None:
+             self.hash_alg = hash_alg
+ 
++        def check_key_length(self, key: AllowedRSAKeys) -> str | None:
++            if key.key_size < self._MIN_KEY_SIZE:
++                return (
++                    f"The RSA key is {key.key_size} bits long, which is below "
++                    f"the minimum recommended size of {self._MIN_KEY_SIZE} bits. "
++                    f"See NIST SP 800-131A."
++                )
++            return None
++
+         def prepare_key(self, key: AllowedRSAKeys | str | bytes) -> AllowedRSAKeys:
+-            if isinstance(key, (RSAPrivateKey, RSAPublicKey)):
++            if isinstance(key, self._crypto_key_types):
+                 return key
+ 
+             if not isinstance(key, (bytes, str)):
+@@ -337,14 +443,20 @@ if has_crypto:
+ 
+             try:
+                 if key_bytes.startswith(b"ssh-rsa"):
+-                    return cast(RSAPublicKey, load_ssh_public_key(key_bytes))
++                    public_key: PublicKeyTypes = load_ssh_public_key(key_bytes)
++                    self.check_crypto_key_type(public_key)
++                    return cast(RSAPublicKey, public_key)
+                 else:
+-                    return cast(
+-                        RSAPrivateKey, load_pem_private_key(key_bytes, password=None)
++                    private_key: PrivateKeyTypes = load_pem_private_key(
++                        key_bytes, password=None
+                     )
++                    self.check_crypto_key_type(private_key)
++                    return cast(RSAPrivateKey, private_key)
+             except ValueError:
+                 try:
+-                    return cast(RSAPublicKey, load_pem_public_key(key_bytes))
++                    public_key = load_pem_public_key(key_bytes)
++                    self.check_crypto_key_type(public_key)
++                    return cast(RSAPublicKey, public_key)
+                 except (ValueError, UnsupportedAlgorithm):
+                     raise InvalidKeyError(
+                         "Could not parse the provided public key."
+@@ -352,15 +464,11 @@ if has_crypto:
+ 
+         @overload
+         @staticmethod
+-        def to_jwk(
+-            key_obj: AllowedRSAKeys, as_dict: Literal[True]
+-        ) -> JWKDict: ...  # pragma: no cover
++        def to_jwk(key_obj: AllowedRSAKeys, as_dict: Literal[True]) -> JWKDict: ...
+ 
+         @overload
+         @staticmethod
+-        def to_jwk(
+-            key_obj: AllowedRSAKeys, as_dict: Literal[False] = False
+-        ) -> str: ...  # pragma: no cover
++        def to_jwk(key_obj: AllowedRSAKeys, as_dict: Literal[False] = False) -> str: ...
+ 
+         @staticmethod
+         def to_jwk(key_obj: AllowedRSAKeys, as_dict: bool = False) -> JWKDict | str:
+@@ -474,7 +582,8 @@ if has_crypto:
+                 raise InvalidKeyError("Not a public or private key")
+ 
+         def sign(self, msg: bytes, key: RSAPrivateKey) -> bytes:
+-            return key.sign(msg, padding.PKCS1v15(), self.hash_alg())
++            signature: bytes = key.sign(msg, padding.PKCS1v15(), self.hash_alg())
++            return signature
+ 
+         def verify(self, msg: bytes, key: RSAPublicKey, sig: bytes) -> bool:
+             try:
+@@ -493,11 +602,30 @@ if has_crypto:
+         SHA384: ClassVar[type[hashes.HashAlgorithm]] = hashes.SHA384
+         SHA512: ClassVar[type[hashes.HashAlgorithm]] = hashes.SHA512
+ 
+-        def __init__(self, hash_alg: type[hashes.HashAlgorithm]) -> None:
++        _crypto_key_types = ALLOWED_EC_KEY_TYPES
++
++        def __init__(
++            self,
++            hash_alg: type[hashes.HashAlgorithm],
++            expected_curve: type[EllipticCurve] | None = None,
++        ) -> None:
+             self.hash_alg = hash_alg
++            self.expected_curve = expected_curve
++
++        def _validate_curve(self, key: AllowedECKeys) -> None:
++            """Validate that the key's curve matches the expected curve."""
++            if self.expected_curve is None:
++                return
++
++            if not isinstance(key.curve, self.expected_curve):
++                raise InvalidKeyError(
++                    f"The key's curve '{key.curve.name}' does not match the expected "
++                    f"curve '{self.expected_curve.name}' for this algorithm"
++                )
+ 
+         def prepare_key(self, key: AllowedECKeys | str | bytes) -> AllowedECKeys:
+-            if isinstance(key, (EllipticCurvePrivateKey, EllipticCurvePublicKey)):
++            if isinstance(key, self._crypto_key_types):
++                self._validate_curve(key)
+                 return key
+ 
+             if not isinstance(key, (bytes, str)):
+@@ -510,21 +638,21 @@ if has_crypto:
+             # the Verifying Key first.
+             try:
+                 if key_bytes.startswith(b"ecdsa-sha2-"):
+-                    crypto_key = load_ssh_public_key(key_bytes)
++                    public_key: PublicKeyTypes = load_ssh_public_key(key_bytes)
+                 else:
+-                    crypto_key = load_pem_public_key(key_bytes)  # type: ignore[assignment]
+-            except ValueError:
+-                crypto_key = load_pem_private_key(key_bytes, password=None)  # type: ignore[assignment]
++                    public_key = load_pem_public_key(key_bytes)
+ 
+-            # Explicit check the key to prevent confusing errors from cryptography
+-            if not isinstance(
+-                crypto_key, (EllipticCurvePrivateKey, EllipticCurvePublicKey)
+-            ):
+-                raise InvalidKeyError(
+-                    "Expecting a EllipticCurvePrivateKey/EllipticCurvePublicKey. Wrong key provided for ECDSA algorithms"
+-                ) from None
+-
+-            return crypto_key
++                # Explicit check the key to prevent confusing errors from cryptography
++                self.check_crypto_key_type(public_key)
++                ec_public_key = cast(EllipticCurvePublicKey, public_key)
++                self._validate_curve(ec_public_key)
++                return ec_public_key
++            except ValueError:
++                private_key = load_pem_private_key(key_bytes, password=None)
++                self.check_crypto_key_type(private_key)
++                ec_private_key = cast(EllipticCurvePrivateKey, private_key)
++                self._validate_curve(ec_private_key)
++                return ec_private_key
+ 
+         def sign(self, msg: bytes, key: EllipticCurvePrivateKey) -> bytes:
+             der_sig = key.sign(msg, ECDSA(self.hash_alg()))
+@@ -550,15 +678,11 @@ if has_crypto:
+ 
+         @overload
+         @staticmethod
+-        def to_jwk(
+-            key_obj: AllowedECKeys, as_dict: Literal[True]
+-        ) -> JWKDict: ...  # pragma: no cover
++        def to_jwk(key_obj: AllowedECKeys, as_dict: Literal[True]) -> JWKDict: ...
+ 
+         @overload
+         @staticmethod
+-        def to_jwk(
+-            key_obj: AllowedECKeys, as_dict: Literal[False] = False
+-        ) -> str: ...  # pragma: no cover
++        def to_jwk(key_obj: AllowedECKeys, as_dict: Literal[False] = False) -> str: ...
+ 
+         @staticmethod
+         def to_jwk(key_obj: AllowedECKeys, as_dict: bool = False) -> JWKDict | str:
+@@ -684,7 +808,7 @@ if has_crypto:
+         """
+ 
+         def sign(self, msg: bytes, key: RSAPrivateKey) -> bytes:
+-            return key.sign(
++            signature: bytes = key.sign(
+                 msg,
+                 padding.PSS(
+                     mgf=padding.MGF1(self.hash_alg()),
+@@ -692,6 +816,7 @@ if has_crypto:
+                 ),
+                 self.hash_alg(),
+             )
++            return signature
+ 
+         def verify(self, msg: bytes, key: RSAPublicKey, sig: bytes) -> bool:
+             try:
+@@ -715,31 +840,32 @@ if has_crypto:
+         This class requires ``cryptography>=2.6`` to be installed.
+         """
+ 
++        _crypto_key_types = ALLOWED_OKP_KEY_TYPES
++
+         def __init__(self, **kwargs: Any) -> None:
+             pass
+ 
+         def prepare_key(self, key: AllowedOKPKeys | str | bytes) -> AllowedOKPKeys:
+-            if isinstance(key, (bytes, str)):
+-                key_str = key.decode("utf-8") if isinstance(key, bytes) else key
+-                key_bytes = key.encode("utf-8") if isinstance(key, str) else key
++            if not isinstance(key, (str, bytes)):
++                self.check_crypto_key_type(key)
++                return key
+ 
+-                if "-----BEGIN PUBLIC" in key_str:
+-                    key = load_pem_public_key(key_bytes)  # type: ignore[assignment]
+-                elif "-----BEGIN PRIVATE" in key_str:
+-                    key = load_pem_private_key(key_bytes, password=None)  # type: ignore[assignment]
+-                elif key_str[0:4] == "ssh-":
+-                    key = load_ssh_public_key(key_bytes)  # type: ignore[assignment]
++            key_str = key.decode("utf-8") if isinstance(key, bytes) else key
++            key_bytes = key.encode("utf-8") if isinstance(key, str) else key
+ 
+-            # Explicit check the key to prevent confusing errors from cryptography
+-            if not isinstance(
+-                key,
+-                (Ed25519PrivateKey, Ed25519PublicKey, Ed448PrivateKey, Ed448PublicKey),
+-            ):
+-                raise InvalidKeyError(
+-                    "Expecting a EllipticCurvePrivateKey/EllipticCurvePublicKey. Wrong key provided for EdDSA algorithms"
+-                )
++            loaded_key: PublicKeyTypes | PrivateKeyTypes
++            if "-----BEGIN PUBLIC" in key_str:
++                loaded_key = load_pem_public_key(key_bytes)
++            elif "-----BEGIN PRIVATE" in key_str:
++                loaded_key = load_pem_private_key(key_bytes, password=None)
++            elif key_str[0:4] == "ssh-":
++                loaded_key = load_ssh_public_key(key_bytes)
++            else:
++                raise InvalidKeyError("Not a public or private key")
+ 
+-            return key
++            # Explicit check the key to prevent confusing errors from cryptography
++            self.check_crypto_key_type(loaded_key)
++            return cast("AllowedOKPKeys", loaded_key)
+ 
+         def sign(
+             self, msg: str | bytes, key: Ed25519PrivateKey | Ed448PrivateKey
+@@ -752,7 +878,8 @@ if has_crypto:
+             :return bytes signature: The signature, as bytes
+             """
+             msg_bytes = msg.encode("utf-8") if isinstance(msg, str) else msg
+-            return key.sign(msg_bytes)
++            signature: bytes = key.sign(msg_bytes)
++            return signature
+ 
+         def verify(
+             self, msg: str | bytes, key: AllowedOKPKeys, sig: str | bytes
+@@ -782,15 +909,11 @@ if has_crypto:
+ 
+         @overload
+         @staticmethod
+-        def to_jwk(
+-            key: AllowedOKPKeys, as_dict: Literal[True]
+-        ) -> JWKDict: ...  # pragma: no cover
++        def to_jwk(key: AllowedOKPKeys, as_dict: Literal[True]) -> JWKDict: ...
+ 
+         @overload
+         @staticmethod
+-        def to_jwk(
+-            key: AllowedOKPKeys, as_dict: Literal[False] = False
+-        ) -> str: ...  # pragma: no cover
++        def to_jwk(key: AllowedOKPKeys, as_dict: Literal[False] = False) -> str: ...
+ 
+         @staticmethod
+         def to_jwk(key: AllowedOKPKeys, as_dict: bool = False) -> JWKDict | str:
+
+diff --git a/jwt/api_jwk.py b/jwt/api_jwk.py
+index 02f4679..3034d04 100644
+--- a/jwt/api_jwk.py
++++ b/jwt/api_jwk.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import json
+ import time
++from collections.abc import Iterator
+ from typing import Any
+ 
+ from .algorithms import get_default_algorithms, has_crypto, requires_cryptography
+@@ -17,6 +18,16 @@ from .types import JWKDict
+ 
+ class PyJWK:
+     def __init__(self, jwk_data: JWKDict, algorithm: str | None = None) -> None:
++        """A class that represents a `JSON Web Key <https://www.rfc-editor.org/rfc/rfc7517>`_.
++
++        :param jwk_data: The decoded JWK data.
++        :type jwk_data: dict[str, typing.Any]
++        :param algorithm: The key algorithm. If not specified, the key's ``alg`` will be used.
++        :type algorithm: str or None
++        :raises InvalidKeyError: If the key type (``kty``) is not found or unsupported, or if the curve (``crv``) is not found or unsupported.
++        :raises MissingCryptographyError: If the algorithm requires ``cryptography`` to be installed and it is not available.
++        :raises PyJWKError: If unable to find an algorithm for the key.
++        """
+         self._algorithms = get_default_algorithms()
+         self._jwk_data = jwk_data
+ 
+@@ -71,23 +82,52 @@ class PyJWK:
+ 
+     @staticmethod
+     def from_dict(obj: JWKDict, algorithm: str | None = None) -> PyJWK:
++        """Creates a :class:`PyJWK` object from a JSON-like dictionary.
++
++        :param obj: The JWK data, as a dictionary
++        :type obj: dict[str, typing.Any]
++        :param algorithm: The key algorithm. If not specified, the key's ``alg`` will be used.
++        :type algorithm: str or None
++        :rtype: PyJWK
++        """
+         return PyJWK(obj, algorithm)
+ 
+     @staticmethod
+     def from_json(data: str, algorithm: None = None) -> PyJWK:
++        """Create a :class:`PyJWK` object from a JSON string.
++        Implicitly calls :meth:`PyJWK.from_dict()`.
++
++        :param str data: The JWK data, as a JSON string.
++        :param algorithm:  The key algorithm.  If not specific, the key's ``alg`` will be used.
++        :type algorithm: str or None
++
++        :rtype: PyJWK
++        """
+         obj = json.loads(data)
+         return PyJWK.from_dict(obj, algorithm)
+ 
+     @property
+     def key_type(self) -> str | None:
++        """The `kty` property from the JWK.
++
++        :rtype: str or None
++        """
+         return self._jwk_data.get("kty", None)
+ 
+     @property
+     def key_id(self) -> str | None:
++        """The `kid` property from the JWK.
++
++        :rtype: str or None
++        """
+         return self._jwk_data.get("kid", None)
+ 
+     @property
+     def public_key_use(self) -> str | None:
++        """The `use` property from the JWK.
++
++        :rtype: str or None
++        """
+         return self._jwk_data.get("use", None)
+ 
+ 
+@@ -131,6 +171,9 @@ class PyJWKSet:
+                 return key
+         raise KeyError(f"keyset has no key for kid: {kid}")
+ 
++    def __iter__(self) -> Iterator[PyJWK]:
++        return iter(self.keys)
++
+ 
+ class PyJWTSetWithTimestamp:
+     def __init__(self, jwk_set: PyJWKSet):
+
+diff --git a/jwt/api_jws.py b/jwt/api_jws.py
+index 654ee0b..28da7a8 100644
+--- a/jwt/api_jws.py
++++ b/jwt/api_jws.py
+@@ -16,14 +16,16 @@ from .api_jwk import PyJWK
+ from .exceptions import (
+     DecodeError,
+     InvalidAlgorithmError,
++    InvalidKeyError,
+     InvalidSignatureError,
+     InvalidTokenError,
+ )
+ from .utils import base64url_decode, base64url_encode
+-from .warnings import RemovedInPyjwt3Warning
++from .warnings import InsecureKeyLengthWarning, RemovedInPyjwt3Warning
+ 
+ if TYPE_CHECKING:
+     from .algorithms import AllowedPrivateKeys, AllowedPublicKeys
++    from .types import SigOptions
+ 
+ 
+ class PyJWS:
+@@ -32,7 +34,7 @@ class PyJWS:
+     def __init__(
+         self,
+         algorithms: Sequence[str] | None = None,
+-        options: dict[str, Any] | None = None,
++        options: SigOptions | None = None,
+     ) -> None:
+         self._algorithms = get_default_algorithms()
+         self._valid_algs = (
+@@ -44,17 +46,21 @@ class PyJWS:
+             if key not in self._valid_algs:
+                 del self._algorithms[key]
+ 
+-        if options is None:
+-            options = {}
+-        self.options = {**self._get_default_options(), **options}
++        self.options: SigOptions = self._get_default_options()
++        if options is not None:
++            self.options = {**self.options, **options}
+ 
+     @staticmethod
+-    def _get_default_options() -> dict[str, bool]:
+-        return {"verify_signature": True}
++    def _get_default_options() -> SigOptions:
++        return {"verify_signature": True, "enforce_minimum_key_length": False}
+ 
+     def register_algorithm(self, alg_id: str, alg_obj: Algorithm) -> None:
+         """
+         Registers a new Algorithm for use when creating and verifying tokens.
++
++        :param str alg_id: the ID of the Algorithm
++        :param alg_obj: the Algorithm object
++        :type alg_obj: Algorithm
+         """
+         if alg_id in self._algorithms:
+             raise ValueError("Algorithm already has a handler.")
+@@ -68,7 +74,8 @@ class PyJWS:
+     def unregister_algorithm(self, alg_id: str) -> None:
+         """
+         Unregisters an Algorithm for use when creating and verifying tokens
+-        Throws KeyError if algorithm is not registered.
++        :param str alg_id: the ID of the Algorithm
++        :raises KeyError: if algorithm is not registered.
+         """
+         if alg_id not in self._algorithms:
+             raise KeyError(
+@@ -81,7 +88,9 @@ class PyJWS:
+ 
+     def get_algorithms(self) -> list[str]:
+         """
+-        Returns a list of supported values for the 'alg' parameter.
++        Returns a list of supported values for the `alg` parameter.
++
++        :rtype: list[str]
+         """
+         return list(self._valid_algs)
+ 
+@@ -90,8 +99,12 @@ class PyJWS:
+         For a given string name, return the matching Algorithm object.
+ 
+         Example usage:
+-
++        >>> jws_obj = PyJWS()
+         >>> jws_obj.get_algorithm_by_name("RS256")
++
++        :param alg_name: The name of the algorithm to retrieve
++        :type alg_name: str
++        :rtype: Algorithm
+         """
+         try:
+             return self._algorithms[alg_name]
+@@ -106,20 +119,20 @@ class PyJWS:
+         self,
+         payload: bytes,
+         key: AllowedPrivateKeys | PyJWK | str | bytes,
+-        algorithm: str | None = None,
++        algorithm: str | None = "HS256",
+         headers: dict[str, Any] | None = None,
+         json_encoder: type[json.JSONEncoder] | None = None,
+         is_payload_detached: bool = False,
+         sort_headers: bool = True,
+     ) -> str:
+-        segments = []
++        segments: list[bytes] = []
+ 
+         # declare a new var to narrow the type for type checkers
+         if algorithm is None:
+             if isinstance(key, PyJWK):
+                 algorithm_ = key.algorithm_name
+             else:
+-                algorithm_ = "HS256"
++                algorithm_ = "none"
+         else:
+             algorithm_ = algorithm
+ 
+@@ -168,6 +181,14 @@ class PyJWS:
+         if isinstance(key, PyJWK):
+             key = key.key
+         key = alg_obj.prepare_key(key)
++
++        key_length_msg = alg_obj.check_key_length(key)
++        if key_length_msg:
++            if self.options.get("enforce_minimum_key_length", False):
++                raise InvalidKeyError(key_length_msg)
++            else:
++                warnings.warn(key_length_msg, InsecureKeyLengthWarning, stacklevel=2)
++
+         signature = alg_obj.sign(signing_input, key)
+ 
+         segments.append(base64url_encode(signature))
+@@ -184,9 +205,9 @@ class PyJWS:
+         jwt: str | bytes,
+         key: AllowedPublicKeys | PyJWK | str | bytes = "",
+         algorithms: Sequence[str] | None = None,
+-        options: dict[str, Any] | None = None,
++        options: SigOptions | None = None,
+         detached_payload: bytes | None = None,
+-        **kwargs,
++        **kwargs: dict[str, Any],
+     ) -> dict[str, Any]:
+         if kwargs:
+             warnings.warn(
+@@ -196,9 +217,12 @@ class PyJWS:
+                 RemovedInPyjwt3Warning,
+                 stacklevel=2,
+             )
++        merged_options: SigOptions
+         if options is None:
+-            options = {}
+-        merged_options = {**self.options, **options}
++            merged_options = self.options
++        else:
++            merged_options = {**self.options, **options}
++
+         verify_signature = merged_options["verify_signature"]
+ 
+         if verify_signature and not algorithms and not isinstance(key, PyJWK):
+@@ -230,9 +254,9 @@ class PyJWS:
+         jwt: str | bytes,
+         key: AllowedPublicKeys | PyJWK | str | bytes = "",
+         algorithms: Sequence[str] | None = None,
+-        options: dict[str, Any] | None = None,
++        options: SigOptions | None = None,
+         detached_payload: bytes | None = None,
+-        **kwargs,
++        **kwargs: dict[str, Any],
+     ) -> Any:
+         if kwargs:
+             warnings.warn(
+@@ -248,7 +272,7 @@ class PyJWS:
+         return decoded["payload"]
+ 
+     def get_unverified_header(self, jwt: str | bytes) -> dict[str, Any]:
+-        """Returns back the JWT header parameters as a dict()
++        """Returns back the JWT header parameters as a `dict`
+ 
+         Note: The signature is not verified so the header parameters
+         should not be fully trusted until signature verification is complete
+@@ -277,7 +301,7 @@ class PyJWS:
+             raise DecodeError("Invalid header padding") from err
+ 
+         try:
+-            header = json.loads(header_data)
++            header: dict[str, Any] = json.loads(header_data)
+         except ValueError as e:
+             raise DecodeError(f"Invalid header string: {e}") from e
+ 
+@@ -324,6 +348,13 @@ class PyJWS:
+                 raise InvalidAlgorithmError("Algorithm not supported") from e
+             prepared_key = alg_obj.prepare_key(key)
+ 
++        key_length_msg = alg_obj.check_key_length(prepared_key)
++        if key_length_msg:
++            if self.options.get("enforce_minimum_key_length", False):
++                raise InvalidKeyError(key_length_msg)
++            else:
++                warnings.warn(key_length_msg, InsecureKeyLengthWarning, stacklevel=4)
++
+         if not alg_obj.verify(signing_input, prepared_key, signature):
+             raise InvalidSignatureError("Signature verification failed")
+ 
+
+diff --git a/jwt/api_jwt.py b/jwt/api_jwt.py
+index 3a20143..14b8a8d 100644
+--- a/jwt/api_jwt.py
++++ b/jwt/api_jwt.py
+@@ -1,13 +1,14 @@
+ from __future__ import annotations
+ 
+ import json
++import os
+ import warnings
+ from calendar import timegm
+-from collections.abc import Iterable, Sequence
++from collections.abc import Container, Iterable, Sequence
+ from datetime import datetime, timedelta, timezone
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING, Any, Union, cast
+ 
+-from . import api_jws
++from .api_jws import PyJWS, _jws_global_obj
+ from .exceptions import (
+     DecodeError,
+     ExpiredSignatureError,
+@@ -21,19 +22,40 @@ from .exceptions import (
+ )
+ from .warnings import RemovedInPyjwt3Warning
+ 
+-if TYPE_CHECKING:
+-    from .algorithms import AllowedPrivateKeys, AllowedPublicKeys
++if TYPE_CHECKING or bool(os.getenv("SPHINX_BUILD", "")):
++    import sys
++
++    if sys.version_info >= (3, 10):
++        from typing import TypeAlias
++    else:
++        # Python 3.9 and lower
++        from typing_extensions import TypeAlias
++
++    from .algorithms import has_crypto
+     from .api_jwk import PyJWK
++    from .types import FullOptions, Options, SigOptions
++
++    if has_crypto:
++        from .algorithms import AllowedPrivateKeys, AllowedPublicKeys
++
++        AllowedPrivateKeyTypes: TypeAlias = Union[AllowedPrivateKeys, PyJWK, str, bytes]
++        AllowedPublicKeyTypes: TypeAlias = Union[AllowedPublicKeys, PyJWK, str, bytes]
++    else:
++        AllowedPrivateKeyTypes: TypeAlias = Union[PyJWK, str, bytes]  # type: ignore
++        AllowedPublicKeyTypes: TypeAlias = Union[PyJWK, str, bytes]  # type: ignore
+ 
+ 
+ class PyJWT:
+-    def __init__(self, options: dict[str, Any] | None = None) -> None:
+-        if options is None:
+-            options = {}
+-        self.options: dict[str, Any] = {**self._get_default_options(), **options}
++    def __init__(self, options: Options | None = None) -> None:
++        self.options: FullOptions
++        self.options = self._get_default_options()
++        if options is not None:
++            self.options = self._merge_options(options)
++
++        self._jws = PyJWS(options=self._get_sig_options())
+ 
+     @staticmethod
+-    def _get_default_options() -> dict[str, bool | list[str]]:
++    def _get_default_options() -> FullOptions:
+         return {
+             "verify_signature": True,
+             "verify_exp": True,
+@@ -44,17 +66,66 @@ class PyJWT:
+             "verify_sub": True,
+             "verify_jti": True,
+             "require": [],
++            "strict_aud": False,
++            "enforce_minimum_key_length": False,
+         }
+ 
++    def _get_sig_options(self) -> SigOptions:
++        return {
++            "verify_signature": self.options["verify_signature"],
++            "enforce_minimum_key_length": self.options.get(
++                "enforce_minimum_key_length", False
++            ),
++        }
++
++    def _merge_options(self, options: Options | None = None) -> FullOptions:
++        if options is None:
++            return self.options
++
++        # (defensive) set defaults for verify_x to False if verify_signature is False
++        if not options.get("verify_signature", True):
++            options["verify_exp"] = options.get("verify_exp", False)
++            options["verify_nbf"] = options.get("verify_nbf", False)
++            options["verify_iat"] = options.get("verify_iat", False)
++            options["verify_aud"] = options.get("verify_aud", False)
++            options["verify_iss"] = options.get("verify_iss", False)
++            options["verify_sub"] = options.get("verify_sub", False)
++            options["verify_jti"] = options.get("verify_jti", False)
++        return {**self.options, **options}
++
+     def encode(
+         self,
+         payload: dict[str, Any],
+-        key: AllowedPrivateKeys | PyJWK | str | bytes,
+-        algorithm: str | None = None,
++        key: AllowedPrivateKeyTypes,
++        algorithm: str | None = "HS256",
+         headers: dict[str, Any] | None = None,
+         json_encoder: type[json.JSONEncoder] | None = None,
+         sort_headers: bool = True,
+     ) -> str:
++        """Encode the ``payload`` as JSON Web Token.
++
++        :param payload: JWT claims, e.g. ``dict(iss=..., aud=..., sub=...)``
++        :type payload: dict[str, typing.Any]
++        :param key: a key suitable for the chosen algorithm:
++
++            * for **asymmetric algorithms**: PEM-formatted private key, a multiline string
++            * for **symmetric algorithms**: plain string, sufficiently long for security
++
++        :type key: str or bytes or PyJWK or :py:class:`jwt.algorithms.AllowedPrivateKeys`
++        :param algorithm: algorithm to sign the token with, e.g. ``"ES256"``.
++            If ``headers`` includes ``alg``, it will be preferred to this parameter.
++            If ``key`` is a :class:`PyJWK` object, by default the key algorithm will be used.
++        :type algorithm: str or None
++        :param headers: additional JWT header fields, e.g. ``dict(kid="my-key-id")``.
++        :type headers: dict[str, typing.Any] or None
++        :param json_encoder: custom JSON encoder for ``payload`` and ``headers``
++        :type json_encoder: json.JSONEncoder or None
++
++        :rtype: str
++        :returns: a JSON Web Token
++
++        :raises TypeError: if ``payload`` is not a ``dict``
++        """
+         # Check that we get a dict
+         if not isinstance(payload, dict):
+             raise TypeError(
+@@ -69,13 +140,17 @@ class PyJWT:
+             if isinstance(payload.get(time_claim), datetime):
+                 payload[time_claim] = timegm(payload[time_claim].utctimetuple())
+ 
++        # Issue #1039, iss being set to non-string
++        if "iss" in payload and not isinstance(payload["iss"], str):
++            raise TypeError("Issuer (iss) must be a string.")
++
+         json_payload = self._encode_payload(
+             payload,
+             headers=headers,
+             json_encoder=json_encoder,
+         )
+ 
+-        return api_jws.encode(
++        return self._jws.encode(
+             json_payload,
+             key,
+             algorithm,
+@@ -105,9 +180,9 @@ class PyJWT:
+     def decode_complete(
+         self,
+         jwt: str | bytes,
+-        key: AllowedPublicKeys | PyJWK | str | bytes = "",
++        key: AllowedPublicKeyTypes = "",
+         algorithms: Sequence[str] | None = None,
+-        options: dict[str, Any] | None = None,
++        options: Options | None = None,
+         # deprecated arg, remove in pyjwt3
+         verify: bool | None = None,
+         # could be used as passthrough to api_jws, consider removal in pyjwt3
+@@ -115,12 +190,50 @@ class PyJWT:
+         # passthrough arguments to _validate_claims
+         # consider putting in options
+         audience: str | Iterable[str] | None = None,
+-        issuer: str | Sequence[str] | None = None,
++        issuer: str | Container[str] | None = None,
+         subject: str | None = None,
+         leeway: float | timedelta = 0,
+         # kwargs
+         **kwargs: Any,
+     ) -> dict[str, Any]:
++        """Identical to ``jwt.decode`` except for return value which is a dictionary containing the token header (JOSE Header),
++        the token payload (JWT Payload), and token signature (JWT Signature) on the keys "header", "payload",
++        and "signature" respectively.
++
++        :param jwt: the token to be decoded
++        :type jwt: str or bytes
++        :param key: the key suitable for the allowed algorithm
++        :type key: str or bytes or PyJWK or :py:class:`jwt.algorithms.AllowedPublicKeys`
++
++        :param algorithms: allowed algorithms, e.g. ``["ES256"]``
++
++            .. warning::
++
++               Do **not** compute the ``algorithms`` parameter based on
++               the ``alg`` from the token itself, or on any other data
++               that an attacker may be able to influence, as that might
++               expose you to various vulnerabilities (see `RFC 8725 §2.1
++               <https://www.rfc-editor.org/rfc/rfc8725.html#section-2.1>`_). Instead,
++               either hard-code a fixed value for ``algorithms``, or
++               configure it in the same place you configure the
++               ``key``. Make sure not to mix symmetric and asymmetric
++               algorithms that interpret the ``key`` in different ways
++               (e.g. HS\\* and RS\\*).
++        :type algorithms: typing.Sequence[str] or None
++
++        :param jwt.types.Options options: extended decoding and validation options
++            Refer to :py:class:`jwt.types.Options` for more information.
++
++        :param audience: optional, the value for ``verify_aud`` check
++        :type audience: str or typing.Iterable[str] or None
++        :param issuer: optional, the value for ``verify_iss`` check
++        :type issuer: str or typing.Container[str] or None
++        :param leeway: a time margin in seconds for the expiration check
++        :type leeway: float or datetime.timedelta
++        :rtype: dict[str, typing.Any]
++        :returns: Decoded JWT with the JOSE Header on the key ``header``, the JWS
++         Payload on the key ``payload``, and the JWS Signature on the key ``signature``.
++        """
+         if kwargs:
+             warnings.warn(
+                 "passing additional kwargs to decode_complete() is deprecated "
+@@ -129,13 +242,16 @@ class PyJWT:
+                 RemovedInPyjwt3Warning,
+                 stacklevel=2,
+             )
+-        options = dict(options or {})  # shallow-copy or initialize an empty dict
+-        options.setdefault("verify_signature", True)
++
++        if options is None:
++            verify_signature = True
++        else:
++            verify_signature = options.get("verify_signature", True)
+ 
+         # If the user has set the legacy `verify` argument, and it doesn't match
+         # what the relevant `options` entry for the argument is, inform the user
+         # that they're likely making a mistake.
+-        if verify is not None and verify != options["verify_signature"]:
++        if verify is not None and verify != verify_signature:
+             warnings.warn(
+                 "The `verify` argument to `decode` does nothing in PyJWT 2.0 and newer. "
+                 "The equivalent is setting `verify_signature` to False in the `options` dictionary. "
+@@ -144,26 +260,21 @@ class PyJWT:
+                 stacklevel=2,
+             )
+ 
+-        if not options["verify_signature"]:
+-            options.setdefault("verify_exp", False)
+-            options.setdefault("verify_nbf", False)
+-            options.setdefault("verify_iat", False)
+-            options.setdefault("verify_aud", False)
+-            options.setdefault("verify_iss", False)
+-            options.setdefault("verify_sub", False)
+-            options.setdefault("verify_jti", False)
++        merged_options = self._merge_options(options)
+ 
+-        decoded = api_jws.decode_complete(
++        sig_options: SigOptions = {
++            "verify_signature": verify_signature,
++        }
++        decoded = self._jws.decode_complete(
+             jwt,
+             key=key,
+             algorithms=algorithms,
+-            options=options,
++            options=sig_options,
+             detached_payload=detached_payload,
+         )
+ 
+         payload = self._decode_payload(decoded)
+ 
+-        merged_options = {**self.options, **options}
+         self._validate_claims(
+             payload,
+             merged_options,
+@@ -176,7 +287,7 @@ class PyJWT:
+         decoded["payload"] = payload
+         return decoded
+ 
+-    def _decode_payload(self, decoded: dict[str, Any]) -> Any:
++    def _decode_payload(self, decoded: dict[str, Any]) -> dict[str, Any]:
+         """
+         Decode the payload from a JWS dictionary (payload, signature, header).
+ 
+@@ -185,7 +296,7 @@ class PyJWT:
+         payloads.
+         """
+         try:
+-            payload = json.loads(decoded["payload"])
++            payload: dict[str, Any] = json.loads(decoded["payload"])
+         except ValueError as e:
+             raise DecodeError(f"Invalid payload string: {e}") from e
+         if not isinstance(payload, dict):
+@@ -197,7 +308,7 @@ class PyJWT:
+         jwt: str | bytes,
+         key: AllowedPublicKeys | PyJWK | str | bytes = "",
+         algorithms: Sequence[str] | None = None,
+-        options: dict[str, Any] | None = None,
++        options: Options | None = None,
+         # deprecated arg, remove in pyjwt3
+         verify: bool | None = None,
+         # could be used as passthrough to api_jws, consider removal in pyjwt3
+@@ -206,11 +317,49 @@ class PyJWT:
+         # consider putting in options
+         audience: str | Iterable[str] | None = None,
+         subject: str | None = None,
+-        issuer: str | Sequence[str] | None = None,
++        issuer: str | Container[str] | None = None,
+         leeway: float | timedelta = 0,
+         # kwargs
+         **kwargs: Any,
+-    ) -> Any:
++    ) -> dict[str, Any]:
++        """Verify the ``jwt`` token signature and return the token claims.
++
++        :param jwt: the token to be decoded
++        :type jwt: str or bytes
++        :param key: the key suitable for the allowed algorithm
++        :type key: str or bytes or PyJWK or :py:class:`jwt.algorithms.AllowedPublicKeys`
++
++        :param algorithms: allowed algorithms, e.g. ``["ES256"]``
++            If ``key`` is a :class:`PyJWK` object, allowed algorithms will default to the key algorithm.
++
++            .. warning::
++
++               Do **not** compute the ``algorithms`` parameter based on
++               the ``alg`` from the token itself, or on any other data
++               that an attacker may be able to influence, as that might
++               expose you to various vulnerabilities (see `RFC 8725 §2.1
++               <https://www.rfc-editor.org/rfc/rfc8725.html#section-2.1>`_). Instead,
++               either hard-code a fixed value for ``algorithms``, or
++               configure it in the same place you configure the
++               ``key``. Make sure not to mix symmetric and asymmetric
++               algorithms that interpret the ``key`` in different ways
++               (e.g. HS\\* and RS\\*).
++        :type algorithms: typing.Sequence[str] or None
++
++        :param jwt.types.Options options: extended decoding and validation options
++            Refer to :py:class:`jwt.types.Options` for more information.
++
++        :param audience: optional, the value for ``verify_aud`` check
++        :type audience: str or typing.Iterable[str] or None
++        :param subject: optional, the value for ``verify_sub`` check
++        :type subject: str or None
++        :param issuer: optional, the value for ``verify_iss`` check
++        :type issuer: str or typing.Container[str] or None
++        :param leeway: a time margin in seconds for the expiration check
++        :type leeway: float or datetime.timedelta
++        :rtype: dict[str, typing.Any]
++        :returns: the JWT claims
++        """
+         if kwargs:
+             warnings.warn(
+                 "passing additional kwargs to decode() is deprecated "
+@@ -231,14 +380,14 @@ class PyJWT:
+             issuer=issuer,
+             leeway=leeway,
+         )
+-        return decoded["payload"]
++        return cast(dict[str, Any], decoded["payload"])
+ 
+     def _validate_claims(
+         self,
+         payload: dict[str, Any],
+-        options: dict[str, Any],
+-        audience=None,
+-        issuer=None,
++        options: FullOptions,
++        audience: Iterable[str] | str | None = None,
++        issuer: Container[str] | str | None = None,
+         subject: str | None = None,
+         leeway: float | timedelta = 0,
+     ) -> None:
+@@ -248,7 +397,7 @@ class PyJWT:
+         if audience is not None and not isinstance(audience, (str, Iterable)):
+             raise TypeError("audience must be a string, iterable or None")
+ 
+-        self._validate_required_claims(payload, options)
++        self._validate_required_claims(payload, options["require"])
+ 
+         now = datetime.now(tz=timezone.utc).timestamp()
+ 
+@@ -278,15 +427,17 @@ class PyJWT:
+     def _validate_required_claims(
+         self,
+         payload: dict[str, Any],
+-        options: dict[str, Any],
++        claims: Iterable[str],
+     ) -> None:
+-        for claim in options["require"]:
++        for claim in claims:
+             if payload.get(claim) is None:
+                 raise MissingRequiredClaimError(claim)
+ 
+-    def _validate_sub(self, payload: dict[str, Any], subject=None) -> None:
++    def _validate_sub(
++        self, payload: dict[str, Any], subject: str | None = None
++    ) -> None:
+         """
+-        Checks whether "sub" if in the payload is valid ot not.
++        Checks whether "sub" if in the payload is valid or not.
+         This is an Optional claim
+ 
+         :param payload(dict): The payload which needs to be validated
+@@ -305,7 +456,7 @@ class PyJWT:
+ 
+     def _validate_jti(self, payload: dict[str, Any]) -> None:
+         """
+-        Checks whether "jti" if in the payload is valid ot not
++        Checks whether "jti" if in the payload is valid or not
+         This is an Optional claim
+ 
+         :param payload(dict): The payload which needs to be validated
+@@ -412,22 +563,34 @@ class PyJWT:
+         if all(aud not in audience_claims for aud in audience):
+             raise InvalidAudienceError("Audience doesn't match")
+ 
+-    def _validate_iss(self, payload: dict[str, Any], issuer: Any) -> None:
++    def _validate_iss(
++        self, payload: dict[str, Any], issuer: Container[str] | str | None
++    ) -> None:
+         if issuer is None:
+             return
+ 
+         if "iss" not in payload:
+             raise MissingRequiredClaimError("iss")
+ 
++        iss = payload["iss"]
++        if not isinstance(iss, str):
++            raise InvalidIssuerError("Payload Issuer (iss) must be a string")
++
+         if isinstance(issuer, str):
+-            if payload["iss"] != issuer:
++            if iss != issuer:
+                 raise InvalidIssuerError("Invalid issuer")
+         else:
+-            if payload["iss"] not in issuer:
+-                raise InvalidIssuerError("Invalid issuer")
++            try:
++                if iss not in issuer:
++                    raise InvalidIssuerError("Invalid issuer")
++            except TypeError:
++                raise InvalidIssuerError(
++                    'Issuer param must be "str" or "Container[str]"'
++                ) from None
+ 
+ 
+ _jwt_global_obj = PyJWT()
++_jwt_global_obj._jws = _jws_global_obj
+ encode = _jwt_global_obj.encode
+ decode_complete = _jwt_global_obj.decode_complete
+ decode = _jwt_global_obj.decode
+
+diff --git a/jwt/exceptions.py b/jwt/exceptions.py
+index 9b45ae4..57559fc 100644
+--- a/jwt/exceptions.py
++++ b/jwt/exceptions.py
+@@ -7,46 +7,71 @@ class PyJWTError(Exception):
+ 
+ 
+ class InvalidTokenError(PyJWTError):
++    """Base exception when ``decode()`` fails on a token"""
++
+     pass
+ 
+ 
+ class DecodeError(InvalidTokenError):
++    """Raised when a token cannot be decoded because it failed validation"""
++
+     pass
+ 
+ 
+ class InvalidSignatureError(DecodeError):
++    """Raised when a token's signature doesn't match the one provided as part of
++    the token."""
++
+     pass
+ 
+ 
+ class ExpiredSignatureError(InvalidTokenError):
++    """Raised when a token's ``exp`` claim indicates that it has expired"""
++
+     pass
+ 
+ 
+ class InvalidAudienceError(InvalidTokenError):
++    """Raised when a token's ``aud`` claim does not match one of the expected
++    audience values"""
++
+     pass
+ 
+ 
+ class InvalidIssuerError(InvalidTokenError):
++    """Raised when a token's ``iss`` claim does not match the expected issuer"""
++
+     pass
+ 
+ 
+ class InvalidIssuedAtError(InvalidTokenError):
++    """Raised when a token's ``iat`` claim is non-numeric"""
++
+     pass
+ 
+ 
+ class ImmatureSignatureError(InvalidTokenError):
++    """Raised when a token's ``nbf`` or ``iat`` claims represent a time in the future"""
++
+     pass
+ 
+ 
+ class InvalidKeyError(PyJWTError):
++    """Raised when the specified key is not in the proper format"""
++
+     pass
+ 
+ 
+ class InvalidAlgorithmError(InvalidTokenError):
++    """Raised when the specified algorithm is not recognized by PyJWT"""
++
+     pass
+ 
+ 
+ class MissingRequiredClaimError(InvalidTokenError):
++    """Raised when a claim that is required to be present is not contained
++    in the claimset"""
++
+     def __init__(self, claim: str) -> None:
+         self.claim = claim
+ 
+@@ -59,6 +84,8 @@ class PyJWKError(PyJWTError):
+ 
+ 
+ class MissingCryptographyError(PyJWKError):
++    """Raised if the algorithm requires ``cryptography`` to be installed and it is not available."""
++
+     pass
+ 
+ 
+@@ -75,8 +102,12 @@ class PyJWKClientConnectionError(PyJWKClientError):
+ 
+ 
+ class InvalidSubjectError(InvalidTokenError):
++    """Raised when a token's ``sub`` claim is not a string or doesn't match the expected ``subject``"""
++
+     pass
+ 
+ 
+ class InvalidJTIError(InvalidTokenError):
++    """Raised when a token's ``jti`` claim is not a string"""
++
+     pass
+
+diff --git a/jwt/help.py b/jwt/help.py
+index 8e1c228..2f42b5d 100644
+--- a/jwt/help.py
++++ b/jwt/help.py
+@@ -1,7 +1,6 @@
+ import json
+ import platform
+ import sys
+-from typing import Dict
+ 
+ from . import __version__ as pyjwt_version
+ 
+@@ -13,7 +12,7 @@ except ModuleNotFoundError:
+     cryptography_version = ""
+ 
+ 
+-def info() -> Dict[str, Dict[str, str]]:
++def info() -> dict[str, dict[str, str]]:
+     """
+     Generate information for a bug report.
+     Based on the requests package help utility module.
+
+diff --git a/jwt/jwk_set_cache.py b/jwt/jwk_set_cache.py
+index 2432563..f3f3ca5 100644
+--- a/jwt/jwk_set_cache.py
++++ b/jwt/jwk_set_cache.py
+@@ -5,7 +5,7 @@ from .api_jwk import PyJWKSet, PyJWTSetWithTimestamp
+ 
+ 
+ class JWKSetCache:
+-    def __init__(self, lifespan: int) -> None:
++    def __init__(self, lifespan: float) -> None:
+         self.jwk_set_with_timestamp: Optional[PyJWTSetWithTimestamp] = None
+         self.lifespan = lifespan
+ 
+
+diff --git a/jwt/jwks_client.py b/jwt/jwks_client.py
+index 9a8992c..533b72f 100644
+--- a/jwt/jwks_client.py
++++ b/jwt/jwks_client.py
+@@ -1,8 +1,10 @@
++from __future__ import annotations
++
+ import json
+ import urllib.request
+ from functools import lru_cache
+ from ssl import SSLContext
+-from typing import Any, Dict, List, Optional
++from typing import Any
+ from urllib.error import URLError
+ 
+ from .api_jwk import PyJWK, PyJWKSet
+@@ -18,15 +20,15 @@ class PyJWKClient:
+         cache_keys: bool = False,
+         max_cached_keys: int = 16,
+         cache_jwk_set: bool = True,
+-        lifespan: int = 300,
+-        headers: Optional[Dict[str, Any]] = None,
+-        timeout: int = 30,
+-        ssl_context: Optional[SSLContext] = None,
++        lifespan: float = 300,
++        headers: dict[str, Any] | None = None,
++        timeout: float = 30,
++        ssl_context: SSLContext | None = None,
+     ):
+         if headers is None:
+             headers = {}
+         self.uri = uri
+-        self.jwk_set_cache: Optional[JWKSetCache] = None
++        self.jwk_set_cache: JWKSetCache | None = None
+         self.headers = headers
+         self.timeout = timeout
+         self.ssl_context = ssl_context
+@@ -44,10 +46,9 @@ class PyJWKClient:
+ 
+         if cache_keys:
+             # Cache signing keys
++            get_signing_key = lru_cache(maxsize=max_cached_keys)(self.get_signing_key)
+             # Ignore mypy (https://github.com/python/mypy/issues/2427)
+-            self.get_signing_key = lru_cache(maxsize=max_cached_keys)(
+-                self.get_signing_key
+-            )  # type: ignore
++            self.get_signing_key = get_signing_key  # type: ignore[method-assign]
+ 
+     def fetch_data(self) -> Any:
+         jwk_set: Any = None
+@@ -80,7 +81,7 @@ class PyJWKClient:
+ 
+         return PyJWKSet.from_dict(data)
+ 
+-    def get_signing_keys(self, refresh: bool = False) -> List[PyJWK]:
++    def get_signing_keys(self, refresh: bool = False) -> list[PyJWK]:
+         jwk_set = self.get_jwk_set(refresh)
+         signing_keys = [
+             jwk_set_key
+@@ -109,13 +110,13 @@ class PyJWKClient:
+ 
+         return signing_key
+ 
+-    def get_signing_key_from_jwt(self, token: str) -> PyJWK:
++    def get_signing_key_from_jwt(self, token: str | bytes) -> PyJWK:
+         unverified = decode_token(token, options={"verify_signature": False})
+         header = unverified["header"]
+         return self.get_signing_key(header.get("kid"))
+ 
+     @staticmethod
+-    def match_kid(signing_keys: List[PyJWK], kid: str) -> Optional[PyJWK]:
++    def match_kid(signing_keys: list[PyJWK], kid: str) -> PyJWK | None:
+         signing_key = None
+ 
+         for key in signing_keys:
+
+diff --git a/jwt/types.py b/jwt/types.py
+index 7d99352..fa861e2 100644
+--- a/jwt/types.py
++++ b/jwt/types.py
+@@ -1,5 +1,69 @@
+-from typing import Any, Callable, Dict
++from typing import Any, Callable, TypedDict
+ 
+-JWKDict = Dict[str, Any]
++JWKDict = dict[str, Any]
+ 
+ HashlibHash = Callable[..., Any]
++
++
++class SigOptions(TypedDict, total=False):
++    """Options for PyJWS class (TypedDict). Note that this is a smaller set of options than
++    for :py:func:`jwt.decode()`."""
++
++    verify_signature: bool
++    """verify the JWT cryptographic signature"""
++    enforce_minimum_key_length: bool
++    """Default: ``False``. Raise :py:class:`jwt.exceptions.InvalidKeyError` instead of warning when keys are below minimum recommended length."""
++
++
++class Options(TypedDict, total=False):
++    """Options for :py:func:`jwt.decode()` and :py:func:`jwt.api_jwt.decode_complete()` (TypedDict).
++
++    .. warning::
++
++        Some claims, such as ``exp``, ``iat``, ``jti``, ``nbf``, and ``sub``,
++        will only be verified if present. Please refer to the documentation below
++        for which ones, and make sure to include them in the ``require`` param
++        if you want to make sure that they are always present (and therefore always verified
++        if ``verify_{claim} = True`` for that claim).
++    """
++
++    verify_signature: bool
++    """Default: ``True``. Verify the JWT cryptographic signature."""
++    require: list[str]
++    """Default: ``[]``. List of claims that must be present.
++          Example: ``require=["exp", "iat", "nbf"]``.
++          **Only verifies that the claims exists**. Does not verify that the claims are valid."""
++    strict_aud: bool
++    """Default: ``False``. (requires ``verify_aud=True``) Check that the ``aud`` claim is a single value (not a list), and matches ``audience`` exactly."""
++    verify_aud: bool
++    """Default: ``verify_signature``. Check that ``aud`` (audience) claim matches ``audience``."""
++    verify_exp: bool
++    """Default: ``verify_signature``. Check that ``exp`` (expiration) claim value is in the future (if present in payload). """
++    verify_iat: bool
++    """Default: ``verify_signature``. Check that ``iat`` (issued at) claim value is an integer (if present in payload). """
++    verify_iss: bool
++    """Default: ``verify_signature``. Check that ``iss`` (issuer) claim matches ``issuer``. """
++    verify_jti: bool
++    """Default: ``verify_signature``. Check that ``jti`` (JWT ID) claim is a string (if present in payload). """
++    verify_nbf: bool
++    """Default: ``verify_signature``. Check that ``nbf`` (not before) claim value is in the past (if present in payload). """
++    verify_sub: bool
++    """Default: ``verify_signature``. Check that ``sub`` (subject) claim is a string and matches ``subject`` (if present in payload). """
++    enforce_minimum_key_length: bool
++    """Default: ``False``. Raise :py:class:`jwt.exceptions.InvalidKeyError` instead of warning when keys are below minimum recommended length."""
++
++
++# The only difference between Options and FullOptions is that FullOptions
++# required _every_ value to be there; Options doesn't require any
++class FullOptions(TypedDict):
++    verify_signature: bool
++    require: list[str]
++    strict_aud: bool
++    verify_aud: bool
++    verify_exp: bool
++    verify_iat: bool
++    verify_iss: bool
++    verify_jti: bool
++    verify_nbf: bool
++    verify_sub: bool
++    enforce_minimum_key_length: bool
+
+diff --git a/jwt/warnings.py b/jwt/warnings.py
+index 8762a8c..8a41a36 100644
+--- a/jwt/warnings.py
++++ b/jwt/warnings.py
+@@ -1,2 +1,11 @@
+ class RemovedInPyjwt3Warning(DeprecationWarning):
++    """Warning for features that will be removed in PyJWT 3."""
++
++    pass
++
++
++class InsecureKeyLengthWarning(UserWarning):
++    """Warning emitted when a cryptographic key is shorter than the minimum
++    recommended length. See :ref:`key-length-validation` for details."""
++
+     pass

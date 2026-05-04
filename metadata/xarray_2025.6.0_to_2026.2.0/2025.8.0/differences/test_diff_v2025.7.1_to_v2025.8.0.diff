@@ -1,0 +1,3632 @@
+diff --git a/xarray/tests/__init__.py b/xarray/tests/__init__.py
+index 4de9e42..3b4e49c 100644
+--- a/xarray/tests/__init__.py
++++ b/xarray/tests/__init__.py
+@@ -48,6 +48,7 @@ except ImportError:
+ warnings.filterwarnings("ignore", "'urllib3.contrib.pyopenssl' module is deprecated")
+ warnings.filterwarnings("ignore", "Deprecated call to `pkg_resources.declare_namespace")
+ warnings.filterwarnings("ignore", "pkg_resources is deprecated as an API")
++warnings.filterwarnings("ignore", message="numpy.ndarray size changed")
+ 
+ arm_xfail = pytest.mark.xfail(
+     platform.machine() == "aarch64" or "arm" in platform.machine(),
+@@ -131,6 +132,7 @@ has_rasterio, requires_rasterio = _importorskip("rasterio")
+ has_zarr, requires_zarr = _importorskip("zarr")
+ has_zarr_v3, requires_zarr_v3 = _importorskip("zarr", "3.0.0")
+ has_zarr_v3_dtypes, requires_zarr_v3_dtypes = _importorskip("zarr", "3.1.0")
++has_zarr_v3_async_oindex, requires_zarr_v3_async_oindex = _importorskip("zarr", "3.1.2")
+ if has_zarr_v3:
+     import zarr
+ 
+@@ -139,10 +141,15 @@ if has_zarr_v3:
+     # installing from git main is giving me a lower version than the
+     # most recently released zarr
+     has_zarr_v3_dtypes = hasattr(zarr.core, "dtype")
++    has_zarr_v3_async_oindex = hasattr(zarr.AsyncArray, "oindex")
+ 
+     requires_zarr_v3_dtypes = pytest.mark.skipif(
+         not has_zarr_v3_dtypes, reason="requires zarr>3.1.0"
+     )
++    requires_zarr_v3_async_oindex = pytest.mark.skipif(
++        not has_zarr_v3_async_oindex, reason="requires zarr>3.1.1"
++    )
++
+ 
+ has_fsspec, requires_fsspec = _importorskip("fsspec")
+ has_iris, requires_iris = _importorskip("iris")
+
+diff --git a/xarray/tests/arrays.py b/xarray/tests/arrays.py
+index 31f380d..4ee4156 100644
+--- a/xarray/tests/arrays.py
++++ b/xarray/tests/arrays.py
+@@ -3,7 +3,7 @@ This module contains various lazy array classes which can be wrapped and manipul
+ """
+ 
+ from collections.abc import Callable, Iterable
+-from typing import Any
++from typing import Any, Self
+ 
+ import numpy as np
+ 
+@@ -126,6 +126,23 @@ def broadcast_to(
+     return ConcatenatableArray(result)
+ 
+ 
++@implements(np.full_like)
++def full_like(
++    x: "ConcatenatableArray", /, fill_value, **kwargs
++) -> "ConcatenatableArray":
++    """
++    Broadcasts an array to a specified shape, by either manipulating chunk keys or copying chunk manifest entries.
++    """
++    if not isinstance(x, ConcatenatableArray):
++        raise TypeError
++    return ConcatenatableArray(np.full(x.shape, fill_value=fill_value, **kwargs))
++
++
++@implements(np.all)
++def numpy_all(x: "ConcatenatableArray", **kwargs) -> "ConcatenatableArray":
++    return type(x)(np.all(x._array, **kwargs))
++
++
+ class ConcatenatableArray:
+     """Disallows loading or coercing to an index but does support concatenation / stacking."""
+ 
+@@ -156,7 +173,7 @@ class ConcatenatableArray:
+     ) -> np.ndarray:
+         raise UnexpectedDataAccess("Tried accessing data")
+ 
+-    def __getitem__(self, key) -> "ConcatenatableArray":
++    def __getitem__(self, key) -> Self:
+         """Some cases of concat require supporting expanding dims by dimensions of size 1"""
+         # see https://data-apis.org/array-api/2022.12/API_specification/indexing.html#multi-axis-indexing
+         arr = self._array
+@@ -167,7 +184,10 @@ class ConcatenatableArray:
+                 pass
+             else:
+                 raise UnexpectedDataAccess("Tried accessing data.")
+-        return ConcatenatableArray(arr)
++        return type(self)(arr)
++
++    def __eq__(self, other: Self) -> Self:  # type: ignore[override]
++        return type(self)(self._array == other._array)
+ 
+     def __array_function__(self, func, types, args, kwargs) -> Any:
+         if func not in CONCATENATABLEARRAY_HANDLED_ARRAY_FUNCTIONS:
+@@ -184,9 +204,15 @@ class ConcatenatableArray:
+         """We have to define this in order to convince xarray that this class is a duckarray, even though we will never support ufuncs."""
+         return NotImplemented
+ 
+-    def astype(self, dtype: np.dtype, /, *, copy: bool = True) -> "ConcatenatableArray":
++    def astype(self, dtype: np.dtype, /, *, copy: bool = True) -> Self:
+         """Needed because xarray will call this even when it's a no-op"""
+         if dtype != self.dtype:
+             raise NotImplementedError()
+         else:
+             return self
++
++    def __and__(self, other: Self) -> Self:
++        return type(self)(self._array & other._array)
++
++    def __or__(self, other: Self) -> Self:
++        return type(self)(self._array | other._array)
+
+diff --git a/xarray/tests/test_backends.py b/xarray/tests/test_backends.py
+index 32ebe52..c336fe7 100644
+--- a/xarray/tests/test_backends.py
++++ b/xarray/tests/test_backends.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import asyncio
+ import contextlib
+ import gzip
+ import itertools
+@@ -16,6 +17,7 @@ import warnings
+ from collections import ChainMap
+ from collections.abc import Generator, Iterator, Mapping
+ from contextlib import ExitStack
++from importlib import import_module
+ from io import BytesIO
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any, Final, Literal, cast
+@@ -28,6 +30,7 @@ from packaging.version import Version
+ from pandas.errors import OutOfBoundsDatetime
+ 
+ import xarray as xr
++import xarray.testing as xrt
+ from xarray import (
+     DataArray,
+     Dataset,
+@@ -60,6 +63,7 @@ from xarray.core.options import set_options
+ from xarray.core.types import PDDatetimeUnitOptions
+ from xarray.core.utils import module_available
+ from xarray.namedarray.pycompat import array_type
++from xarray.structure.alignment import AlignmentError
+ from xarray.tests import (
+     assert_allclose,
+     assert_array_equal,
+@@ -73,9 +77,11 @@ from xarray.tests import (
+     has_scipy,
+     has_zarr,
+     has_zarr_v3,
++    has_zarr_v3_async_oindex,
+     has_zarr_v3_dtypes,
+     mock,
+     network,
++    parametrize_zarr_format,
+     requires_cftime,
+     requires_dask,
+     requires_fsspec,
+@@ -308,7 +314,15 @@ def create_encoded_unsigned_false_masked_scaled_data(dtype: np.dtype) -> Dataset
+ 
+ def create_boolean_data() -> Dataset:
+     attributes = {"units": "-"}
+-    return Dataset({"x": ("t", [True, False, False, True], attributes)})
++    return Dataset(
++        {
++            "x": (
++                ("t", "x"),
++                [[False, True, False, True], [True, False, False, True]],
++                attributes,
++            )
++        }
++    )
+ 
+ 
+ class TestCommon:
+@@ -339,6 +353,11 @@ class TestCommon:
+ class NetCDF3Only:
+     netcdf3_formats: tuple[T_NetcdfTypes, ...] = ("NETCDF3_CLASSIC", "NETCDF3_64BIT")
+ 
++    @pytest.mark.asyncio
++    @pytest.mark.skip(reason="NetCDF backends don't support async loading")
++    async def test_load_async(self) -> None:
++        pass
++
+     @requires_scipy
+     def test_dtype_coercion_error(self) -> None:
+         """Failing dtype coercion should lead to an error"""
+@@ -449,6 +468,7 @@ class DatasetIOBase:
+             assert_identical(expected, actual)
+ 
+     def test_load(self) -> None:
++        # Note: please keep this in sync with test_load_async below as much as possible!
+         expected = create_test_data()
+ 
+         @contextlib.contextmanager
+@@ -481,6 +501,43 @@ class DatasetIOBase:
+             actual = ds.load()
+         assert_identical(expected, actual)
+ 
++    @pytest.mark.asyncio
++    async def test_load_async(self) -> None:
++        # Note: please keep this in sync with test_load above as much as possible!
++
++        # Copied from `test_load` on the base test class, but won't work for netcdf
++        expected = create_test_data()
++
++        @contextlib.contextmanager
++        def assert_loads(vars=None):
++            if vars is None:
++                vars = expected
++            with self.roundtrip(expected) as actual:
++                for k, v in actual.variables.items():
++                    # IndexVariables are eagerly loaded into memory
++                    assert v._in_memory == (k in actual.dims)
++                yield actual
++                for k, v in actual.variables.items():
++                    if k in vars:
++                        assert v._in_memory
++                assert_identical(expected, actual)
++
++        with pytest.raises(AssertionError):
++            # make sure the contextmanager works!
++            with assert_loads() as ds:
++                pass
++
++        with assert_loads() as ds:
++            await ds.load_async()
++
++        with assert_loads(["var1", "dim1", "dim2"]) as ds:
++            await ds["var1"].load_async()
++
++        # verify we can read data even after closing the file
++        with self.roundtrip(expected) as ds:
++            actual = await ds.load_async()
++        assert_identical(expected, actual)
++
+     def test_dataset_compute(self) -> None:
+         expected = create_test_data()
+ 
+@@ -726,6 +783,9 @@ class DatasetIOBase:
+             with self.roundtrip(actual) as actual2:
+                 assert_identical(original, actual2)
+                 assert actual2["x"].dtype == "bool"
++            with self.roundtrip(actual) as actual3:
++                # GH10536
++                assert_identical(original.transpose(), actual3.transpose())
+ 
+     def test_orthogonal_indexing(self) -> None:
+         in_memory = create_test_data()
+@@ -1312,6 +1372,47 @@ class CFEncodedBase(DatasetIOBase):
+             with self.roundtrip(ds, save_kwargs=kwargs) as actual:
+                 pass
+ 
++    def test_encoding_unlimited_dims(self) -> None:
++        if isinstance(self, ZarrBase):
++            pytest.skip("No unlimited_dims handled in zarr.")
++        ds = Dataset({"x": ("y", np.arange(10.0))})
++        with self.roundtrip(ds, save_kwargs=dict(unlimited_dims=["y"])) as actual:
++            assert actual.encoding["unlimited_dims"] == set("y")
++            assert_equal(ds, actual)
++
++        # Regression test for https://github.com/pydata/xarray/issues/2134
++        with self.roundtrip(ds, save_kwargs=dict(unlimited_dims="y")) as actual:
++            assert actual.encoding["unlimited_dims"] == set("y")
++            assert_equal(ds, actual)
++
++        ds.encoding = {"unlimited_dims": ["y"]}
++        with self.roundtrip(ds) as actual:
++            assert actual.encoding["unlimited_dims"] == set("y")
++            assert_equal(ds, actual)
++
++        # Regression test for https://github.com/pydata/xarray/issues/2134
++        ds.encoding = {"unlimited_dims": "y"}
++        with self.roundtrip(ds) as actual:
++            assert actual.encoding["unlimited_dims"] == set("y")
++            assert_equal(ds, actual)
++
++        # test unlimited_dims validation
++        # https://github.com/pydata/xarray/issues/10549
++        ds.encoding = {"unlimited_dims": "z"}
++        with pytest.raises(
++            ValueError,
++            match=r"Unlimited dimension\(s\) .* declared in 'dataset.encoding'",
++        ):
++            with self.roundtrip(ds) as _:
++                pass
++        ds.encoding = {}
++        with pytest.raises(
++            ValueError,
++            match=r"Unlimited dimension\(s\) .* declared in 'unlimited_dims-kwarg'",
++        ):
++            with self.roundtrip(ds, save_kwargs=dict(unlimited_dims=["z"])) as _:
++                pass
++
+     def test_encoding_kwarg_dates(self) -> None:
+         ds = Dataset({"t": pd.date_range("2000-01-01", periods=3)})
+         units = "days since 1900-01-01"
+@@ -1468,6 +1569,11 @@ class CFEncodedBase(DatasetIOBase):
+ class NetCDFBase(CFEncodedBase):
+     """Tests for all netCDF3 and netCDF4 backends."""
+ 
++    @pytest.mark.asyncio
++    @pytest.mark.skip(reason="NetCDF backends don't support async loading")
++    async def test_load_async(self) -> None:
++        await super().test_load_async()
++
+     @pytest.mark.skipif(
+         ON_WINDOWS, reason="Windows does not allow modifying open files"
+     )
+@@ -1598,6 +1704,17 @@ class NetCDF4Base(NetCDFBase):
+             with self.open(tmp_file, group="data/2") as actual2:
+                 assert_identical(data2, actual2)
+ 
++    def test_child_group_with_inconsistent_dimensions(self) -> None:
++        base = Dataset(coords={"x": [1, 2]})
++        child = Dataset(coords={"x": [1, 2, 3]})
++        with create_tmp_file() as tmp_file:
++            self.save(base, tmp_file)
++            self.save(child, tmp_file, group="child", mode="a")
++            with self.open(tmp_file) as actual_base:
++                assert_identical(base, actual_base)
++            with self.open(tmp_file, group="child") as actual_child:
++                assert_identical(child, actual_child)
++
+     @pytest.mark.parametrize(
+         "input_strings, is_bytes",
+         [
+@@ -1906,16 +2023,6 @@ class NetCDF4Base(NetCDFBase):
+                 with open_dataset(tmp_file, **cast(dict, kwargs)) as actual:
+                     assert_identical(expected, actual)
+ 
+-    def test_encoding_unlimited_dims(self) -> None:
+-        ds = Dataset({"x": ("y", np.arange(10.0))})
+-        with self.roundtrip(ds, save_kwargs=dict(unlimited_dims=["y"])) as actual:
+-            assert actual.encoding["unlimited_dims"] == set("y")
+-            assert_equal(ds, actual)
+-        ds.encoding = {"unlimited_dims": ["y"]}
+-        with self.roundtrip(ds) as actual:
+-            assert actual.encoding["unlimited_dims"] == set("y")
+-            assert_equal(ds, actual)
+-
+     def test_raise_on_forward_slashes_in_names(self) -> None:
+         # test for forward slash in variable names and dimensions
+         # see GH 7943
+@@ -2407,6 +2514,14 @@ class ZarrBase(CFEncodedBase):
+             with self.open(store_target, **open_kwargs) as ds:
+                 yield ds
+ 
++    @pytest.mark.asyncio
++    @pytest.mark.skipif(
++        not has_zarr_v3,
++        reason="zarr-python <3 did not support async loading",
++    )
++    async def test_load_async(self) -> None:
++        await super().test_load_async()
++
+     def test_roundtrip_bytes_with_fill_value(self):
+         pytest.xfail("Broken by Zarr 3.0.7")
+ 
+@@ -3647,10 +3762,6 @@ class TestInstrumentedZarrStore:
+                 )
+ 
+     @requires_dask
+-    @pytest.mark.skipif(
+-        sys.version_info < (3, 11),
+-        reason="zarr too old",
+-    )
+     def test_region_write(self) -> None:
+         ds = Dataset({"foo": ("x", [1, 2, 3])}, coords={"x": [1, 2, 3]}).chunk()
+         with self.create_zarr_target() as store:
+@@ -3790,6 +3901,239 @@ class TestZarrDictStore(ZarrBase):
+                 # Verify chunks are preserved
+                 assert actual["var1"].encoding["chunks"] == (2, 2)
+ 
++    @pytest.mark.asyncio
++    @requires_zarr_v3
++    async def test_async_load_multiple_variables(self) -> None:
++        target_class = zarr.AsyncArray
++        method_name = "getitem"
++        original_method = getattr(target_class, method_name)
++
++        # the indexed coordinate variables is not lazy, so the create_test_dataset has 4 lazy variables in total
++        N_LAZY_VARS = 4
++
++        original = create_test_data()
++        with self.create_zarr_target() as store:
++            original.to_zarr(store, zarr_format=3, consolidated=False)
++
++            with patch.object(
++                target_class, method_name, wraps=original_method, autospec=True
++            ) as mocked_meth:
++                # blocks upon loading the coordinate variables here
++                ds = xr.open_zarr(store, consolidated=False, chunks=None)
++
++                # TODO we're not actually testing that these indexing methods are not blocking...
++                result_ds = await ds.load_async()
++
++                mocked_meth.assert_called()
++                assert mocked_meth.call_count == N_LAZY_VARS
++                mocked_meth.assert_awaited()
++
++            xrt.assert_identical(result_ds, ds.load())
++
++    @pytest.mark.asyncio
++    @requires_zarr_v3
++    @pytest.mark.parametrize("cls_name", ["Variable", "DataArray", "Dataset"])
++    async def test_concurrent_load_multiple_objects(
++        self,
++        cls_name,
++    ) -> None:
++        N_OBJECTS = 5
++        N_LAZY_VARS = {
++            "Variable": 1,
++            "DataArray": 1,
++            "Dataset": 4,
++        }  # specific to the create_test_data() used
++
++        target_class = zarr.AsyncArray
++        method_name = "getitem"
++        original_method = getattr(target_class, method_name)
++
++        original = create_test_data()
++        with self.create_zarr_target() as store:
++            original.to_zarr(store, consolidated=False, zarr_format=3)
++
++            with patch.object(
++                target_class, method_name, wraps=original_method, autospec=True
++            ) as mocked_meth:
++                xr_obj = get_xr_obj(store, cls_name)
++
++                # TODO we're not actually testing that these indexing methods are not blocking...
++                coros = [xr_obj.load_async() for _ in range(N_OBJECTS)]
++                results = await asyncio.gather(*coros)
++
++                mocked_meth.assert_called()
++                assert mocked_meth.call_count == N_OBJECTS * N_LAZY_VARS[cls_name]
++                mocked_meth.assert_awaited()
++
++            for result in results:
++                xrt.assert_identical(result, xr_obj.load())
++
++    @pytest.mark.asyncio
++    @requires_zarr_v3
++    @pytest.mark.parametrize("cls_name", ["Variable", "DataArray", "Dataset"])
++    @pytest.mark.parametrize(
++        "indexer, method, target_zarr_class",
++        [
++            pytest.param({}, "sel", "zarr.AsyncArray", id="no-indexing-sel"),
++            pytest.param({}, "isel", "zarr.AsyncArray", id="no-indexing-isel"),
++            pytest.param({"dim2": 1.0}, "sel", "zarr.AsyncArray", id="basic-int-sel"),
++            pytest.param({"dim2": 2}, "isel", "zarr.AsyncArray", id="basic-int-isel"),
++            pytest.param(
++                {"dim2": slice(1.0, 3.0)},
++                "sel",
++                "zarr.AsyncArray",
++                id="basic-slice-sel",
++            ),
++            pytest.param(
++                {"dim2": slice(1, 3)}, "isel", "zarr.AsyncArray", id="basic-slice-isel"
++            ),
++            pytest.param(
++                {"dim2": [1.0, 3.0]},
++                "sel",
++                "zarr.core.indexing.AsyncOIndex",
++                id="outer-sel",
++            ),
++            pytest.param(
++                {"dim2": [1, 3]},
++                "isel",
++                "zarr.core.indexing.AsyncOIndex",
++                id="outer-isel",
++            ),
++            pytest.param(
++                {
++                    "dim1": xr.Variable(data=[2, 3], dims="points"),
++                    "dim2": xr.Variable(data=[1.0, 2.0], dims="points"),
++                },
++                "sel",
++                "zarr.core.indexing.AsyncVIndex",
++                id="vectorized-sel",
++            ),
++            pytest.param(
++                {
++                    "dim1": xr.Variable(data=[2, 3], dims="points"),
++                    "dim2": xr.Variable(data=[1, 3], dims="points"),
++                },
++                "isel",
++                "zarr.core.indexing.AsyncVIndex",
++                id="vectorized-isel",
++            ),
++        ],
++    )
++    async def test_indexing(
++        self,
++        cls_name,
++        method,
++        indexer,
++        target_zarr_class,
++    ) -> None:
++        if not has_zarr_v3_async_oindex and target_zarr_class in (
++            "zarr.core.indexing.AsyncOIndex",
++            "zarr.core.indexing.AsyncVIndex",
++        ):
++            pytest.skip(
++                "current version of zarr does not support orthogonal or vectorized async indexing"
++            )
++
++        if cls_name == "Variable" and method == "sel":
++            pytest.skip("Variable doesn't have a .sel method")
++
++        # Each type of indexing ends up calling a different zarr indexing method
++        # They all use a method named .getitem, but on a different internal zarr class
++        def _resolve_class_from_string(class_path: str) -> type[Any]:
++            """Resolve a string class path like 'zarr.AsyncArray' to the actual class."""
++            module_path, class_name = class_path.rsplit(".", 1)
++            module = import_module(module_path)
++            return getattr(module, class_name)
++
++        target_class = _resolve_class_from_string(target_zarr_class)
++        method_name = "getitem"
++        original_method = getattr(target_class, method_name)
++
++        original = create_test_data()
++        with self.create_zarr_target() as store:
++            original.to_zarr(store, consolidated=False, zarr_format=3)
++
++            with patch.object(
++                target_class, method_name, wraps=original_method, autospec=True
++            ) as mocked_meth:
++                xr_obj = get_xr_obj(store, cls_name)
++
++                # TODO we're not actually testing that these indexing methods are not blocking...
++                result = await getattr(xr_obj, method)(**indexer).load_async()
++
++                mocked_meth.assert_called()
++                mocked_meth.assert_awaited()
++                assert mocked_meth.call_count > 0
++
++            expected = getattr(xr_obj, method)(**indexer).load()
++            xrt.assert_identical(result, expected)
++
++    @pytest.mark.asyncio
++    @pytest.mark.parametrize(
++        ("indexer", "expected_err_msg"),
++        [
++            pytest.param(
++                {"dim2": 2},
++                "basic async indexing",
++                marks=pytest.mark.skipif(
++                    has_zarr_v3,
++                    reason="current version of zarr has basic async indexing",
++                ),
++            ),  # tests basic indexing
++            pytest.param(
++                {"dim2": [1, 3]},
++                "orthogonal async indexing",
++                marks=pytest.mark.skipif(
++                    has_zarr_v3_async_oindex,
++                    reason="current version of zarr has async orthogonal indexing",
++                ),
++            ),  # tests oindexing
++            pytest.param(
++                {
++                    "dim1": xr.Variable(data=[2, 3], dims="points"),
++                    "dim2": xr.Variable(data=[1, 3], dims="points"),
++                },
++                "vectorized async indexing",
++                marks=pytest.mark.skipif(
++                    has_zarr_v3_async_oindex,
++                    reason="current version of zarr has async vectorized indexing",
++                ),
++            ),  # tests vindexing
++        ],
++    )
++    @parametrize_zarr_format
++    async def test_raise_on_older_zarr_version(
++        self,
++        indexer,
++        expected_err_msg,
++        zarr_format,
++    ):
++        """Test that trying to use async load with insufficiently new version of zarr raises a clear error"""
++
++        original = create_test_data()
++        with self.create_zarr_target() as store:
++            original.to_zarr(store, consolidated=False, zarr_format=zarr_format)
++
++            ds = xr.open_zarr(store, consolidated=False, chunks=None)
++            var = ds["var1"].variable
++
++            with pytest.raises(NotImplementedError, match=expected_err_msg):
++                await var.isel(**indexer).load_async()
++
++
++def get_xr_obj(
++    store: zarr.abc.store.Store, cls_name: Literal["Variable", "DataArray", "Dataset"]
++):
++    ds = xr.open_zarr(store, consolidated=False, chunks=None)
++
++    match cls_name:
++        case "Variable":
++            return ds["var1"].variable
++        case "DataArray":
++            return ds["var1"]
++        case "Dataset":
++            return ds
++
+ 
+ class NoConsolidatedMetadataSupportStore(WrapperStore):
+     """
+@@ -4040,7 +4384,7 @@ def test_zarr_version_deprecated() -> None:
+ 
+ 
+ @requires_scipy
+-class TestScipyInMemoryData(CFEncodedBase, NetCDF3Only):
++class TestScipyInMemoryData(NetCDF3Only, CFEncodedBase):
+     engine: T_NetcdfEngine = "scipy"
+ 
+     @contextlib.contextmanager
+@@ -4048,20 +4392,44 @@ class TestScipyInMemoryData(CFEncodedBase, NetCDF3Only):
+         fobj = BytesIO()
+         yield backends.ScipyDataStore(fobj, "w")
+ 
++    @pytest.mark.asyncio
++    @pytest.mark.skip(reason="NetCDF backends don't support async loading")
++    async def test_load_async(self) -> None:
++        await super().test_load_async()
++
+     def test_to_netcdf_explicit_engine(self) -> None:
+-        # regression test for GH1321
+-        Dataset({"foo": 42}).to_netcdf(engine="scipy")
++        with pytest.warns(
++            FutureWarning,
++            match=re.escape("return value of to_netcdf() without a target"),
++        ):
++            Dataset({"foo": 42}).to_netcdf(engine="scipy")
++
++    def test_roundtrip_via_bytes(self) -> None:
++        original = create_test_data()
++        with pytest.warns(
++            FutureWarning,
++            match=re.escape("return value of to_netcdf() without a target"),
++        ):
++            netcdf_bytes = original.to_netcdf(engine="scipy")
++        roundtrip = open_dataset(netcdf_bytes, engine="scipy")
++        assert_identical(roundtrip, original)
+ 
+     def test_bytes_pickle(self) -> None:
+         data = Dataset({"foo": ("x", [1, 2, 3])})
+-        fobj = data.to_netcdf()
++        with pytest.warns(
++            FutureWarning,
++            match=re.escape("return value of to_netcdf() without a target"),
++        ):
++            fobj = data.to_netcdf()
+         with self.open(fobj) as ds:
+             unpickled = pickle.loads(pickle.dumps(ds))
+             assert_identical(unpickled, data)
+ 
+ 
+ @requires_scipy
+-class TestScipyFileObject(CFEncodedBase, NetCDF3Only):
++class TestScipyFileObject(NetCDF3Only, CFEncodedBase):
++    # TODO: Consider consolidating some of these cases (e.g.,
++    # test_file_remains_open) with TestH5NetCDFFileObject
+     engine: T_NetcdfEngine = "scipy"
+ 
+     @contextlib.contextmanager
+@@ -4084,6 +4452,20 @@ class TestScipyFileObject(CFEncodedBase, NetCDF3Only):
+                 with self.open(f, **open_kwargs) as ds:
+                     yield ds
+ 
++    @pytest.mark.xfail(
++        reason="scipy.io.netcdf_file closes files upon garbage collection"
++    )
++    def test_file_remains_open(self) -> None:
++        data = Dataset({"foo": ("x", [1, 2, 3])})
++        f = BytesIO()
++        data.to_netcdf(f, engine="scipy")
++        assert not f.closed
++        restored = open_dataset(f, engine="scipy")
++        assert not f.closed
++        assert_identical(restored, data)
++        restored.close()
++        assert not f.closed
++
+     @pytest.mark.skip(reason="cannot pickle file objects")
+     def test_pickle(self) -> None:
+         pass
+@@ -4114,7 +4496,7 @@ class TestScipyFileObject(CFEncodedBase, NetCDF3Only):
+ 
+ 
+ @requires_scipy
+-class TestScipyFilePath(CFEncodedBase, NetCDF3Only):
++class TestScipyFilePath(NetCDF3Only, CFEncodedBase):
+     engine: T_NetcdfEngine = "scipy"
+ 
+     @contextlib.contextmanager
+@@ -4151,7 +4533,7 @@ class TestScipyFilePath(CFEncodedBase, NetCDF3Only):
+ 
+ 
+ @requires_netCDF4
+-class TestNetCDF3ViaNetCDF4Data(CFEncodedBase, NetCDF3Only):
++class TestNetCDF3ViaNetCDF4Data(NetCDF3Only, CFEncodedBase):
+     engine: T_NetcdfEngine = "netcdf4"
+     file_format: T_NetcdfTypes = "NETCDF3_CLASSIC"
+ 
+@@ -4172,7 +4554,7 @@ class TestNetCDF3ViaNetCDF4Data(CFEncodedBase, NetCDF3Only):
+ 
+ 
+ @requires_netCDF4
+-class TestNetCDF4ClassicViaNetCDF4Data(CFEncodedBase, NetCDF3Only):
++class TestNetCDF4ClassicViaNetCDF4Data(NetCDF3Only, CFEncodedBase):
+     engine: T_NetcdfEngine = "netcdf4"
+     file_format: T_NetcdfTypes = "NETCDF4_CLASSIC"
+ 
+@@ -4186,7 +4568,7 @@ class TestNetCDF4ClassicViaNetCDF4Data(CFEncodedBase, NetCDF3Only):
+ 
+ 
+ @requires_scipy_or_netCDF4
+-class TestGenericNetCDFData(CFEncodedBase, NetCDF3Only):
++class TestGenericNetCDFData(NetCDF3Only, CFEncodedBase):
+     # verify that we can read and write netCDF3 files as long as we have scipy
+     # or netCDF4-python installed
+     file_format: T_NetcdfTypes = "NETCDF3_64BIT"
+@@ -4208,9 +4590,10 @@ class TestGenericNetCDFData(CFEncodedBase, NetCDF3Only):
+             with pytest.raises(ValueError, match=r"unrecognized engine"):
+                 open_dataset(tmp_file, engine="foobar")
+ 
+-        netcdf_bytes = data.to_netcdf()
++        bytes_io = BytesIO()
++        data.to_netcdf(bytes_io, engine="scipy")
+         with pytest.raises(ValueError, match=r"unrecognized engine"):
+-            open_dataset(BytesIO(netcdf_bytes), engine="foobar")
++            open_dataset(bytes_io, engine="foobar")
+ 
+     def test_cross_engine_read_write_netcdf3(self) -> None:
+         data = create_test_data()
+@@ -4257,6 +4640,32 @@ class TestGenericNetCDFData(CFEncodedBase, NetCDF3Only):
+             assert actual.encoding["unlimited_dims"] == set("y")
+             assert_equal(ds, actual)
+ 
++    @requires_scipy
++    def test_roundtrip_via_bytes(self) -> None:
++        original = create_test_data()
++        with pytest.warns(
++            FutureWarning,
++            match=re.escape("return value of to_netcdf() without a target"),
++        ):
++            netcdf_bytes = original.to_netcdf()
++        roundtrip = open_dataset(netcdf_bytes)
++        assert_identical(roundtrip, original)
++
++    @pytest.mark.xfail(
++        reason="scipy.io.netcdf_file closes files upon garbage collection"
++    )
++    @requires_scipy
++    def test_roundtrip_via_file_object(self) -> None:
++        original = create_test_data()
++        f = BytesIO()
++        original.to_netcdf(f)
++        assert not f.closed
++        restored = open_dataset(f)
++        assert not f.closed
++        assert_identical(restored, original)
++        restored.close()
++        assert not f.closed
++
+ 
+ @requires_h5netcdf
+ @requires_netCDF4
+@@ -4325,16 +4734,6 @@ class TestH5NetCDFData(NetCDF4Base):
+                 expected = Dataset(attrs={"foo": "bar"})
+                 assert_identical(expected, actual)
+ 
+-    def test_encoding_unlimited_dims(self) -> None:
+-        ds = Dataset({"x": ("y", np.arange(10.0))})
+-        with self.roundtrip(ds, save_kwargs=dict(unlimited_dims=["y"])) as actual:
+-            assert actual.encoding["unlimited_dims"] == set("y")
+-            assert_equal(ds, actual)
+-        ds.encoding = {"unlimited_dims": ["y"]}
+-        with self.roundtrip(ds) as actual:
+-            assert actual.encoding["unlimited_dims"] == set("y")
+-            assert_equal(ds, actual)
+-
+     def test_compression_encoding_h5py(self) -> None:
+         ENCODINGS: tuple[tuple[dict[str, Any], dict[str, Any]], ...] = (
+             # h5py style compression with gzip codec will be converted to
+@@ -4536,16 +4935,13 @@ class TestH5NetCDFFileObject(TestH5NetCDFData):
+     engine: T_NetcdfEngine = "h5netcdf"
+ 
+     def test_open_badbytes(self) -> None:
+-        with pytest.raises(ValueError, match=r"HDF5 as bytes"):
+-            with open_dataset(b"\211HDF\r\n\032\n", engine="h5netcdf"):  # type: ignore[arg-type]
+-                pass
+         with pytest.raises(
+             ValueError, match=r"match in any of xarray's currently installed IO"
+         ):
+-            with open_dataset(b"garbage"):  # type: ignore[arg-type]
++            with open_dataset(b"garbage"):
+                 pass
+         with pytest.raises(ValueError, match=r"can only read bytes"):
+-            with open_dataset(b"garbage", engine="netcdf4"):  # type: ignore[arg-type]
++            with open_dataset(b"garbage", engine="netcdf4"):
+                 pass
+         with pytest.raises(
+             ValueError, match=r"not the signature of a valid netCDF4 file"
+@@ -4596,6 +4992,32 @@ class TestH5NetCDFFileObject(TestH5NetCDFData):
+                 with open_dataset(f):  # ensure file gets closed
+                     pass
+ 
++    def test_file_remains_open(self) -> None:
++        data = Dataset({"foo": ("x", [1, 2, 3])})
++        f = BytesIO()
++        data.to_netcdf(f, engine="h5netcdf")
++        assert not f.closed
++        restored = open_dataset(f, engine="h5netcdf")
++        assert not f.closed
++        assert_identical(restored, data)
++        restored.close()
++        assert not f.closed
++
++
++@requires_h5netcdf
++class TestH5NetCDFInMemoryData:
++    def test_roundtrip_via_bytes(self) -> None:
++        original = create_test_data()
++        netcdf_bytes = original.to_netcdf(engine="h5netcdf")
++        roundtrip = open_dataset(netcdf_bytes, engine="h5netcdf")
++        assert_identical(roundtrip, original)
++
++    def test_roundtrip_group_via_bytes(self) -> None:
++        original = create_test_data()
++        netcdf_bytes = original.to_netcdf(group="sub", engine="h5netcdf")
++        roundtrip = open_dataset(netcdf_bytes, group="sub", engine="h5netcdf")
++        assert_identical(roundtrip, original)
++
+ 
+ @requires_h5netcdf
+ @requires_dask
+@@ -4799,7 +5221,7 @@ class TestOpenMFDatasetWithDataVarsAndCoordsKw:
+     var_name = "v1"
+ 
+     @contextlib.contextmanager
+-    def setup_files_and_datasets(self, fuzz=0):
++    def setup_files_and_datasets(self, *, fuzz=0, new_combine_kwargs: bool = False):
+         ds1, ds2 = self.gen_datasets_with_common_coord_and_time()
+ 
+         # to test join='exact'
+@@ -4811,7 +5233,8 @@ class TestOpenMFDatasetWithDataVarsAndCoordsKw:
+                 ds1.to_netcdf(tmpfile1)
+                 ds2.to_netcdf(tmpfile2)
+ 
+-                yield [tmpfile1, tmpfile2], [ds1, ds2]
++                with set_options(use_new_combine_kwarg_defaults=new_combine_kwargs):
++                    yield [tmpfile1, tmpfile2], [ds1, ds2]
+ 
+     def gen_datasets_with_common_coord_and_time(self):
+         # create coordinate data
+@@ -4848,11 +5271,19 @@ class TestOpenMFDatasetWithDataVarsAndCoordsKw:
+             if combine == "by_coords":
+                 files.reverse()
+             with open_mfdataset(
+-                files, data_vars=opt, combine=combine, concat_dim=concat_dim, join=join
++                files,
++                data_vars=opt,
++                combine=combine,
++                concat_dim=concat_dim,
++                join=join,
++                compat="equals",
+             ) as ds:
+-                ds_expect = xr.concat([ds1, ds2], data_vars=opt, dim="t", join=join)
++                ds_expect = xr.concat(
++                    [ds1, ds2], data_vars=opt, dim="t", join=join, compat="equals"
++                )
+                 assert_identical(ds, ds_expect)
+ 
++    @pytest.mark.parametrize("use_new_combine_kwarg_defaults", [True, False])
+     @pytest.mark.parametrize(
+         ["combine_attrs", "attrs", "expected", "expect_error"],
+         (
+@@ -4880,7 +5311,12 @@ class TestOpenMFDatasetWithDataVarsAndCoordsKw:
+         ),
+     )
+     def test_open_mfdataset_dataset_combine_attrs(
+-        self, combine_attrs, attrs, expected, expect_error
++        self,
++        use_new_combine_kwarg_defaults,
++        combine_attrs,
++        attrs,
++        expected,
++        expect_error,
+     ):
+         with self.setup_files_and_datasets() as (files, [ds1, ds2]):
+             # Give the files an inconsistent attribute
+@@ -4890,22 +5326,28 @@ class TestOpenMFDatasetWithDataVarsAndCoordsKw:
+                 ds.close()
+                 ds.to_netcdf(f)
+ 
+-            if expect_error:
+-                with pytest.raises(xr.MergeError):
+-                    xr.open_mfdataset(
+-                        files,
+-                        combine="nested",
+-                        concat_dim="t",
+-                        combine_attrs=combine_attrs,
+-                    )
+-            else:
+-                with xr.open_mfdataset(
+-                    files,
+-                    combine="nested",
+-                    concat_dim="t",
+-                    combine_attrs=combine_attrs,
+-                ) as ds:
+-                    assert ds.attrs == expected
++            with set_options(
++                use_new_combine_kwarg_defaults=use_new_combine_kwarg_defaults
++            ):
++                warning: contextlib.AbstractContextManager = (
++                    pytest.warns(FutureWarning)
++                    if not use_new_combine_kwarg_defaults
++                    else contextlib.nullcontext()
++                )
++                error: contextlib.AbstractContextManager = (
++                    pytest.raises(xr.MergeError)
++                    if expect_error
++                    else contextlib.nullcontext()
++                )
++                with warning:
++                    with error:
++                        with xr.open_mfdataset(
++                            files,
++                            combine="nested",
++                            concat_dim="t",
++                            combine_attrs=combine_attrs,
++                        ) as ds:
++                            assert ds.attrs == expected
+ 
+     def test_open_mfdataset_dataset_attr_by_coords(self) -> None:
+         """
+@@ -4919,14 +5361,18 @@ class TestOpenMFDatasetWithDataVarsAndCoordsKw:
+                 ds.close()
+                 ds.to_netcdf(f)
+ 
+-            with xr.open_mfdataset(files, combine="nested", concat_dim="t") as ds:
+-                assert ds.test_dataset_attr == 10
++            with set_options(use_new_combine_kwarg_defaults=True):
++                with xr.open_mfdataset(files, combine="nested", concat_dim="t") as ds:
++                    assert ds.test_dataset_attr == 10
+ 
+     def test_open_mfdataset_dataarray_attr_by_coords(self) -> None:
+         """
+         Case when an attribute of a member DataArray differs across the multiple files
+         """
+-        with self.setup_files_and_datasets() as (files, [ds1, ds2]):
++        with self.setup_files_and_datasets(new_combine_kwargs=True) as (
++            files,
++            [ds1, ds2],
++        ):
+             # Give the files an inconsistent attribute
+             for i, f in enumerate(files):
+                 ds = open_dataset(f).load()
+@@ -4934,30 +5380,67 @@ class TestOpenMFDatasetWithDataVarsAndCoordsKw:
+                 ds.close()
+                 ds.to_netcdf(f)
+ 
+-            with xr.open_mfdataset(files, combine="nested", concat_dim="t") as ds:
+-                assert ds["v1"].test_dataarray_attr == 0
++                with xr.open_mfdataset(
++                    files, data_vars=None, combine="nested", concat_dim="t"
++                ) as ds:
++                    assert ds["v1"].test_dataarray_attr == 0
+ 
+     @pytest.mark.parametrize(
+         "combine, concat_dim", [("nested", "t"), ("by_coords", None)]
+     )
+-    @pytest.mark.parametrize("opt", ["all", "minimal", "different"])
++    @pytest.mark.parametrize(
++        "kwargs",
++        [
++            {"data_vars": "all"},
++            {"data_vars": "minimal"},
++            {
++                "data_vars": "all",
++                "coords": "different",
++                "compat": "no_conflicts",
++            },  # old defaults
++            {
++                "data_vars": None,
++                "coords": "minimal",
++                "compat": "override",
++            },  # new defaults
++            {"data_vars": "different", "compat": "no_conflicts"},
++            {},
++        ],
++    )
+     def test_open_mfdataset_exact_join_raises_error(
+-        self, combine, concat_dim, opt
++        self, combine, concat_dim, kwargs
+     ) -> None:
+-        with self.setup_files_and_datasets(fuzz=0.1) as (files, [ds1, ds2]):
++        with self.setup_files_and_datasets(fuzz=0.1, new_combine_kwargs=True) as (
++            files,
++            _,
++        ):
+             if combine == "by_coords":
+                 files.reverse()
++
+             with pytest.raises(
+-                ValueError, match=r"cannot align objects.*join.*exact.*"
++                ValueError, match="cannot align objects with join='exact'"
+             ):
+                 open_mfdataset(
+                     files,
+-                    data_vars=opt,
++                    **kwargs,
+                     combine=combine,
+                     concat_dim=concat_dim,
+                     join="exact",
+                 )
+ 
++    def test_open_mfdataset_defaults_with_exact_join_warns_as_well_as_raising(
++        self,
++    ) -> None:
++        with self.setup_files_and_datasets(fuzz=0.1, new_combine_kwargs=True) as (
++            files,
++            _,
++        ):
++            files.reverse()
++            with pytest.raises(
++                ValueError, match="cannot align objects with join='exact'"
++            ):
++                open_mfdataset(files, combine="by_coords")
++
+     def test_common_coord_when_datavars_all(self) -> None:
+         opt: Final = "all"
+ 
+@@ -4979,7 +5462,10 @@ class TestOpenMFDatasetWithDataVarsAndCoordsKw:
+     def test_common_coord_when_datavars_minimal(self) -> None:
+         opt: Final = "minimal"
+ 
+-        with self.setup_files_and_datasets() as (files, [ds1, ds2]):
++        with self.setup_files_and_datasets(new_combine_kwargs=True) as (
++            files,
++            [ds1, ds2],
++        ):
+             # open the files using data_vars option
+             with open_mfdataset(
+                 files, data_vars=opt, combine="nested", concat_dim="t"
+@@ -5005,6 +5491,55 @@ class TestOpenMFDatasetWithDataVarsAndCoordsKw:
+                 with open_mfdataset(files, coords="minimum", combine="by_coords"):
+                     pass
+ 
++    @pytest.mark.parametrize(
++        "combine, concat_dim", [("nested", "t"), ("by_coords", None)]
++    )
++    @pytest.mark.parametrize(
++        "kwargs", [{"data_vars": "different"}, {"coords": "different"}]
++    )
++    def test_open_mfdataset_warns_when_kwargs_set_to_different(
++        self, combine, concat_dim, kwargs
++    ) -> None:
++        with self.setup_files_and_datasets(new_combine_kwargs=True) as (
++            files,
++            [ds1, ds2],
++        ):
++            if combine == "by_coords":
++                files.reverse()
++            with pytest.raises(
++                ValueError, match="Previously the default was `compat='no_conflicts'`"
++            ):
++                open_mfdataset(files, combine=combine, concat_dim=concat_dim, **kwargs)
++            with pytest.raises(
++                ValueError, match="Previously the default was `compat='equals'`"
++            ):
++                xr.concat([ds1, ds2], dim="t", **kwargs)
++
++            with set_options(use_new_combine_kwarg_defaults=False):
++                expectation: contextlib.AbstractContextManager = (
++                    pytest.warns(
++                        FutureWarning,
++                        match="will change from data_vars='all'",
++                    )
++                    if "data_vars" not in kwargs
++                    else contextlib.nullcontext()
++                )
++
++                with pytest.warns(
++                    FutureWarning,
++                    match="will change from compat='equals'",
++                ):
++                    with expectation:
++                        ds_expect = xr.concat([ds1, ds2], dim="t", **kwargs)
++                with pytest.warns(
++                    FutureWarning, match="will change from compat='no_conflicts'"
++                ):
++                    with expectation:
++                        with open_mfdataset(
++                            files, combine=combine, concat_dim=concat_dim, **kwargs
++                        ) as ds:
++                            assert_identical(ds, ds_expect)
++
+ 
+ @requires_dask
+ @requires_scipy
+@@ -5167,6 +5702,68 @@ class TestDask(DatasetIOBase):
+                 ) as actual:
+                     assert_identical(original, actual)
+ 
++    def test_open_mfdataset_with_ignore(self) -> None:
++        original = Dataset({"foo": ("x", np.random.randn(10))})
++        with create_tmp_files(2) as (tmp1, tmp2):
++            ds1 = original.isel(x=slice(5))
++            ds2 = original.isel(x=slice(5, 10))
++            ds1.to_netcdf(tmp1)
++            ds2.to_netcdf(tmp2)
++            with open_mfdataset(
++                [tmp1, "non-existent-file.nc", tmp2],
++                concat_dim="x",
++                combine="nested",
++                errors="ignore",
++            ) as actual:
++                assert_identical(original, actual)
++
++    def test_open_mfdataset_with_warn(self) -> None:
++        original = Dataset({"foo": ("x", np.random.randn(10))})
++        with pytest.warns(UserWarning, match="Ignoring."):
++            with create_tmp_files(2) as (tmp1, tmp2):
++                ds1 = original.isel(x=slice(5))
++                ds2 = original.isel(x=slice(5, 10))
++                ds1.to_netcdf(tmp1)
++                ds2.to_netcdf(tmp2)
++                with open_mfdataset(
++                    [tmp1, "non-existent-file.nc", tmp2],
++                    concat_dim="x",
++                    combine="nested",
++                    errors="warn",
++                ) as actual:
++                    assert_identical(original, actual)
++
++    def test_open_mfdataset_2d_with_ignore(self) -> None:
++        original = Dataset({"foo": (["x", "y"], np.random.randn(10, 8))})
++        with create_tmp_files(4) as (tmp1, tmp2, tmp3, tmp4):
++            original.isel(x=slice(5), y=slice(4)).to_netcdf(tmp1)
++            original.isel(x=slice(5, 10), y=slice(4)).to_netcdf(tmp2)
++            original.isel(x=slice(5), y=slice(4, 8)).to_netcdf(tmp3)
++            original.isel(x=slice(5, 10), y=slice(4, 8)).to_netcdf(tmp4)
++            with open_mfdataset(
++                [[tmp1, tmp2], ["non-existent-file.nc", tmp3, tmp4]],
++                combine="nested",
++                concat_dim=["y", "x"],
++                errors="ignore",
++            ) as actual:
++                assert_identical(original, actual)
++
++    def test_open_mfdataset_2d_with_warn(self) -> None:
++        original = Dataset({"foo": (["x", "y"], np.random.randn(10, 8))})
++        with pytest.warns(UserWarning, match="Ignoring."):
++            with create_tmp_files(4) as (tmp1, tmp2, tmp3, tmp4):
++                original.isel(x=slice(5), y=slice(4)).to_netcdf(tmp1)
++                original.isel(x=slice(5, 10), y=slice(4)).to_netcdf(tmp2)
++                original.isel(x=slice(5), y=slice(4, 8)).to_netcdf(tmp3)
++                original.isel(x=slice(5, 10), y=slice(4, 8)).to_netcdf(tmp4)
++                with open_mfdataset(
++                    [[tmp1, tmp2, "non-existent-file.nc"], [tmp3, tmp4]],
++                    combine="nested",
++                    concat_dim=["y", "x"],
++                    errors="warn",
++                ) as actual:
++                    assert_identical(original, actual)
++
+     def test_attrs_mfdataset(self) -> None:
+         original = Dataset({"foo": ("x", np.random.randn(10))})
+         with create_tmp_file() as tmp1:
+@@ -5260,11 +5857,48 @@ class TestDask(DatasetIOBase):
+                 ds2.t.encoding["units"] = "days since 2000-01-01"
+                 ds1.to_netcdf(tmp1)
+                 ds2.to_netcdf(tmp2)
+-                with open_mfdataset([tmp1, tmp2], combine="nested") as actual:
++                with open_mfdataset(
++                    [tmp1, tmp2], combine="nested", concat_dim="t"
++                ) as actual:
+                     assert actual.t.encoding["units"] == original.t.encoding["units"]
+                     assert actual.t.encoding["units"] == ds1.t.encoding["units"]
+                     assert actual.t.encoding["units"] != ds2.t.encoding["units"]
+ 
++    def test_encoding_mfdataset_new_defaults(self) -> None:
++        original = Dataset(
++            {
++                "foo": ("t", np.random.randn(10)),
++                "t": ("t", pd.date_range(start="2010-01-01", periods=10, freq="1D")),
++            }
++        )
++        original.t.encoding["units"] = "days since 2010-01-01"
++
++        with create_tmp_file() as tmp1:
++            with create_tmp_file() as tmp2:
++                ds1 = original.isel(t=slice(5))
++                ds2 = original.isel(t=slice(5, 10))
++                ds1.t.encoding["units"] = "days since 2010-01-01"
++                ds2.t.encoding["units"] = "days since 2000-01-01"
++                ds1.to_netcdf(tmp1)
++                ds2.to_netcdf(tmp2)
++
++                for setting in [True, False]:
++                    with set_options(use_new_combine_kwarg_defaults=setting):
++                        with open_mfdataset(
++                            [tmp1, tmp2], combine="nested", concat_dim="t"
++                        ) as old:
++                            assert (
++                                old.t.encoding["units"] == original.t.encoding["units"]
++                            )
++                            assert old.t.encoding["units"] == ds1.t.encoding["units"]
++                            assert old.t.encoding["units"] != ds2.t.encoding["units"]
++
++                with set_options(use_new_combine_kwarg_defaults=True):
++                    with pytest.raises(
++                        AlignmentError, match="If you are intending to concatenate"
++                    ):
++                        open_mfdataset([tmp1, tmp2], combine="nested")
++
+     def test_preprocess_mfdataset(self) -> None:
+         original = Dataset({"foo": ("x", np.random.randn(10))})
+         with create_tmp_file() as tmp:
+@@ -5347,25 +5981,21 @@ class TestDask(DatasetIOBase):
+                 actual = 1.0 * ds
+                 assert_allclose(original, actual, decode_bytes=False)
+ 
+-    def test_open_mfdataset_concat_dim_none(self) -> None:
+-        with create_tmp_file() as tmp1:
+-            with create_tmp_file() as tmp2:
+-                data = Dataset({"x": 0})
+-                data.to_netcdf(tmp1)
+-                Dataset({"x": np.nan}).to_netcdf(tmp2)
+-                with open_mfdataset(
+-                    [tmp1, tmp2], concat_dim=None, combine="nested"
+-                ) as actual:
+-                    assert_identical(data, actual)
+-
+-    def test_open_mfdataset_concat_dim_default_none(self) -> None:
+-        with create_tmp_file() as tmp1:
+-            with create_tmp_file() as tmp2:
+-                data = Dataset({"x": 0})
+-                data.to_netcdf(tmp1)
+-                Dataset({"x": np.nan}).to_netcdf(tmp2)
+-                with open_mfdataset([tmp1, tmp2], combine="nested") as actual:
+-                    assert_identical(data, actual)
++    @pytest.mark.parametrize(
++        "kwargs",
++        [pytest.param({"concat_dim": None}, id="none"), pytest.param({}, id="default")],
++    )
++    def test_open_mfdataset_concat_dim(self, kwargs) -> None:
++        with set_options(use_new_combine_kwarg_defaults=True):
++            with create_tmp_file() as tmp1:
++                with create_tmp_file() as tmp2:
++                    data = Dataset({"x": 0})
++                    data.to_netcdf(tmp1)
++                    Dataset({"x": np.nan}).to_netcdf(tmp2)
++                    with open_mfdataset(
++                        [tmp1, tmp2], **kwargs, combine="nested"
++                    ) as actual:
++                        assert_identical(data, actual)
+ 
+     def test_open_dataset(self) -> None:
+         original = Dataset({"foo": ("x", np.random.randn(10))})
+@@ -5392,7 +6022,9 @@ class TestDask(DatasetIOBase):
+         )
+         with create_tmp_file() as tmp:
+             original.to_netcdf(tmp)
+-            with open_mfdataset([tmp], concat_dim=dim, combine="nested") as actual:
++            with open_mfdataset(
++                [tmp], concat_dim=dim, data_vars="all", combine="nested"
++            ) as actual:
+                 assert_identical(expected, actual)
+ 
+     def test_open_multi_dataset(self) -> None:
+@@ -5416,7 +6048,7 @@ class TestDask(DatasetIOBase):
+             original.to_netcdf(tmp1)
+             original.to_netcdf(tmp2)
+             with open_mfdataset(
+-                [tmp1, tmp2], concat_dim=dim, combine="nested"
++                [tmp1, tmp2], concat_dim=dim, data_vars="all", combine="nested"
+             ) as actual:
+                 assert_identical(expected, actual)
+ 
+@@ -5817,7 +6449,11 @@ class TestDataArrayToNetCDF:
+     def test_dataarray_to_netcdf_return_bytes(self) -> None:
+         # regression test for GH1410
+         data = xr.DataArray([1, 2, 3])
+-        output = data.to_netcdf()
++        with pytest.warns(
++            FutureWarning,
++            match=re.escape("return value of to_netcdf() without a target"),
++        ):
++            output = data.to_netcdf(engine="scipy")
+         assert isinstance(output, bytes)
+ 
+     def test_dataarray_to_netcdf_no_name_pathlib(self) -> None:
+@@ -6354,7 +6990,10 @@ def test_scipy_entrypoint(tmp_path: Path) -> None:
+     with open(path, "rb") as f:
+         _check_guess_can_open_and_open(entrypoint, f, engine="scipy", expected=ds)
+ 
+-    contents = ds.to_netcdf(engine="scipy")
++    with pytest.warns(
++        FutureWarning, match=re.escape("return value of to_netcdf() without a target")
++    ):
++        contents = ds.to_netcdf(engine="scipy")
+     _check_guess_can_open_and_open(entrypoint, contents, engine="scipy", expected=ds)
+     _check_guess_can_open_and_open(
+         entrypoint, BytesIO(contents), engine="scipy", expected=ds
+@@ -6369,7 +7008,7 @@ def test_scipy_entrypoint(tmp_path: Path) -> None:
+     assert entrypoint.guess_can_open("something-local.nc")
+     assert entrypoint.guess_can_open("something-local.nc.gz")
+     assert not entrypoint.guess_can_open("not-found-and-no-extension")
+-    assert not entrypoint.guess_can_open(b"not-a-netcdf-file")  # type: ignore[arg-type]
++    assert not entrypoint.guess_can_open(b"not-a-netcdf-file")
+ 
+ 
+ @requires_h5netcdf
+@@ -6953,7 +7592,8 @@ def test_h5netcdf_storage_options() -> None:
+             files,
+             engine="h5netcdf",
+             concat_dim="time",
++            data_vars="all",
+             combine="nested",
+             storage_options={"skip_instance_cache": False},
+         ) as ds:
+-            assert_identical(xr.concat([ds1, ds2], dim="time"), ds)
++            assert_identical(xr.concat([ds1, ds2], dim="time", data_vars="all"), ds)
+
+diff --git a/xarray/tests/test_backends_api.py b/xarray/tests/test_backends_api.py
+index 778e800..ed487b0 100644
+--- a/xarray/tests/test_backends_api.py
++++ b/xarray/tests/test_backends_api.py
+@@ -1,16 +1,18 @@
+ from __future__ import annotations
+ 
++import sys
+ from numbers import Number
+ 
+ import numpy as np
+ import pytest
+ 
+ import xarray as xr
+-from xarray.backends.api import _get_default_engine
++from xarray.backends.api import _get_default_engine, _get_default_engine_netcdf
+ from xarray.tests import (
+     assert_identical,
+     assert_no_warnings,
+     requires_dask,
++    requires_h5netcdf,
+     requires_netCDF4,
+     requires_scipy,
+ )
+@@ -29,6 +31,17 @@ def test__get_default_engine() -> None:
+     assert engine_default == "netcdf4"
+ 
+ 
++@requires_h5netcdf
++def test_default_engine_h5netcdf(monkeypatch):
++    """Test the default netcdf engine when h5netcdf is the only importable module."""
++
++    monkeypatch.delitem(sys.modules, "netCDF4", raising=False)
++    monkeypatch.delitem(sys.modules, "scipy", raising=False)
++    monkeypatch.setattr(sys, "meta_path", [])
++
++    assert _get_default_engine_netcdf() == "h5netcdf"
++
++
+ def test_custom_engine() -> None:
+     expected = xr.Dataset(
+         dict(a=2 * np.arange(5)), coords=dict(x=("x", np.arange(5), dict(units="s")))
+
+diff --git a/xarray/tests/test_backends_common.py b/xarray/tests/test_backends_common.py
+index 33da027..a423818 100644
+--- a/xarray/tests/test_backends_common.py
++++ b/xarray/tests/test_backends_common.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import io
+ import re
+ 
+ import numpy as np
+@@ -53,10 +54,11 @@ def test_infer_dtype_error_on_mixed_types(data):
+ def test_encoding_failure_note():
+     # Create an arbitrary value that cannot be encoded in netCDF3
+     ds = xr.Dataset({"invalid": np.array([2**63 - 1], dtype=np.int64)})
++    f = io.BytesIO()
+     with pytest.raises(
+         ValueError,
+         match=re.escape(
+             "Raised while encoding variable 'invalid' with value <xarray.Variable"
+         ),
+     ):
+-        ds.to_netcdf()
++        ds.to_netcdf(f, engine="scipy")
+
+diff --git a/xarray/tests/test_backends_datatree.py b/xarray/tests/test_backends_datatree.py
+index 518758a..2bdae6d 100644
+--- a/xarray/tests/test_backends_datatree.py
++++ b/xarray/tests/test_backends_datatree.py
+@@ -265,6 +265,23 @@ class DatatreeIOBase:
+             assert_equal(original_dt, roundtrip_dt)
+             assert_identical(expected_dt, roundtrip_dt)
+ 
++    @requires_netCDF4
++    def test_no_redundant_dimensions(self, tmpdir):
++        # regression test for https://github.com/pydata/xarray/issues/10241
++        original_dt = DataTree.from_dict(
++            {
++                "/": xr.Dataset(coords={"x": [1, 2, 3]}),
++                "/child": xr.Dataset({"foo": ("x", [4, 5, 6])}),
++            }
++        )
++        filepath = tmpdir / "test.zarr"
++        original_dt.to_netcdf(filepath, engine=self.engine)
++
++        root = nc4.Dataset(str(filepath))
++        child = root.groups["child"]
++        assert list(root.dimensions) == ["x"]
++        assert list(child.dimensions) == []
++
+ 
+ @requires_netCDF4
+ class TestNetCDF4DatatreeIO(DatatreeIOBase):
+@@ -495,7 +512,7 @@ class TestPyDAPDatatreeIO:
+             |       Salinity     (time, Z, Y, X) float32 ...
+         """
+         tree = open_datatree(url, engine=self.engine)
+-        assert list(tree.dims) == ["time", "Z", "nv"]
++        assert set(tree.dims) == {"time", "Z", "nv"}
+         assert tree["/SimpleGroup"].coords["time"].dims == ("time",)
+         assert tree["/SimpleGroup"].coords["Z"].dims == ("Z",)
+         assert tree["/SimpleGroup"].coords["Y"].dims == ("Y",)
+@@ -539,6 +556,28 @@ class TestH5NetCDFDatatreeIO(DatatreeIOBase):
+                     "phony_dim_3": 25,
+                 }
+ 
++    def test_roundtrip_via_bytes(self, simple_datatree):
++        original_dt = simple_datatree
++        roundtrip_dt = open_datatree(original_dt.to_netcdf())
++        assert_equal(original_dt, roundtrip_dt)
++
++    def test_roundtrip_via_bytes_engine_specified(self, simple_datatree):
++        original_dt = simple_datatree
++        roundtrip_dt = open_datatree(original_dt.to_netcdf(engine=self.engine))
++        assert_equal(original_dt, roundtrip_dt)
++
++    def test_roundtrip_using_filelike_object(self, tmpdir, simple_datatree):
++        original_dt = simple_datatree
++        filepath = tmpdir + "/test.nc"
++        # h5py requires both read and write access when writing, it will
++        # work with file-like objects provided they support both, and are
++        # seekable.
++        with open(filepath, "wb+") as file:
++            original_dt.to_netcdf(file, engine=self.engine)
++        with open(filepath, "rb") as file:
++            with open_datatree(file, engine=self.engine) as roundtrip_dt:
++                assert_equal(original_dt, roundtrip_dt)
++
+ 
+ @requires_zarr
+ @parametrize_zarr_format
+
+diff --git a/xarray/tests/test_calendar_ops.py b/xarray/tests/test_calendar_ops.py
+index 8dc1c2a..4ec45e4 100644
+--- a/xarray/tests/test_calendar_ops.py
++++ b/xarray/tests/test_calendar_ops.py
+@@ -239,6 +239,18 @@ def test_convert_calendar_errors():
+         convert_calendar(da, "standard", dim="x")
+ 
+ 
++def test_convert_calendar_dimension_name():
++    src = DataArray(
++        date_range("2004-01-01", "2004-01-31", freq="D", calendar="noleap"),
++        dims=("date",),
++        name="date",
++    )
++
++    out = convert_calendar(src, "proleptic_gregorian", dim="date")
++
++    np.testing.assert_array_equal(src, out)
++
++
+ def test_convert_calendar_same_calendar():
+     src = DataArray(
+         date_range("2000-01-01", periods=12, freq="6h", use_cftime=False),
+
+diff --git a/xarray/tests/test_coding_times.py b/xarray/tests/test_coding_times.py
+index af29716..322ff96 100644
+--- a/xarray/tests/test_coding_times.py
++++ b/xarray/tests/test_coding_times.py
+@@ -1867,7 +1867,10 @@ def test_decode_timedelta_via_units(
+     var = Variable(["time"], timedeltas, encoding=attrs)
+     encoded = Variable(["time"], np.array([0, 1, 2]), attrs=attrs)
+     if warns:
+-        with pytest.warns(FutureWarning, match="decode_timedelta"):
++        with pytest.warns(
++            FutureWarning,
++            match="xarray will not decode the variable 'foo' into a timedelta64 dtype",
++        ):
+             decoded = conventions.decode_cf_variable(
+                 "foo",
+                 encoded,
+@@ -1886,45 +1889,56 @@ def test_decode_timedelta_via_units(
+ 
+ 
+ _DECODE_TIMEDELTA_VIA_DTYPE_TESTS = {
+-    "default": (True, None, np.dtype("timedelta64[ns]")),
+-    "decode_timedelta=False": (True, False, np.dtype("int64")),
+-    "decode_timedelta=True": (True, True, np.dtype("timedelta64[ns]")),
++    "default": (True, None, "ns", np.dtype("timedelta64[ns]")),
++    "decode_timedelta=False": (True, False, "ns", np.dtype("int64")),
++    "decode_timedelta=True": (True, True, "ns", np.dtype("timedelta64[ns]")),
++    "use-original-units": (True, True, "s", np.dtype("timedelta64[s]")),
+     "inherit-time_unit-from-decode_times": (
+         CFDatetimeCoder(time_unit="s"),
+         None,
++        "ns",
+         np.dtype("timedelta64[s]"),
+     ),
+     "set-time_unit-via-CFTimedeltaCoder-decode_times=True": (
+         True,
+         CFTimedeltaCoder(time_unit="s"),
++        "ns",
+         np.dtype("timedelta64[s]"),
+     ),
+     "set-time_unit-via-CFTimedeltaCoder-decode_times=False": (
+         False,
+         CFTimedeltaCoder(time_unit="s"),
++        "ns",
+         np.dtype("timedelta64[s]"),
+     ),
+     "override-time_unit-from-decode_times": (
+         CFDatetimeCoder(time_unit="ns"),
+         CFTimedeltaCoder(time_unit="s"),
++        "ns",
+         np.dtype("timedelta64[s]"),
+     ),
++    "decode-different-units": (
++        True,
++        CFTimedeltaCoder(time_unit="us"),
++        "s",
++        np.dtype("timedelta64[us]"),
++    ),
+ }
+ 
+ 
+ @pytest.mark.parametrize(
+-    ("decode_times", "decode_timedelta", "expected_dtype"),
++    ("decode_times", "decode_timedelta", "original_unit", "expected_dtype"),
+     list(_DECODE_TIMEDELTA_VIA_DTYPE_TESTS.values()),
+     ids=list(_DECODE_TIMEDELTA_VIA_DTYPE_TESTS.keys()),
+ )
+ def test_decode_timedelta_via_dtype(
+-    decode_times, decode_timedelta, expected_dtype
++    decode_times, decode_timedelta, original_unit, expected_dtype
+ ) -> None:
+-    timedeltas = pd.timedelta_range(0, freq="D", periods=3)
++    timedeltas = pd.timedelta_range(0, freq="D", periods=3, unit=original_unit)  # type: ignore[call-arg]
+     encoding = {"units": "days"}
+     var = Variable(["time"], timedeltas, encoding=encoding)
+     encoded = conventions.encode_cf_variable(var)
+-    assert encoded.attrs["dtype"] == "timedelta64[ns]"
++    assert encoded.attrs["dtype"] == f"timedelta64[{original_unit}]"
+     assert encoded.attrs["units"] == encoding["units"]
+     decoded = conventions.decode_cf_variable(
+         "foo", encoded, decode_times=decode_times, decode_timedelta=decode_timedelta
+
+diff --git a/xarray/tests/test_combine.py b/xarray/tests/test_combine.py
+index 40d63ed..3b4ad09 100644
+--- a/xarray/tests/test_combine.py
++++ b/xarray/tests/test_combine.py
+@@ -13,6 +13,7 @@ from xarray import (
+     combine_nested,
+     concat,
+     merge,
++    set_options,
+ )
+ from xarray.core import dtypes
+ from xarray.structure.combine import (
+@@ -279,8 +280,10 @@ class TestNewTileIDs:
+ 
+ 
+ class TestCombineND:
+-    @pytest.mark.parametrize("concat_dim", ["dim1", "new_dim"])
+-    def test_concat_once(self, create_combined_ids, concat_dim):
++    @pytest.mark.parametrize(
++        "concat_dim, kwargs", [("dim1", {}), ("new_dim", {"data_vars": "all"})]
++    )
++    def test_concat_once(self, create_combined_ids, concat_dim, kwargs):
+         shape = (2,)
+         combined_ids = create_combined_ids(shape)
+         ds = create_test_data
+@@ -290,9 +293,12 @@ class TestCombineND:
+             data_vars="all",
+             coords="different",
+             compat="no_conflicts",
++            fill_value=dtypes.NA,
++            join="outer",
++            combine_attrs="drop",
+         )
+ 
+-        expected_ds = concat([ds(0), ds(1)], dim=concat_dim)
++        expected_ds = concat([ds(0), ds(1)], dim=concat_dim, **kwargs)
+         assert_combined_tile_ids_equal(result, {(): expected_ds})
+ 
+     def test_concat_only_first_dim(self, create_combined_ids):
+@@ -304,6 +310,9 @@ class TestCombineND:
+             data_vars="all",
+             coords="different",
+             compat="no_conflicts",
++            fill_value=dtypes.NA,
++            join="outer",
++            combine_attrs="drop",
+         )
+ 
+         ds = create_test_data
+@@ -315,17 +324,28 @@ class TestCombineND:
+ 
+         assert_combined_tile_ids_equal(result, expected)
+ 
+-    @pytest.mark.parametrize("concat_dim", ["dim1", "new_dim"])
+-    def test_concat_twice(self, create_combined_ids, concat_dim):
++    @pytest.mark.parametrize(
++        "concat_dim, kwargs", [("dim1", {}), ("new_dim", {"data_vars": "all"})]
++    )
++    def test_concat_twice(self, create_combined_ids, concat_dim, kwargs):
+         shape = (2, 3)
+         combined_ids = create_combined_ids(shape)
+-        result = _combine_nd(combined_ids, concat_dims=["dim1", concat_dim])
++        result = _combine_nd(
++            combined_ids,
++            concat_dims=["dim1", concat_dim],
++            data_vars="all",
++            coords="different",
++            compat="no_conflicts",
++            fill_value=dtypes.NA,
++            join="outer",
++            combine_attrs="drop",
++        )
+ 
+         ds = create_test_data
+         partway1 = concat([ds(0), ds(3)], dim="dim1")
+         partway2 = concat([ds(1), ds(4)], dim="dim1")
+         partway3 = concat([ds(2), ds(5)], dim="dim1")
+-        expected = concat([partway1, partway2, partway3], dim=concat_dim)
++        expected = concat([partway1, partway2, partway3], **kwargs, dim=concat_dim)
+ 
+         assert_equal(result, expected)
+ 
+@@ -417,7 +437,7 @@ class TestNestedCombine:
+             Dataset({"a": ("x", [20]), "x": [0]}),
+         ]
+         expected = Dataset({"a": (("t", "x"), [[10], [20]]), "x": [0]})
+-        actual = combine_nested(objs, concat_dim="t")
++        actual = combine_nested(objs, data_vars="all", concat_dim="t")
+         assert_identical(expected, actual)
+ 
+         # Same but with a DataArray as new dim, see GH #1988 and #2647
+@@ -425,42 +445,60 @@ class TestNestedCombine:
+         expected = Dataset(
+             {"a": (("baz", "x"), [[10], [20]]), "x": [0], "baz": [100, 150]}
+         )
+-        actual = combine_nested(objs, concat_dim=dim)
++        actual = combine_nested(objs, data_vars="all", concat_dim=dim)
+         assert_identical(expected, actual)
+ 
+-    def test_nested_merge(self):
++    def test_nested_merge_with_self(self):
+         data = Dataset({"x": 0})
+         actual = combine_nested([data, data, data], concat_dim=None)
+         assert_identical(data, actual)
+ 
++    def test_nested_merge_with_overlapping_values(self):
+         ds1 = Dataset({"a": ("x", [1, 2]), "x": [0, 1]})
+         ds2 = Dataset({"a": ("x", [2, 3]), "x": [1, 2]})
+         expected = Dataset({"a": ("x", [1, 2, 3]), "x": [0, 1, 2]})
+-        actual = combine_nested([ds1, ds2], concat_dim=None)
++        with pytest.warns(
++            FutureWarning,
++            match="will change from compat='no_conflicts' to compat='override'",
++        ):
++            actual = combine_nested([ds1, ds2], join="outer", concat_dim=None)
+         assert_identical(expected, actual)
+-        actual = combine_nested([ds1, ds2], concat_dim=[None])
++        actual = combine_nested(
++            [ds1, ds2], join="outer", compat="no_conflicts", concat_dim=None
++        )
++        assert_identical(expected, actual)
++        actual = combine_nested(
++            [ds1, ds2], join="outer", compat="no_conflicts", concat_dim=[None]
++        )
+         assert_identical(expected, actual)
+ 
++    def test_nested_merge_with_nan_no_conflicts(self):
+         tmp1 = Dataset({"x": 0})
+         tmp2 = Dataset({"x": np.nan})
+-        actual = combine_nested([tmp1, tmp2], concat_dim=None)
++        actual = combine_nested([tmp1, tmp2], compat="no_conflicts", concat_dim=None)
+         assert_identical(tmp1, actual)
+-        actual = combine_nested([tmp1, tmp2], concat_dim=[None])
++        with pytest.warns(
++            FutureWarning,
++            match="will change from compat='no_conflicts' to compat='override'",
++        ):
++            combine_nested([tmp1, tmp2], concat_dim=None)
++        actual = combine_nested([tmp1, tmp2], compat="no_conflicts", concat_dim=[None])
+         assert_identical(tmp1, actual)
+ 
+-        # Single object, with a concat_dim explicitly provided
++    def test_nested_merge_with_concat_dim_explicitly_provided(self):
+         # Test the issue reported in GH #1988
+         objs = [Dataset({"x": 0, "y": 1})]
+         dim = DataArray([100], name="baz", dims="baz")
+-        actual = combine_nested(objs, concat_dim=[dim])
++        actual = combine_nested(objs, concat_dim=[dim], data_vars="all")
+         expected = Dataset({"x": ("baz", [0]), "y": ("baz", [1])}, {"baz": [100]})
+         assert_identical(expected, actual)
+ 
++    def test_nested_merge_with_non_scalars(self):
+         # Just making sure that auto_combine is doing what is
+         # expected for non-scalar values, too.
+         objs = [Dataset({"x": ("z", [0, 1]), "y": ("z", [1, 2])})]
+         dim = DataArray([100], name="baz", dims="baz")
+-        actual = combine_nested(objs, concat_dim=[dim])
++        actual = combine_nested(objs, concat_dim=[dim], data_vars="all")
+         expected = Dataset(
+             {"x": (("baz", "z"), [[0, 1]]), "y": (("baz", "z"), [[1, 2]])},
+             {"baz": [100]},
+@@ -510,10 +548,14 @@ class TestNestedCombine:
+         partway1 = concat([ds(0), ds(3)], dim="dim1")
+         partway2 = concat([ds(1), ds(4)], dim="dim1")
+         partway3 = concat([ds(2), ds(5)], dim="dim1")
+-        expected = concat([partway1, partway2, partway3], dim="dim2")
++        expected = concat([partway1, partway2, partway3], data_vars="all", dim="dim2")
+ 
+         datasets = [[ds(0), ds(1), ds(2)], [ds(3), ds(4), ds(5)]]
+-        result = combine_nested(datasets, concat_dim=["dim1", "dim2"])
++        result = combine_nested(
++            datasets,
++            data_vars="all",
++            concat_dim=["dim1", "dim2"],
++        )
+         assert_equal(result, expected)
+ 
+     def test_auto_combine_2d_combine_attrs_kwarg(self):
+@@ -522,7 +564,7 @@ class TestNestedCombine:
+         partway1 = concat([ds(0), ds(3)], dim="dim1")
+         partway2 = concat([ds(1), ds(4)], dim="dim1")
+         partway3 = concat([ds(2), ds(5)], dim="dim1")
+-        expected = concat([partway1, partway2, partway3], dim="dim2")
++        expected = concat([partway1, partway2, partway3], data_vars="all", dim="dim2")
+ 
+         expected_dict = {}
+         expected_dict["drop"] = expected.copy(deep=True)
+@@ -553,12 +595,18 @@ class TestNestedCombine:
+ 
+         with pytest.raises(ValueError, match=r"combine_attrs='identical'"):
+             result = combine_nested(
+-                datasets, concat_dim=["dim1", "dim2"], combine_attrs="identical"
++                datasets,
++                concat_dim=["dim1", "dim2"],
++                data_vars="all",
++                combine_attrs="identical",
+             )
+ 
+         for combine_attrs, expected in expected_dict.items():
+             result = combine_nested(
+-                datasets, concat_dim=["dim1", "dim2"], combine_attrs=combine_attrs
++                datasets,
++                concat_dim=["dim1", "dim2"],
++                data_vars="all",
++                combine_attrs=combine_attrs,
+             )
+             assert_identical(result, expected)
+ 
+@@ -572,7 +620,7 @@ class TestNestedCombine:
+         expected = Dataset(
+             {"a": (("t", "x"), [[np.nan, 2, 3], [1, 2, np.nan]])}, {"x": [0, 1, 2]}
+         )
+-        actual = combine_nested(datasets, concat_dim="t")
++        actual = combine_nested(datasets, data_vars="all", join="outer", concat_dim="t")
+         assert_identical(expected, actual)
+ 
+     def test_invalid_hypercube_input(self):
+@@ -650,7 +698,13 @@ class TestNestedCombine:
+             },
+             {"x": [0, 1, 2]},
+         )
+-        actual = combine_nested(datasets, concat_dim="t", fill_value=fill_value)
++        actual = combine_nested(
++            datasets,
++            concat_dim="t",
++            data_vars="all",
++            join="outer",
++            fill_value=fill_value,
++        )
+         assert_identical(expected, actual)
+ 
+     def test_combine_nested_unnamed_data_arrays(self):
+@@ -710,26 +764,30 @@ class TestCombineDatasetsbyCoords:
+         expected = Dataset({"x": [0, 1, 2]})
+         assert_identical(expected, actual)
+ 
++    def test_combine_by_coords_handles_non_sorted_variables(self):
+         # ensure auto_combine handles non-sorted variables
+         objs = [
+             Dataset({"x": ("a", [0]), "y": ("a", [0]), "a": [0]}),
+             Dataset({"x": ("a", [1]), "y": ("a", [1]), "a": [1]}),
+         ]
+-        actual = combine_by_coords(objs)
++        actual = combine_by_coords(objs, join="outer")
+         expected = Dataset({"x": ("a", [0, 1]), "y": ("a", [0, 1]), "a": [0, 1]})
+         assert_identical(expected, actual)
+ 
++    def test_combine_by_coords_multiple_variables(self):
+         objs = [Dataset({"x": [0], "y": [0]}), Dataset({"y": [1], "x": [1]})]
+-        actual = combine_by_coords(objs)
++        actual = combine_by_coords(objs, join="outer")
+         expected = Dataset({"x": [0, 1], "y": [0, 1]})
+         assert_equal(actual, expected)
+ 
++    def test_combine_by_coords_for_scalar_variables(self):
+         objs = [Dataset({"x": 0}), Dataset({"x": 1})]
+         with pytest.raises(
+             ValueError, match=r"Could not find any dimension coordinates"
+         ):
+             combine_by_coords(objs)
+ 
++    def test_combine_by_coords_requires_coord_or_index(self):
+         objs = [Dataset({"x": [0], "y": [0]}), Dataset({"x": [0]})]
+         with pytest.raises(
+             ValueError,
+@@ -959,10 +1017,14 @@ class TestCombineDatasetsbyCoords:
+     def test_infer_order_from_coords(self):
+         data = create_test_data()
+         objs = [data.isel(dim2=slice(4, 9)), data.isel(dim2=slice(4))]
+-        actual = combine_by_coords(objs)
++        actual = combine_by_coords(objs, data_vars="all")
+         expected = data
+         assert expected.broadcast_equals(actual)
+ 
++        with set_options(use_new_combine_kwarg_defaults=True):
++            actual = combine_by_coords(objs)
++        assert_identical(actual, expected)
++
+     def test_combine_leaving_bystander_dimensions(self):
+         # Check non-monotonic bystander dimension coord doesn't raise
+         # ValueError on combine (https://github.com/pydata/xarray/issues/3150)
+@@ -997,7 +1059,7 @@ class TestCombineDatasetsbyCoords:
+             Dataset({"a": ("x", [1]), "x": [1]}),
+         ]
+         expected = Dataset({"a": ("x", [0, 1]), "b": ("x", [0, np.nan])}, {"x": [0, 1]})
+-        actual = combine_by_coords(datasets)
++        actual = combine_by_coords(datasets, join="outer")
+         assert_identical(expected, actual)
+ 
+     def test_combine_by_coords_still_fails(self):
+@@ -1014,7 +1076,7 @@ class TestCombineDatasetsbyCoords:
+         assert_identical(expected, actual)
+ 
+         objs = [Dataset({"x": 0, "y": 1}), Dataset({"y": np.nan, "z": 2})]
+-        actual = combine_by_coords(objs)
++        actual = combine_by_coords(objs, compat="no_conflicts")
+         expected = Dataset({"x": 0, "y": 1, "z": 2})
+         assert_identical(expected, actual)
+ 
+@@ -1032,7 +1094,7 @@ class TestCombineDatasetsbyCoords:
+         x1 = Dataset({"a": (("y", "x"), [[1]])}, coords={"y": [0], "x": [0]})
+         x2 = Dataset({"a": (("y", "x"), [[1]])}, coords={"y": [1], "x": [0]})
+         x3 = Dataset({"a": (("y", "x"), [[1]])}, coords={"y": [0], "x": [1]})
+-        actual = combine_by_coords([x1, x2, x3])
++        actual = combine_by_coords([x1, x2, x3], join="outer")
+         expected = Dataset(
+             {"a": (("y", "x"), [[1, 1], [1, np.nan]])},
+             coords={"y": [0, 1], "x": [0, 1]},
+@@ -1040,8 +1102,10 @@ class TestCombineDatasetsbyCoords:
+         assert_identical(expected, actual)
+ 
+         # test that this fails if fill_value is None
+-        with pytest.raises(ValueError):
+-            combine_by_coords([x1, x2, x3], fill_value=None)
++        with pytest.raises(
++            ValueError, match="supplied objects do not form a hypercube"
++        ):
++            combine_by_coords([x1, x2, x3], join="outer", fill_value=None)
+ 
+     def test_combine_by_coords_override_order(self) -> None:
+         # regression test for https://github.com/pydata/xarray/issues/8828
+@@ -1111,7 +1175,7 @@ class TestCombineMixedObjectsbyCoords:
+         named_da1 = DataArray(name="a", data=[1.0, 2.0], coords={"x": [0, 1]}, dims="x")
+         named_da2 = DataArray(name="b", data=[3.0, 4.0], coords={"x": [2, 3]}, dims="x")
+ 
+-        actual = combine_by_coords([named_da1, named_da2])
++        actual = combine_by_coords([named_da1, named_da2], join="outer")
+         expected = Dataset(
+             {
+                 "a": DataArray(data=[1.0, 2.0], coords={"x": [0, 1]}, dims="x"),
+@@ -1124,11 +1188,132 @@ class TestCombineMixedObjectsbyCoords:
+         named_da1 = DataArray(name="a", data=[1.0, 2.0], coords={"x": [0, 1]}, dims="x")
+         named_da2 = DataArray(name="a", data=[3.0, 4.0], coords={"x": [2, 3]}, dims="x")
+ 
+-        actual = combine_by_coords([named_da1, named_da2])
+-        expected = merge([named_da1, named_da2])
++        actual = combine_by_coords([named_da1, named_da2], join="outer")
++        expected = merge([named_da1, named_da2], compat="no_conflicts", join="outer")
+         assert_identical(expected, actual)
+ 
+ 
++class TestNewDefaults:
++    def test_concat_along_existing_dim(self):
++        concat_dim = "dim1"
++        ds = create_test_data
++        with set_options(use_new_combine_kwarg_defaults=False):
++            old = concat([ds(0), ds(1)], dim=concat_dim)
++        with set_options(use_new_combine_kwarg_defaults=True):
++            new = concat([ds(0), ds(1)], dim=concat_dim)
++        assert_identical(old, new)
++
++    def test_concat_along_new_dim(self):
++        concat_dim = "new_dim"
++        ds = create_test_data
++        with set_options(use_new_combine_kwarg_defaults=False):
++            old = concat([ds(0), ds(1)], dim=concat_dim)
++        with set_options(use_new_combine_kwarg_defaults=True):
++            new = concat([ds(0), ds(1)], dim=concat_dim)
++
++        assert concat_dim in old.dims
++        assert concat_dim in new.dims
++
++    def test_nested_merge_with_overlapping_values(self):
++        ds1 = Dataset({"a": ("x", [1, 2]), "x": [0, 1]})
++        ds2 = Dataset({"a": ("x", [2, 3]), "x": [1, 2]})
++        expected = Dataset({"a": ("x", [1, 2, 3]), "x": [0, 1, 2]})
++        with set_options(use_new_combine_kwarg_defaults=False):
++            with pytest.warns(
++                FutureWarning, match="will change from join='outer' to join='exact'"
++            ):
++                with pytest.warns(
++                    FutureWarning,
++                    match="will change from compat='no_conflicts' to compat='override'",
++                ):
++                    old = combine_nested([ds1, ds2], concat_dim=None)
++        with set_options(use_new_combine_kwarg_defaults=True):
++            with pytest.raises(ValueError, match="might be related to new default"):
++                combine_nested([ds1, ds2], concat_dim=None)
++
++        assert_identical(old, expected)
++
++    def test_nested_merge_with_nan_order_matters(self):
++        ds1 = Dataset({"x": 0})
++        ds2 = Dataset({"x": np.nan})
++        with set_options(use_new_combine_kwarg_defaults=False):
++            with pytest.warns(
++                FutureWarning,
++                match="will change from compat='no_conflicts' to compat='override'",
++            ):
++                old = combine_nested([ds1, ds2], concat_dim=None)
++        with set_options(use_new_combine_kwarg_defaults=True):
++            new = combine_nested([ds1, ds2], concat_dim=None)
++
++        assert_identical(ds1, old)
++        assert_identical(old, new)
++
++        with set_options(use_new_combine_kwarg_defaults=False):
++            with pytest.warns(
++                FutureWarning,
++                match="will change from compat='no_conflicts' to compat='override'",
++            ):
++                old = combine_nested([ds2, ds1], concat_dim=None)
++        with set_options(use_new_combine_kwarg_defaults=True):
++            new = combine_nested([ds2, ds1], concat_dim=None)
++
++        assert_identical(ds1, old)
++        with pytest.raises(AssertionError):
++            assert_identical(old, new)
++
++    def test_nested_merge_with_concat_dim_explicitly_provided(self):
++        # Test the issue reported in GH #1988
++        objs = [Dataset({"x": 0, "y": 1})]
++        dim = DataArray([100], name="baz", dims="baz")
++        expected = Dataset({"x": ("baz", [0]), "y": ("baz", [1])}, {"baz": [100]})
++
++        with set_options(use_new_combine_kwarg_defaults=False):
++            old = combine_nested(objs, concat_dim=dim)
++        with set_options(use_new_combine_kwarg_defaults=True):
++            new = combine_nested(objs, concat_dim=dim)
++
++        assert_identical(expected, old)
++        assert_identical(old, new)
++
++    def test_combine_nested_missing_data_new_dim(self):
++        # Your data includes "time" and "station" dimensions, and each year's
++        # data has a different set of stations.
++        datasets = [
++            Dataset({"a": ("x", [2, 3]), "x": [1, 2]}),
++            Dataset({"a": ("x", [1, 2]), "x": [0, 1]}),
++        ]
++        expected = Dataset(
++            {"a": (("t", "x"), [[np.nan, 2, 3], [1, 2, np.nan]])}, {"x": [0, 1, 2]}
++        )
++        with set_options(use_new_combine_kwarg_defaults=False):
++            with pytest.warns(
++                FutureWarning, match="will change from join='outer' to join='exact'"
++            ):
++                old = combine_nested(datasets, concat_dim="t")
++        with set_options(use_new_combine_kwarg_defaults=True):
++            with pytest.raises(ValueError, match="might be related to new default"):
++                combine_nested(datasets, concat_dim="t")
++            new = combine_nested(datasets, concat_dim="t", join="outer")
++
++        assert_identical(expected, old)
++        assert_identical(expected, new)
++
++    def test_combine_by_coords_multiple_variables(self):
++        objs = [Dataset({"x": [0], "y": [0]}), Dataset({"y": [1], "x": [1]})]
++        expected = Dataset({"x": [0, 1], "y": [0, 1]})
++
++        with set_options(use_new_combine_kwarg_defaults=False):
++            with pytest.warns(
++                FutureWarning, match="will change from join='outer' to join='exact'"
++            ):
++                old = combine_by_coords(objs)
++        with set_options(use_new_combine_kwarg_defaults=True):
++            with pytest.raises(ValueError, match="might be related to new default"):
++                combine_by_coords(objs)
++
++        assert_identical(old, expected)
++
++
+ @requires_cftime
+ def test_combine_by_coords_distant_cftime_dates():
+     # Regression test for https://github.com/pydata/xarray/issues/3535
+
+diff --git a/xarray/tests/test_concat.py b/xarray/tests/test_concat.py
+index 668a48a..2c36928 100644
+--- a/xarray/tests/test_concat.py
++++ b/xarray/tests/test_concat.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ from collections.abc import Callable
++from contextlib import AbstractContextManager, nullcontext
+ from copy import deepcopy
+ from typing import TYPE_CHECKING, Any, Literal
+ 
+@@ -8,7 +9,7 @@ import numpy as np
+ import pandas as pd
+ import pytest
+ 
+-from xarray import AlignmentError, DataArray, Dataset, Variable, concat
++from xarray import AlignmentError, DataArray, Dataset, Variable, concat, set_options
+ from xarray.core import dtypes, types
+ from xarray.core.coordinates import Coordinates
+ from xarray.core.indexes import PandasIndex
+@@ -135,9 +136,9 @@ def test_concat_compat() -> None:
+     for var in ["has_x", "no_x_y"]:
+         assert "y" not in result[var].dims and "y" not in result[var].coords
+     with pytest.raises(ValueError, match=r"'q' not present in all datasets"):
+-        concat([ds1, ds2], dim="q")
++        concat([ds1, ds2], dim="q", data_vars="all", join="outer")
+     with pytest.raises(ValueError, match=r"'q' not present in all datasets"):
+-        concat([ds2, ds1], dim="q")
++        concat([ds2, ds1], dim="q", data_vars="all", join="outer")
+ 
+ 
+ def test_concat_missing_var() -> None:
+@@ -217,8 +218,12 @@ def test_concat_second_empty() -> None:
+     actual = concat([ds1, ds2], dim="y", coords="all")
+     assert_identical(actual, expected)
+ 
++
++def test_concat_second_empty_with_scalar_data_var_only_on_first() -> None:
+     # Check concatenating scalar data_var only present in ds1
+-    ds1["b"] = 0.1
++    ds1 = Dataset(data_vars={"a": ("y", [0.1]), "b": 0.1}, coords={"x": 0.1})
++    ds2 = Dataset(coords={"x": 0.1})
++
+     expected = Dataset(
+         data_vars={"a": ("y", [0.1, np.nan]), "b": ("y", [0.1, np.nan])},
+         coords={"x": ("y", [0.1, 0.1])},
+@@ -229,7 +234,9 @@ def test_concat_second_empty() -> None:
+     expected = Dataset(
+         data_vars={"a": ("y", [0.1, np.nan]), "b": 0.1}, coords={"x": 0.1}
+     )
+-    actual = concat([ds1, ds2], dim="y", coords="different", data_vars="different")
++    actual = concat(
++        [ds1, ds2], dim="y", coords="different", data_vars="different", compat="equals"
++    )
+     assert_identical(actual, expected)
+ 
+ 
+@@ -266,10 +273,13 @@ def test_concat_multiple_datasets_missing_vars(include_day: bool) -> None:
+         "cloud_cover",
+     ]
+ 
++    # must specify if concat_dim='day' is not part of the vars
++    kwargs = {"data_vars": "all"} if not include_day else {}
++
+     datasets = create_concat_datasets(
+         len(vars_to_drop), seed=123, include_day=include_day
+     )
+-    expected = concat(datasets, dim="day")
++    expected = concat(datasets, dim="day", **kwargs)  # type: ignore[call-overload]
+ 
+     for i, name in enumerate(vars_to_drop):
+         if include_day:
+@@ -282,8 +292,7 @@ def test_concat_multiple_datasets_missing_vars(include_day: bool) -> None:
+         ds.drop_vars(varname)
+         for ds, varname in zip(datasets, vars_to_drop, strict=True)
+     ]
+-
+-    actual = concat(datasets, dim="day")
++    actual = concat(datasets, dim="day", **kwargs)  # type: ignore[call-overload]
+ 
+     assert list(actual.data_vars.keys()) == [
+         "pressure",
+@@ -493,8 +502,8 @@ class TestConcatDataset:
+         "dim,data", [["dim1", True], ["dim2", False]], indirect=["data"]
+     )
+     def test_concat_simple(self, data: Dataset, dim, coords) -> None:
+-        datasets = [g for _, g in data.groupby(dim, squeeze=False)]
+-        assert_identical(data, concat(datasets, dim, coords=coords))
++        datasets = [g for _, g in data.groupby(dim)]
++        assert_identical(data, concat(datasets, dim, coords=coords, compat="equals"))
+ 
+     def test_concat_merge_variables_present_in_some_datasets(
+         self, data: Dataset
+@@ -515,7 +524,7 @@ class TestConcatDataset:
+         assert_identical(expected, actual)
+ 
+         # expand foo
+-        actual = concat([data0, data1], "dim1")
++        actual = concat([data0, data1], "dim1", data_vars="all")
+         foo = np.ones((8, 10), dtype=data1.foo.dtype) * np.nan
+         foo[3:] = data1.foo.values[None, ...]
+         expected = data.copy().assign(foo=(["dim1", "bar"], foo))
+@@ -537,9 +546,11 @@ class TestConcatDataset:
+         data = data.copy(deep=True)
+         # make sure the coords argument behaves as expected
+         data.coords["extra"] = ("dim4", np.arange(3))
+-        datasets = [g.squeeze() for _, g in data.groupby(dim, squeeze=False)]
++        datasets = [g for _, g in data.groupby(dim)]
+ 
+-        actual = concat(datasets, data[dim], coords=coords)
++        actual = concat(
++            datasets, data[dim], coords=coords, data_vars="all", compat="equals"
++        )
+         if coords == "all":
+             expected = np.array([data["extra"].values for _ in range(data.sizes[dim])])
+             assert_array_equal(actual["extra"].values, expected)
+@@ -571,41 +582,72 @@ class TestConcatDataset:
+         actual = concat(objs, dim="x", data_vars="minimal")
+         assert_identical(data, actual)
+ 
+-    def test_concat_data_vars(self) -> None:
++    @pytest.mark.parametrize("data_vars", ["minimal", "different", "all", [], ["foo"]])
++    def test_concat_data_vars(self, data_vars) -> None:
+         data = Dataset({"foo": ("x", np.random.randn(10))})
+         objs: list[Dataset] = [data.isel(x=slice(5)), data.isel(x=slice(5, None))]
+-        for data_vars in ["minimal", "different", "all", [], ["foo"]]:
+-            actual = concat(objs, dim="x", data_vars=data_vars)
+-            assert_identical(data, actual)
++        actual = concat(objs, dim="x", data_vars=data_vars, compat="equals")
++        assert_identical(data, actual)
+ 
+-    def test_concat_coords(self):
+-        # TODO: annotating this func fails
++    @pytest.mark.parametrize("coords", ["different", "all", ["c"]])
++    def test_concat_coords(self, coords) -> None:
+         data = Dataset({"foo": ("x", np.random.randn(10))})
+         expected = data.assign_coords(c=("x", [0] * 5 + [1] * 5))
+         objs = [
+             data.isel(x=slice(5)).assign_coords(c=0),
+             data.isel(x=slice(5, None)).assign_coords(c=1),
+         ]
+-        for coords in ["different", "all", ["c"]]:
++        if coords == "different":
++            actual = concat(objs, dim="x", coords=coords, compat="equals")
++        else:
+             actual = concat(objs, dim="x", coords=coords)
+-            assert_identical(expected, actual)
+-        for coords in ["minimal", []]:
+-            with pytest.raises(merge.MergeError, match="conflicting values"):
+-                concat(objs, dim="x", coords=coords)
++        assert_identical(expected, actual)
+ 
+-    def test_concat_constant_index(self):
+-        # TODO: annotating this func fails
++    @pytest.mark.parametrize("coords", ["minimal", []])
++    def test_concat_coords_raises_merge_error(self, coords) -> None:
++        data = Dataset({"foo": ("x", np.random.randn(10))})
++        objs = [
++            data.isel(x=slice(5)).assign_coords(c=0),
++            data.isel(x=slice(5, None)).assign_coords(c=1),
++        ]
++        with pytest.raises(merge.MergeError, match="conflicting values"):
++            concat(objs, dim="x", coords=coords, compat="equals")
++
++    @pytest.mark.parametrize("data_vars", ["different", "all", ["foo"]])
++    def test_concat_constant_index(self, data_vars) -> None:
+         # GH425
+         ds1 = Dataset({"foo": 1.5}, {"y": 1})
+         ds2 = Dataset({"foo": 2.5}, {"y": 1})
+         expected = Dataset({"foo": ("y", [1.5, 2.5]), "y": [1, 1]})
+-        for mode in ["different", "all", ["foo"]]:
+-            actual = concat([ds1, ds2], "y", data_vars=mode)
+-            assert_identical(expected, actual)
+-        with pytest.raises(merge.MergeError, match="conflicting values"):
+-            # previously dim="y", and raised error which makes no sense.
+-            # "foo" has dimension "y" so minimal should concatenate it?
+-            concat([ds1, ds2], "new_dim", data_vars="minimal")
++        if data_vars == "different":
++            actual = concat([ds1, ds2], "y", data_vars=data_vars, compat="equals")
++        else:
++            actual = concat([ds1, ds2], "y", data_vars=data_vars)
++        assert_identical(expected, actual)
++
++    def test_concat_constant_index_None(self) -> None:
++        ds1 = Dataset({"foo": 1.5}, {"y": 1})
++        ds2 = Dataset({"foo": 2.5}, {"y": 1})
++        actual = concat([ds1, ds2], "new_dim", data_vars=None, compat="equals")
++        expected = Dataset(
++            {"foo": ("new_dim", [1.5, 2.5])},
++            coords={"y": 1},
++        )
++        assert_identical(actual, expected)
++
++    def test_concat_constant_index_minimal(self) -> None:
++        ds1 = Dataset({"foo": 1.5}, {"y": 1})
++        ds2 = Dataset({"foo": 2.5}, {"y": 1})
++
++        with set_options(use_new_combine_kwarg_defaults=False):
++            with pytest.raises(merge.MergeError, match="conflicting values"):
++                concat([ds1, ds2], dim="new_dim", data_vars="minimal")
++
++        with set_options(use_new_combine_kwarg_defaults=True):
++            with pytest.raises(
++                ValueError, match="data_vars='minimal' and coords='minimal'"
++            ):
++                concat([ds1, ds2], dim="new_dim", data_vars="minimal")
+ 
+     def test_concat_size0(self) -> None:
+         data = create_test_data()
+@@ -619,7 +661,7 @@ class TestConcatDataset:
+     def test_concat_autoalign(self) -> None:
+         ds1 = Dataset({"foo": DataArray([1, 2], coords=[("x", [1, 2])])})
+         ds2 = Dataset({"foo": DataArray([1, 2], coords=[("x", [1, 3])])})
+-        actual = concat([ds1, ds2], "y")
++        actual = concat([ds1, ds2], "y", data_vars="all", join="outer")
+         expected = Dataset(
+             {
+                 "foo": DataArray(
+@@ -631,8 +673,7 @@ class TestConcatDataset:
+         )
+         assert_identical(expected, actual)
+ 
+-    def test_concat_errors(self):
+-        # TODO: annotating this func fails
++    def test_concat_errors(self) -> None:
+         data = create_test_data()
+         split_data = [data.isel(dim1=slice(3)), data.isel(dim1=slice(3, None))]
+ 
+@@ -662,7 +703,7 @@ class TestConcatDataset:
+         assert_identical(data, concat([data0, data1], "dim1", compat="equals"))
+ 
+         with pytest.raises(ValueError, match=r"compat.* invalid"):
+-            concat(split_data, "dim1", compat="foobar")
++            concat(split_data, "dim1", compat="foobar")  # type: ignore[call-overload]
+ 
+         with pytest.raises(ValueError, match=r"compat.* invalid"):
+             concat(split_data, "dim1", compat="minimal")
+@@ -847,8 +888,7 @@ class TestConcatDataset:
+ 
+             assert_identical(actual, expected)
+ 
+-    def test_concat_promote_shape(self) -> None:
+-        # mixed dims within variables
++    def test_concat_promote_shape_with_mixed_dims_within_variables(self) -> None:
+         objs = [Dataset({}, {"x": 0}), Dataset({"x": [1]})]
+         actual = concat(objs, "x")
+         expected = Dataset({"x": [0, 1]})
+@@ -858,25 +898,30 @@ class TestConcatDataset:
+         actual = concat(objs, "x")
+         assert_identical(actual, expected)
+ 
+-        # mixed dims between variables
++    def test_concat_promote_shape_with_mixed_dims_between_variables(self) -> None:
+         objs = [Dataset({"x": [2], "y": 3}), Dataset({"x": [4], "y": 5})]
+-        actual = concat(objs, "x")
++        actual = concat(objs, "x", data_vars="all")
+         expected = Dataset({"x": [2, 4], "y": ("x", [3, 5])})
+         assert_identical(actual, expected)
+ 
+-        # mixed dims in coord variable
++    def test_concat_promote_shape_with_mixed_dims_in_coord_variable(self) -> None:
+         objs = [Dataset({"x": [0]}, {"y": -1}), Dataset({"x": [1]}, {"y": ("x", [-2])})]
+         actual = concat(objs, "x")
+         expected = Dataset({"x": [0, 1]}, {"y": ("x", [-1, -2])})
+         assert_identical(actual, expected)
+ 
+-        # scalars with mixed lengths along concat dim -- values should repeat
++    def test_concat_promote_shape_for_scalars_with_mixed_lengths_along_concat_dim(
++        self,
++    ) -> None:
++        # values should repeat
+         objs = [Dataset({"x": [0]}, {"y": -1}), Dataset({"x": [1, 2]}, {"y": -2})]
+-        actual = concat(objs, "x")
++        actual = concat(objs, "x", coords="different", compat="equals")
+         expected = Dataset({"x": [0, 1, 2]}, {"y": ("x", [-1, -2, -2])})
+         assert_identical(actual, expected)
++        actual = concat(objs, "x", coords="all")
++        assert_identical(actual, expected)
+ 
+-        # broadcast 1d x 1d -> 2d
++    def test_concat_promote_shape_broadcast_1d_x_1d_goes_to_2d(self) -> None:
+         objs = [
+             Dataset({"z": ("x", [-1])}, {"x": [0], "y": [0]}),
+             Dataset({"z": ("y", [1])}, {"x": [1], "y": [0]}),
+@@ -885,6 +930,7 @@ class TestConcatDataset:
+         expected = Dataset({"z": (("x", "y"), [[-1], [1]])}, {"x": [0, 1], "y": [0]})
+         assert_identical(actual, expected)
+ 
++    def test_concat_promote_shape_with_scalar_coordinates(self) -> None:
+         # regression GH6384
+         objs = [
+             Dataset({}, {"x": pd.Interval(-1, 0, closed="right")}),
+@@ -901,6 +947,7 @@ class TestConcatDataset:
+         )
+         assert_identical(actual, expected)
+ 
++    def test_concat_promote_shape_with_coordinates_of_particular_dtypes(self) -> None:
+         # regression GH6416 (coord dtype) and GH6434
+         time_data1 = np.array(["2022-01-01", "2022-02-01"], dtype="datetime64[ns]")
+         time_data2 = np.array("2022-03-01", dtype="datetime64[ns]")
+@@ -934,14 +981,14 @@ class TestConcatDataset:
+         objs = [Dataset({"x": 0}), Dataset({"x": 1})]
+         coord = Variable("y", [3, 4], attrs={"foo": "bar"})
+         expected = Dataset({"x": ("y", [0, 1]), "y": coord})
+-        actual = concat(objs, coord)
++        actual = concat(objs, coord, data_vars="all")
+         assert_identical(actual, expected)
+ 
+     def test_concat_dim_is_dataarray(self) -> None:
+         objs = [Dataset({"x": 0}), Dataset({"x": 1})]
+         coord = DataArray([3, 4], dims="y", attrs={"foo": "bar"})
+         expected = Dataset({"x": ("y", [0, 1]), "y": coord})
+-        actual = concat(objs, coord)
++        actual = concat(objs, coord, data_vars="all")
+         assert_identical(actual, expected)
+ 
+     def test_concat_multiindex(self) -> None:
+@@ -968,8 +1015,8 @@ class TestConcatDataset:
+     @pytest.mark.parametrize("fill_value", [dtypes.NA, 2, 2.0, {"a": 2, "b": 1}])
+     def test_concat_fill_value(self, fill_value) -> None:
+         datasets = [
+-            Dataset({"a": ("x", [2, 3]), "b": ("x", [-2, 1]), "x": [1, 2]}),
+-            Dataset({"a": ("x", [1, 2]), "b": ("x", [3, -1]), "x": [0, 1]}),
++            Dataset({"a": ("x", [2, 3]), "b": ("x", [-2, 1])}, {"x": [1, 2]}),
++            Dataset({"a": ("x", [1, 2]), "b": ("x", [3, -1])}, {"x": [0, 1]}),
+         ]
+         if fill_value == dtypes.NA:
+             # if we supply the default, we expect the missing value for a
+@@ -987,7 +1034,9 @@ class TestConcatDataset:
+             },
+             {"x": [0, 1, 2]},
+         )
+-        actual = concat(datasets, dim="t", fill_value=fill_value)
++        actual = concat(
++            datasets, dim="t", fill_value=fill_value, data_vars="all", join="outer"
++        )
+         assert_identical(actual, expected)
+ 
+     @pytest.mark.parametrize("dtype", [str, bytes])
+@@ -1009,7 +1058,7 @@ class TestConcatDataset:
+                 "x2": np.array(["c", "d"], dtype=dtype),
+             }
+         )
+-        actual = concat([da1, da2], dim=dim)
++        actual = concat([da1, da2], dim=dim, join="outer")
+ 
+         assert np.issubdtype(actual.x2.dtype, dtype)
+ 
+@@ -1034,7 +1083,7 @@ class TestConcatDataset:
+         assert combined.indexes == {}
+ 
+         # should not raise on stack
+-        combined = concat(datasets, dim="z")
++        combined = concat(datasets, dim="z", data_vars="all")
+         assert combined["a"].shape == (2, 3, 3)
+         assert combined["a"].dims == ("z", "x", "y")
+ 
+@@ -1099,11 +1148,15 @@ class TestConcatDataArray:
+         stacked = concat(grouped, pd.Index(ds["x"], name="x"))
+         assert_identical(foo, stacked)
+ 
+-        actual2 = concat([foo[0], foo[1]], pd.Index([0, 1])).reset_coords(drop=True)
++        actual2 = concat(
++            [foo.isel(x=0), foo.isel(x=1)], pd.Index([0, 1]), coords="all"
++        ).reset_coords(drop=True)
+         expected = foo[:2].rename({"x": "concat_dim"})
+         assert_identical(expected, actual2)
+ 
+-        actual3 = concat([foo[0], foo[1]], [0, 1]).reset_coords(drop=True)
++        actual3 = concat(
++            [foo.isel(x=0), foo.isel(x=1)], [0, 1], coords="all"
++        ).reset_coords(drop=True)
+         expected = foo[:2].rename({"x": "concat_dim"})
+         assert_identical(expected, actual3)
+ 
+@@ -1111,7 +1164,7 @@ class TestConcatDataArray:
+             concat([foo, bar], dim="w", compat="identical")
+ 
+         with pytest.raises(ValueError, match=r"not a valid argument"):
+-            concat([foo, bar], dim="w", data_vars="minimal")
++            concat([foo, bar], dim="w", data_vars="different")
+ 
+     def test_concat_encoding(self) -> None:
+         # Regression test for GH1297
+@@ -1185,7 +1238,7 @@ class TestConcatDataArray:
+             dims=["y", "x"],
+             coords={"x": [1, 2, 3]},
+         )
+-        actual = concat((foo, bar), dim="y", fill_value=fill_value)
++        actual = concat((foo, bar), dim="y", fill_value=fill_value, join="outer")
+         assert_identical(actual, expected)
+ 
+     def test_concat_join_kwarg(self) -> None:
+@@ -1263,7 +1316,7 @@ class TestConcatDataArray:
+             dims=["x1", "x2"],
+             coords={"x1": np.array([1, 2]), "x2": np.array(["c", "d"], dtype=dtype)},
+         )
+-        actual = concat([da1, da2], dim=dim)
++        actual = concat([da1, da2], dim=dim, join="outer")
+ 
+         assert np.issubdtype(actual.x2.dtype, dtype)
+ 
+@@ -1288,16 +1341,17 @@ def test_concat_attrs_first_variable(attr1, attr2) -> None:
+     assert concat_attrs == attr1
+ 
+ 
+-def test_concat_merge_single_non_dim_coord():
+-    # TODO: annotating this func fails
++def test_concat_merge_single_non_dim_coord() -> None:
+     da1 = DataArray([1, 2, 3], dims="x", coords={"x": [1, 2, 3], "y": 1})
+     da2 = DataArray([4, 5, 6], dims="x", coords={"x": [4, 5, 6]})
+ 
+     expected = DataArray(range(1, 7), dims="x", coords={"x": range(1, 7), "y": 1})
+ 
+-    for coords in ["different", "minimal"]:
+-        actual = concat([da1, da2], "x", coords=coords)
+-        assert_identical(actual, expected)
++    actual = concat([da1, da2], "x", coords="minimal", compat="override")
++    assert_identical(actual, expected)
++
++    actual = concat([da1, da2], "x", coords="different", compat="equals")
++    assert_identical(actual, expected)
+ 
+     with pytest.raises(ValueError, match=r"'y' not present in all datasets."):
+         concat([da1, da2], dim="x", coords="all")
+@@ -1305,9 +1359,12 @@ def test_concat_merge_single_non_dim_coord():
+     da1 = DataArray([1, 2, 3], dims="x", coords={"x": [1, 2, 3], "y": 1})
+     da2 = DataArray([4, 5, 6], dims="x", coords={"x": [4, 5, 6]})
+     da3 = DataArray([7, 8, 9], dims="x", coords={"x": [7, 8, 9], "y": 1})
+-    for coords in ["different", "all"]:
+-        with pytest.raises(ValueError, match=r"'y' not present in all datasets"):
+-            concat([da1, da2, da3], dim="x", coords=coords)
++
++    with pytest.raises(ValueError, match=r"'y' not present in all datasets"):
++        concat([da1, da2, da3], dim="x", coords="all")
++
++    with pytest.raises(ValueError, match=r"'y' not present in all datasets"):
++        concat([da1, da2, da3], dim="x", coords="different", compat="equals")
+ 
+ 
+ def test_concat_preserve_coordinate_order() -> None:
+@@ -1384,6 +1441,106 @@ def test_concat_index_not_same_dim() -> None:
+         concat([ds1, ds2], dim="x")
+ 
+ 
++class TestNewDefaults:
++    def test_concat_second_empty_with_scalar_data_var_only_on_first(self) -> None:
++        ds1 = Dataset(data_vars={"a": ("y", [0.1]), "b": 0.1}, coords={"x": 0.1})
++        ds2 = Dataset(coords={"x": 0.1})
++
++        expected = Dataset(
++            data_vars={"a": ("y", [0.1, np.nan]), "b": 0.1}, coords={"x": 0.1}
++        )
++        with set_options(use_new_combine_kwarg_defaults=False):
++            with pytest.warns(
++                FutureWarning,
++                match="will change from compat='equals' to compat='override'",
++            ):
++                actual = concat(
++                    [ds1, ds2], dim="y", coords="different", data_vars="different"
++                )
++                assert_identical(actual, expected)
++        with set_options(use_new_combine_kwarg_defaults=True):
++            with pytest.raises(ValueError, match="might be related to new default"):
++                concat([ds1, ds2], dim="y", coords="different", data_vars="different")
++
++    def test_concat_multiple_datasets_missing_vars(self) -> None:
++        vars_to_drop = [
++            "temperature",
++            "pressure",
++            "humidity",
++            "precipitation",
++            "cloud_cover",
++        ]
++
++        datasets = create_concat_datasets(
++            len(vars_to_drop), seed=123, include_day=False
++        )
++        # set up the test data
++        datasets = [
++            ds.drop_vars(varname)
++            for ds, varname in zip(datasets, vars_to_drop, strict=True)
++        ]
++        with set_options(use_new_combine_kwarg_defaults=False):
++            old = concat(datasets, dim="day")
++        with set_options(use_new_combine_kwarg_defaults=True):
++            new = concat(datasets, dim="day")
++        assert_identical(old, new)
++
++    @pytest.mark.parametrize("coords", ["different", "minimal", "all"])
++    def test_concat_coords_kwarg(
++        self, coords: Literal["all", "minimal", "different"]
++    ) -> None:
++        data = create_test_data().drop_dims("dim3")
++
++        # make sure the coords argument behaves as expected
++        data.coords["extra"] = ("dim4", np.arange(3))
++        datasets = [g for _, g in data.groupby("dim1")]
++
++        with set_options(use_new_combine_kwarg_defaults=False):
++            expectation: AbstractContextManager = (
++                pytest.warns(
++                    FutureWarning,
++                    match="will change from compat='equals' to compat='override'",
++                )
++                if coords == "different"
++                else nullcontext()
++            )
++            with expectation:
++                old = concat(datasets, data["dim1"], coords=coords)
++
++        with set_options(use_new_combine_kwarg_defaults=True):
++            if coords == "different":
++                with pytest.raises(ValueError):
++                    concat(datasets, data["dim1"], coords=coords)
++            else:
++                new = concat(datasets, data["dim1"], coords=coords)
++                assert_identical(old, new)
++
++    def test_concat_promote_shape_for_scalars_with_mixed_lengths_along_concat_dim(
++        self,
++    ) -> None:
++        # values should repeat
++        objs = [Dataset({"x": [0]}, {"y": -1}), Dataset({"x": [1, 2]}, {"y": -2})]
++        expected = Dataset({"x": [0, 1, 2]}, {"y": ("x", [-1, -2, -2])})
++        with set_options(use_new_combine_kwarg_defaults=False):
++            with pytest.warns(
++                FutureWarning,
++                match="will change from coords='different' to coords='minimal'",
++            ):
++                old = concat(objs, "x")
++                assert_identical(old, expected)
++        with set_options(use_new_combine_kwarg_defaults=True):
++            new = concat(objs, "x")
++            with pytest.raises(AssertionError):
++                assert_identical(new, old)
++            with pytest.raises(ValueError, match="might be related to new default"):
++                concat(objs, "x", coords="different")
++            with pytest.raises(merge.MergeError, match="conflicting values"):
++                concat(objs, "x", compat="equals")
++
++            new = concat(objs, "x", coords="different", compat="equals")
++            assert_identical(old, new)
++
++
+ def test_concat_multi_dim_index() -> None:
+     ds1 = (
+         Dataset(
+
+diff --git a/xarray/tests/test_conventions.py b/xarray/tests/test_conventions.py
+index ce792c8..a958d5b 100644
+--- a/xarray/tests/test_conventions.py
++++ b/xarray/tests/test_conventions.py
+@@ -37,6 +37,10 @@ class TestBoolTypeArray:
+         assert bx.dtype == bool
+         assert_array_equal(bx, np.array([True, False, True, True, False], dtype=bool))
+ 
++        x = np.array([[1, 0, 1], [0, 1, 0]], dtype="i1")
++        bx = coding.variables.BoolTypeArray(x)
++        assert_array_equal(bx.transpose((1, 0)), x.transpose((1, 0)))
++
+ 
+ class TestNativeEndiannessArray:
+     def test(self) -> None:
+@@ -47,6 +51,11 @@ class TestNativeEndiannessArray:
+         assert a.dtype == expected[:].dtype
+         assert_array_equal(a, expected)
+ 
++        y = np.arange(6, dtype=">i8").reshape((2, 3))
++        b = coding.variables.NativeEndiannessArray(y)
++        expected2 = np.arange(6, dtype="int64").reshape((2, 3))
++        assert_array_equal(b.transpose((1, 0)), expected2.transpose((1, 0)))
++
+ 
+ def test_decode_cf_with_conflicting_fill_missing_value() -> None:
+     expected = Variable(["t"], [np.nan, np.nan, 2], {"units": "foobar"})
+@@ -597,6 +606,10 @@ class TestCFEncodedDataStore(CFEncodedBase):
+         # CFEncodedInMemoryStore doesn't support explicit string encodings.
+         pass
+ 
++    def test_encoding_unlimited_dims(self) -> None:
++        # CFEncodedInMemoryStore doesn't support unlimited_dims.
++        pass
++
+ 
+ class TestDecodeCFVariableWithArrayUnits:
+     def test_decode_cf_variable_with_array_units(self) -> None:
+
+diff --git a/xarray/tests/test_dask.py b/xarray/tests/test_dask.py
+index 9024f2a..22856e6 100644
+--- a/xarray/tests/test_dask.py
++++ b/xarray/tests/test_dask.py
+@@ -442,7 +442,11 @@ class TestDataArrayAndDataset(DaskTestCase):
+ 
+         assert kernel_call_count == 0
+         out = xr.concat(
+-            [ds1, ds2, ds3], dim="n", data_vars="different", coords="different"
++            [ds1, ds2, ds3],
++            dim="n",
++            data_vars="different",
++            coords="different",
++            compat="equals",
+         )
+         # each kernel is computed exactly once
+         assert kernel_call_count == 6
+@@ -484,7 +488,11 @@ class TestDataArrayAndDataset(DaskTestCase):
+         # stop computing variables as it would not have any benefit
+         ds4 = Dataset(data_vars={"d": ("x", [2.0])}, coords={"c": ("x", [2.0])})
+         out = xr.concat(
+-            [ds1, ds2, ds4, ds3], dim="n", data_vars="different", coords="different"
++            [ds1, ds2, ds4, ds3],
++            dim="n",
++            data_vars="different",
++            coords="different",
++            compat="equals",
+         )
+         # the variables of ds1 and ds2 were computed, but those of ds3 didn't
+         assert kernel_call_count == 22
+@@ -505,7 +513,11 @@ class TestDataArrayAndDataset(DaskTestCase):
+ 
+         # now check that concat() is correctly using dask name equality to skip loads
+         out = xr.concat(
+-            [ds1, ds1, ds1], dim="n", data_vars="different", coords="different"
++            [ds1, ds1, ds1],
++            dim="n",
++            data_vars="different",
++            coords="different",
++            compat="equals",
+         )
+         assert kernel_call_count == 24
+         # variables are not loaded in the output
+@@ -1366,7 +1378,7 @@ def test_map_blocks_ds_transformations(func, map_ds):
+ def test_map_blocks_da_ds_with_template(obj):
+     func = lambda x: x.isel(x=[1])
+     # a simple .isel(x=[1, 5, 9]) puts all those in a single chunk.
+-    template = xr.concat([obj.isel(x=[i]) for i in [1, 5, 9]], dim="x")
++    template = xr.concat([obj.isel(x=[i]) for i in [1, 5, 9]], data_vars=None, dim="x")
+     with raise_if_dask_computes():
+         actual = xr.map_blocks(func, obj, template=template)
+     assert_identical(actual, template)
+@@ -1439,7 +1451,9 @@ def test_map_blocks_errors_bad_template(obj):
+         xr.map_blocks(
+             lambda a: a.isel(x=[1]).assign_coords(x=[120]),  # assign bad index values
+             obj,
+-            template=xr.concat([obj.isel(x=[i]) for i in [1, 5, 9]], dim="x"),
++            template=xr.concat(
++                [obj.isel(x=[i]) for i in [1, 5, 9]], data_vars=None, dim="x"
++            ),
+         ).compute()
+ 
+ 
+
+diff --git a/xarray/tests/test_dataarray.py b/xarray/tests/test_dataarray.py
+index 45c169b..71c1162 100644
+--- a/xarray/tests/test_dataarray.py
++++ b/xarray/tests/test_dataarray.py
+@@ -1439,12 +1439,26 @@ class TestDataArray:
+         # GH: 3512
+         da = DataArray([0, 1], dims=["x"], coords={"x": [0, 1], "y": "a"})
+         db = DataArray([2, 3], dims=["x"], coords={"x": [0, 1], "y": "b"})
+-        data = xr.concat([da, db], dim="x").set_index(xy=["x", "y"])
++        data = xr.concat(
++            [da, db], dim="x", coords="different", compat="equals"
++        ).set_index(xy=["x", "y"])
+         assert data.dims == ("xy",)
+         actual = data.sel(y="a")
+         expected = data.isel(xy=[0, 1]).unstack("xy").squeeze("y")
+         assert_equal(actual, expected)
+ 
++    def test_concat_with_default_coords_warns(self) -> None:
++        da = DataArray([0, 1], dims=["x"], coords={"x": [0, 1], "y": "a"})
++        db = DataArray([2, 3], dims=["x"], coords={"x": [0, 1], "y": "b"})
++
++        with pytest.warns(FutureWarning):
++            original = xr.concat([da, db], dim="x")
++            assert original.y.size == 4
++        with set_options(use_new_combine_kwarg_defaults=True):
++            # default compat="override" will pick the first one
++            new = xr.concat([da, db], dim="x")
++            assert new.y.size == 1
++
+     def test_virtual_default_coords(self) -> None:
+         array = DataArray(np.zeros((5,)), dims="x")
+         expected = DataArray(range(5), dims="x", name="x")
+
+diff --git a/xarray/tests/test_dataset.py b/xarray/tests/test_dataset.py
+index 3e0734c..8e4b09f 100644
+--- a/xarray/tests/test_dataset.py
++++ b/xarray/tests/test_dataset.py
+@@ -13,6 +13,7 @@ from typing import Any, Literal, cast
+ import numpy as np
+ import pandas as pd
+ import pytest
++from packaging.version import Version
+ from pandas.core.indexes.datetimes import DatetimeIndex
+ 
+ # remove once numpy 2.0 is the oldest supported version
+@@ -299,7 +300,7 @@ class TestDataset:
+                 var1     (dim1, dim2) float64 576B -0.9891 -0.3678 1.288 ... -0.2116 0.364
+                 var2     (dim1, dim2) float64 576B 0.953 1.52 1.704 ... 0.1347 -0.6423
+                 var3     (dim3, dim1) float64 640B 0.4107 0.9941 0.1665 ... 0.716 1.555
+-                var4     (dim1) category 32B b c b a c a c a{var5}
++                var4     (dim1) category 3{6 if Version(pd.__version__) >= Version("3.0.0dev0") else 2}B b c b a c a c a{var5}
+             Attributes:
+                 foo:      bar"""
+         )
+@@ -6239,7 +6240,7 @@ class TestDataset:
+         assert_equal(actual, expected)
+ 
+         actual = ds + ds[["bar"]]
+-        expected = (2 * ds[["bar"]]).merge(ds.coords)
++        expected = (2 * ds[["bar"]]).merge(ds.coords, compat="override")
+         assert_identical(expected, actual)
+ 
+         assert_identical(ds + Dataset(), ds.coords.to_dataset())
+@@ -6675,12 +6676,12 @@ class TestDataset:
+             coords={"x": ["a", "b", "c"]},
+         )
+         assert_equal(actual, expected)
+-        assert_equal(actual, xr.merge([dsx0, dsx1]))
++        assert_equal(actual, xr.merge([dsx0, dsx1], join="outer"))
+ 
+         # works just like xr.merge([self, other])
+         dsy2 = DataArray([2, 2, 2], [("x", ["b", "c", "d"])]).to_dataset(name="dsy2")
+         actual = dsx0.combine_first(dsy2)
+-        expected = xr.merge([dsy2, dsx0])
++        expected = xr.merge([dsy2, dsx0], join="outer")
+         assert_equal(actual, expected)
+ 
+     def test_sortby(self) -> None:
+
+diff --git a/xarray/tests/test_datatree.py b/xarray/tests/test_datatree.py
+index 2bf079a..efa2538 100644
+--- a/xarray/tests/test_datatree.py
++++ b/xarray/tests/test_datatree.py
+@@ -1942,6 +1942,85 @@ class TestSubset:
+         )
+         assert_identical(actual, expected)
+ 
++    def test_prune_basic(self) -> None:
++        tree = DataTree.from_dict(
++            {"/a": xr.Dataset({"foo": ("x", [1, 2])}), "/b": xr.Dataset()}
++        )
++
++        pruned = tree.prune()
++
++        assert "a" in pruned.children
++        assert "b" not in pruned.children
++        assert_identical(
++            pruned.children["a"].to_dataset(), tree.children["a"].to_dataset()
++        )
++
++    def test_prune_with_zero_size_vars(self) -> None:
++        tree = DataTree.from_dict(
++            {
++                "/a": xr.Dataset({"foo": ("x", [1, 2])}),
++                "/b": xr.Dataset({"empty": ("dim", [])}),
++                "/c": xr.Dataset(),
++            }
++        )
++
++        pruned_default = tree.prune()
++        expected_default = DataTree.from_dict(
++            {
++                "/a": xr.Dataset({"foo": ("x", [1, 2])}),
++                "/b": xr.Dataset({"empty": ("dim", [])}),
++            }
++        )
++        assert_identical(pruned_default, expected_default)
++
++        pruned_strict = tree.prune(drop_size_zero_vars=True)
++        expected_strict = DataTree.from_dict(
++            {
++                "/a": xr.Dataset({"foo": ("x", [1, 2])}),
++            }
++        )
++        assert_identical(pruned_strict, expected_strict)
++
++    def test_prune_with_intermediate_nodes(self) -> None:
++        tree = DataTree.from_dict(
++            {
++                "/": xr.Dataset(),
++                "/group1": xr.Dataset(),
++                "/group1/subA": xr.Dataset({"temp": ("x", [1, 2])}),
++                "/group1/subB": xr.Dataset(),
++                "/group2": xr.Dataset({"empty": ("dim", [])}),
++            }
++        )
++        pruned = tree.prune()
++        expected_tree = DataTree.from_dict(
++            {
++                "/group1/subA": xr.Dataset({"temp": ("x", [1, 2])}),
++                "/group2": xr.Dataset({"empty": ("dim", [])}),
++            }
++        )
++        assert_identical(pruned, expected_tree)
++
++    def test_prune_after_filtering(self) -> None:
++        from pandas import date_range
++
++        ds1 = xr.Dataset(
++            {"foo": ("time", [1, 2, 3, 4, 5])},
++            coords={"time": date_range("2023-01-01", periods=5, freq="D")},
++        )
++        ds2 = xr.Dataset(
++            {"var": ("time", [1, 2, 3, 4, 5])},
++            coords={"time": date_range("2023-01-04", periods=5, freq="D")},
++        )
++
++        tree = DataTree.from_dict({"a": ds1, "b": ds2})
++        filtered = tree.sel(time=slice("2023-01-01", "2023-01-03"))
++
++        pruned = filtered.prune(drop_size_zero_vars=True)
++        expected_tree = DataTree.from_dict(
++            {"a": ds1.sel(time=slice("2023-01-01", "2023-01-03"))}
++        )
++        assert_identical(pruned, expected_tree)
++
+ 
+ class TestIndexing:
+     def test_isel_siblings(self) -> None:
+
+diff --git a/xarray/tests/test_duck_array_wrapping.py b/xarray/tests/test_duck_array_wrapping.py
+index 4244038..340669b 100644
+--- a/xarray/tests/test_duck_array_wrapping.py
++++ b/xarray/tests/test_duck_array_wrapping.py
+@@ -163,7 +163,7 @@ class TestTopLevelMethods(_BaseTest):
+         assert isinstance(result.data, self.Array)
+ 
+     def test_merge(self):
+-        result = xr.merge([self.x1, self.x2], compat="override")
++        result = xr.merge([self.x1, self.x2], compat="override", join="outer")
+         assert isinstance(result.foo.data, self.Array)
+ 
+     def test_where(self):
+
+diff --git a/xarray/tests/test_groupby.py b/xarray/tests/test_groupby.py
+index 731574b..66dfd2c 100644
+--- a/xarray/tests/test_groupby.py
++++ b/xarray/tests/test_groupby.py
+@@ -2438,6 +2438,7 @@ class TestDatasetResample:
+                 for i in range(3)
+             ],
+             dim=actual["time"],
++            data_vars="all",
+         )
+         assert_allclose(expected, actual)
+ 
+
+diff --git a/xarray/tests/test_indexing.py b/xarray/tests/test_indexing.py
+index 6dd75b5..67bb23c 100644
+--- a/xarray/tests/test_indexing.py
++++ b/xarray/tests/test_indexing.py
+@@ -305,6 +305,22 @@ class TestLazyArray:
+                     actual = x[new_slice]
+                     assert_array_equal(expected, actual)
+ 
++    @pytest.mark.parametrize(
++        ["old_slice", "array", "size"],
++        (
++            (slice(None, 8), np.arange(2, 6), 10),
++            (slice(2, None), np.arange(2, 6), 10),
++            (slice(1, 10, 2), np.arange(1, 4), 15),
++            (slice(10, None, -1), np.array([2, 5, 7]), 12),
++            (slice(2, None, 2), np.array([3, -2, 5, -1]), 13),
++            (slice(8, None), np.array([1, -2, 2, -1, -7]), 20),
++        ),
++    )
++    def test_slice_slice_by_array(self, old_slice, array, size):
++        actual = indexing.slice_slice_by_array(old_slice, array, size)
++        expected = np.arange(size)[old_slice][array]
++        assert_array_equal(actual, expected)
++
+     def test_lazily_indexed_array(self) -> None:
+         original = np.random.rand(10, 20, 30)
+         x = indexing.NumpyIndexingAdapter(original)
+@@ -490,6 +506,25 @@ class TestMemoryCachedArray:
+         assert isinstance(child.array, indexing.NumpyIndexingAdapter)
+         assert isinstance(wrapped.array, indexing.LazilyIndexedArray)
+ 
++    @pytest.mark.asyncio
++    async def test_async_wrapper(self) -> None:
++        original = indexing.LazilyIndexedArray(np.arange(10))
++        wrapped = indexing.MemoryCachedArray(original)
++        await wrapped.async_get_duck_array()
++        assert_array_equal(wrapped, np.arange(10))
++        assert isinstance(wrapped.array, indexing.NumpyIndexingAdapter)
++
++    @pytest.mark.asyncio
++    async def test_async_sub_array(self) -> None:
++        original = indexing.LazilyIndexedArray(np.arange(10))
++        wrapped = indexing.MemoryCachedArray(original)
++        child = wrapped[B[:5]]
++        assert isinstance(child, indexing.MemoryCachedArray)
++        await child.async_get_duck_array()
++        assert_array_equal(child, np.arange(5))
++        assert isinstance(child.array, indexing.NumpyIndexingAdapter)
++        assert isinstance(wrapped.array, indexing.LazilyIndexedArray)
++
+     def test_setitem(self) -> None:
+         original = np.arange(10)
+         wrapped = indexing.MemoryCachedArray(original)
+
+diff --git a/xarray/tests/test_interp.py b/xarray/tests/test_interp.py
+index 7d5a9bf..dd3906c 100644
+--- a/xarray/tests/test_interp.py
++++ b/xarray/tests/test_interp.py
+@@ -1065,6 +1065,28 @@ def test_interp1d_complex_out_of_bounds() -> None:
+     assert_identical(actual, expected)
+ 
+ 
++@requires_scipy
++def test_interp_non_numeric_scalar() -> None:
++    ds = xr.Dataset(
++        {
++            "non_numeric": ("time", np.array(["a"])),
++        },
++        coords={"time": (np.array([0]))},
++    )
++    actual = ds.interp(time=np.linspace(0, 3, 3))
++
++    expected = xr.Dataset(
++        {
++            "non_numeric": ("time", np.array(["a", "a", "a"])),
++        },
++        coords={"time": np.linspace(0, 3, 3)},
++    )
++    xr.testing.assert_identical(actual, expected)
++
++    # Make sure the array is a copy:
++    assert actual["non_numeric"].data.base is None
++
++
+ @requires_scipy
+ def test_interp_non_numeric_1d() -> None:
+     ds = xr.Dataset(
+
+diff --git a/xarray/tests/test_merge.py b/xarray/tests/test_merge.py
+index 1b4e1e3..8ae05fb 100644
+--- a/xarray/tests/test_merge.py
++++ b/xarray/tests/test_merge.py
+@@ -5,6 +5,7 @@ import pytest
+ 
+ import xarray as xr
+ from xarray.core import dtypes
++from xarray.core.options import set_options
+ from xarray.structure import merge
+ from xarray.structure.merge import MergeError
+ from xarray.testing import assert_equal, assert_identical
+@@ -37,15 +38,17 @@ class TestMergeFunction:
+         expected = data[["var1", "var2"]]
+         assert_identical(actual, expected)
+ 
+-    def test_merge_datasets(self):
+-        data = create_test_data(add_attrs=False, use_extension_array=True)
++    @pytest.mark.parametrize("use_new_combine_kwarg_defaults", [True, False])
++    def test_merge_datasets(self, use_new_combine_kwarg_defaults):
++        with set_options(use_new_combine_kwarg_defaults=use_new_combine_kwarg_defaults):
++            data = create_test_data(add_attrs=False, use_extension_array=True)
+ 
+-        actual = xr.merge([data[["var1"]], data[["var2"]]])
+-        expected = data[["var1", "var2"]]
+-        assert_identical(actual, expected)
++            actual = xr.merge([data[["var1"]], data[["var2"]]])
++            expected = data[["var1", "var2"]]
++            assert_identical(actual, expected)
+ 
+-        actual = xr.merge([data, data])
+-        assert_identical(actual, data)
++            actual = xr.merge([data, data])
++            assert_identical(actual, data)
+ 
+     def test_merge_dataarray_unnamed(self):
+         data = xr.DataArray([1, 2], dims="x")
+@@ -194,9 +197,15 @@ class TestMergeFunction:
+ 
+         if expect_exception:
+             with pytest.raises(MergeError, match="combine_attrs"):
+-                actual = xr.merge([data1, data2], combine_attrs=combine_attrs)
++                with pytest.warns(
++                    FutureWarning,
++                    match="will change from compat='no_conflicts' to compat='override'",
++                ):
++                    actual = xr.merge([data1, data2], combine_attrs=combine_attrs)
+         else:
+-            actual = xr.merge([data1, data2], combine_attrs=combine_attrs)
++            actual = xr.merge(
++                [data1, data2], compat="no_conflicts", combine_attrs=combine_attrs
++            )
+             expected = xr.Dataset(
+                 {"var1": ("dim1", [], expected_attrs)},
+                 coords={"dim1": ("dim1", [], expected_attrs)},
+@@ -275,8 +284,12 @@ class TestMergeFunction:
+         ds1 = xr.Dataset({"a": ("x", [1, 2]), "x": [0, 1]})
+         ds2 = xr.Dataset({"a": ("x", [2, 3]), "x": [1, 2]})
+         expected = xr.Dataset({"a": ("x", [1, 2, 3]), "x": [0, 1, 2]})
+-        assert expected.identical(xr.merge([ds1, ds2], compat="no_conflicts"))
+-        assert expected.identical(xr.merge([ds2, ds1], compat="no_conflicts"))
++        assert expected.identical(
++            xr.merge([ds1, ds2], compat="no_conflicts", join="outer")
++        )
++        assert expected.identical(
++            xr.merge([ds2, ds1], compat="no_conflicts", join="outer")
++        )
+         assert ds1.identical(xr.merge([ds1, ds2], compat="no_conflicts", join="left"))
+         assert ds2.identical(xr.merge([ds1, ds2], compat="no_conflicts", join="right"))
+         expected = xr.Dataset({"a": ("x", [2]), "x": [1]})
+@@ -286,11 +299,11 @@ class TestMergeFunction:
+ 
+         with pytest.raises(xr.MergeError):
+             ds3 = xr.Dataset({"a": ("x", [99, 3]), "x": [1, 2]})
+-            xr.merge([ds1, ds3], compat="no_conflicts")
++            xr.merge([ds1, ds3], compat="no_conflicts", join="outer")
+ 
+         with pytest.raises(xr.MergeError):
+             ds3 = xr.Dataset({"a": ("y", [2, 3]), "y": [1, 2]})
+-            xr.merge([ds1, ds3], compat="no_conflicts")
++            xr.merge([ds1, ds3], compat="no_conflicts", join="outer")
+ 
+     def test_merge_no_conflicts_multi_var(self):
+         data = create_test_data(add_attrs=False)
+@@ -317,12 +330,12 @@ class TestMergeFunction:
+ 
+     def test_merge_no_conflicts_broadcast(self):
+         datasets = [xr.Dataset({"x": ("y", [0])}), xr.Dataset({"x": np.nan})]
+-        actual = xr.merge(datasets)
++        actual = xr.merge(datasets, compat="no_conflicts")
+         expected = xr.Dataset({"x": ("y", [0])})
+         assert_identical(expected, actual)
+ 
+         datasets = [xr.Dataset({"x": ("y", [np.nan])}), xr.Dataset({"x": 0})]
+-        actual = xr.merge(datasets)
++        actual = xr.merge(datasets, compat="no_conflicts")
+         assert_identical(expected, actual)
+ 
+ 
+@@ -345,32 +358,35 @@ class TestMergeMethod:
+         actual = data.merge(data.reset_coords(drop=True))
+         assert_identical(data, actual)
+ 
+-        with pytest.raises(ValueError):
++        with pytest.raises(ValueError, match="conflicting values for variable"):
+             ds1.merge(ds2.rename({"var3": "var1"}))
+         with pytest.raises(ValueError, match=r"should be coordinates or not"):
+             data.reset_coords().merge(data)
+         with pytest.raises(ValueError, match=r"should be coordinates or not"):
+             data.merge(data.reset_coords())
+ 
+-    def test_merge_drop_attrs(self):
++    @pytest.mark.parametrize(
++        "join", ["outer", "inner", "left", "right", "exact", "override"]
++    )
++    def test_merge_drop_attrs(self, join):
+         data = create_test_data()
+         ds1 = data[["var1"]]
+         ds2 = data[["var3"]]
+         ds1.coords["dim2"].attrs["keep me"] = "example"
+         ds2.coords["numbers"].attrs["foo"] = "bar"
+-        actual = ds1.merge(ds2, combine_attrs="drop")
++        actual = ds1.merge(ds2, combine_attrs="drop", join=join)
+         assert actual.coords["dim2"].attrs == {}
+         assert actual.coords["numbers"].attrs == {}
+         assert ds1.coords["dim2"].attrs["keep me"] == "example"
+         assert ds2.coords["numbers"].attrs["foo"] == "bar"
+ 
+-    def test_merge_broadcast_equals(self):
++    def test_merge_compat_broadcast_equals(self):
+         ds1 = xr.Dataset({"x": 0})
+         ds2 = xr.Dataset({"x": ("y", [0, 0])})
+-        actual = ds1.merge(ds2)
++        actual = ds1.merge(ds2, compat="broadcast_equals")
+         assert_identical(ds2, actual)
+ 
+-        actual = ds2.merge(ds1)
++        actual = ds2.merge(ds1, compat="broadcast_equals")
+         assert_identical(ds2, actual)
+ 
+         actual = ds1.copy()
+@@ -379,7 +395,7 @@ class TestMergeMethod:
+ 
+         ds1 = xr.Dataset({"x": np.nan})
+         ds2 = xr.Dataset({"x": ("y", [np.nan, np.nan])})
+-        actual = ds1.merge(ds2)
++        actual = ds1.merge(ds2, compat="broadcast_equals")
+         assert_identical(ds2, actual)
+ 
+     def test_merge_compat(self):
+@@ -404,6 +420,7 @@ class TestMergeMethod:
+         assert ds1.identical(ds1.merge(ds2, compat="override"))
+ 
+     def test_merge_compat_minimal(self) -> None:
++        """Test that we drop the conflicting bar coordinate."""
+         # https://github.com/pydata/xarray/issues/7405
+         # https://github.com/pydata/xarray/issues/7588
+         ds1 = xr.Dataset(coords={"foo": [1, 2, 3], "bar": 4})
+@@ -413,14 +430,14 @@ class TestMergeMethod:
+         expected = xr.Dataset(coords={"foo": [1, 2, 3]})
+         assert_identical(actual, expected)
+ 
+-    def test_merge_auto_align(self):
++    def test_merge_join_outer(self):
+         ds1 = xr.Dataset({"a": ("x", [1, 2]), "x": [0, 1]})
+         ds2 = xr.Dataset({"b": ("x", [3, 4]), "x": [1, 2]})
+         expected = xr.Dataset(
+             {"a": ("x", [1, 2, np.nan]), "b": ("x", [np.nan, 3, 4])}, {"x": [0, 1, 2]}
+         )
+-        assert expected.identical(ds1.merge(ds2))
+-        assert expected.identical(ds2.merge(ds1))
++        assert expected.identical(ds1.merge(ds2, join="outer"))
++        assert expected.identical(ds2.merge(ds1, join="outer"))
+ 
+         expected = expected.isel(x=slice(2))
+         assert expected.identical(ds1.merge(ds2, join="left"))
+@@ -448,17 +465,19 @@ class TestMergeMethod:
+             {"a": ("x", [1, 2, fill_value_a]), "b": ("x", [fill_value_b, 3, 4])},
+             {"x": [0, 1, 2]},
+         )
+-        assert expected.identical(ds1.merge(ds2, fill_value=fill_value))
+-        assert expected.identical(ds2.merge(ds1, fill_value=fill_value))
+-        assert expected.identical(xr.merge([ds1, ds2], fill_value=fill_value))
++        assert expected.identical(ds1.merge(ds2, join="outer", fill_value=fill_value))
++        assert expected.identical(ds2.merge(ds1, join="outer", fill_value=fill_value))
++        assert expected.identical(
++            xr.merge([ds1, ds2], join="outer", fill_value=fill_value)
++        )
+ 
+     def test_merge_no_conflicts(self):
+         ds1 = xr.Dataset({"a": ("x", [1, 2]), "x": [0, 1]})
+         ds2 = xr.Dataset({"a": ("x", [2, 3]), "x": [1, 2]})
+         expected = xr.Dataset({"a": ("x", [1, 2, 3]), "x": [0, 1, 2]})
+ 
+-        assert expected.identical(ds1.merge(ds2, compat="no_conflicts"))
+-        assert expected.identical(ds2.merge(ds1, compat="no_conflicts"))
++        assert expected.identical(ds1.merge(ds2, compat="no_conflicts", join="outer"))
++        assert expected.identical(ds2.merge(ds1, compat="no_conflicts", join="outer"))
+ 
+         assert ds1.identical(ds1.merge(ds2, compat="no_conflicts", join="left"))
+ 
+@@ -469,11 +488,11 @@ class TestMergeMethod:
+ 
+         with pytest.raises(xr.MergeError):
+             ds3 = xr.Dataset({"a": ("x", [99, 3]), "x": [1, 2]})
+-            ds1.merge(ds3, compat="no_conflicts")
++            ds1.merge(ds3, compat="no_conflicts", join="outer")
+ 
+         with pytest.raises(xr.MergeError):
+             ds3 = xr.Dataset({"a": ("y", [2, 3]), "y": [1, 2]})
+-            ds1.merge(ds3, compat="no_conflicts")
++            ds1.merge(ds3, compat="no_conflicts", join="outer")
+ 
+     def test_merge_dataarray(self):
+         ds = xr.Dataset({"a": 0})
+@@ -511,3 +530,76 @@ class TestMergeMethod:
+             actual = ds1.merge(ds2, combine_attrs=combine_attrs)
+             expected = xr.Dataset(attrs=expected_attrs)
+             assert_identical(actual, expected)
++
++
++class TestNewDefaults:
++    def test_merge_datasets_false_warning(self):
++        data = create_test_data(add_attrs=False, use_extension_array=True)
++
++        with set_options(use_new_combine_kwarg_defaults=False):
++            old = xr.merge([data, data])
++
++        with set_options(use_new_combine_kwarg_defaults=True):
++            new = xr.merge([data, data])
++
++        assert_identical(old, new)
++
++    def test_merge(self):
++        data = create_test_data()
++        ds1 = data[["var1"]]
++        ds2 = data[["var3"]]
++        expected = data[["var1", "var3"]]
++        with set_options(use_new_combine_kwarg_defaults=True):
++            actual = ds1.merge(ds2)
++            assert_identical(expected, actual)
++
++            actual = ds2.merge(ds1)
++            assert_identical(expected, actual)
++
++            actual = data.merge(data)
++            assert_identical(data, actual)
++
++            ds1.merge(ds2.rename({"var3": "var1"}))
++
++            with pytest.raises(ValueError, match=r"should be coordinates or not"):
++                data.reset_coords().merge(data)
++            with pytest.raises(ValueError, match=r"should be coordinates or not"):
++                data.merge(data.reset_coords())
++
++    def test_merge_broadcast_equals(self):
++        ds1 = xr.Dataset({"x": 0})
++        ds2 = xr.Dataset({"x": ("y", [0, 0])})
++
++        with set_options(use_new_combine_kwarg_defaults=False):
++            with pytest.warns(
++                FutureWarning,
++                match="will change from compat='no_conflicts' to compat='override'",
++            ):
++                old = ds1.merge(ds2)
++
++        with set_options(use_new_combine_kwarg_defaults=True):
++            new = ds1.merge(ds2)
++
++        assert_identical(ds2, old)
++        with pytest.raises(AssertionError):
++            assert_identical(old, new)
++
++    def test_merge_auto_align(self):
++        ds1 = xr.Dataset({"a": ("x", [1, 2]), "x": [0, 1]})
++        ds2 = xr.Dataset({"b": ("x", [3, 4]), "x": [1, 2]})
++        expected = xr.Dataset(
++            {"a": ("x", [1, 2, np.nan]), "b": ("x", [np.nan, 3, 4])}, {"x": [0, 1, 2]}
++        )
++        with set_options(use_new_combine_kwarg_defaults=False):
++            with pytest.warns(
++                FutureWarning, match="will change from join='outer' to join='exact'"
++            ):
++                assert expected.identical(ds1.merge(ds2))
++            with pytest.warns(
++                FutureWarning, match="will change from join='outer' to join='exact'"
++            ):
++                assert expected.identical(ds2.merge(ds1))
++
++        with set_options(use_new_combine_kwarg_defaults=True):
++            with pytest.raises(ValueError, match="might be related to new default"):
++                expected.identical(ds2.merge(ds1))
+
+diff --git a/xarray/tests/test_pandas_to_xarray.py b/xarray/tests/test_pandas_to_xarray.py
+index 1118665..8346f5a 100644
+--- a/xarray/tests/test_pandas_to_xarray.py
++++ b/xarray/tests/test_pandas_to_xarray.py
+@@ -37,6 +37,7 @@ import numpy as np
+ import pandas as pd
+ import pandas._testing as tm
+ import pytest
++from packaging.version import Version
+ from pandas import (
+     Categorical,
+     CategoricalIndex,
+@@ -171,7 +172,9 @@ class TestDataFrameToXArray:
+ 
+         result = result.to_dataframe()
+         expected = df.copy()
+-        expected["f"] = expected["f"].astype(object)
++        expected["f"] = expected["f"].astype(
++            object if Version(pd.__version__) < Version("3.0.0dev0") else str
++        )
+         expected.columns.name = None
+         tm.assert_frame_equal(result, expected)
+ 
+
+diff --git a/xarray/tests/test_plot.py b/xarray/tests/test_plot.py
+index bfe0b81..3dd8a4f 100644
+--- a/xarray/tests/test_plot.py
++++ b/xarray/tests/test_plot.py
+@@ -331,9 +331,10 @@ class TestPlot(PlotTestCase):
+         assert not plt.gca().get_legend()
+         plt.cla()
+         self.darray[:, :, 0].plot.line(x="dim_0", add_legend=True)
+-        assert plt.gca().get_legend()
++        legend = plt.gca().get_legend()
++        assert legend is not None
+         # check whether legend title is set
+-        assert plt.gca().get_legend().get_title().get_text() == "dim_1"
++        assert legend.get_title().get_text() == "dim_1"
+ 
+     def test_2d_line_accepts_x_kw(self) -> None:
+         self.darray[:, :, 0].plot.line(x="dim_0")
+@@ -344,10 +345,14 @@ class TestPlot(PlotTestCase):
+ 
+     def test_2d_line_accepts_hue_kw(self) -> None:
+         self.darray[:, :, 0].plot.line(hue="dim_0")
+-        assert plt.gca().get_legend().get_title().get_text() == "dim_0"
++        legend = plt.gca().get_legend()
++        assert legend is not None
++        assert legend.get_title().get_text() == "dim_0"
+         plt.cla()
+         self.darray[:, :, 0].plot.line(hue="dim_1")
+-        assert plt.gca().get_legend().get_title().get_text() == "dim_1"
++        legend = plt.gca().get_legend()
++        assert legend is not None
++        assert legend.get_title().get_text() == "dim_1"
+ 
+     def test_2d_coords_line_plot(self) -> None:
+         lon, lat = np.meshgrid(np.linspace(-20, 20, 5), np.linspace(0, 30, 4))
+@@ -595,7 +600,7 @@ class TestPlot(PlotTestCase):
+                 [-137.85, -120.99, -103.28, -85.28, -67.62],
+             ]
+         )
+-        data = np.sqrt(lon**2 + lat**2)
++        data = np.hypot(lon, lat)
+         da = DataArray(
+             data,
+             dims=("y", "x"),
+@@ -2917,7 +2922,9 @@ class TestDatasetScatterPlots(PlotTestCase):
+         pc = ds2.plot.scatter(x="A", y="B", markersize="hue")
+         axes = pc.axes
+         assert axes is not None
+-        actual = [t.get_text() for t in axes.get_legend().texts]
++        legend = axes.get_legend()
++        assert legend is not None
++        actual = [t.get_text() for t in legend.texts]
+         expected = ["hue", "a", "b"]
+         assert actual == expected
+ 
+@@ -3183,8 +3190,8 @@ def test_plot_transposes_properly(plotfunc) -> None:
+ def test_facetgrid_single_contour() -> None:
+     # regression test for GH3569
+     x, y = np.meshgrid(np.arange(12), np.arange(12))
+-    z = xr.DataArray(np.sqrt(x**2 + y**2))
+-    z2 = xr.DataArray(np.sqrt(x**2 + y**2) + 1)
++    z = xr.DataArray(np.hypot(x, y))
++    z2 = xr.DataArray(np.hypot(x, y) + 1)
+     ds = xr.concat([z, z2], dim="time")
+     ds["time"] = [0, 1]
+ 
+
+diff --git a/xarray/tests/test_range_index.py b/xarray/tests/test_range_index.py
+index d0644ba..a2412b7 100644
+--- a/xarray/tests/test_range_index.py
++++ b/xarray/tests/test_range_index.py
+@@ -166,6 +166,62 @@ def test_range_index_isel() -> None:
+     assert_identical(actual, expected)
+ 
+ 
++def test_range_index_empty_slice() -> None:
++    """Test that empty slices of RangeIndex are printable and preserve step.
++
++    Regression test for https://github.com/pydata/xarray/issues/10547
++    """
++    # Test with linspace
++    n = 30
++    step = 1
++    da = xr.DataArray(np.zeros(n), dims=["x"])
++    da = da.assign_coords(
++        xr.Coordinates.from_xindex(RangeIndex.linspace(0, (n - 1) * step, n, dim="x"))
++    )
++
++    # This should not raise ZeroDivisionError
++    sub = da.isel(x=slice(0))
++    assert sub.sizes["x"] == 0
++
++    # Test that it's printable
++    repr_str = repr(sub)
++    assert "RangeIndex" in repr_str
++    assert "step=1" in repr_str
++
++    # Test with different step values
++    index = RangeIndex.arange(0, 10, 2.5, dim="y")
++    da2 = xr.DataArray(np.zeros(4), dims=["y"])
++    da2 = da2.assign_coords(xr.Coordinates.from_xindex(index))
++    empty = da2.isel(y=slice(0))
++
++    # Should preserve step
++    assert empty.sizes["y"] == 0
++    range_index_y = empty._indexes["y"]
++    assert isinstance(range_index_y, RangeIndex)
++    assert range_index_y.step == 2.5
++
++    # Test that it's printable
++    repr_str2 = repr(empty)
++    assert "RangeIndex" in repr_str2
++    assert "step=2.5" in repr_str2
++
++    # Test negative step
++    index3 = RangeIndex.arange(10, 0, -1, dim="z")
++    da3 = xr.DataArray(np.zeros(10), dims=["z"])
++    da3 = da3.assign_coords(xr.Coordinates.from_xindex(index3))
++    empty3 = da3.isel(z=slice(0))
++
++    assert empty3.sizes["z"] == 0
++    range_index_z = empty3._indexes["z"]
++    assert isinstance(range_index_z, RangeIndex)
++    assert range_index_z.step == -1.0
++
++    # Test that it's printable
++    repr_str3 = repr(empty3)
++    assert "RangeIndex" in repr_str3
++    assert "step=-1" in repr_str3
++
++
+ def test_range_index_sel() -> None:
+     ds = create_dataset_arange(0.0, 1.0, 0.1)
+ 
+
+diff --git a/xarray/tests/test_units.py b/xarray/tests/test_units.py
+index 7635dde..c955b3c 100644
+--- a/xarray/tests/test_units.py
++++ b/xarray/tests/test_units.py
+@@ -731,6 +731,9 @@ def test_broadcast_dataset(dtype):
+         "coords",
+     ),
+ )
++@pytest.mark.filterwarnings(
++    "ignore:.*the default value for coords will change:FutureWarning"
++)
+ def test_combine_by_coords(variant, unit, error, dtype):
+     original_unit = unit_registry.m
+ 
+@@ -808,6 +811,12 @@ def test_combine_by_coords(variant, unit, error, dtype):
+         "coords",
+     ),
+ )
++@pytest.mark.filterwarnings(
++    "ignore:.*the default value for join will change:FutureWarning"
++)
++@pytest.mark.filterwarnings(
++    "ignore:.*the default value for compat will change:FutureWarning"
++)
+ def test_combine_nested(variant, unit, error, dtype):
+     original_unit = unit_registry.m
+ 
+@@ -1048,6 +1057,12 @@ def test_concat_dataset(variant, unit, error, dtype):
+         "coords",
+     ),
+ )
++@pytest.mark.filterwarnings(
++    "ignore:.*the default value for join will change:FutureWarning"
++)
++@pytest.mark.filterwarnings(
++    "ignore:.*the default value for compat will change:FutureWarning"
++)
+ def test_merge_dataarray(variant, unit, error, dtype):
+     original_unit = unit_registry.m
+ 
+@@ -1152,6 +1167,12 @@ def test_merge_dataarray(variant, unit, error, dtype):
+         "coords",
+     ),
+ )
++@pytest.mark.filterwarnings(
++    "ignore:.*the default value for join will change:FutureWarning"
++)
++@pytest.mark.filterwarnings(
++    "ignore:.*the default value for compat will change:FutureWarning"
++)
+ def test_merge_dataset(variant, unit, error, dtype):
+     original_unit = unit_registry.m
+ 
+@@ -5570,6 +5591,12 @@ class TestDataset:
+             "coords",
+         ),
+     )
++    @pytest.mark.filterwarnings(
++        "ignore:.*the default value for join will change:FutureWarning"
++    )
++    @pytest.mark.filterwarnings(
++        "ignore:.*the default value for compat will change:FutureWarning"
++    )
+     def test_merge(self, variant, unit, error, dtype):
+         left_variants = {
+             "data": (unit_registry.m, 1, 1),
+
+diff --git a/xarray/tests/test_variable.py b/xarray/tests/test_variable.py
+index 2f67e97..de77ec0 100644
+--- a/xarray/tests/test_variable.py
++++ b/xarray/tests/test_variable.py
+@@ -1594,7 +1594,7 @@ class TestVariable(VariableSubclassobjects):
+         data = pd.Categorical(np.arange(10, dtype="int64"))
+         v = self.cls("x", data)
+         print(v)  # should not error
+-        assert pd.api.types.is_extension_array_dtype(v.dtype)
++        assert isinstance(v.dtype, pd.CategoricalDtype)
+ 
+     def test_squeeze(self):
+         v = Variable(["x", "y"], [[1]])
+@@ -2897,18 +2897,34 @@ class TestBackendIndexing:
+         self.d = np.random.random((10, 3)).astype(np.float64)
+         self.cat = PandasExtensionArray(pd.Categorical(["a", "b"] * 5))
+ 
+-    def check_orthogonal_indexing(self, v):
+-        assert np.allclose(v.isel(x=[8, 3], y=[2, 1]), self.d[[8, 3]][:, [2, 1]])
++    async def check_orthogonal_indexing(self, v, load_async):
++        expected = self.d[[8, 3]][:, [2, 1]]
+ 
+-    def check_vectorized_indexing(self, v):
++        if load_async:
++            result = await v.isel(x=[8, 3], y=[2, 1]).load_async()
++        else:
++            result = v.isel(x=[8, 3], y=[2, 1])
++
++        assert np.allclose(result, expected)
++
++    async def check_vectorized_indexing(self, v, load_async):
+         ind_x = Variable("z", [0, 2])
+         ind_y = Variable("z", [2, 1])
+-        assert np.allclose(v.isel(x=ind_x, y=ind_y), self.d[ind_x, ind_y])
++        expected = self.d[ind_x, ind_y]
++
++        if load_async:
++            result = await v.isel(x=ind_x, y=ind_y).load_async()
++        else:
++            result = v.isel(x=ind_x, y=ind_y).load()
++
++        assert np.allclose(result, expected)
+ 
+-    def test_NumpyIndexingAdapter(self):
++    @pytest.mark.asyncio
++    @pytest.mark.parametrize("load_async", [True, False])
++    async def test_NumpyIndexingAdapter(self, load_async):
+         v = Variable(dims=("x", "y"), data=NumpyIndexingAdapter(self.d))
+-        self.check_orthogonal_indexing(v)
+-        self.check_vectorized_indexing(v)
++        await self.check_orthogonal_indexing(v, load_async)
++        await self.check_vectorized_indexing(v, load_async)
+         # could not doubly wrapping
+         with pytest.raises(TypeError, match=r"NumpyIndexingAdapter only wraps "):
+             v = Variable(
+@@ -2923,54 +2939,62 @@ class TestBackendIndexing:
+         lazy = Variable(dims=("x"), data=LazilyIndexedArray(self.cat))
+         assert (lazy[[0, 1, 5]] == ["a", "b", "b"]).all()
+ 
+-    def test_LazilyIndexedArray(self):
++    @pytest.mark.asyncio
++    @pytest.mark.parametrize("load_async", [True, False])
++    async def test_LazilyIndexedArray(self, load_async):
+         v = Variable(dims=("x", "y"), data=LazilyIndexedArray(self.d))
+-        self.check_orthogonal_indexing(v)
+-        self.check_vectorized_indexing(v)
++        await self.check_orthogonal_indexing(v, load_async)
++        await self.check_vectorized_indexing(v, load_async)
+         # doubly wrapping
+         v = Variable(
+             dims=("x", "y"),
+             data=LazilyIndexedArray(LazilyIndexedArray(self.d)),
+         )
+-        self.check_orthogonal_indexing(v)
++        await self.check_orthogonal_indexing(v, load_async)
+         # hierarchical wrapping
+         v = Variable(
+             dims=("x", "y"), data=LazilyIndexedArray(NumpyIndexingAdapter(self.d))
+         )
+-        self.check_orthogonal_indexing(v)
++        await self.check_orthogonal_indexing(v, load_async)
+ 
+-    def test_CopyOnWriteArray(self):
++    @pytest.mark.asyncio
++    @pytest.mark.parametrize("load_async", [True, False])
++    async def test_CopyOnWriteArray(self, load_async):
+         v = Variable(dims=("x", "y"), data=CopyOnWriteArray(self.d))
+-        self.check_orthogonal_indexing(v)
+-        self.check_vectorized_indexing(v)
++        await self.check_orthogonal_indexing(v, load_async)
++        await self.check_vectorized_indexing(v, load_async)
+         # doubly wrapping
+         v = Variable(dims=("x", "y"), data=CopyOnWriteArray(LazilyIndexedArray(self.d)))
+-        self.check_orthogonal_indexing(v)
+-        self.check_vectorized_indexing(v)
++        await self.check_orthogonal_indexing(v, load_async)
++        await self.check_vectorized_indexing(v, load_async)
+ 
+-    def test_MemoryCachedArray(self):
++    @pytest.mark.asyncio
++    @pytest.mark.parametrize("load_async", [True, False])
++    async def test_MemoryCachedArray(self, load_async):
+         v = Variable(dims=("x", "y"), data=MemoryCachedArray(self.d))
+-        self.check_orthogonal_indexing(v)
+-        self.check_vectorized_indexing(v)
++        await self.check_orthogonal_indexing(v, load_async)
++        await self.check_vectorized_indexing(v, load_async)
+         # doubly wrapping
+         v = Variable(dims=("x", "y"), data=CopyOnWriteArray(MemoryCachedArray(self.d)))
+-        self.check_orthogonal_indexing(v)
+-        self.check_vectorized_indexing(v)
++        await self.check_orthogonal_indexing(v, load_async)
++        await self.check_vectorized_indexing(v, load_async)
+ 
+     @requires_dask
+-    def test_DaskIndexingAdapter(self):
++    @pytest.mark.asyncio
++    @pytest.mark.parametrize("load_async", [True, False])
++    async def test_DaskIndexingAdapter(self, load_async):
+         import dask.array as da
+ 
+         dask_array = da.asarray(self.d)
+         v = Variable(dims=("x", "y"), data=DaskIndexingAdapter(dask_array))
+-        self.check_orthogonal_indexing(v)
+-        self.check_vectorized_indexing(v)
++        await self.check_orthogonal_indexing(v, load_async)
++        await self.check_vectorized_indexing(v, load_async)
+         # doubly wrapping
+         v = Variable(
+             dims=("x", "y"), data=CopyOnWriteArray(DaskIndexingAdapter(dask_array))
+         )
+-        self.check_orthogonal_indexing(v)
+-        self.check_vectorized_indexing(v)
++        await self.check_orthogonal_indexing(v, load_async)
++        await self.check_vectorized_indexing(v, load_async)
+ 
+ 
+ def test_clip(var):

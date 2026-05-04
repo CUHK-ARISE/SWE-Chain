@@ -1,0 +1,618 @@
+diff --git a/test/__init__.py b/test/__init__.py
+index b5eedc7..281e411 100644
+--- a/test/__init__.py
++++ b/test/__init__.py
+@@ -26,9 +26,18 @@ except ImportError:
+     brotli = None
+ 
+ try:
+-    import zstandard as _unused_module_zstd  # noqa: F401
++    # Python 3.14
++    from compression import (  # type: ignore[import-not-found] # noqa: F401
++        zstd as _unused_module_zstd,
++    )
+ except ImportError:
+-    HAS_ZSTD = False
++    # Python 3.13 and earlier require the 'zstandard' module.
++    try:
++        import zstandard as _unused_module_zstd  # noqa: F401
++    except ImportError:
++        HAS_ZSTD = False
++    else:
++        HAS_ZSTD = True
+ else:
+     HAS_ZSTD = True
+ 
+@@ -127,14 +136,15 @@ def notBrotli() -> typing.Callable[[_TestFuncT], _TestFuncT]:
+ 
+ def onlyZstd() -> typing.Callable[[_TestFuncT], _TestFuncT]:
+     return pytest.mark.skipif(
+-        not HAS_ZSTD, reason="only run if a python-zstandard library is installed"
++        not HAS_ZSTD,
++        reason="only run if a python-zstandard library is installed or Python 3.14 and later",
+     )
+ 
+ 
+ def notZstd() -> typing.Callable[[_TestFuncT], _TestFuncT]:
+     return pytest.mark.skipif(
+         HAS_ZSTD,
+-        reason="only run if a python-zstandard library is not installed",
++        reason="only run if a python-zstandard library is not installed or Python 3.13 and earlier",
+     )
+ 
+ 
+
+diff --git a/test/contrib/emscripten/conftest.py b/test/contrib/emscripten/conftest.py
+index 0a4573e..09b08ee 100644
+--- a/test/contrib/emscripten/conftest.py
++++ b/test/contrib/emscripten/conftest.py
+@@ -84,6 +84,19 @@ def selenium_coverage(
+         result = self.run_js(
+             f'await pyodide.loadPackage("http://{testserver_http.http_host}:{testserver_http.http_port}/dist/urllib3.whl")'
+         )
++        if not self.with_jspi:
++            # force Chrome to execute the current test without JSPI
++            # even though it is always enabled in
++            # chrome >= 137. We do this by monkeypatching
++            # pyodide.ffi.can_run_sync
++            self.run_async(
++                """
++                import pyodide.ffi
++                if pyodide.ffi.can_run_sync():
++                    pyodide.ffi.can_run_sync = lambda: False
++                """
++            )
++
+         print("Installed package:", result)
+         self.run_js(
+             """
+@@ -128,11 +141,14 @@ _coverage_js.Array.from_(_coverage_outdata)
+ 
+ 
+ class ServerRunnerInfo:
+-    def __init__(self, host: str, port: int, selenium: Any, dist_dir: Path) -> None:
++    def __init__(
++        self, host: str, port: int, selenium: Any, dist_dir: Path, has_jspi: bool
++    ) -> None:
+         self.host = host
+         self.port = port
+         self.selenium = selenium
+         self.dist_dir = dist_dir
++        self.has_jspi = has_jspi
+ 
+     def run_webworker(self, code: str) -> Any:
+         if isinstance(code, str) and code.startswith("\n"):
+@@ -148,6 +164,19 @@ class ServerRunnerInfo:
+             """
+         )
+ 
++        # Monkeypatch pyodide to force disable JSPI in newer chrome
++        # so those code paths get tested
++        if self.has_jspi is False:
++            jspi_fix_code = textwrap.dedent(
++                """
++                import pyodide.ffi
++                if pyodide.ffi.can_run_sync():
++                    pyodide.ffi.can_run_sync = lambda: False
++                """
++            )
++        else:
++            jspi_fix_code = ""
++
+         coverage_end_code = textwrap.dedent(
+             """
+             _coverage.stop()
+@@ -164,7 +193,15 @@ class ServerRunnerInfo:
+ 
+         # the ordering of these code blocks is important - makes sure
+         # that the first thing that happens is our wheel is loaded
+-        code = coverage_init_code + "\n" + code + "\n" + coverage_end_code
++        code = (
++            coverage_init_code
++            + "\n"
++            + jspi_fix_code
++            + "\n"
++            + code
++            + "\n"
++            + coverage_end_code
++        )
+ 
+         if self.selenium.browser == "firefox":
+             # running in worker is SLOW on firefox
+@@ -232,6 +269,7 @@ def run_from_server(
+         testserver_http.https_port,
+         selenium_coverage,
+         dist_dir,
++        selenium_coverage.with_jspi,
+     )
+ 
+ 
+
+diff --git a/test/contrib/emscripten/test_emscripten.py b/test/contrib/emscripten/test_emscripten.py
+index 4872e5b..dbe1f02 100644
+--- a/test/contrib/emscripten/test_emscripten.py
++++ b/test/contrib/emscripten/test_emscripten.py
+@@ -944,6 +944,68 @@ def test_retries(
+     pyodide_test(selenium_coverage, testserver_http.http_host, find_unused_port())
+ 
+ 
++def test_redirects(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    @run_in_pyodide  # type: ignore[misc]
++    def pyodide_test(selenium_coverage: typing.Any, host: str, port: int) -> None:
++        from urllib3 import request
++
++        redirect_url = f"http://{host}:{port}/redirect"
++        response = request("GET", redirect_url)
++        assert response.status == 200
++
++    pyodide_test(
++        selenium_coverage, testserver_http.http_host, testserver_http.http_port
++    )
++
++
++@pytest.mark.with_jspi
++def test_disabled_redirects(
++    selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
++) -> None:
++    """
++    Test that urllib3 can control redirects in Node.js.
++    """
++
++    @run_in_pyodide  # type: ignore[misc]
++    def pyodide_test(selenium_coverage: typing.Any, host: str, port: int) -> None:
++        import pytest
++
++        from urllib3 import PoolManager, request
++        from urllib3.contrib.emscripten.fetch import _is_node_js
++        from urllib3.exceptions import MaxRetryError
++
++        if not _is_node_js():
++            pytest.skip("urllib3 does not control redirects in browsers.")
++
++        redirect_url = f"http://{host}:{port}/redirect"
++
++        with PoolManager(retries=0) as http:
++            with pytest.raises(MaxRetryError):
++                http.request("GET", redirect_url)
++
++            response = http.request("GET", redirect_url, redirect=False)
++            assert response.status == 303
++
++        with PoolManager(retries=False) as http:
++            response = http.request("GET", redirect_url)
++            assert response.status == 303
++
++        with pytest.raises(MaxRetryError):
++            request("GET", redirect_url, retries=0)
++
++        response = request("GET", redirect_url, redirect=False)
++        assert response.status == 303
++
++        response = request("GET", redirect_url, retries=0, redirect=False)
++        assert response.status == 303
++
++    pyodide_test(
++        selenium_coverage, testserver_http.http_host, testserver_http.http_port
++    )
++
++
+ def test_insecure_requests_warning(
+     selenium_coverage: typing.Any, testserver_http: PyodideServerInfo
+ ) -> None:
+
+diff --git a/test/test_poolmanager.py b/test/test_poolmanager.py
+index ab5f203..b481a19 100644
+--- a/test/test_poolmanager.py
++++ b/test/test_poolmanager.py
+@@ -379,9 +379,10 @@ class TestPoolManager:
+ 
+     def test_merge_pool_kwargs(self) -> None:
+         """Assert _merge_pool_kwargs works in the happy case"""
+-        p = PoolManager(retries=100)
++        retries = retry.Retry(total=100)
++        p = PoolManager(retries=retries)
+         merged = p._merge_pool_kwargs({"new_key": "value"})
+-        assert {"retries": 100, "new_key": "value"} == merged
++        assert {"retries": retries, "new_key": "value"} == merged
+ 
+     def test_merge_pool_kwargs_none(self) -> None:
+         """Assert false-y values to _merge_pool_kwargs result in defaults"""
+
+diff --git a/test/test_response.py b/test/test_response.py
+index 3eec0ab..9552689 100644
+--- a/test/test_response.py
++++ b/test/test_response.py
+@@ -35,6 +35,14 @@ from urllib3.util.response import is_fp_closed
+ from urllib3.util.retry import RequestHistory, Retry
+ 
+ 
++def zstd_compress(data: bytes) -> bytes:
++    try:
++        from compression import zstd  # type: ignore[import-not-found] # noqa: F401
++    except ImportError:
++        import zstandard as zstd
++    return zstd.compress(data)  # type: ignore[no-any-return]
++
++
+ class TestBytesQueueBuffer:
+     def test_single_chunk(self) -> None:
+         buffer = BytesQueueBuffer()
+@@ -411,9 +419,7 @@ class TestResponse:
+ 
+     @onlyZstd()
+     def test_decode_zstd(self) -> None:
+-        import zstandard as zstd
+-
+-        data = zstd.compress(b"foo")
++        data = zstd_compress(b"foo")
+ 
+         fp = BytesIO(data)
+         r = HTTPResponse(fp, headers={"content-encoding": "zstd"})
+@@ -421,11 +427,9 @@ class TestResponse:
+ 
+     @onlyZstd()
+     def test_decode_multiframe_zstd(self) -> None:
+-        import zstandard as zstd
+-
+         data = (
+             # Zstandard frame
+-            zstd.compress(b"foo")
++            zstd_compress(b"foo")
+             # skippable frame (must be ignored)
+             + bytes.fromhex(
+                 "50 2A 4D 18"  # Magic_Number (little-endian)
+@@ -433,7 +437,7 @@ class TestResponse:
+                 "00 00 00 00 00 00 00"  # User_Data
+             )
+             # Zstandard frame
+-            + zstd.compress(b"bar")
++            + zstd_compress(b"bar")
+         )
+ 
+         fp = BytesIO(data)
+@@ -442,9 +446,7 @@ class TestResponse:
+ 
+     @onlyZstd()
+     def test_chunked_decoding_zstd(self) -> None:
+-        import zstandard as zstd
+-
+-        data = zstd.compress(b"foobarbaz")
++        data = zstd_compress(b"foobarbaz")
+ 
+         fp = BytesIO(data)
+         r = HTTPResponse(
+@@ -475,9 +477,7 @@ class TestResponse:
+     @onlyZstd()
+     @pytest.mark.parametrize("data", decode_param_set)
+     def test_decode_zstd_incomplete_preload_content(self, data: bytes) -> None:
+-        import zstandard as zstd
+-
+-        data = zstd.compress(data)
++        data = zstd_compress(data)
+         fp = BytesIO(data[:-1])
+ 
+         with pytest.raises(DecodeError):
+@@ -486,9 +486,7 @@ class TestResponse:
+     @onlyZstd()
+     @pytest.mark.parametrize("data", decode_param_set)
+     def test_decode_zstd_incomplete_read(self, data: bytes) -> None:
+-        import zstandard as zstd
+-
+-        data = zstd.compress(data)
++        data = zstd_compress(data)
+         fp = BytesIO(data[:-1])  # shorten the data to trigger DecodeError
+ 
+         # create response object without(!) reading/decoding the content
+@@ -503,9 +501,7 @@ class TestResponse:
+     @onlyZstd()
+     @pytest.mark.parametrize("data", decode_param_set)
+     def test_decode_zstd_incomplete_read1(self, data: bytes) -> None:
+-        import zstandard as zstd
+-
+-        data = zstd.compress(data)
++        data = zstd_compress(data)
+         fp = BytesIO(data[:-1])
+ 
+         r = HTTPResponse(
+@@ -523,9 +519,7 @@ class TestResponse:
+     @onlyZstd()
+     @pytest.mark.parametrize("data", decode_param_set)
+     def test_decode_zstd_read1(self, data: bytes) -> None:
+-        import zstandard as zstd
+-
+-        encoded_data = zstd.compress(data)
++        encoded_data = zstd_compress(data)
+         fp = BytesIO(encoded_data)
+ 
+         r = HTTPResponse(
+
+diff --git a/test/test_ssl.py b/test/test_ssl.py
+index e1b33dc..7c2377a 100644
+--- a/test/test_ssl.py
++++ b/test/test_ssl.py
+@@ -241,7 +241,7 @@ class TestSSL:
+         with pytest.warns(
+             DeprecationWarning,
+             match=r"'ssl_version' option is deprecated and will be removed in "
+-            r"urllib3 v2\.1\.0\. Instead use 'ssl_minimum_version'",
++            r"urllib3 v2\.6\.0\. Instead use 'ssl_minimum_version'",
+         ):
+             ssl_.create_urllib3_context(**kwargs)
+ 
+
+diff --git a/test/with_dummyserver/test_connectionpool.py b/test/with_dummyserver/test_connectionpool.py
+index 767b463..ce165e2 100644
+--- a/test/with_dummyserver/test_connectionpool.py
++++ b/test/with_dummyserver/test_connectionpool.py
+@@ -912,6 +912,18 @@ class TestConnectionPool(HypercornDummyServerTestCase):
+             # the pool should still contain poolsize elements
+             assert http.pool.qsize() == http.pool.maxsize
+ 
++    def test_shutdown_on_connection_released_to_pool(self) -> None:
++        with HTTPConnectionPool(self.host, self.port) as pool:
++            resp = pool.urlopen("GET", "/", preload_content=False)
++            resp.drain_conn()
++            resp.release_conn()
++
++        with pytest.raises(
++            RuntimeError,
++            match="Cannot shutdown as connection has already been released to the pool",
++        ):
++            resp.shutdown()
++
+     def test_mixed_case_hostname(self) -> None:
+         with HTTPConnectionPool("LoCaLhOsT", self.port) as pool:
+             response = pool.request("GET", f"http://LoCaLhOsT:{self.port}/")
+
+diff --git a/test/with_dummyserver/test_https.py b/test/with_dummyserver/test_https.py
+index c6dff91..95d8970 100644
+--- a/test/with_dummyserver/test_https.py
++++ b/test/with_dummyserver/test_https.py
+@@ -762,7 +762,7 @@ class BaseTestHTTPS(HTTPSHypercornDummyServerTestCase):
+                 cmgr = pytest.warns(
+                     DeprecationWarning,
+                     match=r"'ssl_version' option is deprecated and will be removed "
+-                    r"in urllib3 v2\.1\.0\. Instead use 'ssl_minimum_version'",
++                    r"in urllib3 v2\.6\.0\. Instead use 'ssl_minimum_version'",
+                 )
+             with cmgr:
+                 r = https_pool.request("GET", "/")
+@@ -836,7 +836,7 @@ class BaseTestHTTPS(HTTPSHypercornDummyServerTestCase):
+             str(x.message)
+             == (
+                 "'ssl_version' option is deprecated and will be removed in "
+-                "urllib3 v2.1.0. Instead use 'ssl_minimum_version'"
++                "urllib3 v2.6.0. Instead use 'ssl_minimum_version'"
+             )
+             for x in w
+         )
+@@ -1132,7 +1132,7 @@ class BaseTestHTTPS(HTTPSHypercornDummyServerTestCase):
+         with pytest.warns(
+             DeprecationWarning,
+             match=r"'ssl_version' option is deprecated and will be removed in "
+-            r"urllib3 v2\.1\.0\. Instead use 'ssl_minimum_version'",
++            r"urllib3 v2\.6\.0\. Instead use 'ssl_minimum_version'",
+         ):
+             ctx = urllib3.util.ssl_.create_urllib3_context(
+                 ssl_version=self.ssl_version()
+
+diff --git a/test/with_dummyserver/test_poolmanager.py b/test/with_dummyserver/test_poolmanager.py
+index af77241..7f163ab 100644
+--- a/test/with_dummyserver/test_poolmanager.py
++++ b/test/with_dummyserver/test_poolmanager.py
+@@ -84,6 +84,89 @@ class TestPoolManager(HypercornDummyServerTestCase):
+             assert r.status == 200
+             assert r.data == b"Dummy server!"
+ 
++    @pytest.mark.parametrize(
++        "retries",
++        (0, Retry(total=0), Retry(redirect=0), Retry(total=0, redirect=0)),
++    )
++    def test_redirects_disabled_for_pool_manager_with_0(
++        self, retries: typing.Literal[0] | Retry
++    ) -> None:
++        """
++        Check handling redirects when retries is set to 0 on the pool
++        manager.
++        """
++        with PoolManager(retries=retries) as http:
++            with pytest.raises(MaxRetryError):
++                http.request("GET", f"{self.base_url}/redirect")
++
++            # Setting redirect=True should not change the behavior.
++            with pytest.raises(MaxRetryError):
++                http.request("GET", f"{self.base_url}/redirect", redirect=True)
++
++            # Setting redirect=False should not make it follow the redirect,
++            # but MaxRetryError should not be raised.
++            response = http.request("GET", f"{self.base_url}/redirect", redirect=False)
++            assert response.status == 303
++
++    @pytest.mark.parametrize(
++        "retries",
++        (
++            False,
++            Retry(total=False),
++            Retry(redirect=False),
++            Retry(total=False, redirect=False),
++        ),
++    )
++    def test_redirects_disabled_for_pool_manager_with_false(
++        self, retries: typing.Literal[False] | Retry
++    ) -> None:
++        """
++        Check that setting retries set to False on the pool manager disables
++        raising MaxRetryError and redirect=True does not change the
++        behavior.
++        """
++        with PoolManager(retries=retries) as http:
++            response = http.request("GET", f"{self.base_url}/redirect")
++            assert response.status == 303
++
++            response = http.request("GET", f"{self.base_url}/redirect", redirect=True)
++            assert response.status == 303
++
++            response = http.request("GET", f"{self.base_url}/redirect", redirect=False)
++            assert response.status == 303
++
++    def test_redirects_disabled_for_individual_request(self) -> None:
++        """
++        Check handling redirects when they are meant to be disabled
++        on the request level.
++        """
++        with PoolManager() as http:
++            # Check when redirect is not passed.
++            with pytest.raises(MaxRetryError):
++                http.request("GET", f"{self.base_url}/redirect", retries=0)
++            response = http.request("GET", f"{self.base_url}/redirect", retries=False)
++            assert response.status == 303
++
++            # Check when redirect=True.
++            with pytest.raises(MaxRetryError):
++                http.request(
++                    "GET", f"{self.base_url}/redirect", retries=0, redirect=True
++                )
++            response = http.request(
++                "GET", f"{self.base_url}/redirect", retries=False, redirect=True
++            )
++            assert response.status == 303
++
++            # Check when redirect=False.
++            response = http.request(
++                "GET", f"{self.base_url}/redirect", retries=0, redirect=False
++            )
++            assert response.status == 303
++            response = http.request(
++                "GET", f"{self.base_url}/redirect", retries=False, redirect=False
++            )
++            assert response.status == 303
++
+     def test_cross_host_redirect(self) -> None:
+         with PoolManager() as http:
+             cross_host_location = f"{self.base_url_alt}/echo?a=b"
+@@ -138,6 +221,24 @@ class TestPoolManager(HypercornDummyServerTestCase):
+             pool = http.connection_from_host(self.host, self.port)
+             assert pool.num_connections == 1
+ 
++        # Check when retries are configured for the pool manager.
++        with PoolManager(retries=1) as http:
++            with pytest.raises(MaxRetryError):
++                http.request(
++                    "GET",
++                    f"{self.base_url}/redirect",
++                    fields={"target": f"/redirect?target={self.base_url}/"},
++                )
++
++            # Here we allow more retries for the request.
++            response = http.request(
++                "GET",
++                f"{self.base_url}/redirect",
++                fields={"target": f"/redirect?target={self.base_url}/"},
++                retries=2,
++            )
++            assert response.status == 200
++
+     def test_redirect_cross_host_remove_headers(self) -> None:
+         with PoolManager() as http:
+             r = http.request(
+
+diff --git a/test/with_dummyserver/test_socketlevel.py b/test/with_dummyserver/test_socketlevel.py
+index 89db60b..2968669 100644
+--- a/test/with_dummyserver/test_socketlevel.py
++++ b/test/with_dummyserver/test_socketlevel.py
+@@ -22,6 +22,7 @@ from pathlib import Path
+ from test import LONG_TIMEOUT, SHORT_TIMEOUT, notWindows, resolvesLocalhostFQDN
+ from threading import Event
+ from unittest import mock
++from urllib.parse import urlparse
+ 
+ import pytest
+ import trustme
+@@ -1289,7 +1290,7 @@ class TestProxyManager(SocketDummyServerTestCase):
+             r = conn.urlopen("GET", url, retries=0)
+             assert r.status == 200
+ 
+-    def test_connect_ipv6_addr(self) -> None:
++    def test_connect_ipv6_addr_from_host(self) -> None:
+         ipv6_addr = "2001:4998:c:a06::2:4008"
+ 
+         def echo_socket_handler(listener: socket.socket) -> None:
+@@ -1329,13 +1330,75 @@ class TestProxyManager(SocketDummyServerTestCase):
+ 
+         with proxy_from_url(base_url, cert_reqs="NONE") as proxy:
+             url = f"https://[{ipv6_addr}]"
++
++            # Try with connection_from_host
++            parsed_request_url = urlparse(url)
++
++            conn = proxy.connection_from_host(
++                scheme=parsed_request_url.scheme.lower(),
++                host=parsed_request_url.hostname,
++                port=parsed_request_url.port,
++            )
++            try:
++                with pytest.warns(InsecureRequestWarning):
++                    r = conn.urlopen("GET", url, retries=0)
++                assert r.status == 200
++            except MaxRetryError:
++                pytest.fail(
++                    "Invalid IPv6 format in HTTP CONNECT request when using connection_from_host"
++                )
++
++    def test_connect_ipv6_addr_from_url(self) -> None:
++        ipv6_addr = "2001:4998:c:a06::2:4008"
++
++        def echo_socket_handler(listener: socket.socket) -> None:
++            sock = listener.accept()[0]
++
++            buf = b""
++            while not buf.endswith(b"\r\n\r\n"):
++                buf += sock.recv(65536)
++            s = buf.decode("utf-8")
++
++            if s.startswith(f"CONNECT [{ipv6_addr}]:443"):
++                sock.send(b"HTTP/1.1 200 Connection Established\r\n\r\n")
++                ssl_sock = original_ssl_wrap_socket(
++                    sock,
++                    server_side=True,
++                    keyfile=DEFAULT_CERTS["keyfile"],
++                    certfile=DEFAULT_CERTS["certfile"],
++                )
++                buf = b""
++                while not buf.endswith(b"\r\n\r\n"):
++                    buf += ssl_sock.recv(65536)
++
++                ssl_sock.send(
++                    b"HTTP/1.1 200 OK\r\n"
++                    b"Content-Type: text/plain\r\n"
++                    b"Content-Length: 2\r\n"
++                    b"Connection: close\r\n"
++                    b"\r\n"
++                    b"Hi"
++                )
++                ssl_sock.close()
++            else:
++                sock.close()
++
++        self._start_server(echo_socket_handler)
++        base_url = f"http://{self.host}:{self.port}"
++
++        with proxy_from_url(base_url, cert_reqs="NONE") as proxy:
++            url = f"https://[{ipv6_addr}]"
++
++            # Try with connection_from_url
+             conn = proxy.connection_from_url(url)
+             try:
+                 with pytest.warns(InsecureRequestWarning):
+                     r = conn.urlopen("GET", url, retries=0)
+                 assert r.status == 200
+             except MaxRetryError:
+-                pytest.fail("Invalid IPv6 format in HTTP CONNECT request")
++                pytest.fail(
++                    "Invalid IPv6 format in HTTP CONNECT request when using connection_from_url"
++                )
+ 
+     @pytest.mark.parametrize("target_scheme", ["http", "https"])
+     def test_https_proxymanager_connected_to_http_proxy(

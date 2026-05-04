@@ -1,0 +1,190 @@
+diff --git a/tests/console/commands/test_init.py b/tests/console/commands/test_init.py
+index 2a0a9bc..44e472f 100644
+--- a/tests/console/commands/test_init.py
++++ b/tests/console/commands/test_init.py
+@@ -1087,3 +1087,17 @@ python = "^{python}"
+ """
+ 
+     assert expected in pyproject_file.read_text()
++
++
++def test_get_pool(mocker: MockerFixture, source_dir: Path) -> None:
++    """
++    Since we are mocking _get_pool() in the other tests, we at least should make
++    sure it works in general. See https://github.com/python-poetry/poetry/issues/8634.
++    """
++    mocker.patch("pathlib.Path.cwd", return_value=source_dir)
++
++    app = Application()
++    command = app.find("init")
++    assert isinstance(command, InitCommand)
++    pool = command._get_pool()
++    assert pool.repositories
+
+diff --git a/tests/fixtures/project_with_setup_calls_script/my_package/__init__.py b/tests/fixtures/project_with_setup_calls_script/my_package/__init__.py
+new file mode 100644
+index 0000000..e69de29
+
+diff --git a/tests/fixtures/project_with_setup_calls_script/setup.py b/tests/fixtures/project_with_setup_calls_script/setup.py
+new file mode 100644
+index 0000000..815e58c
+--- /dev/null
++++ b/tests/fixtures/project_with_setup_calls_script/setup.py
+@@ -0,0 +1,23 @@
++from __future__ import annotations
++
++import subprocess
++
++from setuptools import setup
++
++if subprocess.call(["exit-code"]) != 42:
++    raise RuntimeError("Wrong exit code.")
++
++kwargs = dict(
++    name="project-with-setup-calls-script",
++    license="MIT",
++    version="0.1.2",
++    description="Demo project.",
++    author="Sébastien Eustace",
++    author_email="sebastien@eustace.io",
++    url="https://github.com/demo/demo",
++    packages=["my_package"],
++    install_requires=["pendulum>=1.4.4", "cachy[msgpack]>=0.2.0"],
++)
++
++
++setup(**kwargs)
+
+diff --git a/tests/installation/test_chef.py b/tests/installation/test_chef.py
+index bcd4f42..9a7e63c 100644
+--- a/tests/installation/test_chef.py
++++ b/tests/installation/test_chef.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import os
++import shutil
+ import sys
+ import tempfile
+ 
+@@ -10,6 +11,7 @@ from zipfile import ZipFile
+ 
+ import pytest
+ 
++from build import ProjectBuilder
+ from poetry.core.packages.utils.link import Link
+ 
+ from poetry.factory import Factory
+@@ -165,3 +167,49 @@ def test_prepare_directory_editable(
+ 
+     # cleanup generated tmp dir artifact
+     os.unlink(wheel)
++
++
++@pytest.mark.network
++def test_prepare_directory_script(
++    config: Config,
++    config_cache_dir: Path,
++    artifact_cache: ArtifactCache,
++    fixture_dir: FixtureDirGetter,
++    tmp_path: Path,
++    mocker: MockerFixture,
++) -> None:
++    """
++    Building a project that requires calling a script from its build_requires.
++    """
++    # make sure the scripts project is on the same drive (for Windows tests in CI)
++    scripts_dir = tmp_path / "scripts"
++    shutil.copytree(fixture_dir("scripts"), scripts_dir)
++
++    orig_build_system_requires = ProjectBuilder.build_system_requires
++
++    class CustomPropertyMock:
++        def __get__(
++            self, obj: ProjectBuilder, obj_type: type[ProjectBuilder] | None = None
++        ) -> set[str]:
++            assert isinstance(obj, ProjectBuilder)
++            return {
++                req.replace("<scripts>", f"scripts @ {scripts_dir.as_uri()}")
++                for req in orig_build_system_requires.fget(obj)  # type: ignore[attr-defined]
++            }
++
++    mocker.patch(
++        "build.ProjectBuilder.build_system_requires",
++        new_callable=CustomPropertyMock,
++    )
++    chef = Chef(
++        artifact_cache, EnvManager.get_system_env(), Factory.create_pool(config)
++    )
++    archive = fixture_dir("project_with_setup_calls_script").resolve()
++
++    wheel = chef.prepare(archive)
++
++    assert wheel.name == "project_with_setup_calls_script-0.1.2-py3-none-any.whl"
++
++    assert wheel.parent.parent == Path(tempfile.gettempdir())
++    # cleanup generated tmp dir artifact
++    os.unlink(wheel)
+
+diff --git a/tests/utils/test_env.py b/tests/utils/test_env.py
+index de2f90d..c8cb98e 100644
+--- a/tests/utils/test_env.py
++++ b/tests/utils/test_env.py
+@@ -1375,22 +1375,39 @@ def test_venv_has_correct_paths(tmp_venv: VirtualEnv) -> None:
+     )
+ 
+ 
+-def test_env_system_packages(tmp_path: Path, poetry: Poetry) -> None:
++@pytest.mark.parametrize("with_system_site_packages", [True, False])
++def test_env_system_packages(
++    tmp_path: Path, poetry: Poetry, with_system_site_packages: bool
++) -> None:
+     venv_path = tmp_path / "venv"
+     pyvenv_cfg = venv_path / "pyvenv.cfg"
+ 
+-    EnvManager(poetry).build_venv(path=venv_path, flags={"system-site-packages": True})
++    EnvManager(poetry).build_venv(
++        path=venv_path, flags={"system-site-packages": with_system_site_packages}
++    )
+     env = VirtualEnv(venv_path)
+ 
+-    assert "include-system-site-packages = true" in pyvenv_cfg.read_text()
+-    assert env.includes_system_site_packages
++    assert (
++        f"include-system-site-packages = {str(with_system_site_packages).lower()}"
++        in pyvenv_cfg.read_text()
++    )
++    assert env.includes_system_site_packages is with_system_site_packages
++
+ 
++def test_generic_env_system_packages(poetry: Poetry) -> None:
++    """https://github.com/python-poetry/poetry/issues/8646"""
++    env = GenericEnv(Path(sys.base_prefix))
++    assert not env.includes_system_site_packages
+ 
++
++@pytest.mark.parametrize("with_system_site_packages", [True, False])
+ def test_env_system_packages_are_relative_to_lib(
+-    tmp_path: Path, poetry: Poetry
++    tmp_path: Path, poetry: Poetry, with_system_site_packages: bool
+ ) -> None:
+     venv_path = tmp_path / "venv"
+-    EnvManager(poetry).build_venv(path=venv_path, flags={"system-site-packages": True})
++    EnvManager(poetry).build_venv(
++        path=venv_path, flags={"system-site-packages": with_system_site_packages}
++    )
+     env = VirtualEnv(venv_path)
+     site_dir = Path(site.getsitepackages()[-1])
+     for dist in metadata.distributions():
+@@ -1398,7 +1415,10 @@ def test_env_system_packages_are_relative_to_lib(
+         with contextlib.suppress(ValueError):
+             dist._path.relative_to(site_dir)  # type: ignore[attr-defined]
+             break
+-    assert env.is_path_relative_to_lib(dist._path)  # type: ignore[attr-defined]
++    assert (
++        env.is_path_relative_to_lib(dist._path)  # type: ignore[attr-defined]
++        is with_system_site_packages
++    )
+ 
+ 
+ @pytest.mark.parametrize(

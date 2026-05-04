@@ -1,0 +1,812 @@
+diff --git a/xarray/tests/test_backends.py b/xarray/tests/test_backends.py
+index 7d58c5b..190adab 100644
+--- a/xarray/tests/test_backends.py
++++ b/xarray/tests/test_backends.py
+@@ -2584,10 +2584,10 @@ class ZarrBase(CFEncodedBase):
+             ds.to_zarr(initial_store, mode="w", **self.version_kwargs)
+             ds1 = xr.open_zarr(initial_store, **self.version_kwargs)
+ 
+-        # Combination of where+squeeze triggers error on write.
+-        ds_sel = ds1.where(ds1.coords["dim3"] == "a", drop=True).squeeze("dim3")
+-        with self.create_zarr_target() as final_store:
+-            ds_sel.to_zarr(final_store, mode="w", **self.version_kwargs)
++            # Combination of where+squeeze triggers error on write.
++            ds_sel = ds1.where(ds1.coords["dim3"] == "a", drop=True).squeeze("dim3")
++            with self.create_zarr_target() as final_store:
++                ds_sel.to_zarr(final_store, mode="w", **self.version_kwargs)
+ 
+     @pytest.mark.parametrize("obj", [Dataset(), DataArray(name="foo")])
+     def test_attributes(self, obj) -> None:
+
+diff --git a/xarray/tests/test_dask.py b/xarray/tests/test_dask.py
+index b37399d..ed18718 100644
+--- a/xarray/tests/test_dask.py
++++ b/xarray/tests/test_dask.py
+@@ -178,6 +178,19 @@ class TestVariable(DaskTestCase):
+         self.assertLazyAndIdentical(u + u, v + v)
+         self.assertLazyAndIdentical(u[0] + u, v[0] + v)
+ 
++    def test_binary_op_bitshift(self) -> None:
++        # bit shifts only work on ints so we need to generate
++        # new eager and lazy vars
++        rng = np.random.default_rng(0)
++        values = rng.integers(low=-10000, high=10000, size=(4, 6))
++        data = da.from_array(values, chunks=(2, 2))
++        u = Variable(("x", "y"), values)
++        v = Variable(("x", "y"), data)
++        self.assertLazyAndIdentical(u << 2, v << 2)
++        self.assertLazyAndIdentical(u << 5, v << 5)
++        self.assertLazyAndIdentical(u >> 2, v >> 2)
++        self.assertLazyAndIdentical(u >> 5, v >> 5)
++
+     def test_repr(self):
+         expected = dedent(
+             """\
+@@ -891,13 +904,12 @@ class TestToDaskDataFrame:
+ 
+ @pytest.mark.parametrize("method", ["load", "compute"])
+ def test_dask_kwargs_variable(method):
+-    x = Variable("y", da.from_array(np.arange(3), chunks=(2,)))
+-    # args should be passed on to da.Array.compute()
+-    with mock.patch.object(
+-        da.Array, "compute", return_value=np.arange(3)
+-    ) as mock_compute:
++    chunked_array = da.from_array(np.arange(3), chunks=(2,))
++    x = Variable("y", chunked_array)
++    # args should be passed on to dask.compute() (via DaskManager.compute())
++    with mock.patch.object(da, "compute", return_value=(np.arange(3),)) as mock_compute:
+         getattr(x, method)(foo="bar")
+-    mock_compute.assert_called_with(foo="bar")
++    mock_compute.assert_called_with(chunked_array, foo="bar")
+ 
+ 
+ @pytest.mark.parametrize("method", ["load", "compute", "persist"])
+
+diff --git a/xarray/tests/test_dataarray.py b/xarray/tests/test_dataarray.py
+index dcbfd42..263653e 100644
+--- a/xarray/tests/test_dataarray.py
++++ b/xarray/tests/test_dataarray.py
+@@ -6,7 +6,7 @@ import warnings
+ from collections.abc import Hashable
+ from copy import deepcopy
+ from textwrap import dedent
+-from typing import Any, Final, cast
++from typing import Any, Final, Literal, cast
+ 
+ import numpy as np
+ import pandas as pd
+@@ -3245,6 +3245,39 @@ class TestDataArray:
+         assert len(actual) == 0
+         assert_array_equal(actual.index.names, list("ABC"))
+ 
++    @requires_dask
++    def test_to_dask_dataframe(self) -> None:
++        arr_np = np.arange(3 * 4).reshape(3, 4)
++        arr = DataArray(arr_np, [("B", [1, 2, 3]), ("A", list("cdef"))], name="foo")
++        expected = arr.to_series()
++        actual = arr.to_dask_dataframe()["foo"]
++
++        assert_array_equal(actual.values, expected.values)
++
++        actual = arr.to_dask_dataframe(dim_order=["A", "B"])["foo"]
++        assert_array_equal(arr_np.transpose().reshape(-1), actual.values)
++
++        # regression test for coords with different dimensions
++
++        arr.coords["C"] = ("B", [-1, -2, -3])
++        expected = arr.to_series().to_frame()
++        expected["C"] = [-1] * 4 + [-2] * 4 + [-3] * 4
++        expected = expected[["C", "foo"]]
++        actual = arr.to_dask_dataframe()[["C", "foo"]]
++
++        assert_array_equal(expected.values, actual.values)
++        assert_array_equal(expected.columns.values, actual.columns.values)
++
++        with pytest.raises(ValueError, match="does not match the set of dimensions"):
++            arr.to_dask_dataframe(dim_order=["B", "A", "C"])
++
++        arr.name = None
++        with pytest.raises(
++            ValueError,
++            match="Cannot convert an unnamed DataArray",
++        ):
++            arr.to_dask_dataframe()
++
+     def test_to_pandas_name_matches_coordinate(self) -> None:
+         # coordinate with same name as array
+         arr = DataArray([1, 2, 3], dims="x", name="x")
+@@ -3345,46 +3378,70 @@ class TestDataArray:
+         arr = DataArray(s)
+         assert "'a'" in repr(arr)  # should not error
+ 
++    @pytest.mark.parametrize("use_dask", [True, False])
++    @pytest.mark.parametrize("data", ["list", "array", True])
+     @pytest.mark.parametrize("encoding", [True, False])
+-    def test_to_and_from_dict(self, encoding) -> None:
++    def test_to_and_from_dict(
++        self, encoding: bool, data: bool | Literal["list", "array"], use_dask: bool
++    ) -> None:
++        if use_dask and not has_dask:
++            pytest.skip("requires dask")
++        encoding_data = {"bar": "spam"}
+         array = DataArray(
+             np.random.randn(2, 3), {"x": ["a", "b"]}, ["x", "y"], name="foo"
+         )
+-        array.encoding = {"bar": "spam"}
+-        expected = {
++        array.encoding = encoding_data
++
++        return_data = array.to_numpy()
++        coords_data = np.array(["a", "b"])
++        if data == "list" or data is True:
++            return_data = return_data.tolist()
++            coords_data = coords_data.tolist()
++
++        expected: dict[str, Any] = {
+             "name": "foo",
+             "dims": ("x", "y"),
+-            "data": array.values.tolist(),
++            "data": return_data,
+             "attrs": {},
+-            "coords": {"x": {"dims": ("x",), "data": ["a", "b"], "attrs": {}}},
++            "coords": {"x": {"dims": ("x",), "data": coords_data, "attrs": {}}},
+         }
+         if encoding:
+-            expected["encoding"] = {"bar": "spam"}
+-        actual = array.to_dict(encoding=encoding)
++            expected["encoding"] = encoding_data
++
++        if has_dask:
++            da = array.chunk()
++        else:
++            da = array
++
++        if data == "array" or data is False:
++            with raise_if_dask_computes():
++                actual = da.to_dict(encoding=encoding, data=data)
++        else:
++            actual = da.to_dict(encoding=encoding, data=data)
+ 
+         # check that they are identical
+-        assert expected == actual
++        np.testing.assert_equal(expected, actual)
+ 
+         # check roundtrip
+-        assert_identical(array, DataArray.from_dict(actual))
++        assert_identical(da, DataArray.from_dict(actual))
+ 
+         # a more bare bones representation still roundtrips
+         d = {
+             "name": "foo",
+             "dims": ("x", "y"),
+-            "data": array.values.tolist(),
++            "data": da.values.tolist(),
+             "coords": {"x": {"dims": "x", "data": ["a", "b"]}},
+         }
+-        assert_identical(array, DataArray.from_dict(d))
++        assert_identical(da, DataArray.from_dict(d))
+ 
+         # and the most bare bones representation still roundtrips
+-        d = {"name": "foo", "dims": ("x", "y"), "data": array.values}
+-        assert_identical(array.drop_vars("x"), DataArray.from_dict(d))
++        d = {"name": "foo", "dims": ("x", "y"), "data": da.values}
++        assert_identical(da.drop_vars("x"), DataArray.from_dict(d))
+ 
+         # missing a dims in the coords
+         d = {
+             "dims": ("x", "y"),
+-            "data": array.values,
++            "data": da.values,
+             "coords": {"x": {"data": ["a", "b"]}},
+         }
+         with pytest.raises(
+@@ -3407,7 +3464,7 @@ class TestDataArray:
+         endiantype = "<U1" if sys.byteorder == "little" else ">U1"
+         expected_no_data["coords"]["x"].update({"dtype": endiantype, "shape": (2,)})
+         expected_no_data.update({"dtype": "float64", "shape": (2, 3)})
+-        actual_no_data = array.to_dict(data=False, encoding=encoding)
++        actual_no_data = da.to_dict(data=False, encoding=encoding)
+         assert expected_no_data == actual_no_data
+ 
+     def test_to_and_from_dict_with_time_dim(self) -> None:
+@@ -3926,6 +3983,11 @@ class TestDataArray:
+         actual = (self.dv > 10).xindexes["x"]
+         assert expected is actual
+ 
++        # use mda for bitshift test as it's type int
++        actual = (self.mda << 2).xindexes["x"]
++        expected = self.mda.xindexes["x"]
++        assert expected is actual
++
+     def test_binary_op_join_setting(self) -> None:
+         dim = "x"
+         align_type: Final = "outer"
+
+diff --git a/xarray/tests/test_dataset.py b/xarray/tests/test_dataset.py
+index 4528672..cc9220d 100644
+--- a/xarray/tests/test_dataset.py
++++ b/xarray/tests/test_dataset.py
+@@ -8,7 +8,7 @@ from collections.abc import Hashable
+ from copy import copy, deepcopy
+ from io import StringIO
+ from textwrap import dedent
+-from typing import Any
++from typing import Any, Literal
+ 
+ import numpy as np
+ import pandas as pd
+@@ -4596,7 +4596,11 @@ class TestDataset:
+         expected = df.apply(np.asarray)
+         assert roundtripped.equals(expected)
+ 
+-    def test_to_and_from_dict(self) -> None:
++    @pytest.mark.parametrize("encoding", [True, False])
++    @pytest.mark.parametrize("data", [True, "list", "array"])
++    def test_to_and_from_dict(
++        self, encoding: bool, data: bool | Literal["list", "array"]
++    ) -> None:
+         # <xarray.Dataset>
+         # Dimensions:  (t: 10)
+         # Coordinates:
+@@ -4617,14 +4621,25 @@ class TestDataset:
+                 "b": {"dims": ("t",), "data": y.tolist(), "attrs": {}},
+             },
+         }
++        if encoding:
++            ds.t.encoding.update({"foo": "bar"})
++            expected["encoding"] = {}
++            expected["coords"]["t"]["encoding"] = ds.t.encoding
++            for vvs in ["a", "b"]:
++                expected["data_vars"][vvs]["encoding"] = {}
+ 
+-        actual = ds.to_dict()
++        actual = ds.to_dict(data=data, encoding=encoding)
+ 
+         # check that they are identical
+-        assert expected == actual
++        np.testing.assert_equal(expected, actual)
+ 
+         # check roundtrip
+-        assert_identical(ds, Dataset.from_dict(actual))
++        ds_rt = Dataset.from_dict(actual)
++        assert_identical(ds, ds_rt)
++        if encoding:
++            assert set(ds_rt.variables) == set(ds.variables)
++            for vv in ds.variables:
++                np.testing.assert_equal(ds_rt[vv].encoding, ds[vv].encoding)
+ 
+         # check the data=False option
+         expected_no_data = expected.copy()
+@@ -4635,14 +4650,18 @@ class TestDataset:
+         expected_no_data["coords"]["t"].update({"dtype": endiantype, "shape": (10,)})
+         expected_no_data["data_vars"]["a"].update({"dtype": "float64", "shape": (10,)})
+         expected_no_data["data_vars"]["b"].update({"dtype": "float64", "shape": (10,)})
+-        actual_no_data = ds.to_dict(data=False)
++        actual_no_data = ds.to_dict(data=False, encoding=encoding)
+         assert expected_no_data == actual_no_data
+ 
+         # verify coords are included roundtrip
+         expected_ds = ds.set_coords("b")
+-        actual2 = Dataset.from_dict(expected_ds.to_dict())
++        actual2 = Dataset.from_dict(expected_ds.to_dict(data=data, encoding=encoding))
+ 
+         assert_identical(expected_ds, actual2)
++        if encoding:
++            assert set(expected_ds.variables) == set(actual2.variables)
++            for vv in ds.variables:
++                np.testing.assert_equal(expected_ds[vv].encoding, actual2[vv].encoding)
+ 
+         # test some incomplete dicts:
+         # this one has no attrs field, the dims are strings, and x, y are
+@@ -4690,7 +4709,10 @@ class TestDataset:
+         roundtripped = Dataset.from_dict(ds.to_dict())
+         assert_identical(ds, roundtripped)
+ 
+-    def test_to_and_from_dict_with_nan_nat(self) -> None:
++    @pytest.mark.parametrize("data", [True, "list", "array"])
++    def test_to_and_from_dict_with_nan_nat(
++        self, data: bool | Literal["list", "array"]
++    ) -> None:
+         x = np.random.randn(10, 3)
+         y = np.random.randn(10, 3)
+         y[2] = np.nan
+@@ -4706,7 +4728,7 @@ class TestDataset:
+                 "lat": ("lat", lat),
+             }
+         )
+-        roundtripped = Dataset.from_dict(ds.to_dict())
++        roundtripped = Dataset.from_dict(ds.to_dict(data=data))
+         assert_identical(ds, roundtripped)
+ 
+     def test_to_dict_with_numpy_attrs(self) -> None:
+
+diff --git a/xarray/tests/test_groupby.py b/xarray/tests/test_groupby.py
+index 4488bda..97ba0b5 100644
+--- a/xarray/tests/test_groupby.py
++++ b/xarray/tests/test_groupby.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import datetime
++import operator
+ import warnings
+ 
+ import numpy as np
+@@ -17,6 +18,7 @@ from xarray.tests import (
+     assert_identical,
+     create_test_data,
+     has_cftime,
++    has_flox,
+     has_pandas_version_two,
+     requires_dask,
+     requires_flox,
+@@ -51,8 +53,9 @@ def test_consolidate_slices() -> None:
+     slices = [slice(2, 3), slice(5, 6)]
+     assert _consolidate_slices(slices) == slices
+ 
++    # ignore type because we're checking for an error anyway
+     with pytest.raises(ValueError):
+-        _consolidate_slices([slice(3), 4])
++        _consolidate_slices([slice(3), 4])  # type: ignore[list-item]
+ 
+ 
+ def test_groupby_dims_property(dataset) -> None:
+@@ -538,7 +541,7 @@ def test_groupby_drops_nans() -> None:
+         .reset_index("id", drop=True)
+         .assign(id=stacked.id.values)
+         .dropna("id")
+-        .transpose(*actual2.dims)
++        .transpose(*actual2.variable.dims)
+     )
+     assert_identical(actual2, expected2)
+ 
+@@ -808,6 +811,56 @@ def test_groupby_math_more() -> None:
+         ds + ds.groupby("time.month")
+ 
+ 
++def test_groupby_math_bitshift() -> None:
++    # create new dataset of int's only
++    ds = Dataset(
++        {
++            "x": ("index", np.ones(4, dtype=int)),
++            "y": ("index", np.ones(4, dtype=int) * -1),
++            "level": ("index", [1, 1, 2, 2]),
++            "index": [0, 1, 2, 3],
++        }
++    )
++    shift = DataArray([1, 2, 1], [("level", [1, 2, 8])])
++
++    left_expected = Dataset(
++        {
++            "x": ("index", [2, 2, 4, 4]),
++            "y": ("index", [-2, -2, -4, -4]),
++            "level": ("index", [2, 2, 8, 8]),
++            "index": [0, 1, 2, 3],
++        }
++    )
++
++    left_manual = []
++    for lev, group in ds.groupby("level"):
++        shifter = shift.sel(level=lev)
++        left_manual.append(group << shifter)
++    left_actual = xr.concat(left_manual, dim="index").reset_coords(names="level")
++    assert_equal(left_expected, left_actual)
++
++    left_actual = (ds.groupby("level") << shift).reset_coords(names="level")
++    assert_equal(left_expected, left_actual)
++
++    right_expected = Dataset(
++        {
++            "x": ("index", [0, 0, 2, 2]),
++            "y": ("index", [-1, -1, -2, -2]),
++            "level": ("index", [0, 0, 4, 4]),
++            "index": [0, 1, 2, 3],
++        }
++    )
++    right_manual = []
++    for lev, group in left_expected.groupby("level"):
++        shifter = shift.sel(level=lev)
++        right_manual.append(group >> shifter)
++    right_actual = xr.concat(right_manual, dim="index").reset_coords(names="level")
++    assert_equal(right_expected, right_actual)
++
++    right_actual = (left_expected.groupby("level") >> shift).reset_coords(names="level")
++    assert_equal(right_expected, right_actual)
++
++
+ @pytest.mark.parametrize("use_flox", [True, False])
+ def test_groupby_bins_cut_kwargs(use_flox: bool) -> None:
+     da = xr.DataArray(np.arange(12).reshape(6, 2), dims=("x", "y"))
+@@ -1274,8 +1327,15 @@ class TestDataArrayGroupBy:
+         expected = DataArray([10, 11, np.nan, np.nan], array.coords)
+         assert_identical(expected, actual)
+ 
++        # regression test for #7797
++        other = array.groupby("b").sum()
++        actual = array.sel(x=[0, 1]).groupby("b") - other
++        expected = DataArray([-1, 0], {"b": ("x", [0, 0]), "x": [0, 1]}, dims="x")
++        assert_identical(expected, actual)
++
+         other = DataArray([10], coords={"c": 123, "b": [0]}, dims="b")
+         actual = array.groupby("b") + other
++        expected = DataArray([10, 11, np.nan, np.nan], array.coords)
+         expected.coords["c"] = (["x"], [123] * 2 + [np.nan] * 2)
+         assert_identical(expected, actual)
+ 
+@@ -1744,7 +1804,7 @@ class TestDataArrayResample:
+         # Nearest
+         rs = array.resample(time="3H")
+         actual = rs.nearest()
+-        new_times = rs._full_index
++        new_times = rs.groupers[0].full_index
+         expected = DataArray(array.reindex(time=new_times, method="nearest"))
+         assert_identical(expected, actual)
+ 
+@@ -2261,3 +2321,54 @@ def test_resample_cumsum(method: str, expected_array: list[float]) -> None:
+     actual = getattr(ds.foo.resample(time="3M"), method)(dim="time")
+     expected.coords["time"] = ds.time
+     assert_identical(expected.drop_vars(["time"]).foo, actual)
++
++
++def test_groupby_binary_op_regression() -> None:
++    # regression test for #7797
++    # monthly timeseries that should return "zero anomalies" everywhere
++    time = xr.date_range("2023-01-01", "2023-12-31", freq="MS")
++    data = np.linspace(-1, 1, 12)
++    x = xr.DataArray(data, coords={"time": time})
++    clim = xr.DataArray(data, coords={"month": np.arange(1, 13, 1)})
++
++    # seems to give the correct result if we use the full x, but not with a slice
++    x_slice = x.sel(time=["2023-04-01"])
++
++    # two typical ways of computing anomalies
++    anom_gb = x_slice.groupby("time.month") - clim
++
++    assert_identical(xr.zeros_like(anom_gb), anom_gb)
++
++
++@requires_flox
++@pytest.mark.parametrize("func", ["sum", "prod"])
++@pytest.mark.parametrize("skipna", [True, False])
++@pytest.mark.parametrize("min_count", [None, 1])
++def test_min_count_vs_flox(func: str, min_count: int | None, skipna: bool) -> None:
++    da = DataArray(
++        data=np.array([np.nan, 1, 1, np.nan, 1, 1]),
++        dims="x",
++        coords={"labels": ("x", np.array([1, 2, 3, 1, 2, 3]))},
++    )
++
++    gb = da.groupby("labels")
++    method = operator.methodcaller(func, min_count=min_count, skipna=skipna)
++    with xr.set_options(use_flox=True):
++        actual = method(gb)
++    with xr.set_options(use_flox=False):
++        expected = method(gb)
++    assert_identical(actual, expected)
++
++
++@pytest.mark.parametrize("use_flox", [True, False])
++def test_min_count_error(use_flox: bool) -> None:
++    if use_flox and not has_flox:
++        pytest.skip()
++    da = DataArray(
++        data=np.array([np.nan, 1, 1, np.nan, 1, 1]),
++        dims="x",
++        coords={"labels": ("x", np.array([1, 2, 3, 1, 2, 3]))},
++    )
++    with xr.set_options(use_flox=use_flox):
++        with pytest.raises(TypeError):
++            da.groupby("labels").mean(min_count=1)
+
+diff --git a/xarray/tests/test_parallelcompat.py b/xarray/tests/test_parallelcompat.py
+new file mode 100644
+index 0000000..2c3378a
+--- /dev/null
++++ b/xarray/tests/test_parallelcompat.py
+@@ -0,0 +1,219 @@
++from __future__ import annotations
++
++from typing import Any
++
++import numpy as np
++import pytest
++
++from xarray.core.daskmanager import DaskManager
++from xarray.core.parallelcompat import (
++    ChunkManagerEntrypoint,
++    get_chunked_array_type,
++    guess_chunkmanager,
++    list_chunkmanagers,
++)
++from xarray.core.types import T_Chunks, T_NormalizedChunks
++from xarray.tests import has_dask, requires_dask
++
++
++class DummyChunkedArray(np.ndarray):
++    """
++    Mock-up of a chunked array class.
++
++    Adds a (non-functional) .chunks attribute by following this example in the numpy docs
++    https://numpy.org/doc/stable/user/basics.subclassing.html#simple-example-adding-an-extra-attribute-to-ndarray
++    """
++
++    chunks: T_NormalizedChunks
++
++    def __new__(
++        cls,
++        shape,
++        dtype=float,
++        buffer=None,
++        offset=0,
++        strides=None,
++        order=None,
++        chunks=None,
++    ):
++        obj = super().__new__(cls, shape, dtype, buffer, offset, strides, order)
++        obj.chunks = chunks
++        return obj
++
++    def __array_finalize__(self, obj):
++        if obj is None:
++            return
++        self.chunks = getattr(obj, "chunks", None)
++
++    def rechunk(self, chunks, **kwargs):
++        copied = self.copy()
++        copied.chunks = chunks
++        return copied
++
++
++class DummyChunkManager(ChunkManagerEntrypoint):
++    """Mock-up of ChunkManager class for DummyChunkedArray"""
++
++    def __init__(self):
++        self.array_cls = DummyChunkedArray
++
++    def is_chunked_array(self, data: Any) -> bool:
++        return isinstance(data, DummyChunkedArray)
++
++    def chunks(self, data: DummyChunkedArray) -> T_NormalizedChunks:
++        return data.chunks
++
++    def normalize_chunks(
++        self,
++        chunks: T_Chunks | T_NormalizedChunks,
++        shape: tuple[int, ...] | None = None,
++        limit: int | None = None,
++        dtype: np.dtype | None = None,
++        previous_chunks: T_NormalizedChunks | None = None,
++    ) -> T_NormalizedChunks:
++        from dask.array.core import normalize_chunks
++
++        return normalize_chunks(chunks, shape, limit, dtype, previous_chunks)
++
++    def from_array(
++        self, data: np.ndarray, chunks: T_Chunks, **kwargs
++    ) -> DummyChunkedArray:
++        from dask import array as da
++
++        return da.from_array(data, chunks, **kwargs)
++
++    def rechunk(self, data: DummyChunkedArray, chunks, **kwargs) -> DummyChunkedArray:
++        return data.rechunk(chunks, **kwargs)
++
++    def compute(self, *data: DummyChunkedArray, **kwargs) -> tuple[np.ndarray, ...]:
++        from dask.array import compute
++
++        return compute(*data, **kwargs)
++
++    def apply_gufunc(
++        self,
++        func,
++        signature,
++        *args,
++        axes=None,
++        axis=None,
++        keepdims=False,
++        output_dtypes=None,
++        output_sizes=None,
++        vectorize=None,
++        allow_rechunk=False,
++        meta=None,
++        **kwargs,
++    ):
++        from dask.array.gufunc import apply_gufunc
++
++        return apply_gufunc(
++            func,
++            signature,
++            *args,
++            axes=axes,
++            axis=axis,
++            keepdims=keepdims,
++            output_dtypes=output_dtypes,
++            output_sizes=output_sizes,
++            vectorize=vectorize,
++            allow_rechunk=allow_rechunk,
++            meta=meta,
++            **kwargs,
++        )
++
++
++@pytest.fixture
++def register_dummy_chunkmanager(monkeypatch):
++    """
++    Mocks the registering of an additional ChunkManagerEntrypoint.
++
++    This preserves the presence of the existing DaskManager, so a test that relies on this and DaskManager both being
++    returned from list_chunkmanagers() at once would still work.
++
++    The monkeypatching changes the behavior of list_chunkmanagers when called inside xarray.core.parallelcompat,
++    but not when called from this tests file.
++    """
++    # Should include DaskManager iff dask is available to be imported
++    preregistered_chunkmanagers = list_chunkmanagers()
++
++    monkeypatch.setattr(
++        "xarray.core.parallelcompat.list_chunkmanagers",
++        lambda: {"dummy": DummyChunkManager()} | preregistered_chunkmanagers,
++    )
++    yield
++
++
++class TestGetChunkManager:
++    def test_get_chunkmanger(self, register_dummy_chunkmanager) -> None:
++        chunkmanager = guess_chunkmanager("dummy")
++        assert isinstance(chunkmanager, DummyChunkManager)
++
++    def test_fail_on_nonexistent_chunkmanager(self) -> None:
++        with pytest.raises(ValueError, match="unrecognized chunk manager foo"):
++            guess_chunkmanager("foo")
++
++    @requires_dask
++    def test_get_dask_if_installed(self) -> None:
++        chunkmanager = guess_chunkmanager(None)
++        assert isinstance(chunkmanager, DaskManager)
++
++    @pytest.mark.skipif(has_dask, reason="requires dask not to be installed")
++    def test_dont_get_dask_if_not_installed(self) -> None:
++        with pytest.raises(ValueError, match="unrecognized chunk manager dask"):
++            guess_chunkmanager("dask")
++
++    @requires_dask
++    def test_choose_dask_over_other_chunkmanagers(
++        self, register_dummy_chunkmanager
++    ) -> None:
++        chunk_manager = guess_chunkmanager(None)
++        assert isinstance(chunk_manager, DaskManager)
++
++
++class TestGetChunkedArrayType:
++    def test_detect_chunked_arrays(self, register_dummy_chunkmanager) -> None:
++        dummy_arr = DummyChunkedArray([1, 2, 3])
++
++        chunk_manager = get_chunked_array_type(dummy_arr)
++        assert isinstance(chunk_manager, DummyChunkManager)
++
++    def test_ignore_inmemory_arrays(self, register_dummy_chunkmanager) -> None:
++        dummy_arr = DummyChunkedArray([1, 2, 3])
++
++        chunk_manager = get_chunked_array_type(*[dummy_arr, 1.0, np.array([5, 6])])
++        assert isinstance(chunk_manager, DummyChunkManager)
++
++        with pytest.raises(TypeError, match="Expected a chunked array"):
++            get_chunked_array_type(5.0)
++
++    def test_raise_if_no_arrays_chunked(self, register_dummy_chunkmanager) -> None:
++        with pytest.raises(TypeError, match="Expected a chunked array "):
++            get_chunked_array_type(*[1.0, np.array([5, 6])])
++
++    def test_raise_if_no_matching_chunkmanagers(self) -> None:
++        dummy_arr = DummyChunkedArray([1, 2, 3])
++
++        with pytest.raises(
++            TypeError, match="Could not find a Chunk Manager which recognises"
++        ):
++            get_chunked_array_type(dummy_arr)
++
++    @requires_dask
++    def test_detect_dask_if_installed(self) -> None:
++        import dask.array as da
++
++        dask_arr = da.from_array([1, 2, 3], chunks=(1,))
++
++        chunk_manager = get_chunked_array_type(dask_arr)
++        assert isinstance(chunk_manager, DaskManager)
++
++    @requires_dask
++    def test_raise_on_mixed_array_types(self, register_dummy_chunkmanager) -> None:
++        import dask.array as da
++
++        dummy_arr = DummyChunkedArray([1, 2, 3])
++        dask_arr = da.from_array([1, 2, 3], chunks=(1,))
++
++        with pytest.raises(TypeError, match="received multiple types"):
++            get_chunked_array_type(*[dask_arr, dummy_arr])
+
+diff --git a/xarray/tests/test_plugins.py b/xarray/tests/test_plugins.py
+index 0882bc1..441f16f 100644
+--- a/xarray/tests/test_plugins.py
++++ b/xarray/tests/test_plugins.py
+@@ -236,6 +236,7 @@ def test_lazy_import() -> None:
+         "sparse",
+         "cupy",
+         "pint",
++        "cubed",
+     ]
+     # ensure that none of the above modules has been imported before
+     modules_backup = {}
+
+diff --git a/xarray/tests/test_variable.py b/xarray/tests/test_variable.py
+index b92db16..a6dffb8 100644
+--- a/xarray/tests/test_variable.py
++++ b/xarray/tests/test_variable.py
+@@ -344,9 +344,10 @@ class VariableSubclassobjects(ABC):
+         assert v[0] == pd.Period("2000", freq="B")
+         assert "Period('2000-01-03', 'B')" in repr(v)
+ 
+-    def test_1d_math(self):
+-        x = 1.0 * np.arange(5)
+-        y = np.ones(5)
++    @pytest.mark.parametrize("dtype", [float, int])
++    def test_1d_math(self, dtype: np.typing.DTypeLike) -> None:
++        x = np.arange(5, dtype=dtype)
++        y = np.ones(5, dtype=dtype)
+ 
+         # should we need `.to_base_variable()`?
+         # probably a break that `+v` changes type?
+@@ -360,11 +361,18 @@ class VariableSubclassobjects(ABC):
+         assert_identical(base_v, v + 0)
+         assert_identical(base_v, 0 + v)
+         assert_identical(base_v, v * 1)
++        if dtype is int:
++            assert_identical(base_v, v << 0)
++            assert_array_equal(v << 3, x << 3)
++            assert_array_equal(v >> 2, x >> 2)
+         # binary ops with numpy arrays
+         assert_array_equal((v * x).values, x**2)
+-        assert_array_equal((x * v).values, x**2)
++        assert_array_equal((x * v).values, x**2)  # type: ignore[attr-defined] # TODO: Fix mypy thinking numpy takes priority, GH7780
+         assert_array_equal(v - y, v - 1)
+         assert_array_equal(y - v, 1 - v)
++        if dtype is int:
++            assert_array_equal(v << x, x << x)
++            assert_array_equal(v >> x, x >> x)
+         # verify attributes are dropped
+         v2 = self.cls(["x"], x, {"units": "meters"})
+         with set_options(keep_attrs=False):
+@@ -378,10 +386,10 @@ class VariableSubclassobjects(ABC):
+         # something complicated
+         assert_array_equal((v**2 * w - 1 + x).values, x**2 * y - 1 + x)
+         # make sure dtype is preserved (for Index objects)
+-        assert float == (+v).dtype
+-        assert float == (+v).values.dtype
+-        assert float == (0 + v).dtype
+-        assert float == (0 + v).values.dtype
++        assert dtype == (+v).dtype
++        assert dtype == (+v).values.dtype
++        assert dtype == (0 + v).dtype
++        assert dtype == (0 + v).values.dtype
+         # check types of returned data
+         assert isinstance(+v, Variable)
+         assert not isinstance(+v, IndexVariable)
+@@ -2552,6 +2560,19 @@ class TestAsCompatibleData:
+         assert_array_equal(expected, actual)
+         assert np.dtype(float) == actual.dtype
+ 
++        original = np.ma.MaskedArray([1.0, 2.0], mask=[True, False])
++        original.flags.writeable = False
++        expected = [np.nan, 2.0]
++        actual = as_compatible_data(original)
++        assert_array_equal(expected, actual)
++        assert np.dtype(float) == actual.dtype
++
++        # GH2377
++        actual = Variable(dims=tuple(), data=np.ma.masked)
++        expected = Variable(dims=tuple(), data=np.nan)
++        assert_array_equal(expected, actual)
++        assert actual.dtype == expected.dtype
++
+     @pytest.mark.filterwarnings("ignore:Converting non-nanosecond")
+     def test_datetime(self):
+         expected = np.datetime64("2000-01-01")

@@ -1,0 +1,159 @@
+diff --git a/dummyserver/app.py b/dummyserver/app.py
+index 0eeb93f..5b82e93 100644
+--- a/dummyserver/app.py
++++ b/dummyserver/app.py
+@@ -233,10 +233,16 @@ async def redirect() -> ResponseReturnValue:
+     values = await request.values
+     target = values.get("target", "/")
+     status = values.get("status", "303 See Other")
++    compressed = values.get("compressed") == "true"
+     status_code = status.split(" ")[0]
+ 
+     headers = [("Location", target)]
+-    return await make_response("", status_code, headers)
++    if compressed:
++        headers.append(("Content-Encoding", "gzip"))
++        data = gzip.compress(b"foo")
++    else:
++        data = b""
++    return await make_response(data, status_code, headers)
+ 
+ 
+ @hypercorn_app.route("/redirect_after")
+
+diff --git a/src/urllib3/_version.py b/src/urllib3/_version.py
+index af8c3f3..268d3b9 100644
+--- a/src/urllib3/_version.py
++++ b/src/urllib3/_version.py
+@@ -28,7 +28,7 @@ version_tuple: VERSION_TUPLE
+ commit_id: COMMIT_ID
+ __commit_id__: COMMIT_ID
+ 
+-__version__ = version = '2.6.2'
+-__version_tuple__ = version_tuple = (2, 6, 2)
++__version__ = version = '2.6.3'
++__version_tuple__ = version_tuple = (2, 6, 3)
+ 
+ __commit_id__ = commit_id = None
+
+diff --git a/src/urllib3/contrib/emscripten/__init__.py b/src/urllib3/contrib/emscripten/__init__.py
+index 8a3c5be..e5b62b2 100644
+--- a/src/urllib3/contrib/emscripten/__init__.py
++++ b/src/urllib3/contrib/emscripten/__init__.py
+@@ -14,3 +14,4 @@ def inject_into_urllib3() -> None:
+     HTTPSConnectionPool.ConnectionCls = EmscriptenHTTPSConnection
+     urllib3.connection.HTTPConnection = EmscriptenHTTPConnection  # type: ignore[misc,assignment]
+     urllib3.connection.HTTPSConnection = EmscriptenHTTPSConnection  # type: ignore[misc,assignment]
++    urllib3.connection.VerifiedHTTPSConnection = EmscriptenHTTPSConnection  # type: ignore[assignment]
+
+diff --git a/src/urllib3/contrib/emscripten/connection.py b/src/urllib3/contrib/emscripten/connection.py
+index a5a353f..63f79dd 100644
+--- a/src/urllib3/contrib/emscripten/connection.py
++++ b/src/urllib3/contrib/emscripten/connection.py
+@@ -40,6 +40,7 @@ class EmscriptenHTTPConnection:
+     is_verified: bool = False
+     proxy_is_verified: bool | None = None
+ 
++    response_class: type[BaseHTTPResponse] = EmscriptenHttpResponseWrapper
+     _response: EmscriptenResponse | None
+ 
+     def __init__(
+
+diff --git a/src/urllib3/http2/connection.py b/src/urllib3/http2/connection.py
+index 7534b77..0a026da 100644
+--- a/src/urllib3/http2/connection.py
++++ b/src/urllib3/http2/connection.py
+@@ -6,9 +6,9 @@ import threading
+ import types
+ import typing
+ 
+-import h2.config  # type: ignore[import-untyped]
+-import h2.connection  # type: ignore[import-untyped]
+-import h2.events  # type: ignore[import-untyped]
++import h2.config
++import h2.connection
++import h2.events
+ 
+ from .._base_connection import _TYPE_BODY
+ from .._collections import HTTPHeaderDict
+
+diff --git a/src/urllib3/response.py b/src/urllib3/response.py
+index f6266f1..ff6d1f4 100644
+--- a/src/urllib3/response.py
++++ b/src/urllib3/response.py
+@@ -797,7 +797,11 @@ class HTTPResponse(BaseHTTPResponse):
+         Unread data in the HTTPResponse connection blocks the connection from being released back to the pool.
+         """
+         try:
+-            self.read()
++            self.read(
++                # Do not spend resources decoding the content unless
++                # decoding has already been initiated.
++                decode_content=self._has_decoded_content,
++            )
+         except (HTTPError, OSError, BaseSSLError, HTTPException):
+             pass
+ 
+
+diff --git a/src/urllib3/util/retry.py b/src/urllib3/util/retry.py
+index 0456cce..b21b4b6 100644
+--- a/src/urllib3/util/retry.py
++++ b/src/urllib3/util/retry.py
+@@ -178,6 +178,11 @@ class Retry:
+         Sequence of headers to remove from the request when a response
+         indicating a redirect is returned before firing off the redirected
+         request.
++
++    :param int retry_after_max: Number of seconds to allow as the maximum for
++        Retry-After headers. Defaults to :attr:`Retry.DEFAULT_RETRY_AFTER_MAX`.
++        Any Retry-After headers larger than this value will be limited to this
++        value.
+     """
+ 
+     #: Default methods to be used for ``allowed_methods``
+@@ -196,6 +201,10 @@ class Retry:
+     #: Default maximum backoff time.
+     DEFAULT_BACKOFF_MAX = 120
+ 
++    # This is undocumented in the RFC. Setting to 6 hours matches other popular libraries.
++    #: Default maximum allowed value for Retry-After headers in seconds
++    DEFAULT_RETRY_AFTER_MAX: typing.Final[int] = 21600
++
+     # Backward compatibility; assigned outside of the class.
+     DEFAULT: typing.ClassVar[Retry]
+ 
+@@ -219,6 +228,7 @@ class Retry:
+             str
+         ] = DEFAULT_REMOVE_HEADERS_ON_REDIRECT,
+         backoff_jitter: float = 0.0,
++        retry_after_max: int = DEFAULT_RETRY_AFTER_MAX,
+     ) -> None:
+         self.total = total
+         self.connect = connect
+@@ -235,6 +245,7 @@ class Retry:
+         self.allowed_methods = allowed_methods
+         self.backoff_factor = backoff_factor
+         self.backoff_max = backoff_max
++        self.retry_after_max = retry_after_max
+         self.raise_on_redirect = raise_on_redirect
+         self.raise_on_status = raise_on_status
+         self.history = history or ()
+@@ -256,6 +267,7 @@ class Retry:
+             status_forcelist=self.status_forcelist,
+             backoff_factor=self.backoff_factor,
+             backoff_max=self.backoff_max,
++            retry_after_max=self.retry_after_max,
+             raise_on_redirect=self.raise_on_redirect,
+             raise_on_status=self.raise_on_status,
+             history=self.history,
+@@ -320,6 +332,10 @@ class Retry:
+ 
+         seconds = max(seconds, 0)
+ 
++        # Check the seconds do not exceed the specified maximum
++        if seconds > self.retry_after_max:
++            seconds = self.retry_after_max
++
+         return seconds
+ 
+     def get_retry_after(self, response: BaseHTTPResponse) -> float | None:

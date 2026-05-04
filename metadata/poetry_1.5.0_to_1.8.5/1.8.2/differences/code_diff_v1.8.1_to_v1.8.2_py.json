@@ -1,0 +1,161 @@
+{
+  "old_dir": ".packages/poetry/1.8.1",
+  "new_dir": ".packages/poetry/1.8.2",
+  "extracted_at": "2026-04-24T01:19:34.711983",
+  "diff_file": "confirmed/poetry_1.5.0_to_1.8.5/1.8.2/differences/code_diff_v1.8.1_to_v1.8.2_py.diff",
+  "diff_content": "diff --git a/src/poetry/console/commands/add.py b/src/poetry/console/commands/add.py\nindex fc13f6f..e02af59 100644\n--- a/src/poetry/console/commands/add.py\n+++ b/src/poetry/console/commands/add.py\n@@ -122,7 +122,9 @@ The add command adds required packages to your <comment>pyproject.toml</> and in\n         # dictionary.\n         content: dict[str, Any] = self.poetry.file.read()\n         poetry_content = content[\"tool\"][\"poetry\"]\n-        project_name = canonicalize_name(poetry_content[\"name\"])\n+        project_name = (\n+            canonicalize_name(name) if (name := poetry_content.get(\"name\")) else None\n+        )\n \n         if group == MAIN_GROUP:\n             if \"dependencies\" not in poetry_content:\n\ndiff --git a/src/poetry/console/commands/install.py b/src/poetry/console/commands/install.py\nindex 8186719..55037d4 100644\n--- a/src/poetry/console/commands/install.py\n+++ b/src/poetry/console/commands/install.py\n@@ -191,8 +191,8 @@ you can set the \"package-mode\" to false in your pyproject.toml file.\n                 \"If you do not want to install the current project\"\n                 \" use <c1>--no-root</c1>.\\n\"\n                 \"If you want to use Poetry only for dependency management\"\n-                \" but not for packaging, you can set the operating mode to \"\n-                '\"non-package\" in your pyproject.toml file.\\n'\n+                \" but not for packaging, you can disable package mode by setting\"\n+                \" <c1>package-mode = false</> in your pyproject.toml file.\\n\"\n                 \"In a future version of Poetry this warning will become an error!\",\n                 style=\"warning\",\n             )\n\ndiff --git a/src/poetry/inspection/lazy_wheel.py b/src/poetry/inspection/lazy_wheel.py\nindex 54f566b..66c6dfc 100644\n--- a/src/poetry/inspection/lazy_wheel.py\n+++ b/src/poetry/inspection/lazy_wheel.py\n@@ -41,15 +41,24 @@ if TYPE_CHECKING:\n logger = logging.getLogger(__name__)\n \n \n-class HTTPRangeRequestUnsupported(Exception):\n+class LazyWheelUnsupportedError(Exception):\n+    \"\"\"Raised when a lazy wheel is unsupported.\"\"\"\n+\n+\n+class HTTPRangeRequestUnsupported(LazyWheelUnsupportedError):\n     \"\"\"Raised when the remote server appears unable to support byte ranges.\"\"\"\n \n \n-class UnsupportedWheel(Exception):\n+class HTTPRangeRequestNotRespected(LazyWheelUnsupportedError):\n+    \"\"\"Raised when the remote server tells us that it supports byte ranges\n+    but does not respect a respective request.\"\"\"\n+\n+\n+class UnsupportedWheel(LazyWheelUnsupportedError):\n     \"\"\"Unsupported wheel.\"\"\"\n \n \n-class InvalidWheel(Exception):\n+class InvalidWheel(LazyWheelUnsupportedError):\n     \"\"\"Invalid (e.g. corrupt) wheel.\"\"\"\n \n     def __init__(self, location: str, name: str) -> None:\n@@ -85,6 +94,24 @@ def metadata_from_wheel_url(\n         # themselves are invalid, not because we've messed up our bookkeeping\n         # and produced an invalid file.\n         raise InvalidWheel(url, name)\n+    except Exception as e:\n+        if isinstance(e, LazyWheelUnsupportedError):\n+            # this is expected when the code handles issues with lazy wheel metadata retrieval correctly\n+            raise e\n+\n+        logger.debug(\n+            \"There was an unexpected %s when handling lazy wheel metadata retrieval for %s from %s: %s\",\n+            type(e).__name__,\n+            name,\n+            url,\n+            e,\n+        )\n+\n+        # Catch all exception to handle any issues that may have occurred during\n+        # attempts to use Lazy Wheel.\n+        raise LazyWheelUnsupportedError(\n+            f\"Attempts to use lazy wheel metadata retrieval for {name} from {url} failed\"\n+        ) from e\n \n \n class MergeIntervals:\n@@ -383,7 +410,9 @@ class LazyFileOverHTTP(ReadOnlyIOWrapper):\n         :raises HTTPRangeRequestUnsupported: if the response fails to indicate support\n                                              for \"bytes\" ranges.\"\"\"\n         self._request_count += 1\n-        head = self._session.head(self._url, headers=self._uncached_headers())\n+        head = self._session.head(\n+            self._url, headers=self._uncached_headers(), allow_redirects=True\n+        )\n         head.raise_for_status()\n         assert head.status_code == codes.ok\n         accepted_range = head.headers.get(\"Accept-Ranges\", None)\n@@ -407,7 +436,12 @@ class LazyFileOverHTTP(ReadOnlyIOWrapper):\n         self._request_count += 1\n         response = self._session.get(self._url, headers=headers, stream=True)\n         response.raise_for_status()\n-        assert int(response.headers[\"Content-Length\"]) == (end - start + 1)\n+        if int(response.headers[\"Content-Length\"]) != (end - start + 1):\n+            raise HTTPRangeRequestNotRespected(\n+                f\"server did not respect byte range request: \"\n+                f\"requested {end - start + 1} bytes, got \"\n+                f\"{response.headers['Content-Length']} bytes\"\n+            )\n         return response\n \n     def _fetch_content_range(self, start: int, end: int) -> Iterator[bytes]:\n@@ -590,6 +624,12 @@ class LazyWheelOverHTTP(LazyFileOverHTTP):\n                 f\"did not receive partial content: got code {code}\"\n             )\n \n+        if \"Content-Range\" not in tail.headers:\n+            raise LazyWheelUnsupportedError(\n+                f\"file length cannot be determined for {self._url}, \"\n+                f\"did not receive content range header from server\"\n+            )\n+\n         file_length = self._parse_full_length_from_content_range(\n             tail.headers[\"Content-Range\"]\n         )\n@@ -614,10 +654,13 @@ class LazyWheelOverHTTP(LazyFileOverHTTP):\n \n             # This indicates that the requested range from the end was larger than the\n             # actual file size: https://www.rfc-editor.org/rfc/rfc9110#status.416.\n-            if code == codes.requested_range_not_satisfiable:\n+            if (\n+                code == codes.requested_range_not_satisfiable\n+                and resp is not None\n+                and \"Content-Range\" in resp.headers\n+            ):\n                 # In this case, we don't have any file content yet, but we do know the\n                 # size the file will be, so we can return that and exit here.\n-                assert resp is not None\n                 file_length = self._parse_full_length_from_content_range(\n                     resp.headers[\"Content-Range\"]\n                 )\n@@ -638,12 +681,12 @@ class LazyWheelOverHTTP(LazyFileOverHTTP):\n             return self._content_length_from_head(), None\n \n         # Some servers that do not support negative offsets,\n-        # handle a negative offset like \"-10\" as \"0-10\".\n-        if int(\n-            tail.headers[\"Content-Length\"]\n-        ) == initial_chunk_size + 1 and tail.headers[\"Content-Range\"].startswith(\n-            f\"bytes 0-{initial_chunk_size}\"\n-        ):\n+        # handle a negative offset like \"-10\" as \"0-10\"...\n+        # ... or behave even more strangely, see\n+        # https://github.com/python-poetry/poetry/issues/9056#issuecomment-1973273721\n+        if int(tail.headers[\"Content-Length\"]) > initial_chunk_size or tail.headers.get(\n+            \"Content-Range\", \"\"\n+        ).startswith(\"bytes -\"):\n             tail = None\n             self._domains_without_negative_range.add(domain)\n         return file_length, tail\n\ndiff --git a/src/poetry/repositories/http_repository.py b/src/poetry/repositories/http_repository.py\nindex 788f7ce..515907e 100644\n--- a/src/poetry/repositories/http_repository.py\n+++ b/src/poetry/repositories/http_repository.py\n@@ -20,7 +20,7 @@ from poetry.core.version.markers import parse_marker\n \n from poetry.config.config import Config\n from poetry.inspection.info import PackageInfo\n-from poetry.inspection.lazy_wheel import HTTPRangeRequestUnsupported\n+from poetry.inspection.lazy_wheel import LazyWheelUnsupportedError\n from poetry.inspection.lazy_wheel import metadata_from_wheel_url\n from poetry.repositories.cached_repository import CachedRepository\n from poetry.repositories.exceptions import PackageNotFound\n@@ -122,9 +122,13 @@ class HTTPRepository(CachedRepository):\n                 package_info = PackageInfo.from_metadata(\n                     metadata_from_wheel_url(link.filename, link.url, self.session)\n                 )\n-            except HTTPRangeRequestUnsupported:\n+            except LazyWheelUnsupportedError as e:\n                 # Do not set to False if we already know that the domain supports\n                 # range requests for some URLs!\n+                self._log(\n+                    f\"Disabling lazy wheel support for {netloc}: {e}\",\n+                    level=\"debug\",\n+                )\n                 raise_accepts_ranges = False\n                 self._supports_range_requests.setdefault(netloc, False)\n             else:\n@@ -165,7 +169,7 @@ class HTTPRepository(CachedRepository):\n                     )\n                 ):\n                     metadata_hash = getattr(hashlib, hash_name)(\n-                        response.text.encode()\n+                        response.content\n                     ).hexdigest()\n                     if metadata_hash != link.metadata_hashes[hash_name]:\n                         self._log(\n",
+  "structured_diff": {
+    "src/poetry/console/commands/add.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -122,7 +122,9 @@",
+          "snippet": " The add command adds required packages to your <comment>pyproject.toml</> and in\n         # dictionary.\n         content: dict[str, Any] = self.poetry.file.read()\n         poetry_content = content[\"tool\"][\"poetry\"]\n-        project_name = canonicalize_name(poetry_content[\"name\"])\n+        project_name = (\n+            canonicalize_name(name) if (name := poetry_content.get(\"name\")) else None\n+        )\n \n         if group == MAIN_GROUP:\n             if \"dependencies\" not in poetry_content:\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/console/commands/add.py::AddCommand::handle"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/console/commands/install.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -191,8 +191,8 @@",
+          "snippet": " you can set the \"package-mode\" to false in your pyproject.toml file.\n                 \"If you do not want to install the current project\"\n                 \" use <c1>--no-root</c1>.\\n\"\n                 \"If you want to use Poetry only for dependency management\"\n-                \" but not for packaging, you can set the operating mode to \"\n-                '\"non-package\" in your pyproject.toml file.\\n'\n+                \" but not for packaging, you can disable package mode by setting\"\n+                \" <c1>package-mode = false</> in your pyproject.toml file.\\n\"\n                 \"In a future version of Poetry this warning will become an error!\",\n                 style=\"warning\",\n             )\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/console/commands/install.py::InstallCommand::handle"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/inspection/lazy_wheel.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -41,15 +41,24 @@",
+          "snippet": " if TYPE_CHECKING:\n logger = logging.getLogger(__name__)\n \n \n-class HTTPRangeRequestUnsupported(Exception):\n+class LazyWheelUnsupportedError(Exception):\n+    \"\"\"Raised when a lazy wheel is unsupported.\"\"\"\n+\n+\n+class HTTPRangeRequestUnsupported(LazyWheelUnsupportedError):\n     \"\"\"Raised when the remote server appears unable to support byte ranges.\"\"\"\n \n \n-class UnsupportedWheel(Exception):\n+class HTTPRangeRequestNotRespected(LazyWheelUnsupportedError):\n+    \"\"\"Raised when the remote server tells us that it supports byte ranges\n+    but does not respect a respective request.\"\"\"\n+\n+\n+class UnsupportedWheel(LazyWheelUnsupportedError):\n     \"\"\"Unsupported wheel.\"\"\"\n \n \n-class InvalidWheel(Exception):\n+class InvalidWheel(LazyWheelUnsupportedError):\n     \"\"\"Invalid (e.g. corrupt) wheel.\"\"\"\n \n     def __init__(self, location: str, name: str) -> None:",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "src/poetry/inspection/lazy_wheel.py::LazyWheelUnsupportedError"
+            },
+            {
+              "kind": "class",
+              "node": "src/poetry/inspection/lazy_wheel.py::HTTPRangeRequestUnsupported"
+            },
+            {
+              "kind": "class",
+              "node": "src/poetry/inspection/lazy_wheel.py::HTTPRangeRequestNotRespected"
+            },
+            {
+              "kind": "class",
+              "node": "src/poetry/inspection/lazy_wheel.py::UnsupportedWheel"
+            },
+            {
+              "kind": "class",
+              "node": "src/poetry/inspection/lazy_wheel.py::InvalidWheel"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -85,6 +94,24 @@",
+          "snippet": " def metadata_from_wheel_url(\n         # themselves are invalid, not because we've messed up our bookkeeping\n         # and produced an invalid file.\n         raise InvalidWheel(url, name)\n+    except Exception as e:\n+        if isinstance(e, LazyWheelUnsupportedError):\n+            # this is expected when the code handles issues with lazy wheel metadata retrieval correctly\n+            raise e\n+\n+        logger.debug(\n+            \"There was an unexpected %s when handling lazy wheel metadata retrieval for %s from %s: %s\",\n+            type(e).__name__,\n+            name,\n+            url,\n+            e,\n+        )\n+\n+        # Catch all exception to handle any issues that may have occurred during\n+        # attempts to use Lazy Wheel.\n+        raise LazyWheelUnsupportedError(\n+            f\"Attempts to use lazy wheel metadata retrieval for {name} from {url} failed\"\n+        ) from e\n \n \n class MergeIntervals:",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "src/poetry/inspection/lazy_wheel.py::metadata_from_wheel_url"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -383,7 +410,9 @@",
+          "snippet": " class LazyFileOverHTTP(ReadOnlyIOWrapper):\n         :raises HTTPRangeRequestUnsupported: if the response fails to indicate support\n                                              for \"bytes\" ranges.\"\"\"\n         self._request_count += 1\n-        head = self._session.head(self._url, headers=self._uncached_headers())\n+        head = self._session.head(\n+            self._url, headers=self._uncached_headers(), allow_redirects=True\n+        )\n         head.raise_for_status()\n         assert head.status_code == codes.ok\n         accepted_range = head.headers.get(\"Accept-Ranges\", None)",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/inspection/lazy_wheel.py::LazyFileOverHTTP::_content_length_from_head"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -407,7 +436,12 @@",
+          "snippet": " class LazyFileOverHTTP(ReadOnlyIOWrapper):\n         self._request_count += 1\n         response = self._session.get(self._url, headers=headers, stream=True)\n         response.raise_for_status()\n-        assert int(response.headers[\"Content-Length\"]) == (end - start + 1)\n+        if int(response.headers[\"Content-Length\"]) != (end - start + 1):\n+            raise HTTPRangeRequestNotRespected(\n+                f\"server did not respect byte range request: \"\n+                f\"requested {end - start + 1} bytes, got \"\n+                f\"{response.headers['Content-Length']} bytes\"\n+            )\n         return response\n \n     def _fetch_content_range(self, start: int, end: int) -> Iterator[bytes]:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/inspection/lazy_wheel.py::LazyFileOverHTTP::_stream_response"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -590,6 +624,12 @@",
+          "snippet": " class LazyWheelOverHTTP(LazyFileOverHTTP):\n                 f\"did not receive partial content: got code {code}\"\n             )\n \n+        if \"Content-Range\" not in tail.headers:\n+            raise LazyWheelUnsupportedError(\n+                f\"file length cannot be determined for {self._url}, \"\n+                f\"did not receive content range header from server\"\n+            )\n+\n         file_length = self._parse_full_length_from_content_range(\n             tail.headers[\"Content-Range\"]\n         )",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/inspection/lazy_wheel.py::LazyWheelOverHTTP::_try_initial_chunk_request"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -614,10 +654,13 @@",
+          "snippet": " class LazyWheelOverHTTP(LazyFileOverHTTP):\n \n             # This indicates that the requested range from the end was larger than the\n             # actual file size: https://www.rfc-editor.org/rfc/rfc9110#status.416.\n-            if code == codes.requested_range_not_satisfiable:\n+            if (\n+                code == codes.requested_range_not_satisfiable\n+                and resp is not None\n+                and \"Content-Range\" in resp.headers\n+            ):\n                 # In this case, we don't have any file content yet, but we do know the\n                 # size the file will be, so we can return that and exit here.\n-                assert resp is not None\n                 file_length = self._parse_full_length_from_content_range(\n                     resp.headers[\"Content-Range\"]\n                 )",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/inspection/lazy_wheel.py::LazyWheelOverHTTP::_extract_content_length"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -638,12 +681,12 @@",
+          "snippet": " class LazyWheelOverHTTP(LazyFileOverHTTP):\n             return self._content_length_from_head(), None\n \n         # Some servers that do not support negative offsets,\n-        # handle a negative offset like \"-10\" as \"0-10\".\n-        if int(\n-            tail.headers[\"Content-Length\"]\n-        ) == initial_chunk_size + 1 and tail.headers[\"Content-Range\"].startswith(\n-            f\"bytes 0-{initial_chunk_size}\"\n-        ):\n+        # handle a negative offset like \"-10\" as \"0-10\"...\n+        # ... or behave even more strangely, see\n+        # https://github.com/python-poetry/poetry/issues/9056#issuecomment-1973273721\n+        if int(tail.headers[\"Content-Length\"]) > initial_chunk_size or tail.headers.get(\n+            \"Content-Range\", \"\"\n+        ).startswith(\"bytes -\"):\n             tail = None\n             self._domains_without_negative_range.add(domain)\n         return file_length, tail\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/inspection/lazy_wheel.py::LazyWheelOverHTTP::_extract_content_length"
+            }
+          ]
+        }
+      ]
+    },
+    "src/poetry/repositories/http_repository.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -20,7 +20,7 @@",
+          "snippet": " from poetry.core.version.markers import parse_marker\n \n from poetry.config.config import Config\n from poetry.inspection.info import PackageInfo\n-from poetry.inspection.lazy_wheel import HTTPRangeRequestUnsupported\n+from poetry.inspection.lazy_wheel import LazyWheelUnsupportedError\n from poetry.inspection.lazy_wheel import metadata_from_wheel_url\n from poetry.repositories.cached_repository import CachedRepository\n from poetry.repositories.exceptions import PackageNotFound",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "src/poetry/repositories/http_repository.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -122,9 +122,13 @@",
+          "snippet": " class HTTPRepository(CachedRepository):\n                 package_info = PackageInfo.from_metadata(\n                     metadata_from_wheel_url(link.filename, link.url, self.session)\n                 )\n-            except HTTPRangeRequestUnsupported:\n+            except LazyWheelUnsupportedError as e:\n                 # Do not set to False if we already know that the domain supports\n                 # range requests for some URLs!\n+                self._log(\n+                    f\"Disabling lazy wheel support for {netloc}: {e}\",\n+                    level=\"debug\",\n+                )\n                 raise_accepts_ranges = False\n                 self._supports_range_requests.setdefault(netloc, False)\n             else:",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/repositories/http_repository.py::HTTPRepository::_get_info_from_wheel"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -165,7 +169,7 @@",
+          "snippet": " class HTTPRepository(CachedRepository):\n                     )\n                 ):\n                     metadata_hash = getattr(hashlib, hash_name)(\n-                        response.text.encode()\n+                        response.content\n                     ).hexdigest()\n                     if metadata_hash != link.metadata_hashes[hash_name]:\n                         self._log(",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "src/poetry/repositories/http_repository.py::HTTPRepository::_get_info_from_metadata"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

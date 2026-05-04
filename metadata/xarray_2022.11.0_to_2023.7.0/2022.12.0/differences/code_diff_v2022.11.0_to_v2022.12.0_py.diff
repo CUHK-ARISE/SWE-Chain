@@ -1,0 +1,3949 @@
+diff --git a/asv_bench/benchmarks/renaming.py b/asv_bench/benchmarks/renaming.py
+new file mode 100644
+index 0000000..3ade5d8
+--- /dev/null
++++ b/asv_bench/benchmarks/renaming.py
+@@ -0,0 +1,27 @@
++import numpy as np
++
++import xarray as xr
++
++
++class SwapDims:
++    param_names = ["size"]
++    params = [[int(1e3), int(1e5), int(1e7)]]
++
++    def setup(self, size: int) -> None:
++        self.ds = xr.Dataset(
++            {"a": (("x", "t"), np.ones((size, 2)))},
++            coords={
++                "x": np.arange(size),
++                "y": np.arange(size),
++                "z": np.arange(size),
++                "x2": ("x", np.arange(size)),
++                "y2": ("y", np.arange(size)),
++                "z2": ("z", np.arange(size)),
++            },
++        )
++
++    def time_swap_dims(self, size: int) -> None:
++        self.ds.swap_dims({"x": "xn", "y": "yn", "z": "zn"})
++
++    def time_swap_dims_newindex(self, size: int) -> None:
++        self.ds.swap_dims({"x": "x2", "y": "y2", "z": "z2"})
+
+diff --git a/ci/min_deps_check.py b/ci/min_deps_check.py
+index 3cc10c7..23621c5 100755
+--- a/ci/min_deps_check.py
++++ b/ci/min_deps_check.py
+@@ -30,12 +30,12 @@ IGNORE_DEPS = {
+ POLICY_MONTHS = {"python": 24, "numpy": 18}
+ POLICY_MONTHS_DEFAULT = 12
+ POLICY_OVERRIDE: Dict[str, Tuple[int, int]] = {}
+-has_errors = False
++errors = []
+ 
+ 
+ def error(msg: str) -> None:
+-    global has_errors
+-    has_errors = True
++    global errors
++    errors.append(msg)
+     print("ERROR:", msg)
+ 
+ 
+@@ -48,7 +48,7 @@ def parse_requirements(fname) -> Iterator[Tuple[str, int, int, Optional[int]]]:
+ 
+     Yield (package name, major version, minor version, [patch version])
+     """
+-    global has_errors
++    global errors
+ 
+     with open(fname) as fh:
+         contents = yaml.safe_load(fh)
+@@ -157,9 +157,9 @@ def process_pkg(
+         status = "> (!)"
+         delta = relativedelta(datetime.now(), policy_published_actual).normalized()
+         n_months = delta.years * 12 + delta.months
+-        error(
+-            f"Package is too new: {pkg}={req_major}.{req_minor} was "
+-            f"published on {versions[req_major, req_minor]:%Y-%m-%d} "
++        warning(
++            f"Package is too new: {pkg}={policy_major}.{policy_minor} was "
++            f"published on {versions[policy_major, policy_minor]:%Y-%m-%d} "
+             f"which was {n_months} months ago (policy is {policy_months} months)"
+         )
+     else:
+@@ -193,13 +193,18 @@ def main() -> None:
+         for pkg, major, minor, patch in parse_requirements(fname)
+     ]
+ 
+-    print("Package           Required             Policy               Status")
++    print("\nPackage           Required             Policy               Status")
+     print("----------------- -------------------- -------------------- ------")
+     fmt = "{:17} {:7} ({:10}) {:7} ({:10}) {}"
+     for row in rows:
+         print(fmt.format(*row))
+ 
+-    assert not has_errors
++    if errors:
++        print("\nErrors:")
++        print("-------")
++        for i, e in enumerate(errors):
++            print(f"{i+1}. {e}")
++        sys.exit(1)
+ 
+ 
+ if __name__ == "__main__":
+
+diff --git a/xarray/__init__.py b/xarray/__init__.py
+index 46dcf0e..e920e94 100644
+--- a/xarray/__init__.py
++++ b/xarray/__init__.py
+@@ -40,7 +40,7 @@ try:
+     from importlib.metadata import version as _version
+ except ImportError:
+     # if the fallback library is missing, we are doomed.
+-    from importlib_metadata import version as _version  # type: ignore[no-redef]
++    from importlib_metadata import version as _version
+ 
+ try:
+     __version__ = _version("xarray")
+
+diff --git a/xarray/backends/api.py b/xarray/backends/api.py
+index 302d0c3..02cf425 100644
+--- a/xarray/backends/api.py
++++ b/xarray/backends/api.py
+@@ -9,6 +9,7 @@ from typing import (
+     TYPE_CHECKING,
+     Any,
+     Callable,
++    Dict,
+     Final,
+     Hashable,
+     Iterable,
+@@ -62,7 +63,7 @@ if TYPE_CHECKING:
+         str,  # no nice typing support for custom backends
+         None,
+     ]
+-    T_Chunks = Union[int, dict[Any, Any], Literal["auto"], None]
++    T_Chunks = Union[int, Dict[Any, Any], Literal["auto"], None]
+     T_NetcdfTypes = Literal[
+         "NETCDF4", "NETCDF4_CLASSIC", "NETCDF3_64BIT", "NETCDF3_CLASSIC"
+     ]
+@@ -1503,6 +1504,7 @@ def to_zarr(
+     region: Mapping[str, slice] | None = None,
+     safe_chunks: bool = True,
+     storage_options: dict[str, str] | None = None,
++    zarr_version: int | None = None,
+ ) -> backends.ZarrStore:
+     ...
+ 
+@@ -1524,6 +1526,7 @@ def to_zarr(
+     region: Mapping[str, slice] | None = None,
+     safe_chunks: bool = True,
+     storage_options: dict[str, str] | None = None,
++    zarr_version: int | None = None,
+ ) -> Delayed:
+     ...
+ 
+@@ -1542,6 +1545,7 @@ def to_zarr(
+     region: Mapping[str, slice] | None = None,
+     safe_chunks: bool = True,
+     storage_options: dict[str, str] | None = None,
++    zarr_version: int | None = None,
+ ) -> backends.ZarrStore | Delayed:
+     """This function creates an appropriate datastore for writing a dataset to
+     a zarr ztore
+@@ -1608,6 +1612,13 @@ def to_zarr(
+                 f"``region`` with to_zarr(), got {append_dim} in both"
+             )
+ 
++    if zarr_version is None:
++        # default to 2 if store doesn't specify it's version (e.g. a path)
++        zarr_version = int(getattr(store, "_store_version", 2))
++
++    if consolidated is None and zarr_version > 2:
++        consolidated = False
++
+     if mode == "r+":
+         already_consolidated = consolidated
+         consolidate_on_close = False
+@@ -1626,6 +1637,7 @@ def to_zarr(
+         write_region=region,
+         safe_chunks=safe_chunks,
+         stacklevel=4,  # for Dataset.to_zarr()
++        zarr_version=zarr_version,
+     )
+ 
+     if mode in ["a", "r+"]:
+
+diff --git a/xarray/backends/h5netcdf_.py b/xarray/backends/h5netcdf_.py
+index 1003358..6a6f547 100644
+--- a/xarray/backends/h5netcdf_.py
++++ b/xarray/backends/h5netcdf_.py
+@@ -4,7 +4,6 @@ import functools
+ import io
+ import os
+ 
+-import numpy as np
+ from packaging.version import Version
+ 
+ from ..core import indexing
+@@ -46,9 +45,6 @@ class H5NetCDFArrayWrapper(BaseNetCDF4Array):
+         )
+ 
+     def _getitem(self, key):
+-        # h5py requires using lists for fancy indexing:
+-        # https://github.com/h5py/h5py/issues/992
+-        key = tuple(list(k) if isinstance(k, np.ndarray) else k for k in key)
+         with self.datastore.lock:
+             array = self.get_array(needs_lock=False)
+             return array[key]
+
+diff --git a/xarray/backends/locks.py b/xarray/backends/locks.py
+index 73144df..1de8fc8 100644
+--- a/xarray/backends/locks.py
++++ b/xarray/backends/locks.py
+@@ -61,7 +61,7 @@ def _get_lock_maker(scheduler=None):
+         try:
+             from dask.distributed import Lock as DistributedLock
+         except ImportError:
+-            DistributedLock = None  # type: ignore
++            DistributedLock = None
+         return DistributedLock
+     else:
+         raise KeyError(scheduler)
+
+diff --git a/xarray/backends/lru_cache.py b/xarray/backends/lru_cache.py
+index 0f7f4c2..c60ef3f 100644
+--- a/xarray/backends/lru_cache.py
++++ b/xarray/backends/lru_cache.py
+@@ -30,7 +30,7 @@ class LRUCache(MutableMapping[K, V]):
+ 
+     __slots__ = ("_cache", "_lock", "_maxsize", "_on_evict")
+ 
+-    def __init__(self, maxsize: int, on_evict: Callable[[K, V], Any] = None):
++    def __init__(self, maxsize: int, on_evict: Callable[[K, V], Any] | None = None):
+         """
+         Parameters
+         ----------
+
+diff --git a/xarray/backends/netCDF4_.py b/xarray/backends/netCDF4_.py
+index 7b37b1a..f8b3192 100644
+--- a/xarray/backends/netCDF4_.py
++++ b/xarray/backends/netCDF4_.py
+@@ -232,11 +232,11 @@ def _extract_nc4_variable_encoding(
+         "shuffle",
+         "_FillValue",
+         "dtype",
++        "compression",
+     }
+     if lsd_okay:
+         valid_encodings.add("least_significant_digit")
+     if h5py_okay:
+-        valid_encodings.add("compression")
+         valid_encodings.add("compression_opts")
+ 
+     if not raise_on_invalid and encoding.get("chunksizes") is not None:
+
+diff --git a/xarray/backends/pynio_.py b/xarray/backends/pynio_.py
+index 07fb2b9..cb7c65c 100644
+--- a/xarray/backends/pynio_.py
++++ b/xarray/backends/pynio_.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++import warnings
++
+ import numpy as np
+ 
+ from ..core import indexing
+@@ -55,6 +57,12 @@ class NioDataStore(AbstractDataStore):
+     def __init__(self, filename, mode="r", lock=None, **kwargs):
+         import Nio
+ 
++        warnings.warn(
++            "The PyNIO backend is Deprecated and will be removed from Xarray in a future release. "
++            "See https://github.com/pydata/xarray/issues/4491 for more information",
++            DeprecationWarning,
++        )
++
+         if lock is None:
+             lock = PYNIO_LOCK
+         self.lock = ensure_lock(lock)
+@@ -94,6 +102,15 @@ class NioDataStore(AbstractDataStore):
+ 
+ 
+ class PynioBackendEntrypoint(BackendEntrypoint):
++    """
++    PyNIO backend
++
++        .. deprecated:: 0.20.0
++
++        Deprecated as PyNIO is no longer supported. See
++        https://github.com/pydata/xarray/issues/4491 for more information
++    """
++
+     available = module_available("Nio")
+ 
+     def open_dataset(
+
+diff --git a/xarray/backends/zarr.py b/xarray/backends/zarr.py
+index 6c547f8..cca2d89 100644
+--- a/xarray/backends/zarr.py
++++ b/xarray/backends/zarr.py
+@@ -353,6 +353,7 @@ class ZarrStore(AbstractWritableDataStore):
+         write_region=None,
+         safe_chunks=True,
+         stacklevel=2,
++        zarr_version=None,
+     ):
+         import zarr
+ 
+@@ -360,12 +361,29 @@ class ZarrStore(AbstractWritableDataStore):
+         if isinstance(store, os.PathLike):
+             store = os.fspath(store)
+ 
++        if zarr_version is None:
++            # default to 2 if store doesn't specify it's version (e.g. a path)
++            zarr_version = getattr(store, "_store_version", 2)
++
+         open_kwargs = dict(
+             mode=mode,
+             synchronizer=synchronizer,
+             path=group,
+         )
+         open_kwargs["storage_options"] = storage_options
++        if zarr_version > 2:
++            open_kwargs["zarr_version"] = zarr_version
++
++            if consolidated or consolidate_on_close:
++                raise ValueError(
++                    "consolidated metadata has not been implemented for zarr "
++                    f"version {zarr_version} yet. Set consolidated=False for "
++                    f"zarr version {zarr_version}. See also "
++                    "https://github.com/zarr-developers/zarr-specs/issues/136"
++                )
++
++            if consolidated is None:
++                consolidated = False
+ 
+         if chunk_store:
+             open_kwargs["chunk_store"] = chunk_store
+@@ -440,6 +458,11 @@ class ZarrStore(AbstractWritableDataStore):
+             zarr_array, DIMENSION_KEY, try_nczarr
+         )
+         attributes = dict(attributes)
++
++        # TODO: this should not be needed once
++        # https://github.com/zarr-developers/zarr-python/issues/1269 is resolved.
++        attributes.pop("filters", None)
++
+         encoding = {
+             "chunks": zarr_array.chunks,
+             "preferred_chunks": dict(zip(dimensions, zarr_array.chunks)),
+@@ -668,6 +691,7 @@ def open_zarr(
+     storage_options=None,
+     decode_timedelta=None,
+     use_cftime=None,
++    zarr_version=None,
+     **kwargs,
+ ):
+     """Load and decode a dataset from a Zarr store.
+@@ -725,6 +749,9 @@ def open_zarr(
+         capability. Only works for stores that have already been consolidated.
+         By default (`consolidate=None`), attempts to read consolidated metadata,
+         falling back to read non-consolidated metadata if that fails.
++
++        When the experimental ``zarr_version=3``, ``consolidated`` must be
++        either be ``None`` or ``False``.
+     chunk_store : MutableMapping, optional
+         A separate Zarr store only for chunk data.
+     storage_options : dict, optional
+@@ -745,6 +772,10 @@ def open_zarr(
+         represented using ``np.datetime64[ns]`` objects.  If False, always
+         decode times to ``np.datetime64[ns]`` objects; if this is not possible
+         raise an error.
++    zarr_version : int or None, optional
++        The desired zarr spec version to target (currently 2 or 3). The default
++        of None will attempt to determine the zarr version from ``store`` when
++        possible, otherwise defaulting to 2.
+ 
+     Returns
+     -------
+@@ -782,6 +813,7 @@ def open_zarr(
+         "chunk_store": chunk_store,
+         "storage_options": storage_options,
+         "stacklevel": 4,
++        "zarr_version": zarr_version,
+     }
+ 
+     ds = open_dataset(
+@@ -798,6 +830,7 @@ def open_zarr(
+         backend_kwargs=backend_kwargs,
+         decode_timedelta=decode_timedelta,
+         use_cftime=use_cftime,
++        zarr_version=zarr_version,
+     )
+     return ds
+ 
+@@ -842,6 +875,7 @@ class ZarrBackendEntrypoint(BackendEntrypoint):
+         chunk_store=None,
+         storage_options=None,
+         stacklevel=3,
++        zarr_version=None,
+     ):
+ 
+         filename_or_obj = _normalize_path(filename_or_obj)
+@@ -855,6 +889,7 @@ class ZarrBackendEntrypoint(BackendEntrypoint):
+             chunk_store=chunk_store,
+             storage_options=storage_options,
+             stacklevel=stacklevel + 1,
++            zarr_version=zarr_version,
+         )
+ 
+         store_entrypoint = StoreBackendEntrypoint()
+
+diff --git a/xarray/coding/cftime_offsets.py b/xarray/coding/cftime_offsets.py
+index a029f39..04b2d77 100644
+--- a/xarray/coding/cftime_offsets.py
++++ b/xarray/coding/cftime_offsets.py
+@@ -207,6 +207,10 @@ class Tick(BaseCFTimeOffset):
+             return new_self * other
+         return type(self)(n=other * self.n)
+ 
++    def as_timedelta(self):
++        """All Tick subclasses must implement an as_timedelta method."""
++        raise NotImplementedError
++
+ 
+ def _get_day_of_month(other, day_option):
+     """Find the day in `other`'s month that satisfies a BaseCFTimeOffset's
+
+diff --git a/xarray/core/_aggregations.py b/xarray/core/_aggregations.py
+index d7d928f..1db330f 100644
+--- a/xarray/core/_aggregations.py
++++ b/xarray/core/_aggregations.py
+@@ -44,9 +44,9 @@ class DatasetAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``count``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         keep_attrs : bool or None, optional
+             If True, ``attrs`` will be copied from the original
+             object to the new one.  If False, the new object will be
+@@ -116,9 +116,9 @@ class DatasetAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``all``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         keep_attrs : bool or None, optional
+             If True, ``attrs`` will be copied from the original
+             object to the new one.  If False, the new object will be
+@@ -188,9 +188,9 @@ class DatasetAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``any``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         keep_attrs : bool or None, optional
+             If True, ``attrs`` will be copied from the original
+             object to the new one.  If False, the new object will be
+@@ -261,9 +261,9 @@ class DatasetAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``max``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -348,9 +348,9 @@ class DatasetAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``min``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -435,9 +435,9 @@ class DatasetAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``mean``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -527,9 +527,9 @@ class DatasetAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``prod``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -634,9 +634,9 @@ class DatasetAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``sum``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -741,9 +741,9 @@ class DatasetAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``std``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -845,9 +845,9 @@ class DatasetAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``var``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -948,9 +948,9 @@ class DatasetAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``median``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -1039,9 +1039,9 @@ class DatasetAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``cumsum``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -1132,9 +1132,9 @@ class DatasetAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``cumprod``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -1240,9 +1240,9 @@ class DataArrayAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``count``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         keep_attrs : bool or None, optional
+             If True, ``attrs`` will be copied from the original
+             object to the new one.  If False, the new object will be
+@@ -1306,9 +1306,9 @@ class DataArrayAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``all``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         keep_attrs : bool or None, optional
+             If True, ``attrs`` will be copied from the original
+             object to the new one.  If False, the new object will be
+@@ -1372,9 +1372,9 @@ class DataArrayAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``any``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         keep_attrs : bool or None, optional
+             If True, ``attrs`` will be copied from the original
+             object to the new one.  If False, the new object will be
+@@ -1439,9 +1439,9 @@ class DataArrayAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``max``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -1518,9 +1518,9 @@ class DataArrayAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``min``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -1597,9 +1597,9 @@ class DataArrayAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``mean``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -1681,9 +1681,9 @@ class DataArrayAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``prod``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -1778,9 +1778,9 @@ class DataArrayAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``sum``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -1875,9 +1875,9 @@ class DataArrayAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``std``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -1969,9 +1969,9 @@ class DataArrayAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``var``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -2062,9 +2062,9 @@ class DataArrayAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``median``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -2145,9 +2145,9 @@ class DataArrayAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``cumsum``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -2234,9 +2234,9 @@ class DataArrayAggregations:
+ 
+         Parameters
+         ----------
+-        dim : str, Iterable of Hashable, or None, default: None
++        dim : str, Iterable of Hashable, "..." or None, default: None
+             Name of dimension[s] along which to apply ``cumprod``. For e.g. ``dim="x"``
+-            or ``dim=["x", "y"]``. If None, will reduce over all dimensions.
++            or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions.
+         skipna : bool or None, optional
+             If True, skip missing values (as marked by NaN). By default, only
+             skips missing values for float dtypes; other dtypes either do not
+@@ -2317,7 +2317,7 @@ class DatasetGroupByAggregations:
+     def reduce(
+         self,
+         func: Callable[..., Any],
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         axis: int | Sequence[int] | None = None,
+         keep_attrs: bool | None = None,
+@@ -2328,14 +2328,14 @@ class DatasetGroupByAggregations:
+ 
+     def _flox_reduce(
+         self,
+-        dim: Dims | ellipsis,
++        dim: Dims,
+         **kwargs: Any,
+     ) -> Dataset:
+         raise NotImplementedError()
+ 
+     def count(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         keep_attrs: bool | None = None,
+         **kwargs: Any,
+@@ -2424,7 +2424,7 @@ class DatasetGroupByAggregations:
+ 
+     def all(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         keep_attrs: bool | None = None,
+         **kwargs: Any,
+@@ -2513,7 +2513,7 @@ class DatasetGroupByAggregations:
+ 
+     def any(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         keep_attrs: bool | None = None,
+         **kwargs: Any,
+@@ -2602,7 +2602,7 @@ class DatasetGroupByAggregations:
+ 
+     def max(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -2709,7 +2709,7 @@ class DatasetGroupByAggregations:
+ 
+     def min(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -2816,7 +2816,7 @@ class DatasetGroupByAggregations:
+ 
+     def mean(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -2927,7 +2927,7 @@ class DatasetGroupByAggregations:
+ 
+     def prod(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         min_count: int | None = None,
+@@ -3057,7 +3057,7 @@ class DatasetGroupByAggregations:
+ 
+     def sum(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         min_count: int | None = None,
+@@ -3187,7 +3187,7 @@ class DatasetGroupByAggregations:
+ 
+     def std(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         ddof: int = 0,
+@@ -3314,7 +3314,7 @@ class DatasetGroupByAggregations:
+ 
+     def var(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         ddof: int = 0,
+@@ -3441,7 +3441,7 @@ class DatasetGroupByAggregations:
+ 
+     def median(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -3537,7 +3537,7 @@ class DatasetGroupByAggregations:
+ 
+     def cumsum(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -3631,7 +3631,7 @@ class DatasetGroupByAggregations:
+ 
+     def cumprod(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -3730,7 +3730,7 @@ class DatasetResampleAggregations:
+     def reduce(
+         self,
+         func: Callable[..., Any],
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         axis: int | Sequence[int] | None = None,
+         keep_attrs: bool | None = None,
+@@ -3741,14 +3741,14 @@ class DatasetResampleAggregations:
+ 
+     def _flox_reduce(
+         self,
+-        dim: Dims | ellipsis,
++        dim: Dims,
+         **kwargs: Any,
+     ) -> Dataset:
+         raise NotImplementedError()
+ 
+     def count(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         keep_attrs: bool | None = None,
+         **kwargs: Any,
+@@ -3837,7 +3837,7 @@ class DatasetResampleAggregations:
+ 
+     def all(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         keep_attrs: bool | None = None,
+         **kwargs: Any,
+@@ -3926,7 +3926,7 @@ class DatasetResampleAggregations:
+ 
+     def any(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         keep_attrs: bool | None = None,
+         **kwargs: Any,
+@@ -4015,7 +4015,7 @@ class DatasetResampleAggregations:
+ 
+     def max(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -4122,7 +4122,7 @@ class DatasetResampleAggregations:
+ 
+     def min(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -4229,7 +4229,7 @@ class DatasetResampleAggregations:
+ 
+     def mean(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -4340,7 +4340,7 @@ class DatasetResampleAggregations:
+ 
+     def prod(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         min_count: int | None = None,
+@@ -4470,7 +4470,7 @@ class DatasetResampleAggregations:
+ 
+     def sum(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         min_count: int | None = None,
+@@ -4600,7 +4600,7 @@ class DatasetResampleAggregations:
+ 
+     def std(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         ddof: int = 0,
+@@ -4727,7 +4727,7 @@ class DatasetResampleAggregations:
+ 
+     def var(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         ddof: int = 0,
+@@ -4854,7 +4854,7 @@ class DatasetResampleAggregations:
+ 
+     def median(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -4950,7 +4950,7 @@ class DatasetResampleAggregations:
+ 
+     def cumsum(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -5044,7 +5044,7 @@ class DatasetResampleAggregations:
+ 
+     def cumprod(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -5143,7 +5143,7 @@ class DataArrayGroupByAggregations:
+     def reduce(
+         self,
+         func: Callable[..., Any],
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         axis: int | Sequence[int] | None = None,
+         keep_attrs: bool | None = None,
+@@ -5154,14 +5154,14 @@ class DataArrayGroupByAggregations:
+ 
+     def _flox_reduce(
+         self,
+-        dim: Dims | ellipsis,
++        dim: Dims,
+         **kwargs: Any,
+     ) -> DataArray:
+         raise NotImplementedError()
+ 
+     def count(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         keep_attrs: bool | None = None,
+         **kwargs: Any,
+@@ -5243,7 +5243,7 @@ class DataArrayGroupByAggregations:
+ 
+     def all(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         keep_attrs: bool | None = None,
+         **kwargs: Any,
+@@ -5325,7 +5325,7 @@ class DataArrayGroupByAggregations:
+ 
+     def any(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         keep_attrs: bool | None = None,
+         **kwargs: Any,
+@@ -5407,7 +5407,7 @@ class DataArrayGroupByAggregations:
+ 
+     def max(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -5505,7 +5505,7 @@ class DataArrayGroupByAggregations:
+ 
+     def min(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -5603,7 +5603,7 @@ class DataArrayGroupByAggregations:
+ 
+     def mean(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -5705,7 +5705,7 @@ class DataArrayGroupByAggregations:
+ 
+     def prod(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         min_count: int | None = None,
+@@ -5824,7 +5824,7 @@ class DataArrayGroupByAggregations:
+ 
+     def sum(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         min_count: int | None = None,
+@@ -5943,7 +5943,7 @@ class DataArrayGroupByAggregations:
+ 
+     def std(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         ddof: int = 0,
+@@ -6059,7 +6059,7 @@ class DataArrayGroupByAggregations:
+ 
+     def var(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         ddof: int = 0,
+@@ -6175,7 +6175,7 @@ class DataArrayGroupByAggregations:
+ 
+     def median(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -6263,7 +6263,7 @@ class DataArrayGroupByAggregations:
+ 
+     def cumsum(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -6353,7 +6353,7 @@ class DataArrayGroupByAggregations:
+ 
+     def cumprod(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -6448,7 +6448,7 @@ class DataArrayResampleAggregations:
+     def reduce(
+         self,
+         func: Callable[..., Any],
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         axis: int | Sequence[int] | None = None,
+         keep_attrs: bool | None = None,
+@@ -6459,14 +6459,14 @@ class DataArrayResampleAggregations:
+ 
+     def _flox_reduce(
+         self,
+-        dim: Dims | ellipsis,
++        dim: Dims,
+         **kwargs: Any,
+     ) -> DataArray:
+         raise NotImplementedError()
+ 
+     def count(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         keep_attrs: bool | None = None,
+         **kwargs: Any,
+@@ -6548,7 +6548,7 @@ class DataArrayResampleAggregations:
+ 
+     def all(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         keep_attrs: bool | None = None,
+         **kwargs: Any,
+@@ -6630,7 +6630,7 @@ class DataArrayResampleAggregations:
+ 
+     def any(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         keep_attrs: bool | None = None,
+         **kwargs: Any,
+@@ -6712,7 +6712,7 @@ class DataArrayResampleAggregations:
+ 
+     def max(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -6810,7 +6810,7 @@ class DataArrayResampleAggregations:
+ 
+     def min(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -6908,7 +6908,7 @@ class DataArrayResampleAggregations:
+ 
+     def mean(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -7010,7 +7010,7 @@ class DataArrayResampleAggregations:
+ 
+     def prod(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         min_count: int | None = None,
+@@ -7129,7 +7129,7 @@ class DataArrayResampleAggregations:
+ 
+     def sum(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         min_count: int | None = None,
+@@ -7248,7 +7248,7 @@ class DataArrayResampleAggregations:
+ 
+     def std(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         ddof: int = 0,
+@@ -7364,7 +7364,7 @@ class DataArrayResampleAggregations:
+ 
+     def var(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         ddof: int = 0,
+@@ -7480,7 +7480,7 @@ class DataArrayResampleAggregations:
+ 
+     def median(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -7568,7 +7568,7 @@ class DataArrayResampleAggregations:
+ 
+     def cumsum(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+@@ -7658,7 +7658,7 @@ class DataArrayResampleAggregations:
+ 
+     def cumprod(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         skipna: bool | None = None,
+         keep_attrs: bool | None = None,
+
+diff --git a/xarray/core/accessor_str.py b/xarray/core/accessor_str.py
+index e84c4ed..2c74d2b 100644
+--- a/xarray/core/accessor_str.py
++++ b/xarray/core/accessor_str.py
+@@ -112,7 +112,7 @@ def _apply_str_ufunc(
+     obj: Any,
+     dtype: DTypeLike = None,
+     output_core_dims: list | tuple = ((),),
+-    output_sizes: Mapping[Any, int] = None,
++    output_sizes: Mapping[Any, int] | None = None,
+     func_args: tuple = (),
+     func_kwargs: Mapping = {},
+ ) -> Any:
+@@ -222,7 +222,7 @@ class StringAccessor(Generic[T_DataArray]):
+         func: Callable,
+         dtype: DTypeLike = None,
+         output_core_dims: list | tuple = ((),),
+-        output_sizes: Mapping[Any, int] = None,
++        output_sizes: Mapping[Any, int] | None = None,
+         func_args: tuple = (),
+         func_kwargs: Mapping = {},
+     ) -> T_DataArray:
+@@ -850,7 +850,7 @@ class StringAccessor(Generic[T_DataArray]):
+         return self._apply(func=lambda x: x.isupper(), dtype=bool)
+ 
+     def count(
+-        self, pat: str | bytes | Pattern | Any, flags: int = 0, case: bool = None
++        self, pat: str | bytes | Pattern | Any, flags: int = 0, case: bool | None = None
+     ) -> T_DataArray:
+         """
+         Count occurrences of pattern in each string of the array.
+@@ -1097,7 +1097,7 @@ class StringAccessor(Generic[T_DataArray]):
+     def contains(
+         self,
+         pat: str | bytes | Pattern | Any,
+-        case: bool = None,
++        case: bool | None = None,
+         flags: int = 0,
+         regex: bool = True,
+     ) -> T_DataArray:
+@@ -1170,7 +1170,7 @@ class StringAccessor(Generic[T_DataArray]):
+     def match(
+         self,
+         pat: str | bytes | Pattern | Any,
+-        case: bool = None,
++        case: bool | None = None,
+         flags: int = 0,
+     ) -> T_DataArray:
+         """
+@@ -1531,7 +1531,7 @@ class StringAccessor(Generic[T_DataArray]):
+         pat: str | bytes | Pattern | Any,
+         repl: str | bytes | Callable | Any,
+         n: int | Any = -1,
+-        case: bool = None,
++        case: bool | None = None,
+         flags: int = 0,
+         regex: bool = True,
+     ) -> T_DataArray:
+@@ -1603,7 +1603,7 @@ class StringAccessor(Generic[T_DataArray]):
+         self,
+         pat: str | bytes | Pattern | Any,
+         dim: Hashable,
+-        case: bool = None,
++        case: bool | None = None,
+         flags: int = 0,
+     ) -> T_DataArray:
+         r"""
+@@ -1748,7 +1748,7 @@ class StringAccessor(Generic[T_DataArray]):
+         pat: str | bytes | Pattern | Any,
+         group_dim: Hashable,
+         match_dim: Hashable,
+-        case: bool = None,
++        case: bool | None = None,
+         flags: int = 0,
+     ) -> T_DataArray:
+         r"""
+@@ -1921,7 +1921,7 @@ class StringAccessor(Generic[T_DataArray]):
+     def findall(
+         self,
+         pat: str | bytes | Pattern | Any,
+-        case: bool = None,
++        case: bool | None = None,
+         flags: int = 0,
+     ) -> T_DataArray:
+         r"""
+
+diff --git a/xarray/core/alignment.py b/xarray/core/alignment.py
+index df6f541..ef30d9a 100644
+--- a/xarray/core/alignment.py
++++ b/xarray/core/alignment.py
+@@ -141,10 +141,10 @@ class Aligner(Generic[DataAlignable]):
+         self,
+         objects: Iterable[DataAlignable],
+         join: str = "inner",
+-        indexes: Mapping[Any, Any] = None,
++        indexes: Mapping[Any, Any] | None = None,
+         exclude_dims: Iterable = frozenset(),
+         exclude_vars: Iterable[Hashable] = frozenset(),
+-        method: str = None,
++        method: str | None = None,
+         tolerance: int | float | Iterable[int | float] | None = None,
+         copy: bool = True,
+         fill_value: Any = dtypes.NA,
+@@ -474,7 +474,7 @@ class Aligner(Generic[DataAlignable]):
+                 if obj_idx is not None:
+                     for name, var in self.aligned_index_vars[key].items():
+                         new_indexes[name] = aligned_idx
+-                        new_variables[name] = var.copy()
++                        new_variables[name] = var.copy(deep=self.copy)
+ 
+             objects[i + 1] = obj._overwrite_indexes(new_indexes, new_variables)
+ 
+@@ -490,7 +490,7 @@ class Aligner(Generic[DataAlignable]):
+             obj_idx = matching_indexes.get(key)
+             if obj_idx is not None:
+                 if self.reindex[key]:
+-                    indexers = obj_idx.reindex_like(aligned_idx, **self.reindex_kwargs)  # type: ignore[call-arg]
++                    indexers = obj_idx.reindex_like(aligned_idx, **self.reindex_kwargs)
+                     dim_pos_indexers.update(indexers)
+ 
+         return dim_pos_indexers
+@@ -514,7 +514,7 @@ class Aligner(Generic[DataAlignable]):
+             if obj_idx is not None:
+                 for name, var in index_vars.items():
+                     new_indexes[name] = aligned_idx
+-                    new_variables[name] = var.copy()
++                    new_variables[name] = var.copy(deep=self.copy)
+ 
+         return new_indexes, new_variables
+ 
+@@ -853,7 +853,7 @@ def deep_align(
+ def reindex(
+     obj: DataAlignable,
+     indexers: Mapping[Any, Any],
+-    method: str = None,
++    method: str | None = None,
+     tolerance: int | float | Iterable[int | float] | None = None,
+     copy: bool = True,
+     fill_value: Any = dtypes.NA,
+@@ -892,7 +892,7 @@ def reindex(
+ def reindex_like(
+     obj: DataAlignable,
+     other: Dataset | DataArray,
+-    method: str = None,
++    method: str | None = None,
+     tolerance: int | float | Iterable[int | float] | None = None,
+     copy: bool = True,
+     fill_value: Any = dtypes.NA,
+
+diff --git a/xarray/core/combine.py b/xarray/core/combine.py
+index fe4178e..f474d3b 100644
+--- a/xarray/core/combine.py
++++ b/xarray/core/combine.py
+@@ -377,7 +377,7 @@ def _nested_combine(
+ 
+ # Define type for arbitrarily-nested list of lists recursively
+ # Currently mypy cannot handle this but other linters can (https://stackoverflow.com/a/53845083/3154101)
+-DATASET_HYPERCUBE = Union[Dataset, Iterable["DATASET_HYPERCUBE"]]  # type: ignore
++DATASET_HYPERCUBE = Union[Dataset, Iterable["DATASET_HYPERCUBE"]]  # type: ignore[misc]
+ 
+ 
+ def combine_nested(
+@@ -669,7 +669,7 @@ def combine_by_coords(
+     fill_value: object = dtypes.NA,
+     join: JoinOptions = "outer",
+     combine_attrs: CombineAttrsOptions = "no_conflicts",
+-    datasets: Iterable[Dataset] = None,
++    datasets: Iterable[Dataset] | None = None,
+ ) -> Dataset | DataArray:
+     """
+ 
+
+diff --git a/xarray/core/common.py b/xarray/core/common.py
+index 13fd91d..d1387d6 100644
+--- a/xarray/core/common.py
++++ b/xarray/core/common.py
+@@ -44,7 +44,13 @@ if TYPE_CHECKING:
+     from .indexes import Index
+     from .resample import Resample
+     from .rolling_exp import RollingExp
+-    from .types import DTypeLikeSave, ScalarOrArray, SideOptions, T_DataWithCoords
++    from .types import (
++        DatetimeLike,
++        DTypeLikeSave,
++        ScalarOrArray,
++        SideOptions,
++        T_DataWithCoords,
++    )
+     from .variable import Variable
+ 
+     DTypeMaybeMapping = Union[DTypeLikeSave, Mapping[Any, DTypeLikeSave]]
+@@ -770,7 +776,7 @@ class DataWithCoords(AttrAccessMixin):
+ 
+     def rolling_exp(
+         self: T_DataWithCoords,
+-        window: Mapping[Any, int] = None,
++        window: Mapping[Any, int] | None = None,
+         window_type: str = "span",
+         **window_kwargs,
+     ) -> RollingExp[T_DataWithCoords]:
+@@ -817,7 +823,9 @@ class DataWithCoords(AttrAccessMixin):
+         skipna: bool | None,
+         closed: SideOptions | None,
+         label: SideOptions | None,
+-        base: int,
++        base: int | None,
++        offset: pd.Timedelta | datetime.timedelta | str | None,
++        origin: str | DatetimeLike,
+         keep_attrs: bool | None,
+         loffset: datetime.timedelta | str | None,
+         restore_coord_dims: bool | None,
+@@ -845,6 +853,18 @@ class DataWithCoords(AttrAccessMixin):
+             For frequencies that evenly subdivide 1 day, the "origin" of the
+             aggregated intervals. For example, for "24H" frequency, base could
+             range from 0 through 23.
++        origin : {'epoch', 'start', 'start_day', 'end', 'end_day'}, pd.Timestamp, datetime.datetime, np.datetime64, or cftime.datetime, default 'start_day'
++            The datetime on which to adjust the grouping. The timezone of origin
++            must match the timezone of the index.
++
++            If a datetime is not used, these values are also supported:
++            - 'epoch': `origin` is 1970-01-01
++            - 'start': `origin` is the first value of the timeseries
++            - 'start_day': `origin` is the first day at midnight of the timeseries
++            - 'end': `origin` is the last value of the timeseries
++            - 'end_day': `origin` is the ceiling midnight of the last day
++        offset : pd.Timedelta, datetime.timedelta, or str, default is None
++            An offset timedelta added to the origin.
+         loffset : timedelta or str, optional
+             Offset used to adjust the resampled time labels. Some pandas date
+             offset strings are supported.
+@@ -960,10 +980,24 @@ class DataWithCoords(AttrAccessMixin):
+             if isinstance(self._indexes[dim_name].to_pandas_index(), CFTimeIndex):
+                 from .resample_cftime import CFTimeGrouper
+ 
+-                grouper = CFTimeGrouper(freq, closed, label, base, loffset)
++                grouper = CFTimeGrouper(
++                    freq=freq,
++                    closed=closed,
++                    label=label,
++                    base=base,
++                    loffset=loffset,
++                    origin=origin,
++                    offset=offset,
++                )
+             else:
+                 grouper = pd.Grouper(
+-                    freq=freq, closed=closed, label=label, base=base, loffset=loffset
++                    freq=freq,
++                    closed=closed,
++                    label=label,
++                    base=base,
++                    offset=offset,
++                    origin=origin,
++                    loffset=loffset,
+                 )
+         group = DataArray(
+             dim_coord, coords=dim_coord.coords, dims=dim_coord.dims, name=RESAMPLE_DIM
+
+diff --git a/xarray/core/computation.py b/xarray/core/computation.py
+index 6ec3845..41d529b 100644
+--- a/xarray/core/computation.py
++++ b/xarray/core/computation.py
+@@ -846,7 +846,7 @@ def apply_array_ufunc(func, *args, dask="forbidden"):
+ def apply_ufunc(
+     func: Callable,
+     *args: Any,
+-    input_core_dims: Sequence[Sequence] = None,
++    input_core_dims: Sequence[Sequence] | None = None,
+     output_core_dims: Sequence[Sequence] | None = ((),),
+     exclude_dims: AbstractSet = frozenset(),
+     vectorize: bool = False,
+@@ -1734,7 +1734,7 @@ def dot(
+             dim_counts.update(arr.dims)
+         dims = tuple(d for d, c in dim_counts.items() if c > 1)
+ 
+-    dot_dims: set[Hashable] = set(dims)  # type:ignore[arg-type]
++    dot_dims: set[Hashable] = set(dims)
+ 
+     # dimensions to be parallelized
+     broadcast_dims = common_dims - dot_dims
+@@ -1855,15 +1855,13 @@ def where(cond, x, y, keep_attrs=None):
+     Dataset.where, DataArray.where :
+         equivalent methods
+     """
++    from .dataset import Dataset
++
+     if keep_attrs is None:
+         keep_attrs = _get_keep_attrs(default=False)
+-    if keep_attrs is True:
+-        # keep the attributes of x, the second parameter, by default to
+-        # be consistent with the `where` method of `DataArray` and `Dataset`
+-        keep_attrs = lambda attrs, context: getattr(x, "attrs", {})
+ 
+     # alignment for three arguments is complicated, so don't support it yet
+-    return apply_ufunc(
++    result = apply_ufunc(
+         duck_array_ops.where,
+         cond,
+         x,
+@@ -1874,24 +1872,53 @@ def where(cond, x, y, keep_attrs=None):
+         keep_attrs=keep_attrs,
+     )
+ 
++    # keep the attributes of x, the second parameter, by default to
++    # be consistent with the `where` method of `DataArray` and `Dataset`
++    # rebuild the attrs from x at each level of the output, which could be
++    # Dataset, DataArray, or Variable, and also handle coords
++    if keep_attrs is True:
++        if isinstance(y, Dataset) and not isinstance(x, Dataset):
++            # handle special case where x gets promoted to Dataset
++            result.attrs = {}
++            if getattr(x, "name", None) in result.data_vars:
++                result[x.name].attrs = getattr(x, "attrs", {})
++        else:
++            # otherwise, fill in global attrs and variable attrs (if they exist)
++            result.attrs = getattr(x, "attrs", {})
++            for v in getattr(result, "data_vars", []):
++                result[v].attrs = getattr(getattr(x, v, None), "attrs", {})
++        for c in getattr(result, "coords", []):
++            # always fill coord attrs of x
++            result[c].attrs = getattr(getattr(x, c, None), "attrs", {})
++
++    return result
++
+ 
+ @overload
+-def polyval(coord: DataArray, coeffs: DataArray, degree_dim: Hashable) -> DataArray:
++def polyval(
++    coord: DataArray, coeffs: DataArray, degree_dim: Hashable = "degree"
++) -> DataArray:
+     ...
+ 
+ 
+ @overload
+-def polyval(coord: DataArray, coeffs: Dataset, degree_dim: Hashable) -> Dataset:
++def polyval(
++    coord: DataArray, coeffs: Dataset, degree_dim: Hashable = "degree"
++) -> Dataset:
+     ...
+ 
+ 
+ @overload
+-def polyval(coord: Dataset, coeffs: DataArray, degree_dim: Hashable) -> Dataset:
++def polyval(
++    coord: Dataset, coeffs: DataArray, degree_dim: Hashable = "degree"
++) -> Dataset:
+     ...
+ 
+ 
+ @overload
+-def polyval(coord: Dataset, coeffs: Dataset, degree_dim: Hashable) -> Dataset:
++def polyval(
++    coord: Dataset, coeffs: Dataset, degree_dim: Hashable = "degree"
++) -> Dataset:
+     ...
+ 
+ 
+@@ -2001,10 +2028,10 @@ def _calc_idxminmax(
+     *,
+     array,
+     func: Callable,
+-    dim: Hashable = None,
+-    skipna: bool = None,
++    dim: Hashable | None = None,
++    skipna: bool | None = None,
+     fill_value: Any = dtypes.NA,
+-    keep_attrs: bool = None,
++    keep_attrs: bool | None = None,
+ ):
+     """Apply common operations for idxmin and idxmax."""
+     # This function doesn't make sense for scalars so don't try
+
+diff --git a/xarray/core/coordinates.py b/xarray/core/coordinates.py
+index 47350b9..3a6b70f 100644
+--- a/xarray/core/coordinates.py
++++ b/xarray/core/coordinates.py
+@@ -2,7 +2,7 @@ from __future__ import annotations
+ 
+ import warnings
+ from contextlib import contextmanager
+-from typing import TYPE_CHECKING, Any, Hashable, Iterator, Mapping, Sequence, cast
++from typing import TYPE_CHECKING, Any, Hashable, Iterator, List, Mapping, Sequence
+ 
+ import numpy as np
+ import pandas as pd
+@@ -14,18 +14,27 @@ from .utils import Frozen, ReprObject
+ from .variable import Variable, calculate_dimensions
+ 
+ if TYPE_CHECKING:
++    from .common import DataWithCoords
+     from .dataarray import DataArray
+     from .dataset import Dataset
++    from .types import T_DataArray
+ 
+ # Used as the key corresponding to a DataArray's variable when converting
+ # arbitrary DataArray objects to datasets
+ _THIS_ARRAY = ReprObject("<this-array>")
+ 
++# TODO: Remove when min python version >= 3.9:
++GenericAlias = type(List[int])
+ 
+-class Coordinates(Mapping[Hashable, "DataArray"]):
+-    __slots__ = ()
+ 
+-    def __getitem__(self, key: Hashable) -> DataArray:
++class Coordinates(Mapping[Hashable, "T_DataArray"]):
++    _data: DataWithCoords
++    __slots__ = ("_data",)
++
++    # TODO: Remove when min python version >= 3.9:
++    __class_getitem__ = classmethod(GenericAlias)
++
++    def __getitem__(self, key: Hashable) -> T_DataArray:
+         raise NotImplementedError()
+ 
+     def __setitem__(self, key: Hashable, value: Any) -> None:
+@@ -45,11 +54,11 @@ class Coordinates(Mapping[Hashable, "DataArray"]):
+ 
+     @property
+     def indexes(self) -> Indexes[pd.Index]:
+-        return self._data.indexes  # type: ignore[attr-defined]
++        return self._data.indexes
+ 
+     @property
+     def xindexes(self) -> Indexes[Index]:
+-        return self._data.xindexes  # type: ignore[attr-defined]
++        return self._data.xindexes
+ 
+     @property
+     def variables(self):
+@@ -79,7 +88,7 @@ class Coordinates(Mapping[Hashable, "DataArray"]):
+     def to_dataset(self) -> Dataset:
+         raise NotImplementedError()
+ 
+-    def to_index(self, ordered_dims: Sequence[Hashable] = None) -> pd.Index:
++    def to_index(self, ordered_dims: Sequence[Hashable] | None = None) -> pd.Index:
+         """Convert all index coordinates into a :py:class:`pandas.Index`.
+ 
+         Parameters
+@@ -107,11 +116,9 @@ class Coordinates(Mapping[Hashable, "DataArray"]):
+             raise ValueError("no valid index for a 0-dimensional object")
+         elif len(ordered_dims) == 1:
+             (dim,) = ordered_dims
+-            return self._data.get_index(dim)  # type: ignore[attr-defined]
++            return self._data.get_index(dim)
+         else:
+-            indexes = [
+-                self._data.get_index(k) for k in ordered_dims  # type: ignore[attr-defined]
+-            ]
++            indexes = [self._data.get_index(k) for k in ordered_dims]
+ 
+             # compute the sizes of the repeat and tile for the cartesian product
+             # (taken from pandas.core.reshape.util)
+@@ -238,6 +245,8 @@ class DatasetCoordinates(Coordinates):
+     objects.
+     """
+ 
++    _data: Dataset
++
+     __slots__ = ("_data",)
+ 
+     def __init__(self, dataset: Dataset):
+@@ -278,7 +287,7 @@ class DatasetCoordinates(Coordinates):
+     def __getitem__(self, key: Hashable) -> DataArray:
+         if key in self._data.data_vars:
+             raise KeyError(key)
+-        return cast("DataArray", self._data[key])
++        return self._data[key]
+ 
+     def to_dataset(self) -> Dataset:
+         """Convert these coordinates into a new Dataset"""
+@@ -334,16 +343,18 @@ class DatasetCoordinates(Coordinates):
+         ]
+ 
+ 
+-class DataArrayCoordinates(Coordinates):
++class DataArrayCoordinates(Coordinates["T_DataArray"]):
+     """Dictionary like container for DataArray coordinates.
+ 
+     Essentially a dict with keys given by the array's
+     dimensions and the values given by corresponding DataArray objects.
+     """
+ 
++    _data: T_DataArray
++
+     __slots__ = ("_data",)
+ 
+-    def __init__(self, dataarray: DataArray):
++    def __init__(self, dataarray: T_DataArray) -> None:
+         self._data = dataarray
+ 
+     @property
+@@ -366,7 +377,7 @@ class DataArrayCoordinates(Coordinates):
+     def _names(self) -> set[Hashable]:
+         return set(self._data._coords)
+ 
+-    def __getitem__(self, key: Hashable) -> DataArray:
++    def __getitem__(self, key: Hashable) -> T_DataArray:
+         return self._data._getitem_coord(key)
+ 
+     def _update_coords(
+@@ -452,7 +463,7 @@ def drop_coords(
+ 
+ 
+ def assert_coordinate_consistent(
+-    obj: DataArray | Dataset, coords: Mapping[Any, Variable]
++    obj: T_DataArray | Dataset, coords: Mapping[Any, Variable]
+ ) -> None:
+     """Make sure the dimension coordinate of obj is consistent with coords.
+ 
+
+diff --git a/xarray/core/dataarray.py b/xarray/core/dataarray.py
+index 15d1777..f939a2c 100644
+--- a/xarray/core/dataarray.py
++++ b/xarray/core/dataarray.py
+@@ -78,6 +78,7 @@ if TYPE_CHECKING:
+     from .rolling import DataArrayCoarsen, DataArrayRolling
+     from .types import (
+         CoarsenBoundaryOptions,
++        DatetimeLike,
+         DatetimeUnitOptions,
+         Dims,
+         ErrorOptions,
+@@ -377,10 +378,10 @@ class DataArray(
+         | Mapping[Any, Any]
+         | None = None,
+         dims: Hashable | Sequence[Hashable] | None = None,
+-        name: Hashable = None,
+-        attrs: Mapping = None,
++        name: Hashable | None = None,
++        attrs: Mapping | None = None,
+         # internal parameters
+-        indexes: dict[Hashable, Index] = None,
++        indexes: dict[Hashable, Index] | None = None,
+         fastpath: bool = False,
+     ) -> None:
+         if fastpath:
+@@ -427,7 +428,7 @@ class DataArray(
+ 
+         # TODO(shoyer): document this argument, once it becomes part of the
+         # public interface.
+-        self._indexes = indexes  # type: ignore[assignment]
++        self._indexes = indexes
+ 
+         self._close = None
+ 
+@@ -452,7 +453,7 @@ class DataArray(
+ 
+     def _replace(
+         self: T_DataArray,
+-        variable: Variable = None,
++        variable: Variable | None = None,
+         coords=None,
+         name: Hashable | None | Default = _default,
+         indexes=None,
+@@ -495,9 +496,9 @@ class DataArray(
+     def _overwrite_indexes(
+         self: T_DataArray,
+         indexes: Mapping[Any, Index],
+-        coords: Mapping[Any, Variable] = None,
+-        drop_coords: list[Hashable] = None,
+-        rename_dims: Mapping[Any, Any] = None,
++        coords: Mapping[Any, Variable] | None = None,
++        drop_coords: list[Hashable] | None = None,
++        rename_dims: Mapping[Any, Any] | None = None,
+     ) -> T_DataArray:
+         """Maybe replace indexes and their corresponding coordinates."""
+         if not indexes:
+@@ -1415,8 +1416,8 @@ class DataArray(
+ 
+     def sel(
+         self: T_DataArray,
+-        indexers: Mapping[Any, Any] = None,
+-        method: str = None,
++        indexers: Mapping[Any, Any] | None = None,
++        method: str | None = None,
+         tolerance=None,
+         drop: bool = False,
+         **indexers_kwargs: Any,
+@@ -1953,7 +1954,7 @@ class DataArray(
+ 
+     def reindex(
+         self: T_DataArray,
+-        indexers: Mapping[Any, Any] = None,
++        indexers: Mapping[Any, Any] | None = None,
+         method: ReindexMethodOptions = None,
+         tolerance: float | Iterable[float] | None = None,
+         copy: bool = True,
+@@ -2515,7 +2516,7 @@ class DataArray(
+     # https://github.com/python/mypy/issues/12846 is resolved
+     def set_index(
+         self,
+-        indexes: Mapping[Any, Hashable | Sequence[Hashable]] = None,
++        indexes: Mapping[Any, Hashable | Sequence[Hashable]] | None = None,
+         append: bool = False,
+         **indexes_kwargs: Hashable | Sequence[Hashable],
+     ) -> DataArray:
+@@ -3613,7 +3614,7 @@ class DataArray(
+     def reduce(
+         self: T_DataArray,
+         func: Callable[..., Any],
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         axis: int | Sequence[int] | None = None,
+         keep_attrs: bool | None = None,
+@@ -3993,8 +3994,8 @@ class DataArray(
+         """
+         d = self.variable.to_dict(data=data)
+         d.update({"coords": {}, "name": self.name})
+-        for k in self.coords:
+-            d["coords"][k] = self.coords[k].variable.to_dict(data=data)
++        for k, coord in self.coords.items():
++            d["coords"][k] = coord.variable.to_dict(data=data)
+         if encoding:
+             d["encoding"] = dict(self.encoding)
+         return d
+@@ -4600,7 +4601,7 @@ class DataArray(
+     def dot(
+         self: T_DataArray,
+         other: T_DataArray,
+-        dims: Dims | ellipsis = None,
++        dims: Dims = None,
+     ) -> T_DataArray:
+         """Perform dot product of two DataArrays along their shared dims.
+ 
+@@ -4724,7 +4725,7 @@ class DataArray(
+         method: QuantileMethods = "linear",
+         keep_attrs: bool | None = None,
+         skipna: bool | None = None,
+-        interpolation: QuantileMethods = None,
++        interpolation: QuantileMethods | None = None,
+     ) -> T_DataArray:
+         """Compute the qth quantile of the data along the specified dimension.
+ 
+@@ -5604,7 +5605,7 @@ class DataArray(
+     # https://github.com/python/mypy/issues/12846 is resolved
+     def argmin(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         axis: int | None = None,
+         keep_attrs: bool | None = None,
+         skipna: bool | None = None,
+@@ -5706,7 +5707,7 @@ class DataArray(
+     # https://github.com/python/mypy/issues/12846 is resolved
+     def argmax(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         axis: int | None = None,
+         keep_attrs: bool | None = None,
+         skipna: bool | None = None,
+@@ -6531,7 +6532,9 @@ class DataArray(
+         skipna: bool | None = None,
+         closed: SideOptions | None = None,
+         label: SideOptions | None = None,
+-        base: int = 0,
++        base: int | None = None,
++        offset: pd.Timedelta | datetime.timedelta | str | None = None,
++        origin: str | DatetimeLike = "start_day",
+         keep_attrs: bool | None = None,
+         loffset: datetime.timedelta | str | None = None,
+         restore_coord_dims: bool | None = None,
+@@ -6555,10 +6558,22 @@ class DataArray(
+             Side of each interval to treat as closed.
+         label : {"left", "right"}, optional
+             Side of each interval to use for labeling.
+-        base : int, default = 0
++        base : int, optional
+             For frequencies that evenly subdivide 1 day, the "origin" of the
+             aggregated intervals. For example, for "24H" frequency, base could
+             range from 0 through 23.
++        origin : {'epoch', 'start', 'start_day', 'end', 'end_day'}, pd.Timestamp, datetime.datetime, np.datetime64, or cftime.datetime, default 'start_day'
++            The datetime on which to adjust the grouping. The timezone of origin
++            must match the timezone of the index.
++
++            If a datetime is not used, these values are also supported:
++            - 'epoch': `origin` is 1970-01-01
++            - 'start': `origin` is the first value of the timeseries
++            - 'start_day': `origin` is the first day at midnight of the timeseries
++            - 'end': `origin` is the last value of the timeseries
++            - 'end_day': `origin` is the ceiling midnight of the last day
++        offset : pd.Timedelta, datetime.timedelta, or str, default is None
++            An offset timedelta added to the origin.
+         loffset : timedelta or str, optional
+             Offset used to adjust the resampled time labels. Some pandas date
+             offset strings are supported.
+@@ -6640,6 +6655,8 @@ class DataArray(
+             closed=closed,
+             label=label,
+             base=base,
++            offset=offset,
++            origin=origin,
+             keep_attrs=keep_attrs,
+             loffset=loffset,
+             restore_coord_dims=restore_coord_dims,
+
+diff --git a/xarray/core/dataset.py b/xarray/core/dataset.py
+index dbf5e46..4f376bd 100644
+--- a/xarray/core/dataset.py
++++ b/xarray/core/dataset.py
+@@ -107,6 +107,7 @@ if TYPE_CHECKING:
+         CoarsenBoundaryOptions,
+         CombineAttrsOptions,
+         CompatOptions,
++        DatetimeLike,
+         DatetimeUnitOptions,
+         Dims,
+         ErrorOptions,
+@@ -153,7 +154,7 @@ _DATETIMEINDEX_COMPONENTS = [
+ 
+ 
+ def _get_virtual_variable(
+-    variables, key: Hashable, dim_sizes: Mapping = None
++    variables, key: Hashable, dim_sizes: Mapping | None = None
+ ) -> tuple[Hashable, Hashable, Variable]:
+     """Get a virtual variable (e.g., 'time.year') from a dict of xarray.Variable
+     objects (if possible)
+@@ -831,7 +832,7 @@ class Dataset(
+         )
+ 
+     def _dask_postpersist(
+-        self: T_Dataset, dsk: Mapping, *, rename: Mapping[str, str] = None
++        self: T_Dataset, dsk: Mapping, *, rename: Mapping[str, str] | None = None
+     ) -> T_Dataset:
+         from dask import is_dask_collection
+         from dask.highlevelgraph import HighLevelGraph
+@@ -971,7 +972,7 @@ class Dataset(
+ 
+     def _replace(
+         self: T_Dataset,
+-        variables: dict[Hashable, Variable] = None,
++        variables: dict[Hashable, Variable] | None = None,
+         coord_names: set[Hashable] | None = None,
+         dims: dict[Any, int] | None = None,
+         attrs: dict[Hashable, Any] | None | Default = _default,
+@@ -1767,7 +1768,7 @@ class Dataset(
+         format: T_NetcdfTypes | None = None,
+         group: str | None = None,
+         engine: T_NetcdfEngine | None = None,
+-        encoding: Mapping[Hashable, Mapping[str, Any]] | None = None,
++        encoding: Mapping[Any, Mapping[str, Any]] | None = None,
+         unlimited_dims: Iterable[Hashable] | None = None,
+         compute: bool = True,
+         invalid_netcdf: bool = False,
+@@ -1783,7 +1784,7 @@ class Dataset(
+         format: T_NetcdfTypes | None = None,
+         group: str | None = None,
+         engine: T_NetcdfEngine | None = None,
+-        encoding: Mapping[Hashable, Mapping[str, Any]] | None = None,
++        encoding: Mapping[Any, Mapping[str, Any]] | None = None,
+         unlimited_dims: Iterable[Hashable] | None = None,
+         compute: Literal[True] = True,
+         invalid_netcdf: bool = False,
+@@ -1799,7 +1800,7 @@ class Dataset(
+         format: T_NetcdfTypes | None = None,
+         group: str | None = None,
+         engine: T_NetcdfEngine | None = None,
+-        encoding: Mapping[Hashable, Mapping[str, Any]] | None = None,
++        encoding: Mapping[Any, Mapping[str, Any]] | None = None,
+         unlimited_dims: Iterable[Hashable] | None = None,
+         *,
+         compute: Literal[False],
+@@ -1814,7 +1815,7 @@ class Dataset(
+         format: T_NetcdfTypes | None = None,
+         group: str | None = None,
+         engine: T_NetcdfEngine | None = None,
+-        encoding: Mapping[Hashable, Mapping[str, Any]] | None = None,
++        encoding: Mapping[Any, Mapping[str, Any]] | None = None,
+         unlimited_dims: Iterable[Hashable] | None = None,
+         compute: bool = True,
+         invalid_netcdf: bool = False,
+@@ -1930,6 +1931,7 @@ class Dataset(
+         region: Mapping[str, slice] | None = None,
+         safe_chunks: bool = True,
+         storage_options: dict[str, str] | None = None,
++        zarr_version: int | None = None,
+     ) -> ZarrStore:
+         ...
+ 
+@@ -1967,6 +1969,7 @@ class Dataset(
+         region: Mapping[str, slice] | None = None,
+         safe_chunks: bool = True,
+         storage_options: dict[str, str] | None = None,
++        zarr_version: int | None = None,
+     ) -> ZarrStore | Delayed:
+         """Write dataset contents to a zarr group.
+ 
+@@ -2017,6 +2020,9 @@ class Dataset(
+             metadata; if False, do not. The default (`consolidated=None`) means
+             write consolidated metadata and attempt to read consolidated
+             metadata for existing stores (falling back to non-consolidated).
++
++            When the experimental ``zarr_version=3``, ``consolidated`` must be
++            either be ``None`` or ``False``.
+         append_dim : hashable, optional
+             If set, the dimension along which the data will be appended. All
+             other dimensions on overridden variables must remain the same size.
+@@ -2048,6 +2054,10 @@ class Dataset(
+         storage_options : dict, optional
+             Any additional parameters for the storage backend (ignored for local
+             paths).
++        zarr_version : int or None, optional
++            The desired zarr spec version to target (currently 2 or 3). The
++            default of None will attempt to determine the zarr version from
++            ``store`` when possible, otherwise defaulting to 2.
+ 
+         Returns
+         -------
+@@ -2092,6 +2102,7 @@ class Dataset(
+             append_dim=append_dim,
+             region=region,
+             safe_chunks=safe_chunks,
++            zarr_version=zarr_version,
+         )
+ 
+     def __repr__(self) -> str:
+@@ -2484,8 +2495,8 @@ class Dataset(
+ 
+     def sel(
+         self: T_Dataset,
+-        indexers: Mapping[Any, Any] = None,
+-        method: str = None,
++        indexers: Mapping[Any, Any] | None = None,
++        method: str | None = None,
+         tolerance: int | float | Iterable[int | float] | None = None,
+         drop: bool = False,
+         **indexers_kwargs: Any,
+@@ -2749,7 +2760,9 @@ class Dataset(
+         return self.isel(indexers_slices)
+ 
+     def broadcast_like(
+-        self: T_Dataset, other: Dataset | DataArray, exclude: Iterable[Hashable] = None
++        self: T_Dataset,
++        other: Dataset | DataArray,
++        exclude: Iterable[Hashable] | None = None,
+     ) -> T_Dataset:
+         """Broadcast this DataArray against another Dataset or DataArray.
+         This is equivalent to xr.broadcast(other, self)[1]
+@@ -3117,8 +3130,8 @@ class Dataset(
+ 
+     def _reindex(
+         self: T_Dataset,
+-        indexers: Mapping[Any, Any] = None,
+-        method: str = None,
++        indexers: Mapping[Any, Any] | None = None,
++        method: str | None = None,
+         tolerance: int | float | Iterable[int | float] | None = None,
+         copy: bool = True,
+         fill_value: Any = xrdtypes.NA,
+@@ -3144,7 +3157,7 @@ class Dataset(
+         coords: Mapping[Any, Any] | None = None,
+         method: InterpOptions = "linear",
+         assume_sorted: bool = False,
+-        kwargs: Mapping[str, Any] = None,
++        kwargs: Mapping[str, Any] | None = None,
+         method_non_numeric: str = "nearest",
+         **coords_kwargs: Any,
+     ) -> T_Dataset:
+@@ -3694,7 +3707,9 @@ class Dataset(
+         return self._replace(variables, coord_names, dims=sizes, indexes=indexes)
+ 
+     def rename_vars(
+-        self: T_Dataset, name_dict: Mapping[Any, Hashable] = None, **names: Hashable
++        self: T_Dataset,
++        name_dict: Mapping[Any, Hashable] | None = None,
++        **names: Hashable,
+     ) -> T_Dataset:
+         """Returns a new object with renamed variables including coordinates
+ 
+@@ -3732,7 +3747,7 @@ class Dataset(
+         return self._replace(variables, coord_names, dims=dims, indexes=indexes)
+ 
+     def swap_dims(
+-        self: T_Dataset, dims_dict: Mapping[Any, Hashable] = None, **dims_kwargs
++        self: T_Dataset, dims_dict: Mapping[Any, Hashable] | None = None, **dims_kwargs
+     ) -> T_Dataset:
+         """Returns a new object with swapped dimensions.
+ 
+@@ -5578,7 +5593,7 @@ class Dataset(
+         self: T_Dataset,
+         dim: Hashable | None = None,
+         method: InterpOptions = "linear",
+-        limit: int = None,
++        limit: int | None = None,
+         use_coordinate: bool | Hashable = True,
+         max_gap: (
+             int | float | str | pd.Timedelta | np.timedelta64 | datetime.timedelta
+@@ -5783,7 +5798,7 @@ class Dataset(
+     def reduce(
+         self: T_Dataset,
+         func: Callable,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         keep_attrs: bool | None = None,
+         keepdims: bool = False,
+@@ -6978,9 +6993,9 @@ class Dataset(
+         dim: Dims = None,
+         method: QuantileMethods = "linear",
+         numeric_only: bool = False,
+-        keep_attrs: bool = None,
+-        skipna: bool = None,
+-        interpolation: QuantileMethods = None,
++        keep_attrs: bool | None = None,
++        skipna: bool | None = None,
++        interpolation: QuantileMethods | None = None,
+     ) -> T_Dataset:
+         """Compute the qth quantile of the data along the specified dimension.
+ 
+@@ -7905,7 +7920,7 @@ class Dataset(
+ 
+     def pad(
+         self: T_Dataset,
+-        pad_width: Mapping[Any, int | tuple[int, int]] = None,
++        pad_width: Mapping[Any, int | tuple[int, int]] | None = None,
+         mode: PadModeOptions = "constant",
+         stat_length: int
+         | tuple[int, int]
+@@ -9114,7 +9129,9 @@ class Dataset(
+         skipna: bool | None = None,
+         closed: SideOptions | None = None,
+         label: SideOptions | None = None,
+-        base: int = 0,
++        base: int | None = None,
++        offset: pd.Timedelta | datetime.timedelta | str | None = None,
++        origin: str | DatetimeLike = "start_day",
+         keep_attrs: bool | None = None,
+         loffset: datetime.timedelta | str | None = None,
+         restore_coord_dims: bool | None = None,
+@@ -9138,10 +9155,22 @@ class Dataset(
+             Side of each interval to treat as closed.
+         label : {"left", "right"}, optional
+             Side of each interval to use for labeling.
+-        base : int, default = 0
++        base : int, optional
+             For frequencies that evenly subdivide 1 day, the "origin" of the
+             aggregated intervals. For example, for "24H" frequency, base could
+             range from 0 through 23.
++        origin : {'epoch', 'start', 'start_day', 'end', 'end_day'}, pd.Timestamp, datetime.datetime, np.datetime64, or cftime.datetime, default 'start_day'
++            The datetime on which to adjust the grouping. The timezone of origin
++            must match the timezone of the index.
++
++            If a datetime is not used, these values are also supported:
++            - 'epoch': `origin` is 1970-01-01
++            - 'start': `origin` is the first value of the timeseries
++            - 'start_day': `origin` is the first day at midnight of the timeseries
++            - 'end': `origin` is the last value of the timeseries
++            - 'end_day': `origin` is the ceiling midnight of the last day
++        offset : pd.Timedelta, datetime.timedelta, or str, default is None
++            An offset timedelta added to the origin.
+         loffset : timedelta or str, optional
+             Offset used to adjust the resampled time labels. Some pandas date
+             offset strings are supported.
+@@ -9176,6 +9205,8 @@ class Dataset(
+             closed=closed,
+             label=label,
+             base=base,
++            offset=offset,
++            origin=origin,
+             keep_attrs=keep_attrs,
+             loffset=loffset,
+             restore_coord_dims=restore_coord_dims,
+
+diff --git a/xarray/core/extensions.py b/xarray/core/extensions.py
+index 84d184d..d40151e 100644
+--- a/xarray/core/extensions.py
++++ b/xarray/core/extensions.py
+@@ -105,6 +105,7 @@ def register_dataset_accessor(name):
+     ...     def plot(self):
+     ...         # plot this array's data on a map, e.g., using Cartopy
+     ...         pass
++    ...
+ 
+     Back in an interactive IPython session:
+ 
+
+diff --git a/xarray/core/formatting.py b/xarray/core/formatting.py
+index b014cf4..351a4b2 100644
+--- a/xarray/core/formatting.py
++++ b/xarray/core/formatting.py
+@@ -285,7 +285,11 @@ def inline_variable_array_repr(var, max_width):
+ 
+ 
+ def summarize_variable(
+-    name: Hashable, var, col_width: int, max_width: int = None, is_index: bool = False
++    name: Hashable,
++    var,
++    col_width: int,
++    max_width: int | None = None,
++    is_index: bool = False,
+ ):
+     """Summarize a variable in one line, e.g., for the Dataset.__repr__."""
+     variable = getattr(var, "variable", var)
+@@ -419,7 +423,9 @@ def inline_index_repr(index, max_width=None):
+     return repr_
+ 
+ 
+-def summarize_index(name: Hashable, index, col_width: int, max_width: int = None):
++def summarize_index(
++    name: Hashable, index, col_width: int, max_width: int | None = None
++):
+     if max_width is None:
+         max_width = OPTIONS["display_width"]
+ 
+
+diff --git a/xarray/core/groupby.py b/xarray/core/groupby.py
+index e42330d..589f6c9 100644
+--- a/xarray/core/groupby.py
++++ b/xarray/core/groupby.py
+@@ -493,7 +493,7 @@ class GroupBy(Generic[T_Xarray]):
+     def reduce(
+         self,
+         func: Callable[..., Any],
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         axis: int | Sequence[int] | None = None,
+         keep_attrs: bool | None = None,
+@@ -652,7 +652,7 @@ class GroupBy(Generic[T_Xarray]):
+ 
+     def _flox_reduce(
+         self,
+-        dim: Dims | ellipsis,
++        dim: Dims,
+         keep_attrs: bool | None = None,
+         **kwargs: Any,
+     ):
+@@ -713,7 +713,7 @@ class GroupBy(Generic[T_Xarray]):
+         elif dim is ...:
+             parsed_dim = tuple(self._original_obj.dims)
+         else:
+-            parsed_dim = tuple(dim)  # type:ignore[arg-type]
++            parsed_dim = tuple(dim)
+ 
+         # Do this so we raise the same error message whether flox is present or not.
+         # Better to control it here than in flox.
+@@ -747,7 +747,7 @@ class GroupBy(Generic[T_Xarray]):
+         result = xarray_reduce(
+             self._original_obj.drop_vars(non_numeric),
+             group,
+-            dim=parsed_dim,  # type:ignore[arg-type]  # https://github.com/xarray-contrib/flox/issues/96
++            dim=parsed_dim,
+             expected_groups=expected_groups,
+             isbin=isbin,
+             keep_attrs=keep_attrs,
+@@ -1143,7 +1143,7 @@ class DataArrayGroupByBase(GroupBy["DataArray"], DataArrayGroupbyArithmetic):
+     def reduce(
+         self,
+         func: Callable[..., Any],
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         axis: int | Sequence[int] | None = None,
+         keep_attrs: bool | None = None,
+@@ -1296,7 +1296,7 @@ class DatasetGroupByBase(GroupBy["Dataset"], DatasetGroupbyArithmetic):
+     def reduce(
+         self,
+         func: Callable[..., Any],
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         axis: int | Sequence[int] | None = None,
+         keep_attrs: bool | None = None,
+
+diff --git a/xarray/core/indexes.py b/xarray/core/indexes.py
+index a18322f..a768155 100644
+--- a/xarray/core/indexes.py
++++ b/xarray/core/indexes.py
+@@ -52,7 +52,7 @@ class Index:
+         cls: type[T_Index],
+         indexes: Sequence[T_Index],
+         dim: Hashable,
+-        positions: Iterable[Iterable[int]] = None,
++        positions: Iterable[Iterable[int]] | None = None,
+     ) -> T_Index:
+         raise NotImplementedError()
+ 
+@@ -117,10 +117,12 @@ class Index:
+     def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Index:
+         return self._copy(deep=True, memo=memo)
+ 
+-    def copy(self, deep: bool = True) -> Index:
++    def copy(self: T_Index, deep: bool = True) -> T_Index:
+         return self._copy(deep=deep)
+ 
+-    def _copy(self, deep: bool = True, memo: dict[int, Any] | None = None) -> Index:
++    def _copy(
++        self: T_Index, deep: bool = True, memo: dict[int, Any] | None = None
++    ) -> T_Index:
+         cls = self.__class__
+         copied = cls.__new__(cls)
+         if deep:
+@@ -269,6 +271,9 @@ def get_indexer_nd(index, labels, method=None, tolerance=None):
+     return indexer
+ 
+ 
++T_PandasIndex = TypeVar("T_PandasIndex", bound="PandasIndex")
++
++
+ class PandasIndex(Index):
+     """Wrap a pandas.Index as an xarray compatible index."""
+ 
+@@ -368,7 +373,7 @@ class PandasIndex(Index):
+         cls,
+         indexes: Sequence[PandasIndex],
+         dim: Hashable,
+-        positions: Iterable[Iterable[int]] = None,
++        positions: Iterable[Iterable[int]] | None = None,
+     ) -> PandasIndex:
+         new_pd_index = cls._concat_indexes(indexes, dim, positions)
+ 
+@@ -532,8 +537,11 @@ class PandasIndex(Index):
+         new_dim = dims_dict.get(self.dim, self.dim)
+         return self._replace(index, dim=new_dim)
+ 
+-    def copy(self, deep=True):
++    def _copy(
++        self: T_PandasIndex, deep: bool = True, memo: dict[int, Any] | None = None
++    ) -> T_PandasIndex:
+         if deep:
++            # pandas is not using the memo
+             index = self.index.copy(deep=True)
+         else:
+             # index will be copied in constructor
+@@ -656,7 +664,7 @@ class PandasMultiIndex(PandasIndex):
+         cls,
+         indexes: Sequence[PandasMultiIndex],
+         dim: Hashable,
+-        positions: Iterable[Iterable[int]] = None,
++        positions: Iterable[Iterable[int]] | None = None,
+     ) -> PandasMultiIndex:
+         new_pd_index = cls._concat_indexes(indexes, dim, positions)
+ 
+@@ -1265,11 +1273,19 @@ class Indexes(collections.abc.Mapping, Generic[T_PandasOrXarrayIndex]):
+         return Indexes(indexes, self._variables)
+ 
+     def copy_indexes(
+-        self, deep: bool = True
++        self, deep: bool = True, memo: dict[int, Any] | None = None
+     ) -> tuple[dict[Hashable, T_PandasOrXarrayIndex], dict[Hashable, Variable]]:
+         """Return a new dictionary with copies of indexes, preserving
+         unique indexes.
+ 
++        Parameters
++        ----------
++        deep : bool, default: True
++            Whether the indexes are deep or shallow copied onto the new object.
++        memo : dict if object id to copied objects or None, optional
++            To prevent infinite recursion deepcopy stores all copied elements
++            in this dict.
++
+         """
+         new_indexes = {}
+         new_index_vars = {}
+@@ -1285,7 +1301,7 @@ class Indexes(collections.abc.Mapping, Generic[T_PandasOrXarrayIndex]):
+             else:
+                 convert_new_idx = False
+ 
+-            new_idx = idx.copy(deep=deep)
++            new_idx = idx._copy(deep=deep, memo=memo)
+             idx_vars = idx.create_variables(coords)
+ 
+             if convert_new_idx:
+@@ -1346,7 +1362,7 @@ def indexes_equal(
+     other_index: Index,
+     variable: Variable,
+     other_variable: Variable,
+-    cache: dict[tuple[int, int], bool | None] = None,
++    cache: dict[tuple[int, int], bool | None] | None = None,
+ ) -> bool:
+     """Check if two indexes are equal, possibly with cached results.
+ 
+
+diff --git a/xarray/core/indexing.py b/xarray/core/indexing.py
+index 6b33741..8dd2d1a 100644
+--- a/xarray/core/indexing.py
++++ b/xarray/core/indexing.py
+@@ -180,7 +180,7 @@ def map_index_queries(
+             # forward dimension indexers with no index/coordinate
+             results.append(IndexSelResult(labels))
+         else:
+-            results.append(index.sel(labels, **options))  # type: ignore[call-arg]
++            results.append(index.sel(labels, **options))
+ 
+     merged = merge_sel_results(results)
+ 
+@@ -1422,7 +1422,7 @@ class PandasIndexingAdapter(ExplicitlyIndexedNDArrayMixin):
+         if dtype is None:
+             self._dtype = get_valid_numpy_dtype(array)
+         else:
+-            self._dtype = np.dtype(dtype)  # type: ignore[assignment]
++            self._dtype = np.dtype(dtype)
+ 
+     @property
+     def dtype(self) -> np.dtype:
+
+diff --git a/xarray/core/merge.py b/xarray/core/merge.py
+index c2efcc7..8a8fc6f 100644
+--- a/xarray/core/merge.py
++++ b/xarray/core/merge.py
+@@ -40,9 +40,9 @@ if TYPE_CHECKING:
+     ArrayLike = Any
+     VariableLike = Union[
+         ArrayLike,
+-        tuple[DimsLike, ArrayLike],
+-        tuple[DimsLike, ArrayLike, Mapping],
+-        tuple[DimsLike, ArrayLike, Mapping, Mapping],
++        Tuple[DimsLike, ArrayLike],
++        Tuple[DimsLike, ArrayLike, Mapping],
++        Tuple[DimsLike, ArrayLike, Mapping, Mapping],
+     ]
+     XarrayValue = Union[DataArray, Variable, VariableLike]
+     DatasetLike = Union[Dataset, Mapping[Any, XarrayValue]]
+@@ -207,7 +207,7 @@ def _assert_prioritized_valid(
+ 
+ def merge_collected(
+     grouped: dict[Hashable, list[MergeElement]],
+-    prioritized: Mapping[Any, MergeElement] = None,
++    prioritized: Mapping[Any, MergeElement] | None = None,
+     compat: CompatOptions = "minimal",
+     combine_attrs: CombineAttrsOptions = "override",
+     equals: dict[Hashable, bool] | None = None,
+@@ -355,12 +355,12 @@ def collect_variables_and_indexes(
+ 
+         for name, variable in mapping.items():
+             if isinstance(variable, DataArray):
+-                coords = variable._coords.copy()  # use private API for speed
+-                indexes = dict(variable._indexes)
++                coords_ = variable._coords.copy()  # use private API for speed
++                indexes_ = dict(variable._indexes)
+                 # explicitly overwritten variables should take precedence
+-                coords.pop(name, None)
+-                indexes.pop(name, None)
+-                append_all(coords, indexes)
++                coords_.pop(name, None)
++                indexes_.pop(name, None)
++                append_all(coords_, indexes_)
+ 
+             variable = as_variable(variable, name=name)
+             if name in indexes:
+@@ -391,7 +391,7 @@ def collect_from_coordinates(
+ 
+ def merge_coordinates_without_align(
+     objects: list[Coordinates],
+-    prioritized: Mapping[Any, MergeElement] = None,
++    prioritized: Mapping[Any, MergeElement] | None = None,
+     exclude_dims: AbstractSet = frozenset(),
+     combine_attrs: CombineAttrsOptions = "override",
+ ) -> tuple[dict[Hashable, Variable], dict[Hashable, Index]]:
+@@ -561,7 +561,7 @@ def merge_coords(
+     aligned = deep_align(
+         coerced, join=join, copy=False, indexes=indexes, fill_value=fill_value
+     )
+-    collected = collect_variables_and_indexes(aligned)
++    collected = collect_variables_and_indexes(aligned, indexes=indexes)
+     prioritized = _get_priority_vars_and_indexes(aligned, priority_arg, compat=compat)
+     variables, out_indexes = merge_collected(collected, prioritized, compat=compat)
+     return variables, out_indexes
+
+diff --git a/xarray/core/missing.py b/xarray/core/missing.py
+index 7390c89..93423a4 100644
+--- a/xarray/core/missing.py
++++ b/xarray/core/missing.py
+@@ -308,12 +308,12 @@ def get_clean_interp_index(
+ 
+ def interp_na(
+     self,
+-    dim: Hashable = None,
++    dim: Hashable | None = None,
+     use_coordinate: bool | str = True,
+     method: InterpOptions = "linear",
+-    limit: int = None,
++    limit: int | None = None,
+     max_gap: int | float | str | pd.Timedelta | np.timedelta64 | dt.timedelta = None,
+-    keep_attrs: bool = None,
++    keep_attrs: bool | None = None,
+     **kwargs,
+ ):
+     """Interpolate values according to different methods."""
+
+diff --git a/xarray/core/parallel.py b/xarray/core/parallel.py
+index 50f3c47..0ef428e 100644
+--- a/xarray/core/parallel.py
++++ b/xarray/core/parallel.py
+@@ -157,7 +157,7 @@ def map_blocks(
+     func: Callable[..., T_Xarray],
+     obj: DataArray | Dataset,
+     args: Sequence[Any] = (),
+-    kwargs: Mapping[str, Any] = None,
++    kwargs: Mapping[str, Any] | None = None,
+     template: DataArray | Dataset | None = None,
+ ) -> T_Xarray:
+     """Apply a function to each block of a DataArray or Dataset.
+
+diff --git a/xarray/core/pycompat.py b/xarray/core/pycompat.py
+index 0a6537f..474b694 100644
+--- a/xarray/core/pycompat.py
++++ b/xarray/core/pycompat.py
+@@ -1,7 +1,8 @@
+ from __future__ import annotations
+ 
+ from importlib import import_module
+-from typing import Any, Literal
++from types import ModuleType
++from typing import TYPE_CHECKING, Any, Literal, Tuple, Type
+ 
+ import numpy as np
+ from packaging.version import Version
+@@ -10,7 +11,9 @@ from .utils import is_duck_array, module_available
+ 
+ integer_types = (int, np.integer)
+ 
+-ModType = Literal["dask", "pint", "cupy", "sparse"]
++if TYPE_CHECKING:
++    ModType = Literal["dask", "pint", "cupy", "sparse"]
++    DuckArrayTypes = Tuple[Type[Any], ...]  # TODO: improve this? maybe Generic
+ 
+ 
+ class DuckArrayModule:
+@@ -21,12 +24,15 @@ class DuckArrayModule:
+     https://github.com/pydata/xarray/pull/5561#discussion_r664815718
+     """
+ 
+-    module: ModType | None
++    module: ModuleType | None
+     version: Version
+-    type: tuple[type[Any]]  # TODO: improve this? maybe Generic
++    type: DuckArrayTypes
+     available: bool
+ 
+     def __init__(self, mod: ModType) -> None:
++        duck_array_module: ModuleType | None = None
++        duck_array_version: Version
++        duck_array_type: DuckArrayTypes
+         try:
+             duck_array_module = import_module(mod)
+             duck_array_version = Version(duck_array_module.__version__)
+@@ -53,7 +59,7 @@ class DuckArrayModule:
+         self.available = duck_array_module is not None
+ 
+ 
+-def array_type(mod: ModType) -> tuple[type[Any]]:
++def array_type(mod: ModType) -> DuckArrayTypes:
+     """Quick wrapper to get the array class of the module."""
+     return DuckArrayModule(mod).type
+ 
+
+diff --git a/xarray/core/resample.py b/xarray/core/resample.py
+index 3760030..61a12f1 100644
+--- a/xarray/core/resample.py
++++ b/xarray/core/resample.py
+@@ -49,7 +49,7 @@ class Resample(GroupBy[T_Xarray]):
+ 
+     def _flox_reduce(
+         self,
+-        dim: Dims | ellipsis,
++        dim: Dims,
+         keep_attrs: bool | None = None,
+         **kwargs,
+     ) -> T_Xarray:
+@@ -368,7 +368,7 @@ class DatasetResample(Resample["Dataset"], DatasetGroupByBase, DatasetResampleAg
+     def reduce(
+         self,
+         func: Callable[..., Any],
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         axis: int | Sequence[int] | None = None,
+         keep_attrs: bool | None = None,
+
+diff --git a/xarray/core/resample_cftime.py b/xarray/core/resample_cftime.py
+index 11eceda..da21fdd 100644
+--- a/xarray/core/resample_cftime.py
++++ b/xarray/core/resample_cftime.py
+@@ -38,21 +38,27 @@
+ from __future__ import annotations
+ 
+ import datetime
++import typing
+ 
+ import numpy as np
+ import pandas as pd
+ 
+ from ..coding.cftime_offsets import (
+-    CFTIME_TICKS,
++    BaseCFTimeOffset,
+     Day,
+     MonthEnd,
+     QuarterEnd,
++    Tick,
+     YearEnd,
+     cftime_range,
+     normalize_date,
+     to_offset,
+ )
+ from ..coding.cftimeindex import CFTimeIndex
++from .types import SideOptions
++
++if typing.TYPE_CHECKING:
++    from .types import CFTimeDatetime
+ 
+ 
+ class CFTimeGrouper:
+@@ -60,25 +66,77 @@ class CFTimeGrouper:
+     single method, the only one required for resampling in xarray.  It cannot
+     be used in a call to groupby like a pandas.Grouper object can."""
+ 
+-    def __init__(self, freq, closed=None, label=None, base=0, loffset=None):
++    def __init__(
++        self,
++        freq: str | BaseCFTimeOffset,
++        closed: SideOptions | None = None,
++        label: SideOptions | None = None,
++        base: int | None = None,
++        loffset: str | datetime.timedelta | BaseCFTimeOffset | None = None,
++        origin: str | CFTimeDatetime = "start_day",
++        offset: str | datetime.timedelta | None = None,
++    ):
++        self.offset: datetime.timedelta | None
++        self.closed: SideOptions
++        self.label: SideOptions
++
++        if base is not None and offset is not None:
++            raise ValueError("base and offset cannot be provided at the same time")
++
+         self.freq = to_offset(freq)
+-        self.closed = closed
+-        self.label = label
+-        self.base = base
+         self.loffset = loffset
++        self.origin = origin
+ 
+         if isinstance(self.freq, (MonthEnd, QuarterEnd, YearEnd)):
+-            if self.closed is None:
++            if closed is None:
+                 self.closed = "right"
+-            if self.label is None:
++            else:
++                self.closed = closed
++            if label is None:
+                 self.label = "right"
++            else:
++                self.label = label
++        else:
++            # The backward resample sets ``closed`` to ``'right'`` by default
++            # since the last value should be considered as the edge point for
++            # the last bin. When origin in "end" or "end_day", the value for a
++            # specific ``cftime.datetime`` index stands for the resample result
++            # from the current ``cftime.datetime`` minus ``freq`` to the current
++            # ``cftime.datetime`` with a right close.
++            if self.origin in ["end", "end_day"]:
++                if closed is None:
++                    self.closed = "right"
++                else:
++                    self.closed = closed
++                if label is None:
++                    self.label = "right"
++                else:
++                    self.label = label
++            else:
++                if closed is None:
++                    self.closed = "left"
++                else:
++                    self.closed = closed
++                if label is None:
++                    self.label = "left"
++                else:
++                    self.label = label
++
++        if base is not None and isinstance(self.freq, Tick):
++            offset = type(self.freq)(n=base % self.freq.n).as_timedelta()
++
++        if offset is not None:
++            try:
++                self.offset = _convert_offset_to_timedelta(offset)
++            except (ValueError, AttributeError) as error:
++                raise ValueError(
++                    f"offset must be a datetime.timedelta object or an offset string "
++                    f"that can be converted to a timedelta.  Got {offset} instead."
++                ) from error
+         else:
+-            if self.closed is None:
+-                self.closed = "left"
+-            if self.label is None:
+-                self.label = "left"
++            self.offset = None
+ 
+-    def first_items(self, index):
++    def first_items(self, index: CFTimeIndex):
+         """Meant to reproduce the results of the following
+ 
+         grouper = pandas.Grouper(...)
+@@ -89,7 +147,7 @@ class CFTimeGrouper:
+         """
+ 
+         datetime_bins, labels = _get_time_bins(
+-            index, self.freq, self.closed, self.label, self.base
++            index, self.freq, self.closed, self.label, self.origin, self.offset
+         )
+         if self.loffset is not None:
+             if isinstance(self.loffset, datetime.timedelta):
+@@ -111,7 +169,14 @@ class CFTimeGrouper:
+         return first_items.where(non_duplicate)
+ 
+ 
+-def _get_time_bins(index, freq, closed, label, base):
++def _get_time_bins(
++    index: CFTimeIndex,
++    freq: BaseCFTimeOffset,
++    closed: SideOptions,
++    label: SideOptions,
++    origin: str | CFTimeDatetime,
++    offset: datetime.timedelta | None,
++):
+     """Obtain the bins and their respective labels for resampling operations.
+ 
+     Parameters
+@@ -122,18 +187,26 @@ def _get_time_bins(index, freq, closed, label, base):
+         The offset object representing target conversion a.k.a. resampling
+         frequency (e.g., 'MS', '2D', 'H', or '3T' with
+         coding.cftime_offsets.to_offset() applied to it).
+-    closed : 'left' or 'right', optional
++    closed : 'left' or 'right'
+         Which side of bin interval is closed.
+         The default is 'left' for all frequency offsets except for 'M' and 'A',
+         which have a default of 'right'.
+-    label : 'left' or 'right', optional
++    label : 'left' or 'right'
+         Which bin edge label to label bucket with.
+         The default is 'left' for all frequency offsets except for 'M' and 'A',
+         which have a default of 'right'.
+-    base : int, optional
+-        For frequencies that evenly subdivide 1 day, the "origin" of the
+-        aggregated intervals. For example, for '5min' frequency, base could
+-        range from 0 through 4. Defaults to 0.
++    origin : {'epoch', 'start', 'start_day', 'end', 'end_day'} or cftime.datetime, default 'start_day'
++        The datetime on which to adjust the grouping. The timezone of origin
++        must match the timezone of the index.
++
++        If a datetime is not used, these values are also supported:
++        - 'epoch': `origin` is 1970-01-01
++        - 'start': `origin` is the first value of the timeseries
++        - 'start_day': `origin` is the first day at midnight of the timeseries
++        - 'end': `origin` is the last value of the timeseries
++        - 'end_day': `origin` is the ceiling midnight of the last day
++    offset : datetime.timedelta, default is None
++        An offset timedelta added to the origin.
+ 
+     Returns
+     -------
+@@ -154,7 +227,7 @@ def _get_time_bins(index, freq, closed, label, base):
+         return datetime_bins, labels
+ 
+     first, last = _get_range_edges(
+-        index.min(), index.max(), freq, closed=closed, base=base
++        index.min(), index.max(), freq, closed=closed, origin=origin, offset=offset
+     )
+     datetime_bins = labels = cftime_range(
+         freq=freq, start=first, end=last, name=index.name
+@@ -172,7 +245,13 @@ def _get_time_bins(index, freq, closed, label, base):
+     return datetime_bins, labels
+ 
+ 
+-def _adjust_bin_edges(datetime_bins, offset, closed, index, labels):
++def _adjust_bin_edges(
++    datetime_bins: np.ndarray,
++    freq: BaseCFTimeOffset,
++    closed: SideOptions,
++    index: CFTimeIndex,
++    labels: np.ndarray,
++):
+     """This is required for determining the bin edges resampling with
+     daily frequencies greater than one day, month end, and year end
+     frequencies.
+@@ -207,8 +286,8 @@ def _adjust_bin_edges(datetime_bins, offset, closed, index, labels):
+     This is also required for daily frequencies longer than one day and
+     year-end frequencies.
+     """
+-    is_super_daily = isinstance(offset, (MonthEnd, QuarterEnd, YearEnd)) or (
+-        isinstance(offset, Day) and offset.n > 1
++    is_super_daily = isinstance(freq, (MonthEnd, QuarterEnd, YearEnd)) or (
++        isinstance(freq, Day) and freq.n > 1
+     )
+     if is_super_daily:
+         if closed == "right":
+@@ -220,7 +299,14 @@ def _adjust_bin_edges(datetime_bins, offset, closed, index, labels):
+     return datetime_bins, labels
+ 
+ 
+-def _get_range_edges(first, last, offset, closed="left", base=0):
++def _get_range_edges(
++    first: CFTimeDatetime,
++    last: CFTimeDatetime,
++    freq: BaseCFTimeOffset,
++    closed: SideOptions = "left",
++    origin: str | CFTimeDatetime = "start_day",
++    offset: datetime.timedelta | None = None,
++):
+     """Get the correct starting and ending datetimes for the resampled
+     CFTimeIndex range.
+ 
+@@ -232,16 +318,24 @@ def _get_range_edges(first, last, offset, closed="left", base=0):
+     last : cftime.datetime
+         Uncorrected ending datetime object for resampled CFTimeIndex range.
+         Usually the max of the original CFTimeIndex.
+-    offset : xarray.coding.cftime_offsets.BaseCFTimeOffset
++    freq : xarray.coding.cftime_offsets.BaseCFTimeOffset
+         The offset object representing target conversion a.k.a. resampling
+         frequency. Contains information on offset type (e.g. Day or 'D') and
+         offset magnitude (e.g., n = 3).
+-    closed : 'left' or 'right', optional
++    closed : 'left' or 'right'
+         Which side of bin interval is closed. Defaults to 'left'.
+-    base : int, optional
+-        For frequencies that evenly subdivide 1 day, the "origin" of the
+-        aggregated intervals. For example, for '5min' frequency, base could
+-        range from 0 through 4. Defaults to 0.
++    origin : {'epoch', 'start', 'start_day', 'end', 'end_day'} or cftime.datetime, default 'start_day'
++        The datetime on which to adjust the grouping. The timezone of origin
++        must match the timezone of the index.
++
++        If a datetime is not used, these values are also supported:
++        - 'epoch': `origin` is 1970-01-01
++        - 'start': `origin` is the first value of the timeseries
++        - 'start_day': `origin` is the first day at midnight of the timeseries
++        - 'end': `origin` is the last value of the timeseries
++        - 'end_day': `origin` is the ceiling midnight of the last day
++    offset : datetime.timedelta, default is None
++        An offset timedelta added to the origin.
+ 
+     Returns
+     -------
+@@ -250,21 +344,28 @@ def _get_range_edges(first, last, offset, closed="left", base=0):
+     last : cftime.datetime
+         Corrected ending datetime object for resampled CFTimeIndex range.
+     """
+-    if isinstance(offset, CFTIME_TICKS):
++    if isinstance(freq, Tick):
+         first, last = _adjust_dates_anchored(
+-            first, last, offset, closed=closed, base=base
++            first, last, freq, closed=closed, origin=origin, offset=offset
+         )
+         return first, last
+     else:
+         first = normalize_date(first)
+         last = normalize_date(last)
+ 
+-    first = offset.rollback(first) if closed == "left" else first - offset
+-    last = last + offset
++    first = freq.rollback(first) if closed == "left" else first - freq
++    last = last + freq
+     return first, last
+ 
+ 
+-def _adjust_dates_anchored(first, last, offset, closed="right", base=0):
++def _adjust_dates_anchored(
++    first: CFTimeDatetime,
++    last: CFTimeDatetime,
++    freq: Tick,
++    closed: SideOptions = "right",
++    origin: str | CFTimeDatetime = "start_day",
++    offset: datetime.timedelta | None = None,
++):
+     """First and last offsets should be calculated from the start day to fix
+     an error cause by resampling across multiple days when a one day period is
+     not a multiple of the frequency.
+@@ -276,16 +377,24 @@ def _adjust_dates_anchored(first, last, offset, closed="right", base=0):
+         A datetime object representing the start of a CFTimeIndex range.
+     last : cftime.datetime
+         A datetime object representing the end of a CFTimeIndex range.
+-    offset : xarray.coding.cftime_offsets.BaseCFTimeOffset
++    freq : xarray.coding.cftime_offsets.BaseCFTimeOffset
+         The offset object representing target conversion a.k.a. resampling
+         frequency. Contains information on offset type (e.g. Day or 'D') and
+         offset magnitude (e.g., n = 3).
+-    closed : 'left' or 'right', optional
++    closed : 'left' or 'right'
+         Which side of bin interval is closed. Defaults to 'right'.
+-    base : int, optional
+-        For frequencies that evenly subdivide 1 day, the "origin" of the
+-        aggregated intervals. For example, for '5min' frequency, base could
+-        range from 0 through 4. Defaults to 0.
++    origin : {'epoch', 'start', 'start_day', 'end', 'end_day'} or cftime.datetime, default 'start_day'
++        The datetime on which to adjust the grouping. The timezone of origin
++        must match the timezone of the index.
++
++        If a datetime is not used, these values are also supported:
++        - 'epoch': `origin` is 1970-01-01
++        - 'start': `origin` is the first value of the timeseries
++        - 'start_day': `origin` is the first day at midnight of the timeseries
++        - 'end': `origin` is the last value of the timeseries
++        - 'end_day': `origin` is the ceiling midnight of the last day
++    offset : datetime.timedelta, default is None
++        An offset timedelta added to the origin.
+ 
+     Returns
+     -------
+@@ -296,33 +405,59 @@ def _adjust_dates_anchored(first, last, offset, closed="right", base=0):
+         A datetime object representing the end of a date range that has been
+         adjusted to fix resampling errors.
+     """
++    import cftime
++
++    if origin == "start_day":
++        origin_date = normalize_date(first)
++    elif origin == "start":
++        origin_date = first
++    elif origin == "epoch":
++        origin_date = type(first)(1970, 1, 1)
++    elif origin in ["end", "end_day"]:
++        origin_last = last if origin == "end" else _ceil_via_cftimeindex(last, "D")
++        sub_freq_times = (origin_last - first) // freq.as_timedelta()
++        if closed == "left":
++            sub_freq_times += 1
++        first = origin_last - sub_freq_times * freq
++        origin_date = first
++    elif isinstance(origin, cftime.datetime):
++        origin_date = origin
++    else:
++        raise ValueError(
++            f"origin must be one of {{'epoch', 'start_day', 'start', 'end', 'end_day'}} "
++            f"or a cftime.datetime object.  Got {origin}."
++        )
++
++    if offset is not None:
++        origin_date = origin_date + offset
++
++    foffset = (first - origin_date) % freq.as_timedelta()
++    loffset = (last - origin_date) % freq.as_timedelta()
+ 
+-    base = base % offset.n
+-    start_day = normalize_date(first)
+-    base_td = type(offset)(n=base).as_timedelta()
+-    start_day += base_td
+-    foffset = exact_cftime_datetime_difference(start_day, first) % offset.as_timedelta()
+-    loffset = exact_cftime_datetime_difference(start_day, last) % offset.as_timedelta()
+     if closed == "right":
+         if foffset.total_seconds() > 0:
+             fresult = first - foffset
+         else:
+-            fresult = first - offset.as_timedelta()
++            fresult = first - freq.as_timedelta()
+ 
+         if loffset.total_seconds() > 0:
+-            lresult = last + (offset.as_timedelta() - loffset)
++            lresult = last + (freq.as_timedelta() - loffset)
+         else:
+             lresult = last
+     else:
+-        fresult = first - foffset if foffset.total_seconds() > 0 else first
++        if foffset.total_seconds() > 0:
++            fresult = first - foffset
++        else:
++            fresult = first
++
+         if loffset.total_seconds() > 0:
+-            lresult = last + (offset.as_timedelta() - loffset)
++            lresult = last + (freq.as_timedelta() - loffset)
+         else:
+-            lresult = last + offset.as_timedelta()
++            lresult = last + freq
+     return fresult, lresult
+ 
+ 
+-def exact_cftime_datetime_difference(a, b):
++def exact_cftime_datetime_difference(a: CFTimeDatetime, b: CFTimeDatetime):
+     """Exact computation of b - a
+ 
+     Assumes:
+@@ -360,3 +495,19 @@ def exact_cftime_datetime_difference(a, b):
+     seconds = int(round(seconds.total_seconds()))
+     microseconds = b.microsecond - a.microsecond
+     return datetime.timedelta(seconds=seconds, microseconds=microseconds)
++
++
++def _convert_offset_to_timedelta(
++    offset: datetime.timedelta | str | BaseCFTimeOffset,
++) -> datetime.timedelta:
++    if isinstance(offset, datetime.timedelta):
++        return offset
++    elif isinstance(offset, (str, Tick)):
++        return to_offset(offset).as_timedelta()
++    else:
++        raise ValueError
++
++
++def _ceil_via_cftimeindex(date: CFTimeDatetime, freq: str | BaseCFTimeOffset):
++    index = CFTimeIndex([date])
++    return index.ceil(freq).item()
+
+diff --git a/xarray/core/rolling.py b/xarray/core/rolling.py
+index 57a5456..f7a5730 100644
+--- a/xarray/core/rolling.py
++++ b/xarray/core/rolling.py
+@@ -1002,7 +1002,7 @@ class DataArrayCoarsen(Coarsen["DataArray"]):
+             kwargs["skipna"] = None
+ 
+         def wrapped_func(
+-            self: DataArrayCoarsen, keep_attrs: bool = None, **kwargs
++            self: DataArrayCoarsen, keep_attrs: bool | None = None, **kwargs
+         ) -> DataArray:
+             from .dataarray import DataArray
+ 
+@@ -1033,7 +1033,9 @@ class DataArrayCoarsen(Coarsen["DataArray"]):
+ 
+         return wrapped_func
+ 
+-    def reduce(self, func: Callable, keep_attrs: bool = None, **kwargs) -> DataArray:
++    def reduce(
++        self, func: Callable, keep_attrs: bool | None = None, **kwargs
++    ) -> DataArray:
+         """Reduce the items in this group by applying `func` along some
+         dimension(s).
+ 
+@@ -1088,7 +1090,7 @@ class DatasetCoarsen(Coarsen["Dataset"]):
+             kwargs["skipna"] = None
+ 
+         def wrapped_func(
+-            self: DatasetCoarsen, keep_attrs: bool = None, **kwargs
++            self: DatasetCoarsen, keep_attrs: bool | None = None, **kwargs
+         ) -> Dataset:
+             from .dataset import Dataset
+ 
+
+diff --git a/xarray/core/types.py b/xarray/core/types.py
+index 2b65f4d..adf046d 100644
+--- a/xarray/core/types.py
++++ b/xarray/core/types.py
+@@ -1,20 +1,24 @@
+ from __future__ import annotations
+ 
++import datetime
+ from typing import (
+     TYPE_CHECKING,
+     Any,
+     Callable,
+     Hashable,
+     Iterable,
++    List,
+     Literal,
+     Protocol,
+     Sequence,
+     SupportsIndex,
++    Tuple,
+     TypeVar,
+     Union,
+ )
+ 
+ import numpy as np
++import pandas as pd
+ from packaging.version import Version
+ 
+ if TYPE_CHECKING:
+@@ -70,17 +74,21 @@ if TYPE_CHECKING:
+         # character codes, type strings or comma-separated fields, e.g., 'float64'
+         str,
+         # (flexible_dtype, itemsize)
+-        tuple[_DTypeLikeNested, int],
++        Tuple[_DTypeLikeNested, int],
+         # (fixed_dtype, shape)
+-        tuple[_DTypeLikeNested, _ShapeLike],
++        Tuple[_DTypeLikeNested, _ShapeLike],
+         # (base_dtype, new_dtype)
+-        tuple[_DTypeLikeNested, _DTypeLikeNested],
++        Tuple[_DTypeLikeNested, _DTypeLikeNested],
+         # because numpy does the same?
+-        list[Any],
++        List[Any],
+         # anything with a dtype attribute
+         _SupportsDType,
+     ]
+-
++    try:
++        from cftime import datetime as CFTimeDatetime
++    except ImportError:
++        CFTimeDatetime = Any
++    DatetimeLike = Union[pd.Timestamp, datetime.datetime, np.datetime64, CFTimeDatetime]
+ else:
+     Self: Any = None
+     DTypeLikeSave: Any = None
+@@ -105,7 +113,8 @@ DaCompatible = Union["DataArray", "Variable", "DataArrayGroupBy", "ScalarOrArray
+ VarCompatible = Union["Variable", "ScalarOrArray"]
+ GroupByIncompatible = Union["Variable", "GroupBy"]
+ 
+-Dims = Union[str, Iterable[Hashable], None]
++Dims = Union[str, Iterable[Hashable], "ellipsis", None]
++OrderedDims = Union[str, Sequence[Union[Hashable, "ellipsis"]], "ellipsis", None]
+ 
+ ErrorOptions = Literal["raise", "ignore"]
+ ErrorOptionsWithWarn = Literal["raise", "warn", "ignore"]
+
+diff --git a/xarray/core/utils.py b/xarray/core/utils.py
+index 67aca35..7ecb730 100644
+--- a/xarray/core/utils.py
++++ b/xarray/core/utils.py
+@@ -57,9 +57,11 @@ from typing import (
+     Hashable,
+     Iterable,
+     Iterator,
++    Literal,
+     Mapping,
+     MutableMapping,
+     MutableSet,
++    Sequence,
+     TypeVar,
+     cast,
+     overload,
+@@ -69,7 +71,7 @@ import numpy as np
+ import pandas as pd
+ 
+ if TYPE_CHECKING:
+-    from .types import ErrorOptionsWithWarn
++    from .types import Dims, ErrorOptionsWithWarn, OrderedDims
+ 
+ K = TypeVar("K")
+ V = TypeVar("V")
+@@ -507,7 +509,7 @@ class OrderedSet(MutableSet[T]):
+ 
+     __slots__ = ("_d",)
+ 
+-    def __init__(self, values: Iterable[T] = None):
++    def __init__(self, values: Iterable[T] | None = None):
+         self._d = {}
+         if values is not None:
+             self.update(values)
+@@ -654,15 +656,11 @@ def read_magic_number_from_file(filename_or_obj, count=8) -> bytes:
+         magic_number = filename_or_obj[:count]
+     elif isinstance(filename_or_obj, io.IOBase):
+         if filename_or_obj.tell() != 0:
+-            raise ValueError(
+-                "cannot guess the engine, "
+-                "file-like object read/write pointer not at the start of the file, "
+-                "please close and reopen, or use a context manager"
+-            )
++            filename_or_obj.seek(0)
+         magic_number = filename_or_obj.read(count)
+         filename_or_obj.seek(0)
+     else:
+-        raise TypeError(f"cannot read the magic number form {type(filename_or_obj)}")
++        raise TypeError(f"cannot read the magic number from {type(filename_or_obj)}")
+     return magic_number
+ 
+ 
+@@ -887,15 +885,17 @@ def drop_dims_from_indexers(
+ 
+ 
+ def drop_missing_dims(
+-    supplied_dims: Collection, dims: Collection, missing_dims: ErrorOptionsWithWarn
+-) -> Collection:
++    supplied_dims: Iterable[Hashable],
++    dims: Iterable[Hashable],
++    missing_dims: ErrorOptionsWithWarn,
++) -> Iterable[Hashable]:
+     """Depending on the setting of missing_dims, drop any dimensions from supplied_dims that
+     are not present in dims.
+ 
+     Parameters
+     ----------
+-    supplied_dims : dict
+-    dims : sequence
++    supplied_dims : Iterable of Hashable
++    dims : Iterable of Hashable
+     missing_dims : {"raise", "warn", "ignore"}
+     """
+ 
+@@ -928,6 +928,158 @@ def drop_missing_dims(
+         )
+ 
+ 
++T_None = TypeVar("T_None", None, "ellipsis")
++
++
++@overload
++def parse_dims(
++    dim: str | Iterable[Hashable] | T_None,
++    all_dims: tuple[Hashable, ...],
++    *,
++    check_exists: bool = True,
++    replace_none: Literal[True] = True,
++) -> tuple[Hashable, ...]:
++    ...
++
++
++@overload
++def parse_dims(
++    dim: str | Iterable[Hashable] | T_None,
++    all_dims: tuple[Hashable, ...],
++    *,
++    check_exists: bool = True,
++    replace_none: Literal[False],
++) -> tuple[Hashable, ...] | T_None:
++    ...
++
++
++def parse_dims(
++    dim: Dims,
++    all_dims: tuple[Hashable, ...],
++    *,
++    check_exists: bool = True,
++    replace_none: bool = True,
++) -> tuple[Hashable, ...] | None | ellipsis:
++    """Parse one or more dimensions.
++
++    A single dimension must be always a str, multiple dimensions
++    can be Hashables. This supports e.g. using a tuple as a dimension.
++    If you supply e.g. a set of dimensions the order cannot be
++    conserved, but for sequences it will be.
++
++    Parameters
++    ----------
++    dim : str, Iterable of Hashable, "..." or None
++        Dimension(s) to parse.
++    all_dims : tuple of Hashable
++        All possible dimensions.
++    check_exists: bool, default: True
++        if True, check if dim is a subset of all_dims.
++    replace_none : bool, default: True
++        If True, return all_dims if dim is None or "...".
++
++    Returns
++    -------
++    parsed_dims : tuple of Hashable
++        Input dimensions as a tuple.
++    """
++    if dim is None or dim is ...:
++        if replace_none:
++            return all_dims
++        return dim
++    if isinstance(dim, str):
++        dim = (dim,)
++    if check_exists:
++        _check_dims(set(dim), set(all_dims))
++    return tuple(dim)
++
++
++@overload
++def parse_ordered_dims(
++    dim: str | Sequence[Hashable | ellipsis] | T_None,
++    all_dims: tuple[Hashable, ...],
++    *,
++    check_exists: bool = True,
++    replace_none: Literal[True] = True,
++) -> tuple[Hashable, ...]:
++    ...
++
++
++@overload
++def parse_ordered_dims(
++    dim: str | Sequence[Hashable | ellipsis] | T_None,
++    all_dims: tuple[Hashable, ...],
++    *,
++    check_exists: bool = True,
++    replace_none: Literal[False],
++) -> tuple[Hashable, ...] | T_None:
++    ...
++
++
++def parse_ordered_dims(
++    dim: OrderedDims,
++    all_dims: tuple[Hashable, ...],
++    *,
++    check_exists: bool = True,
++    replace_none: bool = True,
++) -> tuple[Hashable, ...] | None | ellipsis:
++    """Parse one or more dimensions.
++
++    A single dimension must be always a str, multiple dimensions
++    can be Hashables. This supports e.g. using a tuple as a dimension.
++    An ellipsis ("...") in a sequence of dimensions will be
++    replaced with all remaining dimensions. This only makes sense when
++    the input is a sequence and not e.g. a set.
++
++    Parameters
++    ----------
++    dim : str, Sequence of Hashable or "...", "..." or None
++        Dimension(s) to parse. If "..." appears in a Sequence
++        it always gets replaced with all remaining dims
++    all_dims : tuple of Hashable
++        All possible dimensions.
++    check_exists: bool, default: True
++        if True, check if dim is a subset of all_dims.
++    replace_none : bool, default: True
++        If True, return all_dims if dim is None.
++
++    Returns
++    -------
++    parsed_dims : tuple of Hashable
++        Input dimensions as a tuple.
++    """
++    if dim is not None and dim is not ... and not isinstance(dim, str) and ... in dim:
++        dims_set: set[Hashable | ellipsis] = set(dim)
++        all_dims_set = set(all_dims)
++        if check_exists:
++            _check_dims(dims_set, all_dims_set)
++        if len(all_dims_set) != len(all_dims):
++            raise ValueError("Cannot use ellipsis with repeated dims")
++        dims = tuple(dim)
++        if dims.count(...) > 1:
++            raise ValueError("More than one ellipsis supplied")
++        other_dims = tuple(d for d in all_dims if d not in dims_set)
++        idx = dims.index(...)
++        return dims[:idx] + other_dims + dims[idx + 1 :]
++    else:
++        # mypy cannot resolve that the sequence cannot contain "..."
++        return parse_dims(  # type: ignore[call-overload]
++            dim=dim,
++            all_dims=all_dims,
++            check_exists=check_exists,
++            replace_none=replace_none,
++        )
++
++
++def _check_dims(dim: set[Hashable | ellipsis], all_dims: set[Hashable]) -> None:
++    wrong_dims = dim - all_dims
++    if wrong_dims and wrong_dims != {...}:
++        wrong_dims_str = ", ".join(f"'{d!s}'" for d in wrong_dims)
++        raise ValueError(
++            f"Dimension(s) {wrong_dims_str} do not exist. Expected one or more of {all_dims}"
++        )
++
++
+ _Accessor = TypeVar("_Accessor")
+ 
+ 
+
+diff --git a/xarray/core/variable.py b/xarray/core/variable.py
+index 0226f62..bb98839 100644
+--- a/xarray/core/variable.py
++++ b/xarray/core/variable.py
+@@ -1139,7 +1139,7 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+             | tuple[tuple[int, ...], ...]
+             | Mapping[Any, None | int | tuple[int, ...]]
+         ) = {},
+-        name: str = None,
++        name: str | None = None,
+         lock: bool = False,
+         inline_array: bool = False,
+         **chunks_kwargs: Any,
+@@ -1288,7 +1288,7 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+ 
+     def isel(
+         self: T_Variable,
+-        indexers: Mapping[Any, Any] = None,
++        indexers: Mapping[Any, Any] | None = None,
+         missing_dims: ErrorOptionsWithWarn = "raise",
+         **indexers_kwargs: Any,
+     ) -> T_Variable:
+@@ -1509,7 +1509,7 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+         if reflect_type is not None:
+             pad_option_kwargs["reflect_type"] = reflect_type
+ 
+-        array = np.pad(  # type: ignore[call-overload]
++        array = np.pad(
+             self.data.astype(dtype, copy=False),
+             pad_width_by_index,
+             mode=mode,
+@@ -1889,7 +1889,7 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+     def reduce(
+         self,
+         func: Callable[..., Any],
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         axis: int | Sequence[int] | None = None,
+         keep_attrs: bool | None = None,
+         keepdims: bool = False,
+@@ -2122,9 +2122,9 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+         q: ArrayLike,
+         dim: str | Sequence[Hashable] | None = None,
+         method: QuantileMethods = "linear",
+-        keep_attrs: bool = None,
+-        skipna: bool = None,
+-        interpolation: QuantileMethods = None,
++        keep_attrs: bool | None = None,
++        skipna: bool | None = None,
++        interpolation: QuantileMethods | None = None,
+     ) -> Variable:
+         """Compute the qth quantile of the data along the specified dimension.
+ 
+@@ -2522,7 +2522,7 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+ 
+         return variable.data.reshape(shape), tuple(axes)
+ 
+-    def isnull(self, keep_attrs: bool = None):
++    def isnull(self, keep_attrs: bool | None = None):
+         """Test each value in the array for whether it is a missing value.
+ 
+         Returns
+@@ -2556,7 +2556,7 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+             keep_attrs=keep_attrs,
+         )
+ 
+-    def notnull(self, keep_attrs: bool = None):
++    def notnull(self, keep_attrs: bool | None = None):
+         """Test each value in the array for whether it is not a missing value.
+ 
+         Returns
+@@ -2663,7 +2663,7 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+     def _unravel_argminmax(
+         self,
+         argminmax: str,
+-        dim: Dims | ellipsis,
++        dim: Dims,
+         axis: int | None,
+         keep_attrs: bool | None,
+         skipna: bool | None,
+@@ -2732,10 +2732,10 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+ 
+     def argmin(
+         self,
+-        dim: Dims | ellipsis = None,
+-        axis: int = None,
+-        keep_attrs: bool = None,
+-        skipna: bool = None,
++        dim: Dims = None,
++        axis: int | None = None,
++        keep_attrs: bool | None = None,
++        skipna: bool | None = None,
+     ) -> Variable | dict[Hashable, Variable]:
+         """Index or indices of the minimum of the Variable over one or more dimensions.
+         If a sequence is passed to 'dim', then result returned as dict of Variables,
+@@ -2777,10 +2777,10 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+ 
+     def argmax(
+         self,
+-        dim: Dims | ellipsis = None,
+-        axis: int = None,
+-        keep_attrs: bool = None,
+-        skipna: bool = None,
++        dim: Dims = None,
++        axis: int | None = None,
++        keep_attrs: bool | None = None,
++        skipna: bool | None = None,
+     ) -> Variable | dict[Hashable, Variable]:
+         """Index or indices of the maximum of the Variable over one or more dimensions.
+         If a sequence is passed to 'dim', then result returned as dict of Variables,
+@@ -2999,7 +2999,7 @@ class IndexVariable(Variable):
+ 
+     def to_index_variable(self) -> IndexVariable:
+         """Return this variable as an xarray.IndexVariable"""
+-        return self.copy()
++        return self.copy(deep=False)
+ 
+     to_coord = utils.alias(to_index_variable, "to_coord")
+ 
+
+diff --git a/xarray/core/weighted.py b/xarray/core/weighted.py
+index fafe818..0f3a9aa 100644
+--- a/xarray/core/weighted.py
++++ b/xarray/core/weighted.py
+@@ -207,7 +207,7 @@ class Weighted(Generic[T_Xarray]):
+     def _reduce(
+         da: DataArray,
+         weights: DataArray,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         skipna: bool | None = None,
+     ) -> DataArray:
+         """reduce using dot; equivalent to (da * weights).sum(dim, skipna)
+@@ -312,7 +312,7 @@ class Weighted(Generic[T_Xarray]):
+         da: DataArray,
+         q: ArrayLike,
+         dim: Dims = None,
+-        skipna: bool = None,
++        skipna: bool | None = None,
+     ) -> DataArray:
+         """Apply a weighted ``quantile`` to a DataArray along some dimension(s)."""
+ 
+@@ -516,7 +516,7 @@ class Weighted(Generic[T_Xarray]):
+         q: ArrayLike,
+         *,
+         dim: Dims = None,
+-        keep_attrs: bool = None,
++        keep_attrs: bool | None = None,
+         skipna: bool = True,
+     ) -> T_Xarray:
+ 
+
+diff --git a/xarray/plot/dataarray_plot.py b/xarray/plot/dataarray_plot.py
+index ac23f7d..46aaf33 100644
+--- a/xarray/plot/dataarray_plot.py
++++ b/xarray/plot/dataarray_plot.py
+@@ -1488,7 +1488,7 @@ def _plot2d(plotfunc):
+             if ax is None:
+                 # TODO: Importing Axes3D is no longer necessary in matplotlib >= 3.2.
+                 # Remove when minimum requirement of matplotlib is 3.2:
+-                from mpl_toolkits.mplot3d import Axes3D  # type: ignore  # noqa: F401
++                from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+ 
+                 # delete so it does not end up in locals()
+                 del Axes3D
+@@ -1521,7 +1521,7 @@ def _plot2d(plotfunc):
+             and not kwargs.get("_is_facetgrid", False)
+             and ax is not None
+         ):
+-            import mpl_toolkits  # type: ignore
++            import mpl_toolkits
+ 
+             if not isinstance(ax, mpl_toolkits.mplot3d.Axes3D):
+                 raise ValueError(
+
+diff --git a/xarray/plot/utils.py b/xarray/plot/utils.py
+index 31daff5..ba5ea73 100644
+--- a/xarray/plot/utils.py
++++ b/xarray/plot/utils.py
+@@ -51,8 +51,8 @@ if TYPE_CHECKING:
+ ROBUST_PERCENTILE = 2.0
+ 
+ # copied from seaborn
+-_MARKERSIZE_RANGE = (18.0, 72.0)
+-_LINEWIDTH_RANGE = (1.5, 6.0)
++_MARKERSIZE_RANGE = (18.0, 36.0, 72.0)
++_LINEWIDTH_RANGE = (1.5, 1.5, 6.0)
+ 
+ 
+ def import_matplotlib_pyplot():
+@@ -609,8 +609,8 @@ def _resolve_intervals_1dplot(
+         remove_drawstyle = False
+ 
+         # Convert intervals to double points
+-        x_is_interval = _valid_other_type(xval, [pd.Interval])
+-        y_is_interval = _valid_other_type(yval, [pd.Interval])
++        x_is_interval = _valid_other_type(xval, pd.Interval)
++        y_is_interval = _valid_other_type(yval, pd.Interval)
+         if x_is_interval and y_is_interval:
+             raise TypeError("Can't step plot intervals against intervals.")
+         elif x_is_interval:
+@@ -628,10 +628,10 @@ def _resolve_intervals_1dplot(
+     else:
+ 
+         # Convert intervals to mid points and adjust labels
+-        if _valid_other_type(xval, [pd.Interval]):
++        if _valid_other_type(xval, pd.Interval):
+             xval = _interval_to_mid_points(xval)
+             x_suffix = "_center"
+-        if _valid_other_type(yval, [pd.Interval]):
++        if _valid_other_type(yval, pd.Interval):
+             yval = _interval_to_mid_points(yval)
+             y_suffix = "_center"
+ 
+@@ -646,7 +646,7 @@ def _resolve_intervals_2dplot(val, func_name):
+     increases length by 1.
+     """
+     label_extra = ""
+-    if _valid_other_type(val, [pd.Interval]):
++    if _valid_other_type(val, pd.Interval):
+         if func_name == "pcolormesh":
+             val = _interval_to_bound_points(val)
+         else:
+@@ -656,11 +656,13 @@ def _resolve_intervals_2dplot(val, func_name):
+     return val, label_extra
+ 
+ 
+-def _valid_other_type(x, types):
++def _valid_other_type(
++    x: ArrayLike, types: type[object] | tuple[type[object], ...]
++) -> bool:
+     """
+     Do all elements of x have a type from types?
+     """
+-    return all(any(isinstance(el, t) for t in types) for el in np.ravel(x))
++    return all(isinstance(el, types) for el in np.ravel(x))
+ 
+ 
+ def _valid_numpy_subdtype(x, numpy_types):
+@@ -675,47 +677,49 @@ def _valid_numpy_subdtype(x, numpy_types):
+     return any(np.issubdtype(x.dtype, t) for t in numpy_types)
+ 
+ 
+-def _ensure_plottable(*args):
++def _ensure_plottable(*args) -> None:
+     """
+     Raise exception if there is anything in args that can't be plotted on an
+     axis by matplotlib.
+     """
+-    numpy_types = [
++    numpy_types: tuple[type[object], ...] = (
+         np.floating,
+         np.integer,
+         np.timedelta64,
+         np.datetime64,
+         np.bool_,
+         np.str_,
+-    ]
+-    other_types = [datetime]
+-    if cftime is not None:
+-        cftime_datetime_types = [cftime.datetime]
+-        other_types = other_types + cftime_datetime_types
+-    else:
+-        cftime_datetime_types = []
++    )
++    other_types: tuple[type[object], ...] = (datetime,)
++    cftime_datetime_types: tuple[type[object], ...] = (
++        () if cftime is None else (cftime.datetime,)
++    )
++    other_types += cftime_datetime_types
++
+     for x in args:
+         if not (
+-            _valid_numpy_subdtype(np.array(x), numpy_types)
+-            or _valid_other_type(np.array(x), other_types)
++            _valid_numpy_subdtype(np.asarray(x), numpy_types)
++            or _valid_other_type(np.asarray(x), other_types)
+         ):
+             raise TypeError(
+                 "Plotting requires coordinates to be numeric, boolean, "
+                 "or dates of type numpy.datetime64, "
+                 "datetime.datetime, cftime.datetime or "
+-                f"pandas.Interval. Received data of type {np.array(x).dtype} instead."
+-            )
+-        if (
+-            _valid_other_type(np.array(x), cftime_datetime_types)
+-            and not nc_time_axis_available
+-        ):
+-            raise ImportError(
+-                "Plotting of arrays of cftime.datetime "
+-                "objects or arrays indexed by "
+-                "cftime.datetime objects requires the "
+-                "optional `nc-time-axis` (v1.2.0 or later) "
+-                "package."
++                f"pandas.Interval. Received data of type {np.asarray(x).dtype} instead."
+             )
++        if _valid_other_type(np.asarray(x), cftime_datetime_types):
++            if nc_time_axis_available:
++                # Register cftime datetypes to matplotlib.units.registry,
++                # otherwise matplotlib will raise an error:
++                import nc_time_axis  # noqa: F401
++            else:
++                raise ImportError(
++                    "Plotting of arrays of cftime.datetime "
++                    "objects or arrays indexed by "
++                    "cftime.datetime objects requires the "
++                    "optional `nc-time-axis` (v1.2.0 or later) "
++                    "package."
++                )
+ 
+ 
+ def _is_numeric(arr):
+@@ -1337,7 +1341,7 @@ def _parse_size(
+     else:
+         levels = numbers = np.sort(np.unique(flatdata))
+ 
+-    min_width, max_width = _MARKERSIZE_RANGE
++    min_width, default_width, max_width = _MARKERSIZE_RANGE
+     # width_range = min_width, max_width
+ 
+     if norm is None:
+@@ -1374,8 +1378,8 @@ class _Normalize(Sequence):
+     ----------
+     data : DataArray
+         DataArray to normalize.
+-    width : Sequence of two numbers, optional
+-        Normalize the data to theses min and max values.
++    width : Sequence of three numbers, optional
++        Normalize the data to these (min, default, max) values.
+         The default is None.
+     """
+ 
+@@ -1384,7 +1388,7 @@ class _Normalize(Sequence):
+     _data_unique_index: np.ndarray
+     _data_unique_inverse: np.ndarray
+     _data_is_numeric: bool
+-    _width: tuple[float, float] | None
++    _width: tuple[float, float, float] | None
+ 
+     __slots__ = (
+         "_data",
+@@ -1398,7 +1402,7 @@ class _Normalize(Sequence):
+     def __init__(
+         self,
+         data: DataArray | None,
+-        width: tuple[float, float] | None = None,
++        width: tuple[float, float, float] | None = None,
+         _is_facetgrid: bool = False,
+     ) -> None:
+         self._data = data
+@@ -1459,14 +1463,22 @@ class _Normalize(Sequence):
+         ...
+ 
+     def _calc_widths(self, y: np.ndarray | DataArray) -> np.ndarray | DataArray:
++        """
++        Normalize the values so they're inbetween self._width.
++        """
+         if self._width is None:
+             return y
+ 
+-        x0, x1 = self._width
+-
+-        k = (y - np.min(y)) / (np.max(y) - np.min(y))
+-        widths = x0 + k * (x1 - x0)
++        xmin, xdefault, xmax = self._width
+ 
++        diff_maxy_miny = np.max(y) - np.min(y)
++        if diff_maxy_miny == 0:
++            # Use default with if y is constant:
++            widths = xdefault + 0 * y
++        else:
++            # Normalize inbetween xmin and xmax:
++            k = (y - np.min(y)) / diff_maxy_miny
++            widths = xmin + k * (xmax - xmin)
+         return widths
+ 
+     @overload
+@@ -1497,7 +1509,7 @@ class _Normalize(Sequence):
+         array([3, 1, 1, 3, 5])
+         Dimensions without coordinates: dim_0
+ 
+-        >>> _Normalize(a, width=[18, 72]).values
++        >>> _Normalize(a, width=(18, 36, 72)).values
+         <xarray.DataArray (dim_0: 5)>
+         array([45., 18., 18., 45., 72.])
+         Dimensions without coordinates: dim_0
+@@ -1508,10 +1520,16 @@ class _Normalize(Sequence):
+         array([0.5, 0. , 0. , 0.5, 2. , 3. ])
+         Dimensions without coordinates: dim_0
+ 
+-        >>> _Normalize(a, width=[18, 72]).values
++        >>> _Normalize(a, width=(18, 36, 72)).values
+         <xarray.DataArray (dim_0: 6)>
+         array([27., 18., 18., 27., 54., 72.])
+         Dimensions without coordinates: dim_0
++
++        >>> _Normalize(a * 0, width=(18, 36, 72)).values
++        <xarray.DataArray (dim_0: 6)>
++        array([36., 36., 36., 36., 36., 36.])
++        Dimensions without coordinates: dim_0
++
+         """
+         if self.data is None:
+             return None
+@@ -1536,14 +1554,14 @@ class _Normalize(Sequence):
+         >>> _Normalize(a)._values_unique
+         array([1, 3, 5])
+ 
+-        >>> _Normalize(a, width=[18, 72])._values_unique
++        >>> _Normalize(a, width=(18, 36, 72))._values_unique
+         array([18., 45., 72.])
+ 
+         >>> a = xr.DataArray([0.5, 0, 0, 0.5, 2, 3])
+         >>> _Normalize(a)._values_unique
+         array([0. , 0.5, 2. , 3. ])
+ 
+-        >>> _Normalize(a, width=[18, 72])._values_unique
++        >>> _Normalize(a, width=(18, 36, 72))._values_unique
+         array([18., 27., 54., 72.])
+         """
+         if self.data is None:
+@@ -1615,7 +1633,7 @@ class _Normalize(Sequence):
+         Examples
+         --------
+         >>> a = xr.DataArray([0.5, 0, 0, 0.5, 2, 3])
+-        >>> aa = _Normalize(a, width=[0, 1])
++        >>> aa = _Normalize(a, width=(0, 0.5, 1))
+         >>> aa._lookup
+         0.000000    0.0
+         0.166667    0.5
+@@ -1641,7 +1659,7 @@ class _Normalize(Sequence):
+         Examples
+         --------
+         >>> a = xr.DataArray([0.5, 0, 0, 0.5, 2, 3])
+-        >>> aa = _Normalize(a, width=[0, 1])
++        >>> aa = _Normalize(a, width=(0, 0.5, 1))
+         >>> aa._lookup
+         0.000000    0.0
+         0.166667    0.5
+@@ -1663,7 +1681,7 @@ def _determine_guide(
+     sizeplt_norm: _Normalize,
+     add_colorbar: None | bool = None,
+     add_legend: None | bool = None,
+-    plotfunc_name: str = None,
++    plotfunc_name: str | None = None,
+ ) -> tuple[bool, bool]:
+     if plotfunc_name == "hist":
+         return False, False
+
+diff --git a/xarray/util/generate_aggregations.py b/xarray/util/generate_aggregations.py
+index 01576f4..bc48935 100644
+--- a/xarray/util/generate_aggregations.py
++++ b/xarray/util/generate_aggregations.py
+@@ -60,7 +60,7 @@ class {obj}{cls}Aggregations:
+     def reduce(
+         self,
+         func: Callable[..., Any],
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         axis: int | Sequence[int] | None = None,
+         keep_attrs: bool | None = None,
+@@ -71,7 +71,7 @@ class {obj}{cls}Aggregations:
+ 
+     def _flox_reduce(
+         self,
+-        dim: Dims | ellipsis,
++        dim: Dims,
+         **kwargs: Any,
+     ) -> {obj}:
+         raise NotImplementedError()"""
+@@ -84,7 +84,7 @@ class {obj}{cls}Aggregations:
+     def reduce(
+         self,
+         func: Callable[..., Any],
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,
+         axis: int | Sequence[int] | None = None,
+         keep_attrs: bool | None = None,
+@@ -95,7 +95,7 @@ class {obj}{cls}Aggregations:
+ 
+     def _flox_reduce(
+         self,
+-        dim: Dims | ellipsis,
++        dim: Dims,
+         **kwargs: Any,
+     ) -> {obj}:
+         raise NotImplementedError()"""
+@@ -117,7 +117,7 @@ TEMPLATE_REDUCTION_SIGNATURE = '''
+ TEMPLATE_REDUCTION_SIGNATURE_GROUPBY = '''
+     def {method}(
+         self,
+-        dim: Dims | ellipsis = None,
++        dim: Dims = None,
+         *,{extra_kwargs}
+         keep_attrs: bool | None = None,
+         **kwargs: Any,
+@@ -149,9 +149,9 @@ TEMPLATE_NOTES = """
+         -----
+         {notes}"""
+ 
+-_DIM_DOCSTRING = """dim : str, Iterable of Hashable, or None, default: None
++_DIM_DOCSTRING = """dim : str, Iterable of Hashable, "..." or None, default: None
+     Name of dimension[s] along which to apply ``{method}``. For e.g. ``dim="x"``
+-    or ``dim=["x", "y"]``. If None, will reduce over all dimensions."""
++    or ``dim=["x", "y"]``. If "..." or None, will reduce over all dimensions."""
+ 
+ _DIM_DOCSTRING_GROUPBY = """dim : str, Iterable of Hashable, "..." or None, default: None
+     Name of dimension[s] along which to apply ``{method}``. For e.g. ``dim="x"``
+
+diff --git a/xarray/util/generate_ops.py b/xarray/util/generate_ops.py
+index 7407e3d..0ca5954 100644
+--- a/xarray/util/generate_ops.py
++++ b/xarray/util/generate_ops.py
+@@ -110,7 +110,7 @@ stub_da = """\
+     @overload{override}
+     def {method}(self, other: T_Dataset) -> T_Dataset: ...
+     @overload
+-    def {method}(self, other: "DatasetGroupBy") -> "Dataset": ...  # type: ignore[misc]
++    def {method}(self, other: "DatasetGroupBy") -> "Dataset": ...
+     @overload
+     def {method}(self: T_DataArray, other: DaCompatible) -> T_DataArray: ..."""
+ stub_var = """\
+@@ -124,7 +124,7 @@ stub_dsgb = """\
+     @overload{override}
+     def {method}(self, other: T_Dataset) -> T_Dataset: ...
+     @overload
+-    def {method}(self, other: "DataArray") -> "Dataset": ...  # type: ignore[misc]
++    def {method}(self, other: "DataArray") -> "Dataset": ...
+     @overload
+     def {method}(self, other: GroupByIncompatible) -> NoReturn: ..."""
+ stub_dagb = """\
+
+diff --git a/xarray/util/print_versions.py b/xarray/util/print_versions.py
+index b8689e3..d53f1aa 100755
+--- a/xarray/util/print_versions.py
++++ b/xarray/util/print_versions.py
+@@ -129,6 +129,7 @@ def show_versions(file=sys.stdout):
+         ("pip", lambda mod: mod.__version__),
+         ("conda", lambda mod: mod.__version__),
+         ("pytest", lambda mod: mod.__version__),
++        ("mypy", lambda mod: importlib.metadata.version(mod.__name__)),
+         # Misc.
+         ("IPython", lambda mod: mod.__version__),
+         ("sphinx", lambda mod: mod.__version__),

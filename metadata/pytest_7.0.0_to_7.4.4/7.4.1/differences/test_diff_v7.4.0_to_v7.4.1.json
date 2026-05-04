@@ -1,0 +1,127 @@
+{
+  "old_dir": ".packages/pytest/7.4.0",
+  "new_dir": ".packages/pytest/7.4.1",
+  "extracted_at": "2026-03-26T17:57:18.924679",
+  "diff_file": "metadata/pytest_upgrade/v7.4.0_v7.4.1/test_diff_v7.4.0_to_v7.4.1.diff",
+  "diff_content": "diff --git a/testing/acceptance_test.py b/testing/acceptance_test.py\nindex 5658f2f..ed750a9 100644\n--- a/testing/acceptance_test.py\n+++ b/testing/acceptance_test.py\n@@ -1317,3 +1317,38 @@ def test_function_return_non_none_warning(pytester: Pytester) -> None:\n     )\n     res = pytester.runpytest()\n     res.stdout.fnmatch_lines([\"*Did you mean to use `assert` instead of `return`?*\"])\n+\n+\n+def test_doctest_and_normal_imports_with_importlib(pytester: Pytester) -> None:\n+    \"\"\"\n+    Regression test for #10811: previously import_path with ImportMode.importlib would\n+    not return a module if already in sys.modules, resulting in modules being imported\n+    multiple times, which causes problems with modules that have import side effects.\n+    \"\"\"\n+    # Uses the exact reproducer form #10811, given it is very minimal\n+    # and illustrates the problem well.\n+    pytester.makepyfile(\n+        **{\n+            \"pmxbot/commands.py\": \"from . import logging\",\n+            \"pmxbot/logging.py\": \"\",\n+            \"tests/__init__.py\": \"\",\n+            \"tests/test_commands.py\": \"\"\"\n+                import importlib\n+                from pmxbot import logging\n+\n+                class TestCommands:\n+                    def test_boo(self):\n+                        assert importlib.import_module('pmxbot.logging') is logging\n+                \"\"\",\n+        }\n+    )\n+    pytester.makeini(\n+        \"\"\"\n+        [pytest]\n+        addopts=\n+            --doctest-modules\n+            --import-mode importlib\n+        \"\"\"\n+    )\n+    result = pytester.runpytest_subprocess()\n+    result.stdout.fnmatch_lines(\"*1 passed*\")\n\ndiff --git a/testing/python/approx.py b/testing/python/approx.py\nindex 631e52b..6ad411a 100644\n--- a/testing/python/approx.py\n+++ b/testing/python/approx.py\n@@ -122,6 +122,23 @@ class TestApprox:\n             ],\n         )\n \n+        assert_approx_raises_regex(\n+            {\"a\": 1.0, \"b\": None, \"c\": None},\n+            {\n+                \"a\": None,\n+                \"b\": 1000.0,\n+                \"c\": None,\n+            },\n+            [\n+                r\"  comparison failed. Mismatched elements: 2 / 3:\",\n+                r\"  Max absolute difference: -inf\",\n+                r\"  Max relative difference: -inf\",\n+                r\"  Index \\| Obtained\\s+\\| Expected\\s+\",\n+                rf\"  a     \\| {SOME_FLOAT} \\| None\",\n+                rf\"  b     \\| None\\s+\\| {SOME_FLOAT} ± {SOME_FLOAT}\",\n+            ],\n+        )\n+\n         assert_approx_raises_regex(\n             [1.0, 2.0, 3.0, 4.0],\n             [1.0, 3.0, 3.0, 5.0],\n\ndiff --git a/testing/test_pathlib.py b/testing/test_pathlib.py\nindex 56c54e4..3d574e8 100644\n--- a/testing/test_pathlib.py\n+++ b/testing/test_pathlib.py\n@@ -7,6 +7,7 @@ from textwrap import dedent\n from types import ModuleType\n from typing import Any\n from typing import Generator\n+from typing import Iterator\n \n import pytest\n from _pytest.monkeypatch import MonkeyPatch\n@@ -282,29 +283,36 @@ class TestImportPath:\n             import_path(tmp_path / \"invalid.py\", root=tmp_path)\n \n     @pytest.fixture\n-    def simple_module(self, tmp_path: Path) -> Path:\n-        fn = tmp_path / \"_src/tests/mymod.py\"\n+    def simple_module(\n+        self, tmp_path: Path, request: pytest.FixtureRequest\n+    ) -> Iterator[Path]:\n+        name = f\"mymod_{request.node.name}\"\n+        fn = tmp_path / f\"_src/tests/{name}.py\"\n         fn.parent.mkdir(parents=True)\n         fn.write_text(\"def foo(x): return 40 + x\", encoding=\"utf-8\")\n-        return fn\n+        module_name = module_name_from_path(fn, root=tmp_path)\n+        yield fn\n+        sys.modules.pop(module_name, None)\n \n-    def test_importmode_importlib(self, simple_module: Path, tmp_path: Path) -> None:\n+    def test_importmode_importlib(\n+        self, simple_module: Path, tmp_path: Path, request: pytest.FixtureRequest\n+    ) -> None:\n         \"\"\"`importlib` mode does not change sys.path.\"\"\"\n         module = import_path(simple_module, mode=\"importlib\", root=tmp_path)\n         assert module.foo(2) == 42  # type: ignore[attr-defined]\n         assert str(simple_module.parent) not in sys.path\n         assert module.__name__ in sys.modules\n-        assert module.__name__ == \"_src.tests.mymod\"\n+        assert module.__name__ == f\"_src.tests.mymod_{request.node.name}\"\n         assert \"_src\" in sys.modules\n         assert \"_src.tests\" in sys.modules\n \n-    def test_importmode_twice_is_different_module(\n+    def test_remembers_previous_imports(\n         self, simple_module: Path, tmp_path: Path\n     ) -> None:\n-        \"\"\"`importlib` mode always returns a new module.\"\"\"\n+        \"\"\"`importlib` mode called remembers previous module (#10341, #10811).\"\"\"\n         module1 = import_path(simple_module, mode=\"importlib\", root=tmp_path)\n         module2 = import_path(simple_module, mode=\"importlib\", root=tmp_path)\n-        assert module1 is not module2\n+        assert module1 is module2\n \n     def test_no_meta_path_found(\n         self, simple_module: Path, monkeypatch: MonkeyPatch, tmp_path: Path\n@@ -317,6 +325,9 @@ class TestImportPath:\n         # mode='importlib' fails if no spec is found to load the module\n         import importlib.util\n \n+        # Force module to be re-imported.\n+        del sys.modules[module.__name__]\n+\n         monkeypatch.setattr(\n             importlib.util, \"spec_from_file_location\", lambda *args: None\n         )\n@@ -592,3 +603,15 @@ class TestImportLibMode:\n         modules = {}\n         insert_missing_modules(modules, \"\")\n         assert modules == {}\n+\n+    def test_parent_contains_child_module_attribute(\n+        self, monkeypatch: MonkeyPatch, tmp_path: Path\n+    ):\n+        monkeypatch.chdir(tmp_path)\n+        # Use 'xxx' and 'xxy' as parent names as they are unlikely to exist and\n+        # don't end up being imported.\n+        modules = {\"xxx.tests.foo\": ModuleType(\"xxx.tests.foo\")}\n+        insert_missing_modules(modules, \"xxx.tests.foo\")\n+        assert sorted(modules) == [\"xxx\", \"xxx.tests\", \"xxx.tests.foo\"]\n+        assert modules[\"xxx\"].tests is modules[\"xxx.tests\"]\n+        assert modules[\"xxx.tests\"].foo is modules[\"xxx.tests.foo\"]\n\ndiff --git a/testing/test_pluginmanager.py b/testing/test_pluginmanager.py\nindex c6f518b..e577341 100644\n--- a/testing/test_pluginmanager.py\n+++ b/testing/test_pluginmanager.py\n@@ -242,8 +242,12 @@ class TestPytestPluginManager:\n         mod = types.ModuleType(\"temp\")\n         mod.__dict__[\"pytest_plugins\"] = [\"pytest_p1\", \"pytest_p2\"]\n         pytestpm.consider_module(mod)\n-        assert pytestpm.get_plugin(\"pytest_p1\").__name__ == \"pytest_p1\"\n-        assert pytestpm.get_plugin(\"pytest_p2\").__name__ == \"pytest_p2\"\n+        p1 = pytestpm.get_plugin(\"pytest_p1\")\n+        assert p1 is not None\n+        assert p1.__name__ == \"pytest_p1\"\n+        p2 = pytestpm.get_plugin(\"pytest_p2\")\n+        assert p2 is not None\n+        assert p2.__name__ == \"pytest_p2\"\n \n     def test_consider_module_import_module(\n         self, pytester: Pytester, _config_for_test: Config\n@@ -336,6 +340,7 @@ class TestPytestPluginManager:\n         len2 = len(pytestpm.get_plugins())\n         assert len1 == len2\n         plugin1 = pytestpm.get_plugin(\"pytest_hello\")\n+        assert plugin1 is not None\n         assert plugin1.__name__.endswith(\"pytest_hello\")\n         plugin2 = pytestpm.get_plugin(\"pytest_hello\")\n         assert plugin2 is plugin1\n@@ -351,6 +356,7 @@ class TestPytestPluginManager:\n         pluginname = \"pkg.plug\"\n         pytestpm.import_plugin(pluginname)\n         mod = pytestpm.get_plugin(\"pkg.plug\")\n+        assert mod is not None\n         assert mod.x == 3\n \n     def test_consider_conftest_deps(\n",
+  "structured_diff": {
+    "testing/acceptance_test.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -1317,3 +1317,38 @@",
+          "snippet": " def test_function_return_non_none_warning(pytester: Pytester) -> None:\n     )\n     res = pytester.runpytest()\n     res.stdout.fnmatch_lines([\"*Did you mean to use `assert` instead of `return`?*\"])\n+\n+\n+def test_doctest_and_normal_imports_with_importlib(pytester: Pytester) -> None:\n+    \"\"\"\n+    Regression test for #10811: previously import_path with ImportMode.importlib would\n+    not return a module if already in sys.modules, resulting in modules being imported\n+    multiple times, which causes problems with modules that have import side effects.\n+    \"\"\"\n+    # Uses the exact reproducer form #10811, given it is very minimal\n+    # and illustrates the problem well.\n+    pytester.makepyfile(\n+        **{\n+            \"pmxbot/commands.py\": \"from . import logging\",\n+            \"pmxbot/logging.py\": \"\",\n+            \"tests/__init__.py\": \"\",\n+            \"tests/test_commands.py\": \"\"\"\n+                import importlib\n+                from pmxbot import logging\n+\n+                class TestCommands:\n+                    def test_boo(self):\n+                        assert importlib.import_module('pmxbot.logging') is logging\n+                \"\"\",\n+        }\n+    )\n+    pytester.makeini(\n+        \"\"\"\n+        [pytest]\n+        addopts=\n+            --doctest-modules\n+            --import-mode importlib\n+        \"\"\"\n+    )\n+    result = pytester.runpytest_subprocess()\n+    result.stdout.fnmatch_lines(\"*1 passed*\")\n",
+          "affect": [
+            {
+              "kind": "function",
+              "node": "testing/acceptance_test.py::test_doctest_and_normal_imports_with_importlib"
+            }
+          ]
+        }
+      ]
+    },
+    "testing/python/approx.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -122,6 +122,23 @@",
+          "snippet": " class TestApprox:\n             ],\n         )\n \n+        assert_approx_raises_regex(\n+            {\"a\": 1.0, \"b\": None, \"c\": None},\n+            {\n+                \"a\": None,\n+                \"b\": 1000.0,\n+                \"c\": None,\n+            },\n+            [\n+                r\"  comparison failed. Mismatched elements: 2 / 3:\",\n+                r\"  Max absolute difference: -inf\",\n+                r\"  Max relative difference: -inf\",\n+                r\"  Index \\| Obtained\\s+\\| Expected\\s+\",\n+                rf\"  a     \\| {SOME_FLOAT} \\| None\",\n+                rf\"  b     \\| None\\s+\\| {SOME_FLOAT} ± {SOME_FLOAT}\",\n+            ],\n+        )\n+\n         assert_approx_raises_regex(\n             [1.0, 2.0, 3.0, 4.0],\n             [1.0, 3.0, 3.0, 5.0],\n",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "testing/python/approx.py::TestApprox::test_error_messages_native_dtypes"
+            }
+          ]
+        }
+      ]
+    },
+    "testing/test_pathlib.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -7,6 +7,7 @@",
+          "snippet": " from textwrap import dedent\n from types import ModuleType\n from typing import Any\n from typing import Generator\n+from typing import Iterator\n \n import pytest\n from _pytest.monkeypatch import MonkeyPatch",
+          "affect": [
+            {
+              "kind": "module",
+              "node": "testing/test_pathlib.py::<module>"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -282,29 +283,36 @@",
+          "snippet": " class TestImportPath:\n             import_path(tmp_path / \"invalid.py\", root=tmp_path)\n \n     @pytest.fixture\n-    def simple_module(self, tmp_path: Path) -> Path:\n-        fn = tmp_path / \"_src/tests/mymod.py\"\n+    def simple_module(\n+        self, tmp_path: Path, request: pytest.FixtureRequest\n+    ) -> Iterator[Path]:\n+        name = f\"mymod_{request.node.name}\"\n+        fn = tmp_path / f\"_src/tests/{name}.py\"\n         fn.parent.mkdir(parents=True)\n         fn.write_text(\"def foo(x): return 40 + x\", encoding=\"utf-8\")\n-        return fn\n+        module_name = module_name_from_path(fn, root=tmp_path)\n+        yield fn\n+        sys.modules.pop(module_name, None)\n \n-    def test_importmode_importlib(self, simple_module: Path, tmp_path: Path) -> None:\n+    def test_importmode_importlib(\n+        self, simple_module: Path, tmp_path: Path, request: pytest.FixtureRequest\n+    ) -> None:\n         \"\"\"`importlib` mode does not change sys.path.\"\"\"\n         module = import_path(simple_module, mode=\"importlib\", root=tmp_path)\n         assert module.foo(2) == 42  # type: ignore[attr-defined]\n         assert str(simple_module.parent) not in sys.path\n         assert module.__name__ in sys.modules\n-        assert module.__name__ == \"_src.tests.mymod\"\n+        assert module.__name__ == f\"_src.tests.mymod_{request.node.name}\"\n         assert \"_src\" in sys.modules\n         assert \"_src.tests\" in sys.modules\n \n-    def test_importmode_twice_is_different_module(\n+    def test_remembers_previous_imports(\n         self, simple_module: Path, tmp_path: Path\n     ) -> None:\n-        \"\"\"`importlib` mode always returns a new module.\"\"\"\n+        \"\"\"`importlib` mode called remembers previous module (#10341, #10811).\"\"\"\n         module1 = import_path(simple_module, mode=\"importlib\", root=tmp_path)\n         module2 = import_path(simple_module, mode=\"importlib\", root=tmp_path)\n-        assert module1 is not module2\n+        assert module1 is module2\n \n     def test_no_meta_path_found(\n         self, simple_module: Path, monkeypatch: MonkeyPatch, tmp_path: Path",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "testing/test_pathlib.py::TestImportPath::simple_module"
+            },
+            {
+              "kind": "method",
+              "node": "testing/test_pathlib.py::TestImportPath::test_importmode_importlib"
+            },
+            {
+              "kind": "method",
+              "node": "testing/test_pathlib.py::TestImportPath::test_remembers_previous_imports"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -317,6 +325,9 @@",
+          "snippet": " class TestImportPath:\n         # mode='importlib' fails if no spec is found to load the module\n         import importlib.util\n \n+        # Force module to be re-imported.\n+        del sys.modules[module.__name__]\n+\n         monkeypatch.setattr(\n             importlib.util, \"spec_from_file_location\", lambda *args: None\n         )",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "testing/test_pathlib.py::TestImportPath::test_no_meta_path_found"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -592,3 +603,15 @@",
+          "snippet": " class TestImportLibMode:\n         modules = {}\n         insert_missing_modules(modules, \"\")\n         assert modules == {}\n+\n+    def test_parent_contains_child_module_attribute(\n+        self, monkeypatch: MonkeyPatch, tmp_path: Path\n+    ):\n+        monkeypatch.chdir(tmp_path)\n+        # Use 'xxx' and 'xxy' as parent names as they are unlikely to exist and\n+        # don't end up being imported.\n+        modules = {\"xxx.tests.foo\": ModuleType(\"xxx.tests.foo\")}\n+        insert_missing_modules(modules, \"xxx.tests.foo\")\n+        assert sorted(modules) == [\"xxx\", \"xxx.tests\", \"xxx.tests.foo\"]\n+        assert modules[\"xxx\"].tests is modules[\"xxx.tests\"]\n+        assert modules[\"xxx.tests\"].foo is modules[\"xxx.tests.foo\"]\n",
+          "affect": [
+            {
+              "kind": "class",
+              "node": "testing/test_pathlib.py::TestImportLibMode"
+            },
+            {
+              "kind": "method",
+              "node": "testing/test_pathlib.py::TestImportLibMode::test_parent_contains_child_module_attribute"
+            }
+          ]
+        }
+      ]
+    },
+    "testing/test_pluginmanager.py": {
+      "hunks": [
+        {
+          "hunk": "@@ -242,8 +242,12 @@",
+          "snippet": " class TestPytestPluginManager:\n         mod = types.ModuleType(\"temp\")\n         mod.__dict__[\"pytest_plugins\"] = [\"pytest_p1\", \"pytest_p2\"]\n         pytestpm.consider_module(mod)\n-        assert pytestpm.get_plugin(\"pytest_p1\").__name__ == \"pytest_p1\"\n-        assert pytestpm.get_plugin(\"pytest_p2\").__name__ == \"pytest_p2\"\n+        p1 = pytestpm.get_plugin(\"pytest_p1\")\n+        assert p1 is not None\n+        assert p1.__name__ == \"pytest_p1\"\n+        p2 = pytestpm.get_plugin(\"pytest_p2\")\n+        assert p2 is not None\n+        assert p2.__name__ == \"pytest_p2\"\n \n     def test_consider_module_import_module(\n         self, pytester: Pytester, _config_for_test: Config",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "testing/test_pluginmanager.py::TestPytestPluginManager::test_consider_module"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -336,6 +340,7 @@",
+          "snippet": " class TestPytestPluginManager:\n         len2 = len(pytestpm.get_plugins())\n         assert len1 == len2\n         plugin1 = pytestpm.get_plugin(\"pytest_hello\")\n+        assert plugin1 is not None\n         assert plugin1.__name__.endswith(\"pytest_hello\")\n         plugin2 = pytestpm.get_plugin(\"pytest_hello\")\n         assert plugin2 is plugin1",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "testing/test_pluginmanager.py::TestPytestPluginManager::test_import_plugin_importname"
+            }
+          ]
+        },
+        {
+          "hunk": "@@ -351,6 +356,7 @@",
+          "snippet": " class TestPytestPluginManager:\n         pluginname = \"pkg.plug\"\n         pytestpm.import_plugin(pluginname)\n         mod = pytestpm.get_plugin(\"pkg.plug\")\n+        assert mod is not None\n         assert mod.x == 3\n \n     def test_consider_conftest_deps(",
+          "affect": [
+            {
+              "kind": "method",
+              "node": "testing/test_pluginmanager.py::TestPytestPluginManager::test_import_plugin_dotted_name"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
