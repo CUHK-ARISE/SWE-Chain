@@ -60,6 +60,40 @@ For each upgrade step `v_prev → v_next`, we run `v_next`'s test suite against 
 | **unrecovered** | A non-upgrade-related test that was failing before and is still failing. |
 
 
+
+## 🧪 Customize your own chain
+
+### Setup
+
+1. **`packages.yaml`** — add an entry under `packages:` with the Dockerfile version range, testing folder, exec timeout, and protected paths.
+2. **Dockerfile** — drop a Dockerfile under `dockerfiles/` covering the version range declared in step 1.
+3. **Changelog fetcher** — write `fetch_<package>_changelog(versions)` in `fetchers/changelog_fetcher.py` and register it in `FETCHER_MAP`. You can use the existing fetcher as a template.
+
+### Build the chain
+
+```bash
+# 1. Collect metadata: release notes, GitHub PR/issue content, code & test diffs.
+python collect.py flask --from 2.0.0 --to 2.3.3
+# → metadata/flask_2.0.0_to_2.3.3/
+
+# 2a. Build a Docker image per version.
+python build.py metadata/flask_2.0.0_to_2.3.3
+
+# 2b. Run gold tests on each version (per-version baseline).
+python validate_baseline.py metadata/flask_2.0.0_to_2.3.3 --workers 5
+# → oracle/flask_2.0.0_to_2.3.3/2.0.1/v2.0.1_test_results.json
+
+# 2c. Run cross-version tests (v_next test suite on v_prev codebase, in v_next image).
+python validate_cross.py metadata/flask_2.0.0_to_2.3.3 --workers 5
+# → oracle/flask_2.0.0_to_2.3.3/2.0.1/v2.0.0_cross_test_results.json
+
+# 3. Synthesize the agent-readable spec chain.
+python synthesize.py metadata/flask_2.0.0_to_2.3.3 --model gpt-5.1 --workers 3
+# → data/flask_2.0.0_to_2.3.3_specs_chain.jsonl
+```
+
+
+
 ## 🧩 Repository layout
 
 ```
@@ -93,35 +127,4 @@ swe-chain/
 ├── fetchers/                  # changelog + package source fetchers
 ├── dockerfiles/               # per-package, per-version-range Dockerfiles
 └── prompts/                   # Jinja2 templates for the agent
-```
-
-## 🧪 Customize your own chain
-
-### Setup
-
-1. **`packages.yaml`** — add an entry under `packages:` with the Dockerfile version range, testing folder, exec timeout, and protected paths.
-2. **Dockerfile** — drop a Dockerfile under `dockerfiles/` covering the version range declared in step 1.
-3. **Changelog fetcher** — write `fetch_<package>_changelog(versions)` in `fetchers/changelog_fetcher.py` and register it in `FETCHER_MAP`. You can use the existing fetcher as a template.
-
-### Build the chain
-
-```bash
-# 1. Collect metadata: release notes, GitHub PR/issue content, code & test diffs.
-python collect.py flask --from 2.0.0 --to 2.3.3
-# → metadata/flask_2.0.0_to_2.3.3/
-
-# 2a. Build a Docker image per version.
-python build.py metadata/flask_2.0.0_to_2.3.3
-
-# 2b. Run gold tests on each version (per-version baseline).
-python validate_baseline.py metadata/flask_2.0.0_to_2.3.3 --workers 5
-# → oracle/flask_2.0.0_to_2.3.3/2.0.1/v2.0.1_test_results.json
-
-# 2c. Run cross-version tests (v_next test suite on v_prev codebase, in v_next image).
-python validate_cross.py metadata/flask_2.0.0_to_2.3.3 --workers 5
-# → oracle/flask_2.0.0_to_2.3.3/2.0.1/v2.0.0_cross_test_results.json
-
-# 3. Synthesize the agent-readable spec chain.
-python synthesize.py metadata/flask_2.0.0_to_2.3.3 --model gpt-5.1 --workers 3
-# → data/flask_2.0.0_to_2.3.3_specs_chain.jsonl
 ```
