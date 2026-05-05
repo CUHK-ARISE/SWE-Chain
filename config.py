@@ -1,4 +1,3 @@
-import os
 from functools import lru_cache
 from pathlib import Path
 from typing import List, Tuple
@@ -6,18 +5,23 @@ from typing import List, Tuple
 import yaml
 from packaging.version import Version
 
-METADATA_DIR = Path("metadata")
-PACKAGES_ROOT = Path(".packages")
-TMP_PATH = Path(".tmp")
-WORKSPACE_DIR = Path(".workspace")
-DOCKER_BASE_DIR = "/app/code"
-DOCKER_SCRIPTS_DIR = Path("validation/docker_scripts")
+REPO_ROOT = Path(__file__).parent
+
+# Config and metadata paths
+METADATA_DIR = REPO_ROOT / "metadata"
+ORACLE_DIR = REPO_ROOT / "oracle"
+PACKAGES_CONFIG_PATH = REPO_ROOT / "packages.yaml"
+
+# Tmp dirs for intermediate files
+PACKAGES_ROOT = REPO_ROOT / ".packages"
+WORKSPACE_DIR = REPO_ROOT / ".workspace"
+TMP_PATH = REPO_ROOT / ".tmp"
+
 IMAGE_PREFIX = "swe-chain"
+DOCKER_BASE_DIR = "/app/code"
+DOCKER_SCRIPTS_DIR = REPO_ROOT / "validation" / "docker_scripts"
+
 SKIP_DIRS = {"docs", "__pycache__", ".git", "htmlcov", ".eggs", ".pytest_cache"}
-
-PACKAGES_CONFIG_PATH = Path(__file__).parent / "packages.yaml"
-
-ORACLE_DIR = Path(os.environ.get("SWE_CHAIN_ORACLE_DIR", "oracle"))
 
 
 @lru_cache(maxsize=1)

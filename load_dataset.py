@@ -33,31 +33,20 @@ def explode_parquet(parquet_path: Path, data_dir: Path) -> int:
 
 
 def main():
-    snap = Path(snapshot_download(repo_id=HF_REPO_ID, repo_type="dataset"))
+    snap = Path(snapshot_download(repo_id=HF_REPO_ID, repo_type="dataset", allow_patterns=["data/*.parquet"]))
     parquet_path = snap / "data" / "specs_chain.parquet"
     
     if not parquet_path.exists():
         sys.exit(f"expected parquet not found: {parquet_path}")
-    
+        
     data_dir = Path("data")
     n_chains = explode_parquet(parquet_path, data_dir)
     
-    cache_oracle = snap / "oracle"
     local_oracle = Path("oracle")
-    
-    if local_oracle.is_symlink():
-        local_oracle.unlink()
-    
-    if not local_oracle.exists():
-        local_oracle.symlink_to(cache_oracle.resolve())
-    
     n_oracle = sum(1 for _ in local_oracle.rglob("*.json")) if local_oracle.is_dir() else 0
     
     print(f"\nSnapshot:    {snap}")
     print(f"Chains:      {n_chains} -> {data_dir}/<chain>_specs_chain.jsonl")
-    print(f"Oracle JSON: {n_oracle} files (./oracle -> {cache_oracle})")
-    if n_oracle == 0:
-        print("\n[warn] no oracle/*.json found in snapshot — evaluation harness will be unable to score.")
     
     print("\nReady. Next steps:")
     print("  bash run.sh   data/<chain>_specs_chain.jsonl <agent> <provider> <model>")
