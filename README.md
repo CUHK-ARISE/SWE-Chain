@@ -5,6 +5,8 @@
 ## 🧠 Introduction
 SWE-Chain evaluates coding agents (Claude Code, OpenCode, Codex) on multi-step package version upgrades. An agent receives upgrade specs for consecutive version pairs (e.g. Flask 2.0.0 → 2.0.1 → ... → 2.3.3) and must implement each step inside a Docker-isolated environment. Results are scored against the target version's test suite.
 
+The dataset is hosted at [SWE-Chain](https://huggingface.co/datasets/For-Anonymous-Submission-90/SWE-Chain), and our benchmark archive is saved at [SWE-Chain-Results](https://huggingface.co/datasets/For-Anonymous-Submission-90/SWE-Chain-Results/resolve/main/results.zip).
+
 
 ## 🚀 Quickstart
 
@@ -12,7 +14,7 @@ SWE-Chain evaluates coding agents (Claude Code, OpenCode, Codex) on multi-step p
 # 1. Install
 pip install -r requirements.txt
 
-# 2. Pull dataset (specs + oracle test results) from Hugging Face
+# 2. Pull dataset (specs) from Hugging Face
 python load_dataset.py
 
 # 3. Authenticate the agent CLI you'll use (one-time, on the host) - see below.
@@ -115,7 +117,7 @@ swe-chain/
 ├── synthesize.py              #   Specification synthesizing
 │
 ├── data/                      # SWE-Chain dataset: per-chain JSONL specs (downloaded from HF)
-├── oracle/                    # gold test results per version for evaluation (downloaded from HF)
+├── oracle/                    # gold test results per version for evaluation
 ├── results/                   # agent runs & eval outputs
 │
 ├── agent/                     # CLI wrappers for claudecode / codex / opencode
