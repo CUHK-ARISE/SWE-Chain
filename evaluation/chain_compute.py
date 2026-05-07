@@ -2,12 +2,51 @@ import json
 import argparse
 from collections import Counter
 from pathlib import Path
-from typing import Dict, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
 from validation.test_result import TestRunResult, TestStatus
 from evaluation.comparator import VersionComparator
-from evaluation.utils import iter_phases, read_jsonl
+from evaluation.utils import iter_phases, phase_sort_key, read_jsonl
 from config import ORACLE_DIR
+
+
+def aggregate(records: List[Dict]) -> Dict:
+    tp = sum(r["classification"]["tp"] for r in records)
+    fn = sum(r["classification"]["fn"] for r in records)
+    fp = sum(r["classification"]["fp"] for r in records)
+    recall    = round(tp / (tp + fn), 4) if (tp + fn) > 0 else None
+    precision = round(tp / (tp + fp), 4) if (tp + fp) > 0 else None
+    if recall is None or precision is None or (precision + recall) == 0:
+        f1 = None
+    else:
+        f1 = round(2 * precision * recall / (precision + recall), 4)
+    return {"recall": recall, "precision": precision, "f1": f1}
+
+
+def compute_overall(chain: List[Dict]) -> Dict:
+    by_step: Dict[Tuple[str, str], List[Dict]] = {}
+    for r in chain:
+        by_step.setdefault((r["prev_version"], r["next_version"]), []).append(r)
+        
+    build_records: List[Dict] = []
+    build_fix_records: List[Dict] = []
+    for records in by_step.values():
+        by_phase = {r.get("phase"): r for r in records}
+        if "build" in by_phase:
+            build_records.append(by_phase["build"])
+        fix_phases = sorted(
+            (p for p in by_phase if isinstance(p, str) and p.startswith("fix_")),
+            key=phase_sort_key,
+        )
+        if fix_phases:
+            build_fix_records.append(by_phase[fix_phases[-1]])
+        elif "build" in by_phase:
+            build_fix_records.append(by_phase["build"])
+            
+    return {
+        "build":     aggregate(build_records),
+        "build+fix": aggregate(build_fix_records),
+    }
 
 
 def load_curr_jsonl(path: Path) -> Dict[Tuple[str, str, str], TestRunResult]:
@@ -191,8 +230,9 @@ class ChainCompute:
     
     def save(self) -> None:
         meta = {"package": self.package, "model": self.model, "provider": self.provider, "agent": self.agent}
+        overall = compute_overall(self.eval_results)
         with open(self.eval_path, "w") as f:
-            json.dump({**meta, "chain": self.eval_results}, f, indent=2)
+            json.dump({**meta, "overall": overall, "chain": self.eval_results}, f, indent=2)
         print(f"\nEval saved to {self.eval_path}")
     
     
