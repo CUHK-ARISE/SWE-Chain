@@ -90,7 +90,7 @@ python validate_cross.py metadata/flask_2.0.0_to_2.3.3 --workers 5
 # → oracle/flask_2.0.0_to_2.3.3/2.0.1/v2.0.0_cross_test_results.json
 
 # 3. Synthesize the agent-readable spec chain.
-python synthesize.py metadata/flask_2.0.0_to_2.3.3 --model gpt-5.1 --workers 3
+python synthesize.py metadata/flask_2.0.0_to_2.3.3 --model gpt-5.4 --workers 3
 # → data/flask_2.0.0_to_2.3.3_specs_chain.jsonl
 ```
 
