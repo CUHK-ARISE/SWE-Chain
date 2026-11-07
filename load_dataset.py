@@ -8,7 +8,7 @@ import pyarrow.parquet as pq
 from huggingface_hub import snapshot_download
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-HF_REPO_ID = "For-Anonymous-Submission-90/SWE-Chain"
+HF_REPO_ID = "mhlam/SWE-Chain"
 
 
 def explode_parquet(parquet_path: Path, data_dir: Path) -> int:
