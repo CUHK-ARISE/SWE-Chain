@@ -5,7 +5,7 @@
 ## 🧠 Introduction
 SWE-Chain evaluates coding agents (Claude Code, OpenCode, Codex) on multi-step package version upgrades. An agent receives upgrade specs for consecutive version pairs (e.g. Flask 2.0.0 → 2.0.1 → ... → 2.3.3) and must implement each step inside a Docker-isolated environment. Results are scored against the target version's test suite.
 
-The dataset is hosted at [SWE-Chain](https://huggingface.co/datasets/For-Anonymous-Submission-90/SWE-Chain), and our benchmark archive is saved at [SWE-Chain-Results](https://huggingface.co/datasets/For-Anonymous-Submission-90/SWE-Chain-Results/resolve/main/results.zip).
+The dataset is hosted at [SWE-Chain](https://huggingface.co/datasets/mhlam/SWE-Chain).
 
 
 ## 🚀 Quickstart
